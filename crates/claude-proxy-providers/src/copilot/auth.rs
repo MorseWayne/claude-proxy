@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,10 +65,7 @@ pub struct CopilotAuth {
 
 impl CopilotAuth {
     /// Create a new auth manager.  Loads persisted GitHub token if available.
-    pub async fn new(
-        http_client: Client,
-        oauth_app: &str,
-    ) -> Result<Arc<Self>, ProviderError> {
+    pub async fn new(http_client: Client, oauth_app: &str) -> Result<Arc<Self>, ProviderError> {
         let token_dir = Self::token_dir();
         fs::create_dir_all(&token_dir)
             .map_err(|e| ProviderError::Network(format!("failed to create token dir: {e}")))?;
@@ -101,11 +98,11 @@ impl CopilotAuth {
             .join("copilot")
     }
 
-    fn github_token_path(dir: &PathBuf) -> PathBuf {
+    fn github_token_path(dir: &Path) -> PathBuf {
         dir.join("github_token")
     }
 
-    fn load_github_token(dir: &PathBuf) -> Option<String> {
+    fn load_github_token(dir: &Path) -> Option<String> {
         let path = Self::github_token_path(dir);
         fs::read_to_string(&path)
             .ok()
@@ -143,7 +140,10 @@ impl CopilotAuth {
         eprintln!("║  Copilot Authentication Required                         ║");
         eprintln!("╠══════════════════════════════════════════════════════════╣");
         eprintln!("║  Please visit: {}  ║", device_code.verification_uri);
-        eprintln!("║  Enter code:   {}                                  ║", device_code.user_code);
+        eprintln!(
+            "║  Enter code:   {}                                  ║",
+            device_code.user_code
+        );
         eprintln!("╚══════════════════════════════════════════════════════════╝");
         eprintln!();
 
@@ -283,15 +283,13 @@ impl CopilotAuth {
                 ));
             }
 
-            return Err(ProviderError::UpstreamError {
-                status,
-                body,
-            });
+            return Err(ProviderError::UpstreamError { status, body });
         }
 
-        let data: Value = resp.json().await.map_err(|e| {
-            ProviderError::Network(format!("invalid copilot token response: {e}"))
-        })?;
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Network(format!("invalid copilot token response: {e}")))?;
 
         let token_str = data["token"]
             .as_str()
@@ -337,25 +335,23 @@ impl CopilotAuth {
         // If no copilot token or expired, refresh
         let needs_refresh = {
             let ct = self.copilot_token.read().await;
-            ct.as_ref().map_or(true, |t| {
+            ct.as_ref().is_none_or(|t| {
                 let now = chrono::Utc::now().timestamp();
                 now + t.refresh_in >= t.expires_at
             })
         };
 
-        if needs_refresh {
-            if let Err(e) = self.refresh_copilot_token().await {
-                warn!("Failed to refresh Copilot token: {e}");
-                // Return existing token if still valid
-                let ct = self.copilot_token.read().await;
-                if let Some(t) = ct.as_ref() {
-                    let now = chrono::Utc::now().timestamp();
-                    if now < t.expires_at {
-                        return Ok(t.token.clone());
-                    }
+        if needs_refresh && let Err(e) = self.refresh_copilot_token().await {
+            warn!("Failed to refresh Copilot token: {e}");
+            // Return existing token if still valid
+            let ct = self.copilot_token.read().await;
+            if let Some(t) = ct.as_ref() {
+                let now = chrono::Utc::now().timestamp();
+                if now < t.expires_at {
+                    return Ok(t.token.clone());
                 }
-                return Err(e);
             }
+            return Err(e);
         }
 
         self.copilot_token
@@ -376,15 +372,13 @@ impl CopilotAuth {
                 ticker.tick().await;
                 let needs_refresh = {
                     let ct = auth.copilot_token.read().await;
-                    ct.as_ref().map_or(true, |t| {
+                    ct.as_ref().is_none_or(|t| {
                         let now = chrono::Utc::now().timestamp();
                         now + t.refresh_in - 60 >= t.expires_at
                     })
                 };
-                if needs_refresh {
-                    if let Err(e) = auth.refresh_copilot_token().await {
-                        warn!("Background Copilot token refresh failed: {e}");
-                    }
+                if needs_refresh && let Err(e) = auth.refresh_copilot_token().await {
+                    warn!("Background Copilot token refresh failed: {e}");
                 }
             }
         });

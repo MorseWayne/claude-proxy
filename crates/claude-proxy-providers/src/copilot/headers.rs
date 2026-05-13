@@ -15,6 +15,12 @@ pub struct HeaderBuilder {
     editor_plugin_version: String,
 }
 
+impl Default for HeaderBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeaderBuilder {
     pub fn new() -> Self {
         let machine_id = Self::generate_machine_id();
@@ -76,7 +82,10 @@ impl HeaderBuilder {
             ("x-request-id", request_id.clone()),
             ("x-agent-task-id", request_id),
             ("x-interaction-type", "conversation-agent".to_string()),
-            ("x-vscode-user-agent-library-version", "electron-fetch".to_string()),
+            (
+                "x-vscode-user-agent-library-version",
+                "electron-fetch".to_string(),
+            ),
         ];
 
         headers.push(("vscode-machineid", self.machine_id.clone()));
@@ -125,10 +134,7 @@ fn get_first_mac() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        if let Ok(output) = Command::new("ifconfig")
-            .args(["en0"])
-            .output()
-        {
+        if let Ok(output) = Command::new("ifconfig").args(["en0"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.contains("ether") {

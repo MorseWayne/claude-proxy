@@ -311,11 +311,8 @@ async fn handle_provider(action: ProviderAction) {
                 println!();
                 println!("{}", "Authenticating with GitHub Copilot...".bold());
                 let client = reqwest::Client::new();
-                match claude_proxy_providers::copilot::auth::CopilotAuth::new(
-                    client,
-                    "vscode",
-                )
-                .await
+                match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode")
+                    .await
                 {
                     Ok(auth) => {
                         if let Err(e) = auth.run_device_flow().await {
@@ -323,10 +320,7 @@ async fn handle_provider(action: ProviderAction) {
                             return;
                         }
                         let _ = auth.refresh_copilot_token().await;
-                        println!(
-                            "{} Copilot authentication successful!",
-                            "✓".green().bold()
-                        );
+                        println!("{} Copilot authentication successful!", "✓".green().bold());
                     }
                     Err(e) => {
                         eprintln!("{} Auth init failed: {e}", "✗".red().bold());
@@ -338,40 +332,31 @@ async fn handle_provider(action: ProviderAction) {
             // Try to fetch models and let user pick
             let provider_config = settings.providers.get(&provider_id).unwrap();
             println!("Fetching available models...");
-            match claude_proxy_providers::create_provider(
-                &provider_id,
-                provider_config,
-                &settings,
-            )
-            .await
+            match claude_proxy_providers::create_provider(&provider_id, provider_config, &settings)
+                .await
             {
-                Ok(provider) => {
-                    match provider.list_models().await {
-                        Ok(models) if !models.is_empty() => {
-                            let model_names: Vec<String> =
-                                models.iter().map(|m| m.model_id.clone()).collect();
-                            println!();
-                            let selection = dialoguer::Select::new()
-                                .with_prompt("Choose default model")
-                                .items(&model_names)
-                                .default(0)
-                                .interact()
-                                .unwrap();
-                            let model_name = &model_names[selection];
-                            let model_ref = format!("{provider_id}/{model_name}");
-                            settings.model.default = model_ref.clone();
-                            save_settings(&settings);
-                            println!("  → Default model: {}", model_ref.cyan());
-                            return;
-                        }
-                        _ => {
-                            println!(
-                                "  {} Could not fetch models.",
-                                "⚠".yellow()
-                            );
-                        }
+                Ok(provider) => match provider.list_models().await {
+                    Ok(models) if !models.is_empty() => {
+                        let model_names: Vec<String> =
+                            models.iter().map(|m| m.model_id.clone()).collect();
+                        println!();
+                        let selection = dialoguer::Select::new()
+                            .with_prompt("Choose default model")
+                            .items(&model_names)
+                            .default(0)
+                            .interact()
+                            .unwrap();
+                        let model_name = &model_names[selection];
+                        let model_ref = format!("{provider_id}/{model_name}");
+                        settings.model.default = model_ref.clone();
+                        save_settings(&settings);
+                        println!("  → Default model: {}", model_ref.cyan());
+                        return;
                     }
-                }
+                    _ => {
+                        println!("  {} Could not fetch models.", "⚠".yellow());
+                    }
+                },
                 Err(e) => {
                     println!("  {} Provider init failed: {e}", "⚠".yellow());
                 }
@@ -499,8 +484,8 @@ async fn handle_provider(action: ProviderAction) {
             println!("Speed testing provider \"{}\"...", id.yellow());
 
             let start = std::time::Instant::now();
-            let result = claude_proxy_providers::create_provider(&id, provider_config, &settings)
-                .await;
+            let result =
+                claude_proxy_providers::create_provider(&id, provider_config, &settings).await;
             let elapsed = start.elapsed();
 
             match result {

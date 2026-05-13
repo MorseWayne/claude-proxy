@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use claude_proxy_config::settings::{CopilotProviderConfig, Settings, ProviderConfig as ConfigProviderConfig};
+use claude_proxy_config::settings::{
+    CopilotProviderConfig, ProviderConfig as ConfigProviderConfig, Settings,
+};
 use claude_proxy_core::*;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -41,10 +43,7 @@ impl CopilotProvider {
         config: &ConfigProviderConfig,
         settings: &Settings,
     ) -> Result<Self, ProviderError> {
-        let copilot_config = config
-            .copilot
-            .clone()
-            .unwrap_or_default();
+        let copilot_config = config.copilot.clone().unwrap_or_default();
 
         let base_url = if config.base_url.is_empty() {
             "https://api.githubcopilot.com".to_string()
@@ -92,10 +91,10 @@ impl CopilotProvider {
         let headers_vec = hb.build_headers(token, None, vision);
         let mut map = HeaderMap::new();
         for (k, v) in &headers_vec {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(v) {
-                    map.insert(name, value);
-                }
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(v)
+            {
+                map.insert(name, value);
             }
         }
         map
@@ -115,12 +114,7 @@ impl CopilotProvider {
             .and_then(|m| m.supports_thinking)
             .map_or_else(
                 || vec!["/chat/completions".to_string()],
-                |_| {
-                    vec![
-                        "/v1/messages".to_string(),
-                        "/chat/completions".to_string(),
-                    ]
-                },
+                |_| vec!["/v1/messages".to_string(), "/chat/completions".to_string()],
             )
     }
 
@@ -233,7 +227,9 @@ impl CopilotProvider {
                                 let event_str = buffer[..pos].to_string();
                                 buffer = buffer[pos + 2..].to_string();
 
-                                if let Some(openai_chunk) = crate::openai::parse_openai_chunk(&event_str) {
+                                if let Some(openai_chunk) =
+                                    crate::openai::parse_openai_chunk(&event_str)
+                                {
                                     let events = converter.process_chunk(&openai_chunk);
                                     for event in events {
                                         if tx.send(Ok(event)).await.is_err() {
@@ -343,10 +339,10 @@ impl Provider for CopilotProvider {
         let headers_vec = hb.build_models_headers(&token);
         let mut headers = HeaderMap::new();
         for (k, v) in &headers_vec {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(v) {
-                    headers.insert(name, value);
-                }
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                && let Ok(value) = reqwest::header::HeaderValue::from_str(v)
+            {
+                headers.insert(name, value);
             }
         }
         drop(hb);
@@ -370,16 +366,19 @@ impl Provider for CopilotProvider {
             return Err(self.map_upstream_error(response).await);
         }
 
-        let data: Value = response.json().await.map_err(|e| {
-            ProviderError::Network(format!("failed to parse models response: {e}"))
-        })?;
+        let data: Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Network(format!("failed to parse models response: {e}")))?;
 
         let models: Vec<ModelInfo> = data["data"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
-            .filter(|m| m["model_picker_enabled"].as_bool() == Some(true)
-                     || m["capabilities"]["embeddings"].as_str().is_some())
+            .filter(|m| {
+                m["model_picker_enabled"].as_bool() == Some(true)
+                    || m["capabilities"]["embeddings"].as_str().is_some()
+            })
             .map(|m| {
                 let model_id = m["id"].as_str().unwrap_or("unknown").to_string();
                 let supports_thinking = m["capabilities"]

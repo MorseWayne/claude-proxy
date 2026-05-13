@@ -420,6 +420,12 @@ struct ContentBlockState {
     index: u32,
 }
 
+impl Default for StreamConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamConverter {
     pub fn new() -> Self {
         Self {

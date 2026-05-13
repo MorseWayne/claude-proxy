@@ -1,10 +1,8 @@
 use claude_proxy_core::*;
 use serde_json::Value;
 
-const COMPACT_SYSTEM_PREFIXES: &[&str] = &[
-    "This is a compacted conversation",
-    "This is a continuation",
-];
+const COMPACT_SYSTEM_PREFIXES: &[&str] =
+    &["This is a compacted conversation", "This is a continuation"];
 
 /// Result of preprocessing a MessagesRequest for Premium optimization.
 #[derive(Debug, Default)]
@@ -18,12 +16,10 @@ pub struct PreprocessResult {
 fn detect_compact(system: &Option<SystemPrompt>) -> bool {
     let text = match system {
         Some(SystemPrompt::Text(s)) => s.as_str(),
-        Some(SystemPrompt::Blocks(blocks)) => {
-            blocks.first().map_or("", |b| match b {
-                Content::Text { text } => text.as_str(),
-                _ => "",
-            })
-        }
+        Some(SystemPrompt::Blocks(blocks)) => blocks.first().map_or("", |b| match b {
+            Content::Text { text } => text.as_str(),
+            _ => "",
+        }),
         None => return false,
     };
 
@@ -37,12 +33,10 @@ fn detect_compact(system: &Option<SystemPrompt>) -> bool {
 fn detect_subagent(system: &Option<SystemPrompt>) -> bool {
     let text = match system {
         Some(SystemPrompt::Text(s)) => s.as_str(),
-        Some(SystemPrompt::Blocks(blocks)) => {
-            blocks.first().map_or("", |b| match b {
-                Content::Text { text } => text.as_str(),
-                _ => "",
-            })
-        }
+        Some(SystemPrompt::Blocks(blocks)) => blocks.first().map_or("", |b| match b {
+            Content::Text { text } => text.as_str(),
+            _ => "",
+        }),
         None => return false,
     };
 
@@ -51,10 +45,7 @@ fn detect_subagent(system: &Option<SystemPrompt>) -> bool {
 
 /// Detects if the request has an `anthropic-beta` header (via extra fields).
 fn has_beta_header(request: &MessagesRequest) -> bool {
-    request
-        .extra
-        .get("anthropic-beta")
-        .is_some()
+    request.extra.contains_key("anthropic-beta")
 }
 
 /// Apply tool_result merging to the request (mutates in place).
@@ -160,7 +151,7 @@ pub fn preprocess(
 
     if enable_warmup
         && !result.is_compact
-        && request.tools.as_ref().map_or(true, |t| t.is_empty())
+        && request.tools.as_ref().is_none_or(|t| t.is_empty())
         && !has_beta_header(request)
     {
         result.is_warmup = true;
