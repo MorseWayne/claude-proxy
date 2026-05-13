@@ -91,3 +91,4 @@ jobs:
           files: |
             artifacts/**/*
             checksums.txt
+            install.sh
