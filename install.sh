@@ -41,8 +41,9 @@ main() {
     echo "  URL: ${url}"
 
     local tmp_dir
+    tmp_dir=""
+    trap '[[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"' EXIT
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
 
     curl -fsSL "$url" -o "${tmp_dir}/${archive}"
     tar xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
