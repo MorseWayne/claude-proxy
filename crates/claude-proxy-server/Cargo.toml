@@ -1,0 +1,27 @@
+[package]
+name = "claude-proxy-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+claude-proxy-config = { path = "../claude-proxy-config" }
+claude-proxy-core = { path = "../claude-proxy-core" }
+claude-proxy-providers = { path = "../claude-proxy-providers" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio-stream = "0.1"
+futures = "0.3"
+governor = "0.10"
+notify = "7"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
