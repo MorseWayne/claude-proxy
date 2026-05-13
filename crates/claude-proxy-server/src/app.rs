@@ -88,7 +88,7 @@ impl ProviderRegistry {
     }
 
     /// Get or create a provider for the given ID.
-    pub fn get_or_create(
+    pub async fn get_or_create(
         &mut self,
         provider_id: &str,
         settings: &Settings,
@@ -101,6 +101,7 @@ impl ProviderRegistry {
 
             let provider: Box<dyn Provider> =
                 claude_proxy_providers::create_provider(provider_id, provider_config, settings)
+                    .await
                     .map_err(|e| format!("failed to create provider '{provider_id}': {e}"))?;
 
             self.providers.insert(provider_id.to_string(), provider);

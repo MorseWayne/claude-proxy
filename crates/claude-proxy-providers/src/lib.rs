@@ -1,6 +1,7 @@
 //! Provider trait and implementations for upstream API adapters.
 
 pub mod anthropic;
+pub mod copilot;
 pub mod openai;
 pub mod provider;
 
@@ -10,7 +11,7 @@ use claude_proxy_config::Settings;
 use claude_proxy_config::settings::ProviderConfig;
 
 /// Create a provider instance from config.
-pub fn create_provider(
+pub async fn create_provider(
     provider_id: &str,
     config: &ProviderConfig,
     settings: &Settings,
@@ -32,6 +33,9 @@ pub fn create_provider(
             settings.http.connect_timeout,
             settings.http.read_timeout,
         )?)),
+        "copilot" => Ok(Box::new(
+            copilot::CopilotProvider::new(provider_id, config, settings).await?,
+        )),
         _ => Ok(Box::new(openai::OpenAiProvider::new(
             provider_id,
             &config.api_key,

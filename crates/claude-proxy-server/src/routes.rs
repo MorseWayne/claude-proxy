@@ -124,7 +124,7 @@ pub async fn messages(
     // Get or create provider
     let mut registry = state.provider_registry.write().await;
     let settings = state.settings.read().await;
-    let provider = match registry.get_or_create(&provider_id, &settings) {
+    let provider = match registry.get_or_create(&provider_id, &settings).await {
         Ok(p) => p,
         Err(e) => {
             error!("Provider error: {e}");

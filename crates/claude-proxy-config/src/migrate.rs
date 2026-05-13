@@ -131,6 +131,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 api_key: openai_key,
                 base_url: openai_base,
                 proxy: openai_proxy,
+                copilot: None,
             },
         );
     }
@@ -141,6 +142,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 api_key: anthropic_key,
                 base_url: anthropic_base,
                 proxy: anthropic_proxy,
+                copilot: None,
             },
         );
     }

@@ -32,11 +32,54 @@ pub struct Settings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default = "default_empty")]
     pub api_key: String,
     #[serde(default = "default_empty")]
     pub base_url: String,
     #[serde(default = "default_empty")]
     pub proxy: String,
+    /// Copilot-specific OAuth and optimization configuration.
+    #[serde(default)]
+    pub copilot: Option<CopilotProviderConfig>,
+}
+
+/// Copilot provider configuration (OAuth + premium optimizations).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CopilotProviderConfig {
+    /// OAuth application to use: "vscode" (default) or "opencode".
+    #[serde(default = "default_oauth_app")]
+    pub oauth_app: String,
+    /// Model used for warmup requests (no tools, no beta header).
+    #[serde(default = "default_small_model")]
+    pub small_model: String,
+    /// Maximum thinking tokens for requests.
+    #[serde(default = "default_max_thinking_tokens")]
+    pub max_thinking_tokens: u32,
+    /// Enable warmup detection (route tool-less requests to small model).
+    #[serde(default = "default_true")]
+    pub enable_warmup: bool,
+    /// Enable tool_result merging to reduce premium request count.
+    #[serde(default = "default_true")]
+    pub enable_tool_result_merge: bool,
+    /// Enable compact/auto-continue request detection.
+    #[serde(default = "default_true")]
+    pub enable_compact_detection: bool,
+    /// Enable subagent marker detection (x-initiator: agent).
+    #[serde(default = "default_true")]
+    pub enable_agent_marking: bool,
+}
+
+fn default_oauth_app() -> String {
+    "vscode".to_string()
+}
+fn default_small_model() -> String {
+    "gpt-5-mini".to_string()
+}
+fn default_max_thinking_tokens() -> u32 {
+    16000
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

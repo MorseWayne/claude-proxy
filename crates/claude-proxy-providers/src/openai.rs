@@ -362,7 +362,7 @@ impl Provider for OpenAiProvider {
 
 /// Parsed OpenAI streaming chunk.
 #[derive(Debug)]
-struct OpenAiChunk {
+pub struct OpenAiChunk {
     #[allow(dead_code)]
     id: String,
     model: String,
@@ -400,7 +400,7 @@ struct OpenAiFunction {
 }
 
 /// Stateful converter from OpenAI streaming chunks to Anthropic SSE events.
-struct StreamConverter {
+pub struct StreamConverter {
     message_id: String,
     model: String,
     content_blocks: Vec<ContentBlockState>,
@@ -421,7 +421,7 @@ struct ContentBlockState {
 }
 
 impl StreamConverter {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
             model: String::new(),
@@ -435,7 +435,7 @@ impl StreamConverter {
         }
     }
 
-    fn process_chunk(&mut self, chunk: &OpenAiChunk) -> Vec<SseEvent> {
+    pub fn process_chunk(&mut self, chunk: &OpenAiChunk) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         if !self.started {
@@ -653,7 +653,7 @@ impl StreamConverter {
         events
     }
 
-    fn finish(&mut self) -> Vec<SseEvent> {
+    pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // Close any remaining open blocks
@@ -693,7 +693,7 @@ impl StreamConverter {
 }
 
 /// Parse raw SSE text into an OpenAI chunk.
-fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
+pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
     let mut data_str = None;
 
     for line in text.lines() {
@@ -763,7 +763,7 @@ fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
 }
 
 /// Convert a non-streaming OpenAI response to Anthropic format.
-fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
+pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
     let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let model = data["model"].as_str().unwrap_or("unknown").to_string();
 

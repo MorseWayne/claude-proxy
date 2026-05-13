@@ -1,6 +1,6 @@
 # claude-proxy
 
-A Claude-compatible proxy that routes requests to OpenAI-compatible or Anthropic Messages-compatible upstream providers.
+A Claude-compatible proxy that routes requests to OpenAI, Anthropic, **GitHub Copilot**, or any OpenAI-compatible upstream provider.
 
 Single native binary, zero runtime dependencies.
 
@@ -15,8 +15,11 @@ Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/re
 ## Quick Start
 
 ```bash
-# Add a provider
+# Add a provider (auto-fetches available models for default selection)
 claude-proxy provider add openai
+
+# Add GitHub Copilot (auto OAuth authentication)
+claude-proxy provider add copilot
 
 # Start the server
 claude-proxy server start
@@ -87,6 +90,18 @@ api_key = "sk-..."
 base_url = "https://api.openai.com/v1"
 proxy = ""                              # Optional HTTP proxy
 
+# GitHub Copilot provider (OAuth auto-authentication, no api_key needed)
+[providers.copilot]
+base_url = "https://api.githubcopilot.com"
+
+[providers.copilot.copilot]
+oauth_app = "vscode"                    # OAuth app: "vscode" or "opencode"
+small_model = "gpt-5-mini"             # Warmup fallback model
+enable_warmup = true                    # Enable warmup detection (route tool-less requests to small model)
+enable_tool_result_merge = true         # Enable tool_result merging (reduce premium billing)
+enable_compact_detection = true         # Enable compact/auto-continue detection
+enable_agent_marking = true             # Enable sub-agent traffic marking
+
 [model]
 default = "openai/gpt-4.1"
 opus = "anthropic/claude-opus-4-20250514"      # Optional model aliases
@@ -146,11 +161,14 @@ All admin endpoints require `Authorization: Bearer <admin_token>`.
 
 ## Features
 
+- **Multi-Provider**: OpenAI, Anthropic, GitHub Copilot, and any OpenAI-compatible API
+- **Copilot Integration**: Full GitHub OAuth auth, VS Code impersonation, premium request optimization
+- **Auto Model Discovery**: Fetches available models when adding a provider, interactive default model selection
 - **Rate Limiting**: Per-API-key rate limiting using token bucket algorithm
 - **Concurrency Control**: Semaphore-based concurrency limiting with timeout
 - **Config Hot-Reload**: Config file watcher + SIGUSR1 signal for live reload
 - **Daemon Mode**: Background process with PID file management (Unix)
-- **Model Cache Warms**: Pre-fetches model lists from all providers on startup
+- **Model Cache Warmup**: Pre-fetches model lists from all providers on startup
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM for clean exit
 
 ## Build from Source

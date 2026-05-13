@@ -86,7 +86,7 @@ fn spawn_model_warmup(
             let result = {
                 let mut reg = registry.write().await;
                 let s = settings.read().await;
-                match reg.get_or_create(provider_id, &s) {
+                match reg.get_or_create(provider_id, &s).await {
                     Ok(provider) => {
                         let models = provider.list_models().await;
                         Some(models)

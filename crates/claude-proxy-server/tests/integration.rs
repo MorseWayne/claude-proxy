@@ -25,6 +25,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             api_key: "test-key".to_string(),
             base_url: upstream_url.to_string(),
             proxy: String::new(),
+            copilot: None,
         },
     );
 
