@@ -18,17 +18,16 @@ fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
         return true;
     }
-    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if key == auth_token {
-            return true;
-        }
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && key == auth_token
+    {
+        return true;
     }
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            if token == auth_token {
-                return true;
-            }
-        }
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = auth.strip_prefix("Bearer ")
+        && token == auth_token
+    {
+        return true;
     }
     false
 }
