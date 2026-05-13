@@ -42,11 +42,7 @@ impl Metrics {
         let errors = self.errors_total.load(Ordering::Relaxed);
         let latency_sum = self.latency_sum_ms.load(Ordering::Relaxed);
         let latency_count = self.latency_count.load(Ordering::Relaxed);
-        let avg_latency = if latency_count > 0 {
-            latency_sum / latency_count
-        } else {
-            0
-        };
+        let avg_latency = latency_sum.checked_div(latency_count).unwrap_or(0);
 
         json!({
             "requests_total": requests,
