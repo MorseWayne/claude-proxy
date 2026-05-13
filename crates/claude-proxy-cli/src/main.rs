@@ -467,78 +467,66 @@ async fn handle_provider(action: ProviderAction) {
         }
         ProviderAction::Test { id } => {
             let settings = load_settings_or_exit();
-            let Some(provider) = settings.providers.get(&id) else {
+            let Some(provider_config) = settings.providers.get(&id) else {
                 eprintln!("{} Provider \"{}\" not found.", "Error:".red().bold(), id);
                 process::exit(1);
             };
 
             println!("Testing provider \"{}\"...", id.yellow());
-            println!("  Base URL: {}", provider.base_url);
+            println!("  Base URL: {}", provider_config.base_url);
 
-            // Try to hit the models endpoint
-            let client = reqwest::Client::new();
-            let models_url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-            let resp = client
-                .get(&models_url)
-                .header("Authorization", format!("Bearer {}", provider.api_key))
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    println!("  {} API key is valid (HTTP {})", "✓".green(), r.status());
-                }
-                Ok(r) => {
-                    println!(
-                        "  {} HTTP {}: {}",
-                        "✗".red(),
-                        r.status(),
-                        r.text().await.unwrap_or_default()
-                    );
-                }
+            match claude_proxy_providers::create_provider(&id, provider_config, &settings).await {
+                Ok(provider) => match provider.list_models().await {
+                    Ok(_) => {
+                        println!("  {} Provider is working", "✓".green());
+                    }
+                    Err(e) => {
+                        println!("  {} Model list failed: {e}", "✗".red());
+                    }
+                },
                 Err(e) => {
-                    println!("  {} Connection failed: {e}", "✗".red());
+                    println!("  {} Provider init failed: {e}", "✗".red());
                 }
             }
         }
         ProviderAction::Speedtest { id } => {
             let settings = load_settings_or_exit();
-            let Some(provider) = settings.providers.get(&id) else {
+            let Some(provider_config) = settings.providers.get(&id) else {
                 eprintln!("{} Provider \"{}\" not found.", "Error:".red().bold(), id);
                 process::exit(1);
             };
 
             println!("Speed testing provider \"{}\"...", id.yellow());
-            let client = reqwest::Client::new();
-            let models_url = format!("{}/models", provider.base_url.trim_end_matches('/'));
 
             let start = std::time::Instant::now();
-            let resp = client
-                .get(&models_url)
-                .header("Authorization", format!("Bearer {}", provider.api_key))
-                .send()
+            let result = claude_proxy_providers::create_provider(&id, provider_config, &settings)
                 .await;
             let elapsed = start.elapsed();
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    println!(
-                        "  {} Latency: {:.0}ms",
-                        "✓".green(),
-                        elapsed.as_secs_f64() * 1000.0
-                    );
-                }
-                Ok(r) => {
-                    println!(
-                        "  {} HTTP {} ({:.0}ms)",
-                        "✗".red(),
-                        r.status(),
-                        elapsed.as_secs_f64() * 1000.0
-                    );
+            match result {
+                Ok(provider) => {
+                    let model_start = std::time::Instant::now();
+                    match provider.list_models().await {
+                        Ok(_) => {
+                            let latency = model_start.elapsed();
+                            println!(
+                                "  {} Latency: {:.0}ms",
+                                "✓".green(),
+                                latency.as_secs_f64() * 1000.0
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {} Model list failed ({:.0}ms): {e}",
+                                "✗".red(),
+                                elapsed.as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     println!(
-                        "  {} Failed ({:.0}ms): {e}",
+                        "  {} Provider init failed ({:.0}ms): {e}",
                         "✗".red(),
                         elapsed.as_secs_f64() * 1000.0
                     );
@@ -547,37 +535,28 @@ async fn handle_provider(action: ProviderAction) {
         }
         ProviderAction::FetchModels { id } => {
             let settings = load_settings_or_exit();
-            let Some(provider) = settings.providers.get(&id) else {
+            let Some(provider_config) = settings.providers.get(&id) else {
                 eprintln!("{} Provider \"{}\" not found.", "Error:".red().bold(), id);
                 process::exit(1);
             };
 
             println!("Fetching models from \"{}\"...", id.yellow());
-            let client = reqwest::Client::new();
-            let models_url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-            let resp = client
-                .get(&models_url)
-                .header("Authorization", format!("Bearer {}", provider.api_key))
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let data: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
-                    let models = data["data"].as_array().map(|a| a.len()).unwrap_or(0);
-                    println!("  {} Found {} models", "✓".green(), models);
-                    // TODO: cache model list
-                }
-                Ok(r) => {
-                    println!(
-                        "  {} HTTP {}: {}",
-                        "✗".red(),
-                        r.status(),
-                        r.text().await.unwrap_or_default()
-                    );
-                }
+            match claude_proxy_providers::create_provider(&id, provider_config, &settings).await {
+                Ok(provider) => match provider.list_models().await {
+                    Ok(models) => {
+                        println!("  {} Found {} models", "✓".green(), models.len());
+                        if !models.is_empty() {
+                            for m in &models {
+                                println!("    - {}", m.model_id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} Failed: {e}", "✗".red());
+                    }
+                },
                 Err(e) => {
-                    println!("  {} Failed: {e}", "✗".red());
+                    println!("  {} Provider init failed: {e}", "✗".red());
                 }
             }
         }
