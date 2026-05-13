@@ -267,12 +267,11 @@ async fn handle_provider(action: ProviderAction) {
                 .unwrap();
 
             let mut settings = match claude_proxy_config::Settings::config_file_path() {
-                Some(path) if path.exists() => {
-                    claude_proxy_config::Settings::load(&path).unwrap_or_else(|e| {
+                Some(path) if path.exists() => claude_proxy_config::Settings::load(&path)
+                    .unwrap_or_else(|e| {
                         eprintln!("{} Failed to load config: {e}", "Error:".red().bold());
                         process::exit(1);
-                    })
-                }
+                    }),
                 _ => claude_proxy_config::Settings::default(),
             };
             settings.providers.insert(
