@@ -31,6 +31,14 @@ detect_platform() {
     esac
 }
 
+TMP_DIR=""
+cleanup() {
+    if [[ -n "${TMP_DIR:-}" ]]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
 main() {
     local platform
     platform="$(detect_platform)"
@@ -40,16 +48,13 @@ main() {
     echo "Downloading claude-proxy for ${platform}..."
     echo "  URL: ${url}"
 
-    local tmp_dir
-    tmp_dir=""
-    trap '[[ -n "$tmp_dir" ]] && rm -rf "$tmp_dir"' EXIT
-    tmp_dir="$(mktemp -d)"
+    TMP_DIR="$(mktemp -d)"
 
-    curl -fsSL "$url" -o "${tmp_dir}/${archive}"
-    tar xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
+    curl -fsSL "$url" -o "${TMP_DIR}/${archive}"
+    tar xzf "${TMP_DIR}/${archive}" -C "$TMP_DIR"
 
     mkdir -p "$INSTALL_DIR"
-    mv "${tmp_dir}/claude-proxy" "${INSTALL_DIR}/claude-proxy"
+    mv "${TMP_DIR}/claude-proxy" "${INSTALL_DIR}/claude-proxy"
     chmod +x "${INSTALL_DIR}/claude-proxy"
 
     echo ""
