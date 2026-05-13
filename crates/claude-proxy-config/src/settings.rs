@@ -207,22 +207,26 @@ impl Settings {
     }
 
     /// Resolve a Claude model name to a `provider_id/upstream_model` string.
-    pub fn resolve_model(&self, claude_model: &str) -> &str {
+    pub fn resolve_model(&self, claude_model: &str) -> String {
         let lower = claude_model.to_lowercase();
         if lower.contains("opus")
             && let Some(ref m) = self.model.opus
         {
-            return m;
+            return m.clone();
         } else if lower.contains("haiku")
             && let Some(ref m) = self.model.haiku
         {
-            return m;
+            return m.clone();
         } else if lower.contains("sonnet")
             && let Some(ref m) = self.model.sonnet
         {
-            return m;
+            return m.clone();
         }
-        &self.model.default
+        if claude_model.contains('/') {
+            return claude_model.to_string();
+        }
+        let provider = Self::parse_provider_id(&self.model.default);
+        format!("{}/{}", provider, claude_model)
     }
 
     /// Extract the provider ID from a `provider_id/model` string (first `/` only).
@@ -339,7 +343,15 @@ mod tests {
         );
         assert_eq!(
             settings.resolve_model("claude-sonnet-4-20250514"),
-            "openai/gpt-4.1"
+            "openai/claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            settings.resolve_model("deepseek-v4-flash"),
+            "openai/deepseek-v4-flash"
+        );
+        assert_eq!(
+            settings.resolve_model("opencode-go/deepseek-v4-pro"),
+            "opencode-go/deepseek-v4-pro"
         );
     }
 

@@ -104,7 +104,8 @@ impl OpenAiProvider {
                             Content::Thinking { thinking, .. } => {
                                 parts.push(json!({"type": "text", "text": format!("[thinking]\n{thinking}\n[/thinking]")}));
                             }
-                            Content::ToolUse { id, name, input } => {
+                            Content::ToolUse { id, name, input }
+                            | Content::ServerToolUse { id, name, input } => {
                                 messages.push(json!({
                                     "role": "assistant",
                                     "tool_calls": [{
@@ -140,6 +141,7 @@ impl OpenAiProvider {
                                 }));
                                 continue;
                             }
+                            Content::Unknown => {}
                         }
                     }
                     if !parts.is_empty() {
@@ -190,6 +192,17 @@ impl OpenAiProvider {
             body["tool_choice"] = tc.clone();
         }
 
+        if let Some(thinking) = &req.thinking {
+            let mut thinking_value = serde_json::Map::new();
+            if let Some(ref t) = thinking.r#type {
+                thinking_value.insert("type".to_string(), json!(t));
+            }
+            if let Some(bt) = thinking.budget_tokens {
+                thinking_value.insert("budget_tokens".to_string(), json!(bt));
+            }
+            body["thinking"] = json!(thinking_value);
+        }
+
         body
     }
 }
@@ -208,8 +221,13 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         debug!(
-            "OpenAI request: {}",
-            serde_json::to_string(&body).unwrap_or_default()
+            "OpenAI request: model={} stream={} messages={}",
+            body.get("model").and_then(|v| v.as_str()).unwrap_or("?"),
+            request.stream,
+            body.get("messages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
         );
 
         let response = self

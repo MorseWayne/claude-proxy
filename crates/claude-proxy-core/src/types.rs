@@ -87,6 +87,13 @@ pub enum Content {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +106,10 @@ pub struct Tool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
-    pub budget_tokens: u32,
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 /// A unified SSE event from any provider.

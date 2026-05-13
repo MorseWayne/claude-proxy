@@ -15,6 +15,7 @@ use middleware::{RateLimitConfig, RateLimitLayer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 /// Build the Axum router with all routes and middleware.
@@ -34,6 +35,7 @@ pub fn build_router(state: AppState, settings: &Settings) -> Router {
         .route("/admin/metrics", get(routes::admin_metrics))
         .with_state(state)
         .layer(rate_limit_layer)
+        .layer(TraceLayer::new_for_http())
 }
 
 /// Run the server with the given settings.
