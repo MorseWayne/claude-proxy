@@ -32,8 +32,13 @@ pub fn create_provider(
             settings.http.connect_timeout,
             settings.http.read_timeout,
         )?)),
-        _ => Err(ProviderError::ServiceUnavailable(format!(
-            "unknown provider type: {provider_id}"
-        ))),
+        _ => Ok(Box::new(openai::OpenAiProvider::new(
+            provider_id,
+            &config.api_key,
+            &config.base_url,
+            &config.proxy,
+            settings.http.connect_timeout,
+            settings.http.read_timeout,
+        )?)),
     }
 }
