@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="MorseWayne/free-claude-code"
+REPO="MorseWayne/claude-proxy"
 INSTALL_DIR="${CLP_INSTALL_DIR:-$HOME/.local/bin}"
 
 detect_platform() {

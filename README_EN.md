@@ -7,10 +7,10 @@ Single native binary, zero runtime dependencies.
 ## Install
 
 ```bash
-curl -fsSL https://github.com/MorseWayne/free-claude-code/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
 ```
 
-Or download from [GitHub Releases](https://github.com/MorseWayne/free-claude-code/releases).
+Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases).
 
 ## Quick Start
 

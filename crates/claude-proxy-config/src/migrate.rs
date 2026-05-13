@@ -32,7 +32,7 @@ pub fn try_migrate_env(env_path: &Path) -> Result<Option<Settings>, ConfigError>
 /// Check whether a migration is needed (legacy .env exists, TOML doesn't).
 pub fn needs_migration() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let legacy = dirs::config_dir()
-        .map(|p| p.join("free-claude-code").join(".env"))
+        .map(|p| p.join("claude-proxy").join(".env"))
         .filter(|p| p.exists())?;
 
     let toml_path = Settings::config_file_path().filter(|p| !p.exists())?;

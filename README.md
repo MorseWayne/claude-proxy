@@ -9,10 +9,10 @@ Claude 兼容代理服务器，将请求路由到 OpenAI 或 Anthropic Messages 
 ## 安装
 
 ```bash
-curl -fsSL https://github.com/MorseWayne/free-claude-code/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
 ```
 
-或从 [GitHub Releases](https://github.com/MorseWayne/free-claude-code/releases) 下载。
+或从 [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases) 下载。
 
 ## 快速开始
 
