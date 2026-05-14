@@ -98,9 +98,7 @@ impl Metrics {
     /// Record token usage for a model (in-memory).
     pub async fn record_token_usage(&self, model: &str, usage: &TokenUsage) {
         let mut map = self.model_metrics.lock().await;
-        map.entry(model.to_string())
-            .or_default()
-            .add_usage(usage);
+        map.entry(model.to_string()).or_default().add_usage(usage);
     }
 
     /// Record a completed request with usage, persisting to store if available.

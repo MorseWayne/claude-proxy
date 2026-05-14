@@ -9,12 +9,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
@@ -346,7 +348,9 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 app.settings.providers.remove(&id);
                                 app.mark_dirty();
                                 app.clamp_content_idx();
-                                app.show_toast(Toast::success(format!("Provider \"{id}\" deleted")));
+                                app.show_toast(Toast::success(format!(
+                                    "Provider \"{id}\" deleted"
+                                )));
                             }
                             ConfirmAction::SaveAndQuit => {
                                 save_settings(app);
@@ -383,28 +387,26 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                 _ => {}
             }
         }
-        Overlay::Input(input) => {
-            match key.code {
-                KeyCode::Enter => {
-                    let value = input.value.clone();
-                    let action = input.action.clone();
-                    app.overlay = None;
-                    app.focus = Focus::Content;
-                    apply_input_action(app, &action, &value);
-                }
-                KeyCode::Esc => {
-                    app.overlay = None;
-                    app.focus = Focus::Content;
-                }
-                KeyCode::Backspace => {
-                    input.backspace();
-                }
-                KeyCode::Char(c) => {
-                    input.insert(c);
-                }
-                _ => {}
+        Overlay::Input(input) => match key.code {
+            KeyCode::Enter => {
+                let value = input.value.clone();
+                let action = input.action.clone();
+                app.overlay = None;
+                app.focus = Focus::Content;
+                apply_input_action(app, &action, &value);
             }
-        }
+            KeyCode::Esc => {
+                app.overlay = None;
+                app.focus = Focus::Content;
+            }
+            KeyCode::Backspace => {
+                input.backspace();
+            }
+            KeyCode::Char(c) => {
+                input.insert(c);
+            }
+            _ => {}
+        },
         Overlay::Picker(picker) => {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -417,7 +419,11 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 KeyCode::Enter => {
-                    let selected = picker.items.get(picker.selected).cloned().unwrap_or_default();
+                    let selected = picker
+                        .items
+                        .get(picker.selected)
+                        .cloned()
+                        .unwrap_or_default();
                     let action = picker.action.clone();
                     match action {
                         PickerAction::SetModelDefault { provider_id } => {
@@ -445,17 +451,28 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             app.fetch_rx = Some(rx);
                             let pid = selected;
                             std::thread::spawn(move || {
-                                let models = fetch_models_via_provider(&pid, &settings, handle.as_ref());
-                                let _ = tx.send(FetchResult { provider_id: pid, models });
+                                let models =
+                                    fetch_models_via_provider(&pid, &settings, handle.as_ref());
+                                let _ = tx.send(FetchResult {
+                                    provider_id: pid,
+                                    models,
+                                });
                             });
                         }
-                        PickerAction::SetModelField { provider_id, section } => {
+                        PickerAction::SetModelField {
+                            provider_id,
+                            section,
+                        } => {
                             app.overlay = None;
                             app.focus = Focus::Content;
                             let value = format!("{provider_id}/{selected}");
                             set_model_field(app, &section, &value);
                             app.mark_dirty();
-                            app.show_toast(Toast::success(format!("{} = {}", get_section_label(&section), value)));
+                            app.show_toast(Toast::success(format!(
+                                "{} = {}",
+                                get_section_label(&section),
+                                value
+                            )));
                         }
                         PickerAction::SetLogLevel => {
                             app.overlay = None;
@@ -503,7 +520,9 @@ fn request_quit(app: &mut App) {
         app.overlay = Some(Overlay::Confirm(ConfirmOverlay {
             title: "Quit".into(),
             message: "Quit claude-proxy configuration?".into(),
-            kind: ConfirmKind::YesNo { on_yes: ConfirmAction::Quit },
+            kind: ConfirmKind::YesNo {
+                on_yes: ConfirmAction::Quit,
+            },
         }));
     }
     app.focus = Focus::Overlay;
@@ -556,7 +575,9 @@ fn start_editing(app: &mut App) {
         // Build provider list for picker
         let providers: Vec<String> = app.settings.providers.keys().cloned().collect();
         if providers.is_empty() {
-            app.show_toast(Toast::warning("No providers configured. Add a provider first."));
+            app.show_toast(Toast::warning(
+                "No providers configured. Add a provider first.",
+            ));
             return;
         }
         app.overlay = Some(Overlay::Picker(PickerOverlay {
@@ -610,33 +631,78 @@ fn start_editing(app: &mut App) {
 fn get_editable_section(app: &App) -> (Option<EditableSection>, String) {
     match app.nav {
         NavItem::Server => match app.content_idx {
-            0 => (Some(EditableSection::ServerHost), app.settings.server.host.clone()),
-            1 => (Some(EditableSection::ServerPort), app.settings.server.port.to_string()),
-            2 => (Some(EditableSection::ServerAuthToken), app.settings.server.auth_token.clone()),
-            3 => (Some(EditableSection::AdminAuthToken), app.settings.admin.auth_token.clone().unwrap_or_default()),
+            0 => (
+                Some(EditableSection::ServerHost),
+                app.settings.server.host.clone(),
+            ),
+            1 => (
+                Some(EditableSection::ServerPort),
+                app.settings.server.port.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::ServerAuthToken),
+                app.settings.server.auth_token.clone(),
+            ),
+            3 => (
+                Some(EditableSection::AdminAuthToken),
+                app.settings.admin.auth_token.clone().unwrap_or_default(),
+            ),
             _ => (None, String::new()),
         },
         NavItem::Limits => match app.content_idx {
-            0 => (Some(EditableSection::RateLimit), app.settings.limits.rate_limit.to_string()),
-            1 => (Some(EditableSection::RateWindow), app.settings.limits.rate_window.to_string()),
-            2 => (Some(EditableSection::MaxConcurrency), app.settings.limits.max_concurrency.to_string()),
+            0 => (
+                Some(EditableSection::RateLimit),
+                app.settings.limits.rate_limit.to_string(),
+            ),
+            1 => (
+                Some(EditableSection::RateWindow),
+                app.settings.limits.rate_window.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::MaxConcurrency),
+                app.settings.limits.max_concurrency.to_string(),
+            ),
             _ => (None, String::new()),
         },
         NavItem::Http => match app.content_idx {
-            0 => (Some(EditableSection::HttpReadTimeout), app.settings.http.read_timeout.to_string()),
-            1 => (Some(EditableSection::HttpWriteTimeout), app.settings.http.write_timeout.to_string()),
-            2 => (Some(EditableSection::HttpConnectTimeout), app.settings.http.connect_timeout.to_string()),
+            0 => (
+                Some(EditableSection::HttpReadTimeout),
+                app.settings.http.read_timeout.to_string(),
+            ),
+            1 => (
+                Some(EditableSection::HttpWriteTimeout),
+                app.settings.http.write_timeout.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::HttpConnectTimeout),
+                app.settings.http.connect_timeout.to_string(),
+            ),
             _ => (None, String::new()),
         },
         NavItem::Log => match app.content_idx {
-            0 => (Some(EditableSection::LogLevel), app.settings.log.level.clone()),
+            0 => (
+                Some(EditableSection::LogLevel),
+                app.settings.log.level.clone(),
+            ),
             _ => (None, String::new()),
         },
         NavItem::Model => match app.content_idx {
-            0 => (Some(EditableSection::ModelDefault), app.settings.model.default.clone()),
-            1 => (Some(EditableSection::ModelOpus), app.settings.model.opus.clone().unwrap_or_default()),
-            2 => (Some(EditableSection::ModelSonnet), app.settings.model.sonnet.clone().unwrap_or_default()),
-            3 => (Some(EditableSection::ModelHaiku), app.settings.model.haiku.clone().unwrap_or_default()),
+            0 => (
+                Some(EditableSection::ModelDefault),
+                app.settings.model.default.clone(),
+            ),
+            1 => (
+                Some(EditableSection::ModelOpus),
+                app.settings.model.opus.clone().unwrap_or_default(),
+            ),
+            2 => (
+                Some(EditableSection::ModelSonnet),
+                app.settings.model.sonnet.clone().unwrap_or_default(),
+            ),
+            3 => (
+                Some(EditableSection::ModelHaiku),
+                app.settings.model.haiku.clone().unwrap_or_default(),
+            ),
             _ => (None, String::new()),
         },
         _ => (None, String::new()),
@@ -670,36 +736,64 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
             match section {
                 EditableSection::ServerHost => app.settings.server.host = v,
                 EditableSection::ServerPort => {
-                    if let Ok(p) = v.parse() { app.settings.server.port = p; }
-                    else { app.show_toast(Toast::error("Invalid port")); return; }
+                    if let Ok(p) = v.parse() {
+                        app.settings.server.port = p;
+                    } else {
+                        app.show_toast(Toast::error("Invalid port"));
+                        return;
+                    }
                 }
                 EditableSection::ServerAuthToken => app.settings.server.auth_token = v,
                 EditableSection::AdminAuthToken => {
                     app.settings.admin.auth_token = if v.is_empty() { None } else { Some(v) };
                 }
                 EditableSection::RateLimit => {
-                    if let Ok(n) = v.parse() { app.settings.limits.rate_limit = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.rate_limit = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::RateWindow => {
-                    if let Ok(n) = v.parse() { app.settings.limits.rate_window = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.rate_window = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::MaxConcurrency => {
-                    if let Ok(n) = v.parse() { app.settings.limits.max_concurrency = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.max_concurrency = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::HttpReadTimeout => {
-                    if let Ok(n) = v.parse() { app.settings.http.read_timeout = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.read_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::HttpWriteTimeout => {
-                    if let Ok(n) = v.parse() { app.settings.http.write_timeout = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.write_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::HttpConnectTimeout => {
-                    if let Ok(n) = v.parse() { app.settings.http.connect_timeout = n; }
-                    else { app.show_toast(Toast::error("Invalid number")); return; }
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.connect_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return;
+                    }
                 }
                 EditableSection::LogLevel => app.settings.log.level = v,
                 EditableSection::ModelDefault => app.settings.model.default = v,
@@ -719,9 +813,13 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
         InputAction::SetModelDefault { provider_id } => {
             app.settings.model.default = format!("{provider_id}/{value}");
             app.mark_dirty();
-            app.show_toast(Toast::success(format!("Default model: {provider_id}/{value}")));
+            app.show_toast(Toast::success(format!(
+                "Default model: {provider_id}/{value}"
+            )));
         }
-        InputAction::EditProviderField { provider_id, field, .. } => {
+        InputAction::EditProviderField {
+            provider_id, field, ..
+        } => {
             if let Some(cfg) = app.settings.providers.get_mut(provider_id) {
                 match field {
                     ProviderField::ApiKey => cfg.api_key = value.to_string(),
@@ -741,12 +839,26 @@ fn handle_toggle(app: &mut App) {
             1 => {
                 app.settings.log.raw_api_payloads = !app.settings.log.raw_api_payloads;
                 app.mark_dirty();
-                app.show_toast(Toast::info(format!("Raw API payloads: {}", if app.settings.log.raw_api_payloads { "ON" } else { "OFF" })));
+                app.show_toast(Toast::info(format!(
+                    "Raw API payloads: {}",
+                    if app.settings.log.raw_api_payloads {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                )));
             }
             2 => {
                 app.settings.log.raw_sse_events = !app.settings.log.raw_sse_events;
                 app.mark_dirty();
-                app.show_toast(Toast::info(format!("Raw SSE events: {}", if app.settings.log.raw_sse_events { "ON" } else { "OFF" })));
+                app.show_toast(Toast::info(format!(
+                    "Raw SSE events: {}",
+                    if app.settings.log.raw_sse_events {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                )));
             }
             _ => {}
         }
@@ -766,7 +878,9 @@ fn add_provider(app: &mut App) {
     );
     app.mark_dirty();
     app.content_idx = app.settings.providers.len() - 1;
-    app.show_toast(Toast::success(format!("Added \"{id}\". Edit fields, Ctrl+S to save.")));
+    app.show_toast(Toast::success(format!(
+        "Added \"{id}\". Edit fields, Ctrl+S to save."
+    )));
 }
 
 /// Fetch models using the provider trait (handles OAuth, API keys, etc. correctly).
@@ -877,9 +991,15 @@ fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
     let v = value.to_string();
     match section {
         EditableSection::ModelDefault => app.settings.model.default = v,
-        EditableSection::ModelOpus => app.settings.model.opus = if v.is_empty() { None } else { Some(v) },
-        EditableSection::ModelSonnet => app.settings.model.sonnet = if v.is_empty() { None } else { Some(v) },
-        EditableSection::ModelHaiku => app.settings.model.haiku = if v.is_empty() { None } else { Some(v) },
+        EditableSection::ModelOpus => {
+            app.settings.model.opus = if v.is_empty() { None } else { Some(v) }
+        }
+        EditableSection::ModelSonnet => {
+            app.settings.model.sonnet = if v.is_empty() { None } else { Some(v) }
+        }
+        EditableSection::ModelHaiku => {
+            app.settings.model.haiku = if v.is_empty() { None } else { Some(v) }
+        }
         _ => {}
     }
 }
@@ -898,7 +1018,9 @@ fn fetch_live_metrics(app: &mut App) {
         if !admin_token.is_empty() {
             req = req.header("Authorization", format!("Bearer {admin_token}"));
         }
-        req.send().ok().and_then(|r| r.json::<serde_json::Value>().ok())
+        req.send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
     })
     .join()
     .ok()
@@ -906,9 +1028,18 @@ fn fetch_live_metrics(app: &mut App) {
 
     if let Some(data) = metrics {
         let mut live = LiveMetrics {
-            requests_total: data.get("requests_total").and_then(|v| v.as_u64()).unwrap_or(0),
-            errors_total: data.get("errors_total").and_then(|v| v.as_u64()).unwrap_or(0),
-            avg_latency_ms: data.get("avg_latency_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            requests_total: data
+                .get("requests_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            errors_total: data
+                .get("errors_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            avg_latency_ms: data
+                .get("avg_latency_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             models: Vec::new(),
             stored: None,
         };
@@ -940,9 +1071,18 @@ fn fetch_live_metrics(app: &mut App) {
         // Parse stored (all-time) metrics
         if let Some(stored) = data.get("stored") {
             let mut stored_metrics = StoredMetrics {
-                requests_total: stored.get("requests_total").and_then(|v| v.as_u64()).unwrap_or(0),
-                errors_total: stored.get("errors_total").and_then(|v| v.as_u64()).unwrap_or(0),
-                avg_latency_ms: stored.get("avg_latency_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                requests_total: stored
+                    .get("requests_total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                errors_total: stored
+                    .get("errors_total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                avg_latency_ms: stored
+                    .get("avg_latency_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 models: Vec::new(),
             };
             if let Some(models) = stored.get("models").and_then(|v| v.as_object()) {
@@ -951,8 +1091,14 @@ fn fetch_live_metrics(app: &mut App) {
                     .map(|(name, v)| {
                         let m = LiveModelMetrics {
                             requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                            input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                            output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                            input_tokens: v
+                                .get("input_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0),
+                            output_tokens: v
+                                .get("output_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0),
                             cache_creation_input_tokens: v
                                 .get("cache_creation_input_tokens")
                                 .and_then(|x| x.as_u64())

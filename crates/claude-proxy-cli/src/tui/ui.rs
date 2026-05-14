@@ -1,8 +1,8 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     widgets::Paragraph,
-    Frame,
 };
 
 use super::app::{App, Focus, NavItem, Overlay, ProviderFocus};
@@ -24,7 +24,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header with border
-            Constraint::Min(0),   // body
+            Constraint::Min(0),    // body
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -36,7 +36,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(22), // wider nav for icon + text table
-            Constraint::Min(0),    // content
+            Constraint::Min(0),     // content
         ])
         .split(root[1]);
 
@@ -53,9 +53,9 @@ pub fn render(f: &mut Frame, app: &App) {
     // Overlay (centered over content)
     if let Some(ref overlay) = app.overlay {
         match overlay {
-            Overlay::Confirm(c) => widgets::render_confirm_overlay(
-                f, body[1], &c.title, &c.message, &c.kind,
-            ),
+            Overlay::Confirm(c) => {
+                widgets::render_confirm_overlay(f, body[1], &c.title, &c.message, &c.kind)
+            }
             Overlay::Input(input) => widgets::render_input_overlay(f, body[1], input),
             Overlay::Picker(picker) => widgets::render_picker_overlay(f, body[1], picker),
             Overlay::Loading(loading) => widgets::render_loading_overlay(f, body[1], loading),
@@ -73,8 +73,10 @@ fn render_content(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+type HintPair = (&'static str, &'static str);
+
 /// Returns (navigation_hints, action_hints) for the two-tone footer.
-fn get_footer_hints(app: &App) -> (Vec<(&'static str, &'static str)>, Vec<(&'static str, &'static str)>) {
+fn get_footer_hints(app: &App) -> (Vec<HintPair>, Vec<HintPair>) {
     if let Some(overlay) = &app.overlay {
         let acts = match overlay {
             Overlay::Confirm(c) => match c.kind {
@@ -83,34 +85,17 @@ fn get_footer_hints(app: &App) -> (Vec<(&'static str, &'static str)>, Vec<(&'sta
                     ("n", "Discard"),
                     ("Esc", "Cancel"),
                 ],
-                _ => vec![
-                    ("Enter", "Yes"),
-                    ("Esc", "No"),
-                ],
+                _ => vec![("Enter", "Yes"), ("Esc", "No")],
             },
-            Overlay::Input(_) => vec![
-                ("Enter", "Confirm"),
-                ("Esc", "Cancel"),
-            ],
-            Overlay::Picker(_) => vec![
-                ("↑↓", "move"),
-                ("Enter", "select"),
-                ("Esc", "cancel"),
-            ],
-            Overlay::Loading(_) => vec![
-                ("Esc", "cancel"),
-            ],
-            Overlay::Help => vec![
-                ("Esc", "Close"),
-            ],
+            Overlay::Input(_) => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
+            Overlay::Picker(_) => vec![("↑↓", "move"), ("Enter", "select"), ("Esc", "cancel")],
+            Overlay::Loading(_) => vec![("Esc", "cancel")],
+            Overlay::Help => vec![("Esc", "Close")],
         };
         return (vec![], acts);
     }
 
-    let nav = vec![
-        ("←→", "menu/content"),
-        ("↑↓", "move"),
-    ];
+    let nav = vec![("←→", "menu/content"), ("↑↓", "move")];
 
     let acts = match app.focus {
         Focus::Nav => vec![
@@ -137,11 +122,7 @@ fn get_footer_hints(app: &App) -> (Vec<(&'static str, &'static str)>, Vec<(&'sta
                     ],
                 }
             } else {
-                let mut base = vec![
-                    ("e", "edit"),
-                    ("Ctrl+S", "save"),
-                    ("Esc", "back"),
-                ];
+                let mut base = vec![("e", "edit"), ("Ctrl+S", "save"), ("Esc", "back")];
                 if app.nav == NavItem::Log {
                     base.push(("Space", "toggle"));
                 }

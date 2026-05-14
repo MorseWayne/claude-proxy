@@ -41,11 +41,19 @@ impl MetricsStore {
         .map_err(|e| format!("failed to initialize metrics schema: {e}"))?;
 
         info!("Metrics store opened at {}", db_path.display());
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Record a completed request with its token usage.
-    pub async fn record_usage(&self, model: &str, usage: &TokenUsage, is_error: bool, latency_ms: u64) {
+    pub async fn record_usage(
+        &self,
+        model: &str,
+        usage: &TokenUsage,
+        is_error: bool,
+        latency_ms: u64,
+    ) {
         let conn = self.conn.lock().await;
         if let Err(e) = conn.execute(
             "INSERT INTO usage_events (model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
@@ -102,8 +110,8 @@ impl MetricsStore {
                     COALESCE(SUM(cache_read_input_tokens), 0)
              FROM usage_events
              GROUP BY model",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
+        )
+            && let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -112,19 +120,19 @@ impl MetricsStore {
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                 ))
-            }) {
-                for row in rows.flatten() {
-                    totals.model_metrics.insert(
-                        row.0,
-                        StoredModelMetrics {
-                            requests: row.1 as u64,
-                            input_tokens: row.2 as u64,
-                            output_tokens: row.3 as u64,
-                            cache_creation_input_tokens: row.4 as u64,
-                            cache_read_input_tokens: row.5 as u64,
-                        },
-                    );
-                }
+            })
+        {
+            for row in rows.flatten() {
+                totals.model_metrics.insert(
+                    row.0,
+                    StoredModelMetrics {
+                        requests: row.1 as u64,
+                        input_tokens: row.2 as u64,
+                        output_tokens: row.3 as u64,
+                        cache_creation_input_tokens: row.4 as u64,
+                        cache_read_input_tokens: row.5 as u64,
+                    },
+                );
             }
         }
 

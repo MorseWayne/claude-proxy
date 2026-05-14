@@ -82,16 +82,32 @@ pub enum ToastKind {
 
 impl Toast {
     pub fn info(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: ToastKind::Info, remaining_ticks: 15 }
+        Self {
+            message: msg.into(),
+            kind: ToastKind::Info,
+            remaining_ticks: 15,
+        }
     }
     pub fn success(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: ToastKind::Success, remaining_ticks: 15 }
+        Self {
+            message: msg.into(),
+            kind: ToastKind::Success,
+            remaining_ticks: 15,
+        }
     }
     pub fn warning(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: ToastKind::Warning, remaining_ticks: 20 }
+        Self {
+            message: msg.into(),
+            kind: ToastKind::Warning,
+            remaining_ticks: 20,
+        }
     }
     pub fn error(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: ToastKind::Error, remaining_ticks: 25 }
+        Self {
+            message: msg.into(),
+            kind: ToastKind::Error,
+            remaining_ticks: 25,
+        }
     }
 }
 
@@ -140,11 +156,18 @@ pub struct PickerOverlay {
 
 #[derive(Debug, Clone)]
 pub enum PickerAction {
-    SetModelDefault { provider_id: String },
+    SetModelDefault {
+        provider_id: String,
+    },
     /// Step 1: pick provider → then fetch and show model picker
-    PickProviderForModel { section: EditableSection },
+    PickProviderForModel {
+        section: EditableSection,
+    },
     /// Step 2: pick model → set the field
-    SetModelField { provider_id: String, section: EditableSection },
+    SetModelField {
+        provider_id: String,
+        section: EditableSection,
+    },
     /// Pick a log level value
     SetLogLevel,
 }
@@ -168,7 +191,13 @@ pub struct InputOverlay {
 
 impl InputOverlay {
     pub fn new(title: &str, prompt: &str, action: InputAction) -> Self {
-        Self { title: title.into(), prompt: prompt.into(), value: String::new(), cursor: 0, action }
+        Self {
+            title: title.into(),
+            prompt: prompt.into(),
+            value: String::new(),
+            cursor: 0,
+            action,
+        }
     }
 
     pub fn with_value(mut self, value: &str) -> Self {
@@ -193,9 +222,17 @@ impl InputOverlay {
 
 #[derive(Debug, Clone)]
 pub enum InputAction {
-    SetModelDefault { provider_id: String },
-    EditProviderField { provider_id: String, field: ProviderField, field_index: usize },
-    EditSetting { section: EditableSection },
+    SetModelDefault {
+        provider_id: String,
+    },
+    EditProviderField {
+        provider_id: String,
+        field: ProviderField,
+        field_index: usize,
+    },
+    EditSetting {
+        section: EditableSection,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

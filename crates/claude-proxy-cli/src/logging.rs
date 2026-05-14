@@ -23,7 +23,9 @@ pub fn init_logging(log_config: &LogConfig, tui_mode: bool) -> anyhow::Result<()
     // Non-blocking file writer (flushes every second, buffer 128k lines)
     let file_appender = tracing_appender::rolling::never(
         log_file.parent().unwrap_or(&log_dir),
-        log_file.file_name().unwrap_or(std::ffi::OsStr::new("claude-proxy.log")),
+        log_file
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("claude-proxy.log")),
     );
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
@@ -52,12 +54,13 @@ pub fn init_logging(log_config: &LogConfig, tui_mode: bool) -> anyhow::Result<()
             .init();
     } else {
         // File only (for TUI or daemon mode)
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .init();
+        tracing_subscriber::registry().with(file_layer).init();
     }
 
-    tracing::info!("Logging initialized: level={level}, file={}", log_file.display());
+    tracing::info!(
+        "Logging initialized: level={level}, file={}",
+        log_file.display()
+    );
     if !tui_mode && log_config.with_stdout {
         tracing::info!("Dual output: file + stderr");
     }
@@ -69,9 +72,7 @@ fn build_filter(log_config: &LogConfig) -> EnvFilter {
     // Respect RUST_LOG env var first, then fall back to config
     EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = &log_config.level;
-        EnvFilter::new(format!(
-            "{level},hyper=warn,reqwest=warn,tower_http=info"
-        ))
+        EnvFilter::new(format!("{level},hyper=warn,reqwest=warn,tower_http=info"))
     })
 }
 

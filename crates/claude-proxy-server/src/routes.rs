@@ -176,7 +176,9 @@ pub async fn messages(
                     }
                     // Record token usage after stream completes (persisted)
                     let latency_ms = task_start.elapsed().as_millis() as u64;
-                    metrics.record_completed_request(&model_name, &usage, had_error, latency_ms).await;
+                    metrics
+                        .record_completed_request(&model_name, &usage, had_error, latency_ms)
+                        .await;
                 });
 
                 state
@@ -221,9 +223,7 @@ pub async fn messages(
                     .record_completed_request(&request.model, &usage, false, latency_ms)
                     .await;
 
-                state
-                    .metrics
-                    .record_latency(latency_ms);
+                state.metrics.record_latency(latency_ms);
                 Json(response_data).into_response()
             }
         }
@@ -465,7 +465,10 @@ fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
         if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
             usage.input_tokens += v;
         }
-        if let Some(v) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+        if let Some(v) = u
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
             usage.cache_creation_input_tokens += v;
         }
         if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {

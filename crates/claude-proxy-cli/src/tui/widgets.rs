@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
-    Frame,
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
+        Wrap,
+    },
 };
 
 use super::app::{Focus, NavItem};
@@ -78,10 +81,7 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &super::app::App) {
     ];
 
     // Right: status badges
-    let status_text = format!(
-        "  {} providers  ",
-        provider_count,
-    );
+    let status_text = format!("  {} providers  ", provider_count,);
     let model_text = format!("  {}  ", app.settings.model.default);
 
     let right_spans = vec![
@@ -133,7 +133,9 @@ pub fn render_nav(f: &mut Frame, area: Rect, app: &super::app::App) {
                 .border_style(theme::pane_border_style(is_focused))
                 .title(" Menu ")
                 .title_style(if is_focused {
-                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme::FG_DIM)
                 })
@@ -191,11 +193,16 @@ pub fn render_field(
         let line = Line::from(vec![
             Span::styled(
                 format!(" ▸ {:<16}", label),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {} ", display),
-                Style::default().fg(theme::BG_DARK).bg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::BG_DARK)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
         f.render_widget(Paragraph::new(line), area);
@@ -205,10 +212,7 @@ pub fn render_field(
                 format!("   {:<16}", label),
                 Style::default().fg(theme::FG_DIM),
             ),
-            Span::styled(
-                format!(" {}", display),
-                Style::default().fg(theme::FG),
-            ),
+            Span::styled(format!(" {}", display), Style::default().fg(theme::FG)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -216,13 +220,7 @@ pub fn render_field(
 
 // ── Toggle field ──
 
-pub fn render_toggle(
-    f: &mut Frame,
-    area: Rect,
-    label: &str,
-    value: bool,
-    is_selected: bool,
-) {
+pub fn render_toggle(f: &mut Frame, area: Rect, label: &str, value: bool, is_selected: bool) {
     let (mark, mark_color) = if value {
         ("◉ ON ", theme::ACCENT2)
     } else {
@@ -233,11 +231,16 @@ pub fn render_toggle(
         let line = Line::from(vec![
             Span::styled(
                 format!(" ▸ {:<16}", label),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {} ", mark),
-                Style::default().fg(theme::BG_DARK).bg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::BG_DARK)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
         f.render_widget(Paragraph::new(line), area);
@@ -247,10 +250,7 @@ pub fn render_toggle(
                 format!("   {:<16}", label),
                 Style::default().fg(theme::FG_DIM),
             ),
-            Span::styled(
-                format!(" {}", mark),
-                Style::default().fg(mark_color),
-            ),
+            Span::styled(format!(" {}", mark), Style::default().fg(mark_color)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -322,10 +322,7 @@ pub fn render_footer(
         spans.push(Span::styled(" ", act_desc_style));
     }
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ── Toast ──
@@ -366,7 +363,10 @@ pub fn render_toast(f: &mut Frame, area: Rect, app: &super::app::App) {
         f.render_widget(block, toast_area);
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    icon,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(&toast.message, Style::default().fg(color)),
             ]))
             .centered(),
@@ -377,13 +377,23 @@ pub fn render_toast(f: &mut Frame, area: Rect, app: &super::app::App) {
 
 // ── Confirm overlay ──
 
-pub fn render_confirm_overlay(f: &mut Frame, area: Rect, title: &str, message: &str, kind: &super::app::ConfirmKind) {
+pub fn render_confirm_overlay(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: &str,
+    kind: &super::app::ConfirmKind,
+) {
     let dialog = centered_rect_fixed(54, 8, area);
     f.render_widget(Clear, dialog);
 
     let block = Block::default()
         .title(format!(" {} ", title))
-        .title_style(Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme::WARN)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::WARN))
@@ -393,45 +403,84 @@ pub fn render_confirm_overlay(f: &mut Frame, area: Rect, title: &str, message: &
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
     f.render_widget(
-        Paragraph::new(message).style(Style::default().fg(theme::FG)).centered(),
+        Paragraph::new(message)
+            .style(Style::default().fg(theme::FG))
+            .centered(),
         chunks[0],
     );
 
     let hints = match kind {
         super::app::ConfirmKind::YesNo { .. } => {
             vec![
-                Span::styled(" Enter ", Style::default().fg(theme::BG_DARK).bg(theme::ACCENT2).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Yes  ", dim_style()),
-                Span::styled(" Esc ", Style::default().fg(theme::BG_DARK).bg(theme::ERR).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::ERR)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" No", dim_style()),
             ]
         }
         super::app::ConfirmKind::DirtyQuit => {
             vec![
-                Span::styled(" Enter ", Style::default().fg(theme::BG_DARK).bg(theme::ACCENT2).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Save & Quit  ", dim_style()),
-                Span::styled(" n ", Style::default().fg(theme::BG_DARK).bg(theme::WARN).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " n ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::WARN)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Discard  ", dim_style()),
-                Span::styled(" Esc ", Style::default().fg(theme::BG_DARK).bg(theme::ERR).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::ERR)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Cancel", dim_style()),
             ]
         }
         super::app::ConfirmKind::Info => {
             vec![
-                Span::styled(" Enter ", Style::default().fg(theme::BG_DARK).bg(theme::ACCENT2).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(theme::BG_DARK)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Close", dim_style()),
             ]
         }
     };
 
-    f.render_widget(
-        Paragraph::new(Line::from(hints)).centered(),
-        chunks[1],
-    );
+    f.render_widget(Paragraph::new(Line::from(hints)).centered(), chunks[1]);
 }
 
 // ── Input overlay ──
@@ -442,7 +491,11 @@ pub fn render_input_overlay(f: &mut Frame, area: Rect, overlay: &super::app::Inp
 
     let block = Block::default()
         .title(format!(" {} ", overlay.title))
-        .title_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::ACCENT))
@@ -452,7 +505,11 @@ pub fn render_input_overlay(f: &mut Frame, area: Rect, overlay: &super::app::Inp
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
         .split(inner);
 
     f.render_widget(
@@ -470,8 +527,7 @@ pub fn render_input_overlay(f: &mut Frame, area: Rect, overlay: &super::app::Inp
     f.render_widget(input_block, chunks[2]);
 
     f.render_widget(
-        Paragraph::new(format!(" {}▌", overlay.value))
-            .style(Style::default().fg(theme::ACCENT)),
+        Paragraph::new(format!(" {}▌", overlay.value)).style(Style::default().fg(theme::ACCENT)),
         input_inner,
     );
 }
@@ -565,7 +621,11 @@ pub fn render_picker_overlay(f: &mut Frame, area: Rect, overlay: &super::app::Pi
 
     let block = Block::default()
         .title(format!(" {} ", overlay.title))
-        .title_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::ACCENT))
@@ -600,8 +660,7 @@ pub fn render_picker_overlay(f: &mut Frame, area: Rect, overlay: &super::app::Pi
     let max_idx = overlay.items.len().saturating_sub(1);
     let selected = overlay.selected.min(max_idx);
     f.render_stateful_widget(
-        List::new(items)
-            .highlight_style(selection_style()),
+        List::new(items).highlight_style(selection_style()),
         chunks[1],
         &mut ratatui::widgets::ListState::default().with_selected(Some(selected)),
     );
@@ -618,7 +677,11 @@ pub fn render_loading_overlay(f: &mut Frame, area: Rect, overlay: &super::app::L
 
     let block = Block::default()
         .title(format!(" {} {} ", spinner, overlay.title))
-        .title_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::ACCENT))

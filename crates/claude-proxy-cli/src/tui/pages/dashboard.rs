@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 use super::super::app::App;
@@ -37,11 +37,15 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let overview = widgets::render_content_frame(f, top_cols[0], app, "Overview");
     let provider_count = app.settings.providers.len();
     let provider_names: Vec<&str> = app.settings.providers.keys().map(|s| s.as_str()).collect();
-    render_card_details(f, overview, &[
-        ("Providers", &format!("{provider_count} configured")),
-        ("Names", &provider_names.join(", ")),
-        ("Default", &app.settings.model.default),
-    ]);
+    render_card_details(
+        f,
+        overview,
+        &[
+            ("Providers", &format!("{provider_count} configured")),
+            ("Names", &provider_names.join(", ")),
+            ("Default", &app.settings.model.default),
+        ],
+    );
 
     // Live Metrics card
     let metrics_area = widgets::render_content_frame(f, top_cols[1], app, "Live Metrics");
@@ -50,40 +54,85 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         if let Some(ref stored) = metrics.stored {
             let total_reqs = metrics.requests_total + stored.requests_total;
             let total_errs = metrics.errors_total + stored.errors_total;
-            render_card_details(f, metrics_area, &[
-                ("Requests", &format!("{total_reqs} (session: {})", metrics.requests_total)),
-                ("Errors", &format!("{total_errs} (session: {})", metrics.errors_total)),
-                ("Avg Latency", &avg_lat),
-            ]);
+            render_card_details(
+                f,
+                metrics_area,
+                &[
+                    (
+                        "Requests",
+                        &format!("{total_reqs} (session: {})", metrics.requests_total),
+                    ),
+                    (
+                        "Errors",
+                        &format!("{total_errs} (session: {})", metrics.errors_total),
+                    ),
+                    ("Avg Latency", &avg_lat),
+                ],
+            );
         } else {
-            render_card_details(f, metrics_area, &[
-                ("Requests", &format!("{}", metrics.requests_total)),
-                ("Errors", &format!("{}", metrics.errors_total)),
-                ("Avg Latency", &avg_lat),
-            ]);
+            render_card_details(
+                f,
+                metrics_area,
+                &[
+                    ("Requests", &format!("{}", metrics.requests_total)),
+                    ("Errors", &format!("{}", metrics.errors_total)),
+                    ("Avg Latency", &avg_lat),
+                ],
+            );
         }
     } else {
-        render_card_details(f, metrics_area, &[
-            ("Status", "connecting..."),
-            ("", ""),
-            ("", ""),
-        ]);
+        render_card_details(
+            f,
+            metrics_area,
+            &[("Status", "connecting..."), ("", ""), ("", "")],
+        );
     }
 
     // Server card
     let server_area = widgets::render_content_frame(f, bot_cols[0], app, "Server");
-    render_card_details(f, server_area, &[
-        ("Listen", &format!("{}:{}", app.settings.server.host, app.settings.server.port)),
-        ("Auth Token", &widgets::mask_value(&app.settings.server.auth_token)),
-        ("Admin Token", &app.settings.admin.auth_token.as_deref().map(|_| "set").unwrap_or("(none)").to_string()),
-    ]);
+    render_card_details(
+        f,
+        server_area,
+        &[
+            (
+                "Listen",
+                &format!("{}:{}", app.settings.server.host, app.settings.server.port),
+            ),
+            (
+                "Auth Token",
+                &widgets::mask_value(&app.settings.server.auth_token),
+            ),
+            (
+                "Admin Token",
+                app.settings
+                    .admin
+                    .auth_token
+                    .as_deref()
+                    .map(|_| "set")
+                    .unwrap_or("(none)"),
+            ),
+        ],
+    );
 
     // Limits card
     let limits_area = widgets::render_content_frame(f, bot_cols[1], app, "Rate Limits");
-    render_card_details(f, limits_area, &[
-        ("Rate Limit", &format!("{} req / {}s", app.settings.limits.rate_limit, app.settings.limits.rate_window)),
-        ("Concurrency", &app.settings.limits.max_concurrency.to_string()),
-    ]);
+    render_card_details(
+        f,
+        limits_area,
+        &[
+            (
+                "Rate Limit",
+                &format!(
+                    "{} req / {}s",
+                    app.settings.limits.rate_limit, app.settings.limits.rate_window
+                ),
+            ),
+            (
+                "Concurrency",
+                &app.settings.limits.max_concurrency.to_string(),
+            ),
+        ],
+    );
 
     // Model Token Usage section (takes remaining space)
     render_model_usage(f, app, rows[2]);
@@ -114,7 +163,8 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(ref stored) = metrics.stored {
         for (name, m) in &stored.models {
-            combined.entry(name.clone())
+            combined
+                .entry(name.clone())
                 .and_modify(|e| {
                     e.requests += m.requests;
                     e.input_tokens += m.input_tokens;

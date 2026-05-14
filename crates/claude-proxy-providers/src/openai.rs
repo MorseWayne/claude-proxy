@@ -793,7 +793,12 @@ pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
     });
 
-    Some(OpenAiChunk { id, model, choices, usage })
+    Some(OpenAiChunk {
+        id,
+        model,
+        choices,
+        usage,
+    })
 }
 
 /// Convert a non-streaming OpenAI response to Anthropic format.

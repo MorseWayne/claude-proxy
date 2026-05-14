@@ -59,7 +59,8 @@ impl RateLimitLayer {
             .allow_burst(max)
         };
         let governor = Arc::new(RateLimiter::keyed(quota));
-        let retry_after_secs = (config.per_seconds as f64 / config.max_requests as f64).ceil() as u64;
+        let retry_after_secs =
+            (config.per_seconds as f64 / config.max_requests as f64).ceil() as u64;
         Self {
             governor,
             retry_after_secs,
@@ -124,7 +125,8 @@ where
                     .header("content-type", "application/json")
                     .header(
                         "retry-after",
-                        HeaderValue::from_str(&retry_after).unwrap_or(HeaderValue::from_static("1")),
+                        HeaderValue::from_str(&retry_after)
+                            .unwrap_or(HeaderValue::from_static("1")),
                     )
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap();

@@ -152,10 +152,7 @@ async fn async_main(cli: Cli) {
         .and_then(|p| claude_proxy_config::Settings::load(&p).ok());
 
     let log_config = settings.as_ref().map(|s| &s.log);
-    if let Err(e) = logging::init_logging(
-        log_config.unwrap_or(&Default::default()),
-        is_tui,
-    ) {
+    if let Err(e) = logging::init_logging(log_config.unwrap_or(&Default::default()), is_tui) {
         eprintln!("Warning: failed to initialize logging: {e}");
     }
 
