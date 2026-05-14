@@ -96,28 +96,26 @@ impl OpenAiProvider {
                 }
                 MessageContent::Blocks(blocks) => {
                     let mut parts: Vec<Value> = Vec::new();
+                    let mut reasoning_parts: Vec<String> = Vec::new();
+                    let mut tool_calls: Vec<Value> = Vec::new();
                     for block in blocks {
                         match block {
                             Content::Text { text } => {
                                 parts.push(json!({"type": "text", "text": text}));
                             }
                             Content::Thinking { thinking, .. } => {
-                                parts.push(json!({"type": "text", "text": format!("[thinking]\n{thinking}\n[/thinking]")}));
+                                reasoning_parts.push(thinking.clone());
                             }
                             Content::ToolUse { id, name, input }
                             | Content::ServerToolUse { id, name, input } => {
-                                messages.push(json!({
-                                    "role": "assistant",
-                                    "tool_calls": [{
-                                        "id": id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": name,
-                                            "arguments": serde_json::to_string(input).unwrap_or_default()
-                                        }
-                                    }]
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(input).unwrap_or_default()
+                                    }
                                 }));
-                                continue;
                             }
                             Content::ToolResult {
                                 tool_use_id,
@@ -139,13 +137,25 @@ impl OpenAiProvider {
                                     "tool_call_id": tool_use_id,
                                     "content": content_str
                                 }));
-                                continue;
                             }
                             Content::Unknown => {}
                         }
                     }
-                    if !parts.is_empty() {
-                        messages.push(json!({"role": role, "content": parts}));
+                    // Emit content, reasoning, and tool_calls in a single message.
+                    // Matches DeepSeek's official format:
+                    //   {"role":"assistant","content":"...","reasoning_content":"...","tool_calls":[...]}
+                    if !reasoning_parts.is_empty() || !parts.is_empty() || !tool_calls.is_empty() {
+                        let mut msg = json!({"role": role});
+                        if !reasoning_parts.is_empty() {
+                            msg["reasoning_content"] = json!(reasoning_parts.join("\n"));
+                        }
+                        if !parts.is_empty() {
+                            msg["content"] = json!(parts);
+                        }
+                        if !tool_calls.is_empty() {
+                            msg["tool_calls"] = json!(tool_calls);
+                        }
+                        messages.push(msg);
                     }
                 }
             }
