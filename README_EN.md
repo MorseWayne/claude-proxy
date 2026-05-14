@@ -223,8 +223,8 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 ### TUI Dashboard
 ![TUI Dashboard](images/metrics-dashboard.png)
 
-### Using with GitHub Copilot
-![Copilot Integration](images/copilot-usage.png)
+### Using with Claude Code
+![Claude Code Integration](images/claude-code-usage.png)
 
 ## Build from Source
 
