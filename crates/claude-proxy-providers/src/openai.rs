@@ -668,7 +668,7 @@ impl StreamConverter {
                             "stop_reason": stop_reason,
                             "stop_sequence": null
                         },
-                        "usage": {"output_tokens": self.output_tokens}
+                        "usage": {"output_tokens": self.output_tokens, "input_tokens": self.input_tokens}
                     }),
                 });
 
@@ -708,7 +708,7 @@ impl StreamConverter {
                 data: json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                    "usage": {"output_tokens": self.output_tokens}
+                    "usage": {"output_tokens": self.output_tokens, "input_tokens": self.input_tokens}
                 }),
             });
             events.push(SseEvent {

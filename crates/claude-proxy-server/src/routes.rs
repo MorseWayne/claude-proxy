@@ -485,5 +485,15 @@ fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
         if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
             usage.input_tokens += v;
         }
+        // Cache tokens at top level (Anthropic non-streaming response format)
+        if let Some(v) = u
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            usage.cache_creation_input_tokens += v;
+        }
+        if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+            usage.cache_read_input_tokens += v;
+        }
     }
 }

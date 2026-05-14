@@ -21,10 +21,7 @@ pub struct TokenUsage {
 
 impl TokenUsage {
     pub fn total(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
+        self.input_tokens + self.output_tokens
     }
 }
 
