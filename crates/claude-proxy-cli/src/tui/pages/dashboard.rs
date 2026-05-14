@@ -187,7 +187,7 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
 
     // Sort by total tokens descending
     let mut model_list: Vec<(String, LiveModelMetrics)> = combined.into_iter().collect();
-    model_list.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+    model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
 
     // Header line
     let mut lines: Vec<Line> = vec![Line::from(vec![

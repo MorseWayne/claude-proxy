@@ -231,10 +231,10 @@ fn handle_content_key(app: &mut App, code: KeyCode, _key: event::KeyEvent) {
         KeyCode::Left => {
             app.focus = Focus::Nav;
         }
-        KeyCode::Enter | KeyCode::Char('e') => {
-            if app.item_count() > 0 && app.content_idx < app.item_count() {
-                start_editing(app);
-            }
+        KeyCode::Enter | KeyCode::Char('e')
+            if app.item_count() > 0 && app.content_idx < app.item_count() =>
+        {
+            start_editing(app);
         }
         KeyCode::Char(' ') => {
             handle_toggle(app);
@@ -272,11 +272,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
                     app.content_idx += 1;
                 }
             }
-            KeyCode::Right | KeyCode::Enter => {
-                if !app.settings.providers.is_empty() {
-                    app.provider_focus = ProviderFocus::Detail;
-                    app.detail_idx = 0;
-                }
+            KeyCode::Right | KeyCode::Enter if !app.settings.providers.is_empty() => {
+                app.provider_focus = ProviderFocus::Detail;
+                app.detail_idx = 0;
             }
             KeyCode::Left => {
                 app.focus = Focus::Nav;
@@ -1064,7 +1062,7 @@ fn fetch_live_metrics(app: &mut App) {
                     (name.clone(), m)
                 })
                 .collect();
-            model_list.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+            model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
             live.models = model_list;
         }
 
@@ -1111,7 +1109,7 @@ fn fetch_live_metrics(app: &mut App) {
                         (name.clone(), m)
                     })
                     .collect();
-                model_list.sort_by(|a, b| b.1.total_tokens().cmp(&a.1.total_tokens()));
+                model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
                 stored_metrics.models = model_list;
             }
             live.stored = Some(stored_metrics);
