@@ -10,7 +10,8 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
-    AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelConfig, ProviderConfig, ServerConfig,
+    AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelConfig, ProviderConfig, ProviderType,
+    ServerConfig,
 };
 use claude_proxy_server::AppState;
 use serde_json::json;
@@ -25,6 +26,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             api_key: "test-key".to_string(),
             base_url: upstream_url.to_string(),
             proxy: String::new(),
+            provider_type: Some(ProviderType::OpenAI),
             copilot: None,
         },
     );

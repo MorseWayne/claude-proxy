@@ -38,9 +38,26 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default = "default_empty")]
     pub proxy: String,
+    /// Known provider type. Inferred from the provider key if absent in old configs.
+    #[serde(default)]
+    pub provider_type: Option<ProviderType>,
     /// Copilot-specific OAuth and optimization configuration.
     #[serde(default)]
     pub copilot: Option<CopilotProviderConfig>,
+}
+
+impl ProviderConfig {
+    /// Resolve the provider type, falling back to inference from the provider ID.
+    pub fn resolve_type(&self, provider_id: &str) -> ProviderType {
+        self.provider_type
+            .clone()
+            .unwrap_or_else(|| ProviderType::parse(provider_id))
+    }
+
+    /// Whether this provider uses OAuth (not API key).
+    pub fn uses_oauth(&self, provider_id: &str) -> bool {
+        self.resolve_type(provider_id).auth_method() == AuthMethod::OAuth
+    }
 }
 
 /// Copilot provider configuration (OAuth + premium optimizations).
@@ -80,6 +97,139 @@ fn default_max_thinking_tokens() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+
+/// Authentication method for a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthMethod {
+    #[serde(rename = "api_key")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+/// Known provider type. Informs base URL, auth method, and provider implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderType {
+    OpenAI,
+    Anthropic,
+    Copilot,
+    OpenRouter,
+    Google,
+    Custom(String),
+}
+
+impl std::str::FromStr for ProviderType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "openai" => ProviderType::OpenAI,
+            "anthropic" => ProviderType::Anthropic,
+            "copilot" | "github-copilot" => ProviderType::Copilot,
+            "openrouter" => ProviderType::OpenRouter,
+            "google" => ProviderType::Google,
+            _ => ProviderType::Custom(s.to_string()),
+        })
+    }
+}
+
+impl ProviderType {
+    /// Parse from a string identifier (infallible alias for FromStr).
+    pub fn parse(s: &str) -> Self {
+        s.parse().unwrap()
+    }
+
+    /// Return the canonical string identifier.
+    pub fn as_str(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "openai",
+            ProviderType::Anthropic => "anthropic",
+            ProviderType::Copilot => "copilot",
+            ProviderType::OpenRouter => "openrouter",
+            ProviderType::Google => "google",
+            ProviderType::Custom(s) => s.as_str(),
+        }
+    }
+
+    /// Human-readable display name for UI.
+    pub fn display_name(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "OpenAI",
+            ProviderType::Anthropic => "Anthropic",
+            ProviderType::Copilot => "GitHub Copilot",
+            ProviderType::OpenRouter => "OpenRouter",
+            ProviderType::Google => "Google",
+            ProviderType::Custom(_) => "Custom (OpenAI-compatible)",
+        }
+    }
+
+    /// Default API base URL for this provider type.
+    pub fn default_base_url(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "https://api.openai.com/v1",
+            ProviderType::Anthropic => "https://api.anthropic.com",
+            ProviderType::Copilot => "https://api.githubcopilot.com",
+            ProviderType::OpenRouter => "https://openrouter.ai/api/v1",
+            ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta",
+            ProviderType::Custom(_) => "",
+        }
+    }
+
+    /// How this provider authenticates.
+    pub fn auth_method(&self) -> AuthMethod {
+        match self {
+            ProviderType::Copilot => AuthMethod::OAuth,
+            _ => AuthMethod::ApiKey,
+        }
+    }
+
+    /// Whether this provider requires an API key (not OAuth).
+    pub fn needs_api_key(&self) -> bool {
+        matches!(self.auth_method(), AuthMethod::ApiKey)
+    }
+
+    /// Default model name to use as fallback when switching providers.
+    pub fn default_model_name(&self) -> &str {
+        match self {
+            ProviderType::Copilot => "gpt-5",
+            _ => "",
+        }
+    }
+
+    /// All known provider types for selection UIs.
+    pub fn known_types() -> Vec<ProviderType> {
+        vec![
+            ProviderType::OpenAI,
+            ProviderType::Anthropic,
+            ProviderType::Copilot,
+            ProviderType::OpenRouter,
+            ProviderType::Google,
+            ProviderType::Custom(String::new()),
+        ]
+    }
+}
+
+impl Serialize for ProviderType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ProviderType::Custom(s) => {
+                serializer.serialize_str(&format!("custom:{s}"))
+            }
+            _ => serializer.serialize_str(self.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(name) = s.strip_prefix("custom:") {
+            Ok(ProviderType::Custom(name.to_string()))
+        } else {
+            Ok(ProviderType::parse(&s))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,10 +396,21 @@ impl Settings {
 
     /// Parse settings from a TOML string.
     pub fn from_toml(content: &str, path: &Path) -> Result<Self, ConfigError> {
-        toml::from_str(content).map_err(|e| ConfigError::Parse {
+        let mut settings: Self = toml::from_str(content).map_err(|e| ConfigError::Parse {
             path: path.to_path_buf(),
             message: e.to_string(),
-        })
+        })?;
+        settings.infer_provider_types();
+        Ok(settings)
+    }
+
+    /// Fill in missing provider_type fields from the HashMap key.
+    pub fn infer_provider_types(&mut self) {
+        for (id, config) in self.providers.iter_mut() {
+            if config.provider_type.is_none() {
+                config.provider_type = Some(ProviderType::parse(id));
+            }
+        }
     }
 
     /// Serialize settings to a TOML string.
@@ -420,5 +581,95 @@ auth_token = "test-token"
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.port, 9090);
         assert_eq!(settings.server.auth_token, "test-token");
+    }
+
+    #[test]
+    fn test_provider_type_parse() {
+        assert_eq!(ProviderType::parse("openai"), ProviderType::OpenAI);
+        assert_eq!(ProviderType::parse("anthropic"), ProviderType::Anthropic);
+        assert_eq!(ProviderType::parse("copilot"), ProviderType::Copilot);
+        assert_eq!(ProviderType::parse("github-copilot"), ProviderType::Copilot);
+        assert_eq!(ProviderType::parse("openrouter"), ProviderType::OpenRouter);
+        assert_eq!(ProviderType::parse("google"), ProviderType::Google);
+        assert!(matches!(
+            ProviderType::parse("my-custom"),
+            ProviderType::Custom(s) if s == "my-custom"
+        ));
+    }
+
+    #[test]
+    fn test_provider_type_as_str() {
+        assert_eq!(ProviderType::OpenAI.as_str(), "openai");
+        assert_eq!(ProviderType::Anthropic.as_str(), "anthropic");
+        assert_eq!(ProviderType::Copilot.as_str(), "copilot");
+        assert_eq!(ProviderType::Custom("foo".into()).as_str(), "foo");
+    }
+
+    #[test]
+    fn test_provider_type_default_base_url() {
+        assert!(ProviderType::OpenAI.default_base_url().contains("openai.com"));
+        assert!(ProviderType::Anthropic.default_base_url().contains("anthropic.com"));
+        assert!(ProviderType::Copilot.default_base_url().contains("githubcopilot.com"));
+        assert!(ProviderType::OpenRouter.default_base_url().contains("openrouter.ai"));
+        assert_eq!(ProviderType::Custom("x".into()).default_base_url(), "");
+    }
+
+    #[test]
+    fn test_provider_type_auth_method() {
+        assert_eq!(ProviderType::OpenAI.auth_method(), AuthMethod::ApiKey);
+        assert_eq!(ProviderType::Copilot.auth_method(), AuthMethod::OAuth);
+        assert!(ProviderType::OpenAI.needs_api_key());
+        assert!(!ProviderType::Copilot.needs_api_key());
+    }
+
+    #[test]
+    fn test_provider_type_serde_roundtrip() {
+        let cases = vec![
+            ProviderType::OpenAI,
+            ProviderType::Anthropic,
+            ProviderType::Copilot,
+            ProviderType::OpenRouter,
+            ProviderType::Google,
+            ProviderType::Custom("my-provider".into()),
+        ];
+        for pt in cases {
+            let json = serde_json::to_string(&pt).unwrap();
+            let back: ProviderType = serde_json::from_str(&json).unwrap();
+            assert_eq!(pt, back, "roundtrip failed for {pt:?} (json: {json})");
+        }
+    }
+
+    #[test]
+    fn test_infer_provider_types() {
+        let toml = r#"
+[providers.openai]
+api_key = "sk-test"
+
+[providers.copilot]
+base_url = "https://api.githubcopilot.com"
+
+[providers.custom-thing]
+api_key = "custom-key"
+base_url = "https://custom.example.com"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        assert_eq!(
+            settings.providers.get("openai").unwrap().provider_type,
+            Some(ProviderType::OpenAI)
+        );
+        assert_eq!(
+            settings.providers.get("copilot").unwrap().provider_type,
+            Some(ProviderType::Copilot)
+        );
+        assert!(matches!(
+            settings.providers.get("custom-thing").unwrap().provider_type,
+            Some(ProviderType::Custom(ref s)) if s == "custom-thing"
+        ));
+    }
+
+    #[test]
+    fn test_known_types_count() {
+        let types = ProviderType::known_types();
+        assert_eq!(types.len(), 6);
     }
 }

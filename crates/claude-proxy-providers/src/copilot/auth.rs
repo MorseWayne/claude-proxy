@@ -36,6 +36,15 @@ struct DeviceCodeResponse {
     interval: u64,
 }
 
+/// Public device code info returned to callers for display.
+#[derive(Debug, Clone)]
+pub struct DeviceCodeInfo {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum AccessTokenResponse {
@@ -126,6 +135,31 @@ impl CopilotAuth {
     /// Check if we have a valid GitHub token.
     pub async fn has_github_token(&self) -> bool {
         self.github_token.read().await.is_some()
+    }
+
+    /// Request a device code from GitHub and return info for display.
+    /// Caller should show the URL + user_code to the user, then call
+    /// `complete_device_code` to poll for completion.
+    pub async fn start_device_code(&self) -> Result<DeviceCodeInfo, ProviderError> {
+        let resp = self.request_device_code().await?;
+        Ok(DeviceCodeInfo {
+            device_code: resp.device_code,
+            user_code: resp.user_code,
+            verification_uri: resp.verification_uri,
+            interval: resp.interval,
+        })
+    }
+
+    /// Poll GitHub until the user authorizes the device code.
+    /// Returns the GitHub access token on success.
+    pub async fn complete_device_code(&self, info: &DeviceCodeInfo) -> Result<String, ProviderError> {
+        let dc = DeviceCodeResponse {
+            device_code: info.device_code.clone(),
+            user_code: info.user_code.clone(),
+            verification_uri: info.verification_uri.clone(),
+            interval: info.interval,
+        };
+        self.poll_for_token(&dc).await
     }
 
     /// Run the GitHub OAuth Device Flow interactively.

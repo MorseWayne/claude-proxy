@@ -269,10 +269,15 @@ impl CopilotProvider {
 
     async fn map_upstream_error(&self, response: reqwest::Response) -> ProviderError {
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let body = response.text().await.unwrap_or_default();
         match status {
             401 => ProviderError::Authentication(body),
-            429 => ProviderError::RateLimited,
+            429 => ProviderError::RateLimited { retry_after },
             404 => ProviderError::ModelNotFound(body),
             _ => ProviderError::UpstreamError { status, body },
         }

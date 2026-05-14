@@ -397,10 +397,18 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
             StatusCode::UNAUTHORIZED,
             &ErrorResponse::authentication(msg),
         ),
-        ProviderError::RateLimited => error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            &ErrorResponse::rate_limit("rate limited by upstream"),
-        ),
+        ProviderError::RateLimited { retry_after } => {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &ErrorResponse::rate_limit("rate limited by upstream"),
+            );
+            if let Some(secs) = retry_after
+                && let Ok(header_value) = axum::http::HeaderValue::from_str(&secs.to_string())
+            {
+                response.headers_mut().insert("retry-after", header_value);
+            }
+            response
+        }
         ProviderError::ModelNotFound(msg) => {
             error_response(StatusCode::NOT_FOUND, &ErrorResponse::not_found(msg))
         }

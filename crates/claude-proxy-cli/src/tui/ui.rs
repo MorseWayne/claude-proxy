@@ -59,6 +59,7 @@ pub fn render(f: &mut Frame, app: &App) {
             Overlay::Input(input) => widgets::render_input_overlay(f, body[1], input),
             Overlay::Picker(picker) => widgets::render_picker_overlay(f, body[1], picker),
             Overlay::Loading(loading) => widgets::render_loading_overlay(f, body[1], loading),
+            Overlay::OAuth(oauth) => widgets::render_oauth_overlay(f, body[1], oauth),
             Overlay::Help => widgets::render_help_overlay(f, body[1]),
         }
     }
@@ -90,6 +91,7 @@ fn get_footer_hints(app: &App) -> (Vec<HintPair>, Vec<HintPair>) {
             Overlay::Input(_) => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
             Overlay::Picker(_) => vec![("↑↓", "move"), ("Enter", "select"), ("Esc", "cancel")],
             Overlay::Loading(_) => vec![("Esc", "cancel")],
+            Overlay::OAuth(_) => vec![("Esc", "cancel")],
             Overlay::Help => vec![("Esc", "Close")],
         };
         return (vec![], acts);

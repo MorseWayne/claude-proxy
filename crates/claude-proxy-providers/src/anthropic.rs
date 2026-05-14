@@ -97,10 +97,15 @@ impl Provider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
             let body_text = response.text().await.unwrap_or_default();
             return Err(match status {
                 401 => ProviderError::Authentication(body_text),
-                429 => ProviderError::RateLimited,
+                429 => ProviderError::RateLimited { retry_after },
                 404 => ProviderError::ModelNotFound(body_text),
                 _ => ProviderError::UpstreamError {
                     status,

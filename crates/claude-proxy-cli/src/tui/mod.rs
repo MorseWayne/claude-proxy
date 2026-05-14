@@ -20,10 +20,12 @@ use ratatui::backend::{Backend, CrosstermBackend};
 
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
-    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem, Overlay,
-    PickerAction, PickerOverlay, ProviderField, ProviderFocus, StoredMetrics, Toast,
+    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem, OAuthOverlay,
+    OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderField, ProviderFocus,
+    StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
+use claude_proxy_config::settings::{CopilotProviderConfig, ProviderConfig, ProviderType};
 use tracing::{error, info};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
@@ -119,12 +121,18 @@ fn on_tick(app: &mut App) {
     if let Some(Overlay::Loading(ref mut loading)) = app.overlay {
         loading.spinner_tick = app.tick;
     }
+    // Advance OAuth spinner
+    if let Some(Overlay::OAuth(ref mut oauth)) = app.overlay {
+        oauth.spinner_tick = app.tick;
+    }
     // Periodically fetch metrics from the running server
     app.metrics_fetch_tick += 1;
     if app.metrics_fetch_tick >= METRICS_FETCH_INTERVAL {
         app.metrics_fetch_tick = 0;
         fetch_live_metrics(app);
     }
+    // Poll OAuth results
+    poll_oauth(app);
 }
 
 fn handle_key(app: &mut App, key: event::KeyEvent) {
@@ -285,6 +293,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('d') => {
                 delete_provider(app);
             }
+            KeyCode::Char('o') => {
+                oauth_provider(app);
+            }
             KeyCode::Esc => {
                 app.focus = Focus::Nav;
             }
@@ -318,6 +329,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Char('d') => {
                 delete_provider(app);
+            }
+            KeyCode::Char('o') => {
+                oauth_provider(app);
             }
             KeyCode::Char('q') => {
                 request_quit(app);
@@ -479,6 +493,48 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             app.mark_dirty();
                             app.show_toast(Toast::success(format!("Log level: {selected}")));
                         }
+                        PickerAction::AddProvider => {
+                            let idx = picker.selected;
+                            let types = app.pending_provider_types.take().unwrap_or_default();
+                            let provider_type = types
+                                .into_iter()
+                                .nth(idx)
+                                .unwrap_or(ProviderType::Custom(String::new()));
+
+                            let default_id = provider_type.as_str().to_string();
+                            let id = generate_unique_provider_id(&app.settings.providers, &default_id);
+
+                            let copilot = if provider_type == ProviderType::Copilot {
+                                Some(CopilotProviderConfig::default())
+                            } else {
+                                None
+                            };
+
+                            let is_oauth = !provider_type.needs_api_key();
+
+                            app.settings.providers.insert(
+                                id.clone(),
+                                ProviderConfig {
+                                    api_key: String::new(),
+                                    base_url: provider_type.default_base_url().to_string(),
+                                    proxy: String::new(),
+                                    provider_type: Some(provider_type),
+                                    copilot,
+                                },
+                            );
+                            app.mark_dirty();
+                            app.content_idx = app.settings.providers.len().saturating_sub(1);
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            app.show_toast(Toast::success(format!(
+                                "Added \"{id}\". Edit fields, Ctrl+S to save."
+                            )));
+
+                            // Start OAuth flow for providers that need it
+                            if is_oauth {
+                                start_oauth_flow(app, &id);
+                            }
+                        }
                     }
                 }
                 KeyCode::Esc => {
@@ -494,6 +550,16 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                 app.focus = Focus::Content;
                 app.fetch_rx = None;
                 app.show_toast(Toast::info("Cancelled"));
+            }
+        }
+        Overlay::OAuth(_) => {
+            if key.code == KeyCode::Esc {
+                app.overlay = None;
+                app.focus = Focus::Content;
+                app.oauth_rx = None;
+                app.oauth_pending_id = None;
+                app.oauth_device_info = None;
+                app.show_toast(Toast::info("OAuth cancelled"));
             }
         }
         Overlay::Help => {
@@ -531,11 +597,14 @@ fn start_editing(app: &mut App) {
     if app.nav == NavItem::Providers {
         if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
             let id = id.clone();
-            let is_copilot = id == "copilot";
+            let pt = cfg.resolve_type(&id);
             let (field, prompt, value) = match app.detail_idx {
                 0 => {
-                    if is_copilot {
-                        app.show_toast(Toast::info("Copilot uses OAuth (not editable)"));
+                    if !pt.needs_api_key() {
+                        app.show_toast(Toast::info(format!(
+                            "{} uses OAuth (API key not editable)",
+                            pt.display_name()
+                        )));
                         return;
                     }
                     (ProviderField::ApiKey, "API Key", cfg.api_key.clone())
@@ -864,21 +933,42 @@ fn handle_toggle(app: &mut App) {
 }
 
 fn add_provider(app: &mut App) {
-    let id = format!("provider_{}", app.settings.providers.len() + 1);
-    app.settings.providers.insert(
-        id.clone(),
-        claude_proxy_config::settings::ProviderConfig {
-            api_key: String::new(),
-            base_url: String::new(),
-            proxy: String::new(),
-            copilot: None,
-        },
-    );
-    app.mark_dirty();
-    app.content_idx = app.settings.providers.len() - 1;
-    app.show_toast(Toast::success(format!(
-        "Added \"{id}\". Edit fields, Ctrl+S to save."
-    )));
+    let types = ProviderType::known_types();
+    let items: Vec<String> = types
+        .iter()
+        .map(|t| {
+            let desc = match t {
+                ProviderType::Copilot => " — OAuth, no API key needed",
+                ProviderType::OpenAI => " — API key",
+                ProviderType::Anthropic => " — API key",
+                ProviderType::OpenRouter => " — API key, OpenAI-compatible",
+                ProviderType::Google => " — API key, OpenAI-compatible",
+                ProviderType::Custom(_) => " — OpenAI-compatible",
+            };
+            format!("{}{}", t.display_name(), desc)
+        })
+        .collect();
+    app.pending_provider_types = Some(types);
+    app.overlay = Some(Overlay::Picker(PickerOverlay {
+        title: "Add Provider — Select Type".into(),
+        items,
+        selected: 0,
+        action: PickerAction::AddProvider,
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn generate_unique_provider_id(providers: &std::collections::HashMap<String, ProviderConfig>, base: &str) -> String {
+    if !providers.contains_key(base) {
+        return base.to_string();
+    }
+    for n in 2..100 {
+        let candidate = format!("{base}-{n}");
+        if !providers.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", providers.len() + 1)
 }
 
 /// Fetch models using the provider trait (handles OAuth, API keys, etc. correctly).
@@ -923,6 +1013,112 @@ fn fetch_models_via_provider(
     }
 
     result
+}
+
+/// Start the GitHub OAuth device flow for a Copilot provider in the background.
+fn start_oauth_flow(app: &mut App, provider_id: &str) {
+    let pid = provider_id.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.oauth_rx = Some(rx);
+    app.oauth_pending_id = Some(pid.clone());
+    app.overlay = Some(Overlay::OAuth(OAuthOverlay {
+        provider_id: pid.clone(),
+        step: OAuthStep::Requesting,
+        spinner_tick: app.tick,
+    }));
+    app.focus = Focus::Overlay;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("oauth runtime");
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await
+            {
+                Ok(auth) => match auth.start_device_code().await {
+                    Ok(info) => {
+                        let _ = tx.send(OAuthResult::CodeInfo {
+                            url: info.verification_uri.clone(),
+                            code: info.user_code.clone(),
+                            device_code: info.device_code.clone(),
+                            interval: info.interval,
+                        });
+                        // Poll for completion
+                        match auth.complete_device_code(&info).await {
+                            Ok(_token) => {
+                                let _ = auth.refresh_copilot_token().await;
+                                let _ = tx.send(OAuthResult::Token(_token));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(OAuthResult::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(OAuthResult::Error(e.to_string()));
+                }
+            }
+        });
+    });
+}
+
+/// Poll OAuth background thread results and update overlay state.
+fn poll_oauth(app: &mut App) {
+    if let Some(ref rx) = app.oauth_rx
+        && let Ok(result) = rx.try_recv()
+    {
+        match result {
+            OAuthResult::CodeInfo {
+                url,
+                code,
+                device_code,
+                interval,
+            } => {
+                // Stash device_code + interval for the polling phase
+                app.oauth_device_info = Some((device_code, interval));
+                // Update the overlay to show URL + code
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::ShowCode {
+                        url: url.clone(),
+                        code: code.clone(),
+                    };
+                }
+            }
+            OAuthResult::Token(_) => {
+                app.oauth_rx = None;
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::Success;
+                }
+                // Auto-dismiss after brief delay (handled via tick counter in overlay)
+                app.overlay = None;
+                app.focus = Focus::Content;
+                app.oauth_pending_id = None;
+                app.oauth_device_info = None;
+                app.show_toast(Toast::success("Copilot authenticated successfully"));
+            }
+            OAuthResult::Error(err) => {
+                app.oauth_rx = None;
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::Failed(err.clone());
+                }
+                // Keep overlay open so user can see the error; Esc to dismiss
+            }
+        }
+    }
+
+    // Advance Polling state if we've shown the code and are waiting
+    if let Some(Overlay::OAuth(ref mut oa)) = app.overlay
+        && matches!(oa.step, OAuthStep::ShowCode { .. })
+        && app.oauth_rx.is_some()
+    {
+        oa.step = OAuthStep::Polling;
+    }
 }
 
 fn poll_fetch(app: &mut App) {
@@ -972,6 +1168,21 @@ fn delete_provider(app: &mut App) {
             },
         }));
         app.focus = Focus::Overlay;
+    }
+}
+
+fn oauth_provider(app: &mut App) {
+    if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
+        let id = id.clone();
+        if cfg.resolve_type(&id).needs_api_key() {
+            app.show_toast(Toast::info("This provider uses API key authentication, not OAuth"));
+            return;
+        }
+        if cfg.copilot.as_ref().is_some_and(|c| c.oauth_app == "opencode") {
+            app.show_toast(Toast::info("OpenCode Zen uses direct GitHub token authentication"));
+            return;
+        }
+        start_oauth_flow(app, &id);
     }
 }
 

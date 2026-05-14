@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use claude_proxy_config::Settings;
+use claude_proxy_config::settings::ProviderType;
 
 // ── Navigation ──
 
@@ -119,6 +120,7 @@ pub enum Overlay {
     Input(InputOverlay),
     Picker(PickerOverlay),
     Loading(LoadingOverlay),
+    OAuth(OAuthOverlay),
     Help,
 }
 
@@ -170,6 +172,8 @@ pub enum PickerAction {
     },
     /// Pick a log level value
     SetLogLevel,
+    /// Add a new provider of the selected type
+    AddProvider,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +181,43 @@ pub struct LoadingOverlay {
     pub title: String,
     pub message: String,
     pub spinner_tick: u64,
+}
+
+/// OAuth device code authorization overlay.
+#[derive(Debug, Clone)]
+pub struct OAuthOverlay {
+    pub provider_id: String,
+    pub step: OAuthStep,
+    pub spinner_tick: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum OAuthStep {
+    /// Requesting device code from GitHub...
+    Requesting,
+    /// Show the URL and user code to the user.
+    ShowCode {
+        url: String,
+        code: String,
+    },
+    /// Polling for user authorization.
+    Polling,
+    /// Authorization succeeded.
+    Success,
+    /// Authorization failed.
+    Failed(String),
+}
+
+/// Result from a background OAuth operation.
+pub enum OAuthResult {
+    CodeInfo {
+        url: String,
+        code: String,
+        device_code: String,
+        interval: u64,
+    },
+    Token(String),
+    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +377,14 @@ pub struct App {
     pub live_metrics: Option<LiveMetrics>,
     /// Tick counter for metrics refresh (every N ticks).
     pub metrics_fetch_tick: u64,
+    /// Pending provider types for the AddProvider picker.
+    pub pending_provider_types: Option<Vec<ProviderType>>,
+    /// Channel for OAuth background thread results.
+    pub oauth_rx: Option<std::sync::mpsc::Receiver<OAuthResult>>,
+    /// The provider ID currently undergoing OAuth.
+    pub oauth_pending_id: Option<String>,
+    /// Stashed device code info for polling phase.
+    pub oauth_device_info: Option<(String, u64)>,
 }
 
 impl App {
@@ -358,6 +407,10 @@ impl App {
             tokio_handle: tokio::runtime::Handle::try_current().ok(),
             live_metrics: None,
             metrics_fetch_tick: 0,
+            pending_provider_types: None,
+            oauth_rx: None,
+            oauth_pending_id: None,
+            oauth_device_info: None,
         }
     }
 

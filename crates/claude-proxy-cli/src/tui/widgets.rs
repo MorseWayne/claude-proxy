@@ -697,6 +697,104 @@ pub fn render_loading_overlay(f: &mut Frame, area: Rect, overlay: &super::app::L
     );
 }
 
+// ── OAuth overlay ──
+
+pub fn render_oauth_overlay(
+    f: &mut Frame,
+    area: Rect,
+    overlay: &super::app::OAuthOverlay,
+) {
+    use super::app::OAuthStep;
+
+    let width = 54;
+    let height = 9;
+    let dialog = centered_rect_fixed(width, height, area);
+    f.render_widget(Clear, dialog);
+
+    let spinners = ["◜", "◝", "◞", "◟"];
+    let spinner = spinners[(overlay.spinner_tick % 4) as usize];
+
+    let title = match &overlay.step {
+        OAuthStep::Requesting => format!(" {spinner} GitHub Copilot Auth "),
+        OAuthStep::Polling => format!(" {spinner} GitHub Copilot Auth "),
+        OAuthStep::ShowCode { .. } => format!(" {spinner} GitHub Copilot Auth "),
+        OAuthStep::Success => " ✓ GitHub Copilot Auth ".to_string(),
+        OAuthStep::Failed(_) => " ✗ GitHub Copilot Auth ".to_string(),
+    };
+
+    let title_fg = match &overlay.step {
+        OAuthStep::Failed(_) => theme::ERR,
+        OAuthStep::Success => theme::FG,
+        _ => theme::ACCENT,
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(title_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if matches!(overlay.step, OAuthStep::Failed(_)) {
+            theme::ERR
+        } else {
+            theme::ACCENT
+        }))
+        .style(Style::default().bg(theme::BG_DARK));
+    let inner = block.inner(dialog);
+    f.render_widget(block, dialog);
+
+    let lines: Vec<Line> = match &overlay.step {
+        OAuthStep::Requesting => vec![
+            Line::from(""),
+            Line::from(Span::styled("  Requesting device code...", dim_style())),
+        ],
+        OAuthStep::ShowCode { url, code } => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  Open: {url}"),
+                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  Enter code: {code}"),
+                Style::default()
+                    .fg(theme::FG)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("  Waiting for authorization...", dim_style())),
+        ],
+        OAuthStep::Polling => vec![
+            Line::from(""),
+            Line::from(Span::styled("  Waiting for authorization...", dim_style())),
+        ],
+        OAuthStep::Success => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Copilot authenticated successfully!",
+                Style::default().fg(theme::ACCENT),
+            )),
+        ],
+        OAuthStep::Failed(err) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  Error: {err}"),
+                Style::default().fg(theme::ERR),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("  Press Esc to dismiss", dim_style())),
+        ],
+    };
+
+    f.render_widget(
+        Paragraph::new(lines).centered(),
+        inner,
+    );
+}
+
 // ── Helpers ──
 
 pub fn mask_value(s: &str) -> String {

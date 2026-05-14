@@ -3,6 +3,7 @@ use std::process;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use claude_proxy_config::settings::{ProviderConfig, ProviderType};
 use colored::Colorize;
 
 mod logging;
@@ -237,7 +238,7 @@ async fn handle_provider(action: ProviderAction) {
                         id.green().bold(),
                         format!("({})", provider.base_url).dimmed()
                     );
-                    if id == "copilot" {
+                    if provider.uses_oauth(id) {
                         println!("    Auth: OAuth (automatic)");
                     } else {
                         let masked_key = mask_key(&provider.api_key);
@@ -267,20 +268,32 @@ async fn handle_provider(action: ProviderAction) {
                     .unwrap()
             });
 
-            let is_copilot = provider_id == "copilot";
+            // Select provider type
+            let known_types = ProviderType::known_types();
+            let type_names: Vec<String> = known_types
+                .iter()
+                .map(|t| t.display_name().to_string())
+                .collect();
+            let type_idx = dialoguer::Select::new()
+                .with_prompt("Provider type")
+                .items(&type_names)
+                .default(0)
+                .interact()
+                .unwrap();
+            let provider_type = known_types[type_idx].clone();
 
-            let api_key: String = if is_copilot {
-                String::new()
-            } else {
+            let api_key: String = if provider_type.needs_api_key() {
                 dialoguer::Password::new()
                     .with_prompt("API Key")
                     .interact()
                     .unwrap()
+            } else {
+                String::new()
             };
 
             let base_url: String = dialoguer::Input::new()
                 .with_prompt("Base URL")
-                .default(default_base_url(&provider_id))
+                .default(provider_type.default_base_url().to_string())
                 .interact_text()
                 .unwrap();
 
@@ -289,6 +302,12 @@ async fn handle_provider(action: ProviderAction) {
                 .default("".to_string())
                 .interact_text()
                 .unwrap();
+
+            let copilot = if provider_type == ProviderType::Copilot {
+                Some(claude_proxy_config::settings::CopilotProviderConfig::default())
+            } else {
+                None
+            };
 
             let mut settings = match claude_proxy_config::Settings::config_file_path() {
                 Some(path) if path.exists() => claude_proxy_config::Settings::load(&path)
@@ -300,23 +319,25 @@ async fn handle_provider(action: ProviderAction) {
             };
             settings.providers.insert(
                 provider_id.clone(),
-                claude_proxy_config::settings::ProviderConfig {
+                ProviderConfig {
                     api_key,
                     base_url: base_url.clone(),
                     proxy,
-                    copilot: None,
+                    provider_type: Some(provider_type.clone()),
+                    copilot,
                 },
             );
 
             save_settings(&settings);
             println!(
-                "{} Provider \"{}\" added.",
+                "{} Provider \"{}\" (type: {}) added.",
                 "✓".green().bold(),
-                provider_id.green()
+                provider_id.green(),
+                provider_type.display_name()
             );
 
-            // Authenticate if copilot
-            if is_copilot {
+            // Authenticate if OAuth (copilot)
+            if provider_type == ProviderType::Copilot {
                 println!();
                 println!("{}", "Authenticating with GitHub Copilot...".bold());
                 let client = reqwest::Client::new();
@@ -374,7 +395,7 @@ async fn handle_provider(action: ProviderAction) {
             // Fallback: ask for model name
             let model_name: String = dialoguer::Input::new()
                 .with_prompt("Default model name")
-                .default(String::new())
+                .default(provider_type.default_model_name().to_string())
                 .interact_text()
                 .unwrap();
             let model_ref = if model_name.is_empty() {
@@ -449,7 +470,15 @@ async fn handle_provider(action: ProviderAction) {
                 eprintln!("{} Provider \"{}\" not found.", "Error:".red().bold(), id);
                 process::exit(1);
             }
-            let model_name = if id == "copilot" { "gpt-5" } else { "default" };
+            let model_name = settings
+                .providers
+                .get(&id)
+                .and_then(|cfg| {
+                    let pt = cfg.resolve_type(&id);
+                    let m = pt.default_model_name();
+                    if m.is_empty() { None } else { Some(m.to_string()) }
+                })
+                .unwrap_or_else(|| "default".to_string());
             let model_ref = format!("{id}/{model_name}");
             settings.model.default = model_ref.clone();
             save_settings(&settings);
@@ -790,15 +819,6 @@ fn mask_key(key: &str) -> String {
         "***".to_string()
     } else {
         format!("{}...{}", &key[..4], &key[key.len() - 4..])
-    }
-}
-
-fn default_base_url(provider_id: &str) -> String {
-    match provider_id {
-        "openai" => "https://api.openai.com/v1".to_string(),
-        "anthropic" => "https://api.anthropic.com".to_string(),
-        "copilot" => "https://api.githubcopilot.com".to_string(),
-        _ => String::new(),
     }
 }
 

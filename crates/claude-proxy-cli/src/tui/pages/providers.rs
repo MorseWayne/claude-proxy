@@ -6,6 +6,8 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
 };
 
+use claude_proxy_config::settings::ProviderType;
+
 use super::super::app::{App, Focus, ProviderFocus};
 use super::super::{theme, widgets};
 
@@ -126,12 +128,12 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         .content_idx
         .min(app.settings.providers.len().saturating_sub(1));
     let (id, cfg) = app.settings.providers.iter().nth(idx).unwrap();
-    let is_copilot = id == "copilot";
+    let pt = cfg.resolve_type(id);
 
     let rows = widgets::field_rows(inner, 7);
 
     // API Key (detail_idx == 0)
-    let key_display = if is_copilot {
+    let key_display = if !pt.needs_api_key() {
         "OAuth (auto)"
     } else {
         &cfg.api_key
@@ -142,7 +144,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         "API Key",
         key_display,
         detail_focused && app.detail_idx == 0,
-        !is_copilot,
+        pt.needs_api_key(),
     );
 
     // Base URL (detail_idx == 1)
@@ -180,7 +182,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_field(f, rows[3], "Status", &status, false, false);
 
     // Copilot info (read-only)
-    if is_copilot && let Some(ref cc) = cfg.copilot {
+    if pt == ProviderType::Copilot && let Some(ref cc) = cfg.copilot {
         let info = format!(
             "oauth={} small={} warmup={}",
             cc.oauth_app, cc.small_model, cc.enable_warmup

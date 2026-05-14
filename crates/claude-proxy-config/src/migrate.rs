@@ -5,7 +5,9 @@ use std::path::Path;
 use tracing::info;
 
 use crate::error::ConfigError;
-use crate::settings::{ModelConfig, ProviderConfig, ServerConfig, Settings};
+use crate::settings::{
+    ModelConfig, ProviderConfig, ProviderType, ServerConfig, Settings,
+};
 
 /// Migrate a legacy `.env` file to a `Settings` struct.
 ///
@@ -131,6 +133,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 api_key: openai_key,
                 base_url: openai_base,
                 proxy: openai_proxy,
+                provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
             },
         );
@@ -142,6 +145,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 api_key: anthropic_key,
                 base_url: anthropic_base,
                 proxy: anthropic_proxy,
+                provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
             },
         );

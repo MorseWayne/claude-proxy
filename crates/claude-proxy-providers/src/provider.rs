@@ -15,7 +15,7 @@ pub enum ProviderError {
     ModelNotFound(String),
 
     #[error("rate limited")]
-    RateLimited,
+    RateLimited { retry_after: Option<u64> },
 
     #[error("upstream error (HTTP {status}): {body}")]
     UpstreamError { status: u16, body: String },
