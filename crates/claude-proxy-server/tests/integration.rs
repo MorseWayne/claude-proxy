@@ -104,7 +104,7 @@ async fn mock_models() -> Json<serde_json::Value> {
 
 /// Start the proxy server on a random port. Returns the base URL.
 async fn start_proxy(settings: Settings) -> String {
-    let state = AppState::new(settings.clone());
+    let state = AppState::new(settings.clone(), None);
     let router = claude_proxy_server::build_router(state, &settings);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

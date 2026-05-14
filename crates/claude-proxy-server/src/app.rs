@@ -1,10 +1,59 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claude_proxy_config::Settings;
 use claude_proxy_providers::provider::Provider;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+
+use crate::persistence::{MetricsStore, StoredTotals};
+
+/// Token usage breakdown for a single request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+}
+
+/// Accumulated metrics for a specific model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelMetrics {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl ModelMetrics {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+
+    fn add_usage(&mut self, usage: &TokenUsage) {
+        self.requests += 1;
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_read_input_tokens += usage.cache_read_input_tokens;
+    }
+}
 
 /// Request metrics counters.
 pub struct Metrics {
@@ -12,15 +61,24 @@ pub struct Metrics {
     pub errors_total: AtomicU64,
     pub latency_sum_ms: AtomicU64,
     pub latency_count: AtomicU64,
+    /// Per-model token usage metrics (current session).
+    pub model_metrics: Mutex<HashMap<String, ModelMetrics>>,
+    /// Persistent store for all-time metrics.
+    store: Option<Arc<MetricsStore>>,
+    /// All-time totals loaded from store at startup.
+    stored_totals: Mutex<StoredTotals>,
 }
 
 impl Metrics {
-    pub fn new() -> Self {
+    pub fn new(store: Option<Arc<MetricsStore>>) -> Self {
         Self {
             requests_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
+            model_metrics: Mutex::new(HashMap::new()),
+            store,
+            stored_totals: Mutex::new(StoredTotals::default()),
         }
     }
 
@@ -37,24 +95,68 @@ impl Metrics {
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
+    /// Record token usage for a model (in-memory).
+    pub async fn record_token_usage(&self, model: &str, usage: &TokenUsage) {
+        let mut map = self.model_metrics.lock().await;
+        map.entry(model.to_string())
+            .or_default()
+            .add_usage(usage);
+    }
+
+    /// Record a completed request with usage, persisting to store if available.
+    pub async fn record_completed_request(
+        &self,
+        model: &str,
+        usage: &TokenUsage,
+        is_error: bool,
+        latency_ms: u64,
+    ) {
+        self.record_token_usage(model, usage).await;
+        if let Some(ref store) = self.store {
+            store.record_usage(model, usage, is_error, latency_ms).await;
+        }
+    }
+
+    /// Load stored totals from persistence (called once at startup).
+    pub async fn load_stored_totals(&self) {
+        if let Some(ref store) = self.store {
+            let totals = store.load_totals().await;
+            *self.stored_totals.lock().await = totals;
+        }
+    }
+
+    pub async fn to_json(&self) -> serde_json::Value {
         let requests = self.requests_total.load(Ordering::Relaxed);
         let errors = self.errors_total.load(Ordering::Relaxed);
         let latency_sum = self.latency_sum_ms.load(Ordering::Relaxed);
         let latency_count = self.latency_count.load(Ordering::Relaxed);
         let avg_latency = latency_sum.checked_div(latency_count).unwrap_or(0);
 
+        let model_metrics = self.model_metrics.lock().await;
+        let models: serde_json::Value = serde_json::to_value(&*model_metrics).unwrap_or_default();
+
+        let stored = self.stored_totals.lock().await;
+        let stored_models: serde_json::Value =
+            serde_json::to_value(&stored.model_metrics).unwrap_or_default();
+
         json!({
             "requests_total": requests,
             "errors_total": errors,
             "avg_latency_ms": avg_latency,
+            "models": models,
+            "stored": {
+                "requests_total": stored.requests_total,
+                "errors_total": stored.errors_total,
+                "avg_latency_ms": stored.latency_sum_ms.checked_div(stored.latency_count).unwrap_or(0),
+                "models": stored_models,
+            },
         })
     }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -133,13 +235,13 @@ impl ProviderRegistry {
 }
 
 impl AppState {
-    pub fn new(settings: Settings) -> Self {
+    pub fn new(settings: Settings, store: Option<Arc<MetricsStore>>) -> Self {
         let max_concurrency = settings.limits.max_concurrency as usize;
         Self {
             settings: Arc::new(RwLock::new(settings)),
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
             concurrency_semaphore: Arc::new(Semaphore::new(max_concurrency)),
-            metrics: Arc::new(Metrics::new()),
+            metrics: Arc::new(Metrics::new(store)),
         }
     }
 }

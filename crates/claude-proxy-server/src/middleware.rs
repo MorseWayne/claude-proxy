@@ -43,6 +43,7 @@ pub struct RateLimitConfig {
 #[derive(Clone)]
 pub struct RateLimitLayer {
     governor: Arc<Governor>,
+    retry_after_secs: u64,
 }
 
 impl RateLimitLayer {
@@ -51,12 +52,18 @@ impl RateLimitLayer {
         let quota = if config.per_seconds <= 1 {
             Quota::per_second(max)
         } else {
-            Quota::with_period(Duration::from_secs(config.per_seconds as u64))
-                .unwrap()
-                .allow_burst(max)
+            Quota::with_period(Duration::from_secs_f64(
+                config.per_seconds as f64 / config.max_requests as f64,
+            ))
+            .unwrap()
+            .allow_burst(max)
         };
         let governor = Arc::new(RateLimiter::keyed(quota));
-        Self { governor }
+        let retry_after_secs = (config.per_seconds as f64 / config.max_requests as f64).ceil() as u64;
+        Self {
+            governor,
+            retry_after_secs,
+        }
     }
 }
 
@@ -67,6 +74,7 @@ impl<S> Layer<S> for RateLimitLayer {
         RateLimitService {
             inner,
             governor: self.governor.clone(),
+            retry_after_secs: self.retry_after_secs,
         }
     }
 }
@@ -76,6 +84,7 @@ impl<S> Layer<S> for RateLimitLayer {
 pub struct RateLimitService<S> {
     inner: S,
     governor: Arc<Governor>,
+    retry_after_secs: u64,
 }
 
 impl<S, B> Service<Request<B>> for RateLimitService<S>
@@ -102,6 +111,7 @@ where
             }
             Err(_) => {
                 // Rate limited
+                let retry_after = self.retry_after_secs.max(1).to_string();
                 let body = serde_json::json!({
                     "type": "error",
                     "error": {
@@ -112,7 +122,10 @@ where
                 let response = Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .header("content-type", "application/json")
-                    .header("retry-after", HeaderValue::from_static("1"))
+                    .header(
+                        "retry-after",
+                        HeaderValue::from_str(&retry_after).unwrap_or(HeaderValue::from_static("1")),
+                    )
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap();
                 Box::pin(async move { Ok(response) })

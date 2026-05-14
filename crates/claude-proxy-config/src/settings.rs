@@ -130,6 +130,12 @@ pub struct HttpConfig {
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Path to log file. Defaults to config_dir/claude-proxy.log if not set.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Also emit logs to stderr (true for non-daemon server, false for TUI/daemon).
+    #[serde(default = "default_true")]
+    pub with_stdout: bool,
     #[serde(default)]
     pub raw_api_payloads: bool,
     #[serde(default)]
@@ -220,6 +226,8 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+            file: None,
+            with_stdout: true,
             raw_api_payloads: false,
             raw_sse_events: false,
         }

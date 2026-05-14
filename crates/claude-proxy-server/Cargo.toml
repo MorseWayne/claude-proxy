@@ -22,6 +22,7 @@ futures = "0.3"
 governor = "0.10"
 notify = "7"
 uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use crate::app::AppState;
+use crate::app::{AppState, TokenUsage};
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -146,16 +146,24 @@ pub async fn messages(
                 // Streaming SSE response
                 let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
+                let metrics = state.metrics.clone();
+                let model_name = request.model.clone();
                 tokio::spawn(async move {
+                    let task_start = std::time::Instant::now();
+                    let mut usage = TokenUsage::default();
+                    let mut had_error = false;
                     while let Some(event_result) = stream.next().await {
                         match event_result {
                             Ok(event) => {
+                                // Extract token usage from streaming events
+                                extract_usage_from_event(&event.data, &mut usage);
                                 let sse_text = format_sse_event(&event);
                                 if sender.send(Ok(sse_text.into_bytes())).await.is_err() {
                                     break;
                                 }
                             }
                             Err(e) => {
+                                had_error = true;
                                 let error_event = SseEvent {
                                     event: "error".to_string(),
                                     data: json!({"error": {"type": "api_error", "message": e.to_string()}}),
@@ -166,6 +174,9 @@ pub async fn messages(
                             }
                         }
                     }
+                    // Record token usage after stream completes (persisted)
+                    let latency_ms = task_start.elapsed().as_millis() as u64;
+                    metrics.record_completed_request(&model_name, &usage, had_error, latency_ms).await;
                 });
 
                 state
@@ -197,18 +208,34 @@ pub async fn messages(
                     .last()
                     .map(|e| e.data.clone())
                     .unwrap_or(json!({"error": "no response from provider"}));
+
+                // Extract token usage from all events (message_start has input_tokens,
+                // message_delta has output_tokens; message_stop has none)
+                let mut usage = TokenUsage::default();
+                for event in &events {
+                    extract_usage_from_event(&event.data, &mut usage);
+                }
+                let latency_ms = start.elapsed().as_millis() as u64;
                 state
                     .metrics
-                    .record_latency(start.elapsed().as_millis() as u64);
+                    .record_completed_request(&request.model, &usage, false, latency_ms)
+                    .await;
+
+                state
+                    .metrics
+                    .record_latency(latency_ms);
                 Json(response_data).into_response()
             }
         }
         Err(e) => {
             error!("Provider error: {e}");
             state.metrics.record_error();
+            let latency_ms = start.elapsed().as_millis() as u64;
+            state.metrics.record_latency(latency_ms);
             state
                 .metrics
-                .record_latency(start.elapsed().as_millis() as u64);
+                .record_completed_request(&request.model, &TokenUsage::default(), true, latency_ms)
+                .await;
             provider_error_to_response(&e)
         }
     }
@@ -352,7 +379,7 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
             &ErrorResponse::authentication("invalid admin token"),
         );
     }
-    Json(state.metrics.to_json()).into_response()
+    Json(state.metrics.to_json().await).into_response()
 }
 
 fn format_sse_event(event: &SseEvent) -> String {
@@ -424,4 +451,36 @@ fn mask_toml_keys(toml_str: &str) -> String {
         result.push('\n');
     }
     result
+}
+
+/// Extract token usage from a streaming SSE event.
+/// In streaming, usage comes in:
+/// - `message_start` event: `message.usage.input_tokens`
+/// - `message_delta` event: `usage.output_tokens`
+fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
+    // message_start: { "message": { "usage": { "input_tokens": N, ... } } }
+    if let Some(message) = data.get("message")
+        && let Some(u) = message.get("usage")
+    {
+        if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+            usage.input_tokens += v;
+        }
+        if let Some(v) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+            usage.cache_creation_input_tokens += v;
+        }
+        if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+            usage.cache_read_input_tokens += v;
+        }
+    }
+
+    // message_delta: { "usage": { "output_tokens": N } }
+    if let Some(u) = data.get("usage") {
+        if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+            usage.output_tokens += v;
+        }
+        // Also check for input tokens in delta (some providers include them)
+        if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+            usage.input_tokens += v;
+        }
+    }
 }

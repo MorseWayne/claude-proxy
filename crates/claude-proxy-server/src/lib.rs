@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod middleware;
+pub mod persistence;
 pub mod routes;
 
 pub use app::AppState;
@@ -13,6 +14,7 @@ use axum::routing::{get, post, put};
 use claude_proxy_config::Settings;
 use middleware::{RateLimitConfig, RateLimitLayer};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use persistence::MetricsStore;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
@@ -43,7 +45,20 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let host = settings.server.host.clone();
     let port = settings.server.port;
 
-    let state = AppState::new(settings.clone());
+    // Initialize metrics persistence
+    let store = Settings::config_dir().and_then(|dir| {
+        let db_path = dir.join("metrics.db");
+        match MetricsStore::open(db_path) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                warn!("Metrics persistence disabled: {e}");
+                None
+            }
+        }
+    });
+
+    let state = AppState::new(settings.clone(), store);
+    state.metrics.load_stored_totals().await;
     let router = build_router(state.clone(), &settings);
 
     // Spawn config file watcher

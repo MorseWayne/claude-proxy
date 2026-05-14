@@ -5,6 +5,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use colored::Colorize;
 
+mod logging;
+mod tui;
+
 #[derive(Parser)]
 #[command(
     name = "claude-proxy",
@@ -39,6 +42,8 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Launch interactive TUI configuration interface
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -140,18 +145,19 @@ fn main() {
 }
 
 async fn async_main(cli: Cli) {
-    // Initialize tracing
-    let default_level = if cfg!(debug_assertions) {
-        "debug,tower_http=debug,hyper=info"
-    } else {
-        "info"
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
-        )
-        .init();
+    // Initialize logging (early — before any work)
+    let is_tui = matches!(cli.command, Commands::Tui);
+    let settings = claude_proxy_config::Settings::config_file_path()
+        .filter(|p| p.exists())
+        .and_then(|p| claude_proxy_config::Settings::load(&p).ok());
+
+    let log_config = settings.as_ref().map(|s| &s.log);
+    if let Err(e) = logging::init_logging(
+        log_config.unwrap_or(&Default::default()),
+        is_tui,
+    ) {
+        eprintln!("Warning: failed to initialize logging: {e}");
+    }
 
     match cli.command {
         Commands::Provider { action } => handle_provider(action).await,
@@ -160,6 +166,12 @@ async fn async_main(cli: Cli) {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "claude-proxy", &mut std::io::stdout());
+        }
+        Commands::Tui => {
+            if let Err(e) = tui::run() {
+                eprintln!("{} TUI error: {e}", "Error:".red().bold());
+                process::exit(1);
+            }
         }
     }
 }

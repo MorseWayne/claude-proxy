@@ -377,6 +377,13 @@ pub struct OpenAiChunk {
     id: String,
     model: String,
     choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug)]
+struct OpenAiUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
 }
 
 #[derive(Debug)]
@@ -453,6 +460,12 @@ impl StreamConverter {
 
     pub fn process_chunk(&mut self, chunk: &OpenAiChunk) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // Extract usage if present in this chunk (OpenAI sends it in the final chunk)
+        if let Some(ref usage) = chunk.usage {
+            self.input_tokens = usage.prompt_tokens;
+            self.output_tokens = usage.completion_tokens;
+        }
 
         if !self.started {
             self.model = chunk.model.clone();
@@ -775,7 +788,12 @@ pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
         })
         .collect();
 
-    Some(OpenAiChunk { id, model, choices })
+    let usage = data.get("usage").map(|u| OpenAiUsage {
+        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+    });
+
+    Some(OpenAiChunk { id, model, choices, usage })
 }
 
 /// Convert a non-streaming OpenAI response to Anthropic format.
@@ -958,6 +976,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let events = converter.process_chunk(&chunk);
         assert_eq!(events.len(), 1); // message_start
@@ -976,6 +995,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let events = converter.process_chunk(&chunk2);
         assert_eq!(events.len(), 2); // content_block_start + content_block_delta
@@ -1001,6 +1021,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         converter.process_chunk(&chunk);
 
@@ -1018,6 +1039,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let events = converter.process_chunk(&chunk2);
         assert_eq!(events.len(), 2); // content_block_start (thinking) + content_block_delta

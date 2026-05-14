@@ -80,6 +80,16 @@ Add to shell (example for bash):
 eval "$(claude-proxy completions bash)"
 ```
 
+### TUI Configuration
+
+```bash
+claude-proxy tui                        # Launch interactive terminal UI config interface
+```
+
+Keyboard-navigable TUI for configuration management, provider management, and model list browsing.
+
+![TUI Model Selection](images/tui-model-selection.png)
+
 ## Configuration
 
 Config file: `~/.config/claude-proxy/config.toml`
@@ -97,6 +107,7 @@ base_url = "https://api.githubcopilot.com"
 [providers.copilot.copilot]
 oauth_app = "vscode"                    # OAuth app: "vscode" or "opencode"
 small_model = "gpt-5-mini"             # Warmup fallback model
+max_thinking_tokens = 16000             # Maximum thinking tokens
 enable_warmup = true                    # Enable warmup detection (route tool-less requests to small model)
 enable_tool_result_merge = true         # Enable tool_result merging (reduce premium billing)
 enable_compact_detection = true         # Enable compact/auto-continue detection
@@ -114,20 +125,22 @@ port = 8082
 auth_token = "freecc"                   # API key required from clients
 
 [admin]
-auth_token = ""                         # Admin API token (empty = disabled)
+auth_token = ""                         # Admin API token (empty = fallback to server.auth_token)
 
 [limits]
-rate_limit = 100                        # Max requests per window
+rate_limit = 40                         # Max requests per window
 rate_window = 60                        # Window in seconds
-max_concurrency = 10                    # Max concurrent requests
+max_concurrency = 5                     # Max concurrent requests
 
 [http]
 read_timeout = 300                      # Upstream read timeout (seconds)
 write_timeout = 60                      # Upstream write timeout (seconds)
-connect_timeout = 10                    # Upstream connect timeout (seconds)
+connect_timeout = 60                    # Upstream connect timeout (seconds)
 
 [log]
 level = "info"                          # Log level (trace/debug/info/warn/error)
+file = ""                               # Optional, log file path (defaults to config_dir/claude-proxy.log)
+with_stdout = true                      # Also emit to stderr (foreground server and CLI)
 raw_api_payloads = false                # Log raw request payloads
 raw_sse_events = false                  # Log raw SSE events
 ```
@@ -150,26 +163,68 @@ Claude model names (e.g., `claude-opus-4-20250514`) are automatically resolved t
 
 ### Admin Endpoints
 
-All admin endpoints require `Authorization: Bearer <admin_token>`.
+All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to `server.auth_token` if admin_token is not set.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/admin/config` | Get current config (keys masked) |
 | `PUT` | `/admin/config` | Update config (`{"config": "<toml>"}`) |
 | `POST` | `/admin/restart` | Reload config from disk |
-| `GET` | `/admin/metrics` | Get request metrics |
+| `GET` | `/admin/metrics` | Get request metrics (including all-time history) |
+
+`GET /admin/metrics` response format:
+
+```json
+{
+  "requests_total": 42,
+  "errors_total": 1,
+  "avg_latency_ms": 320,
+  "models": {
+    "openai/gpt-4.1": {
+      "requests": 30,
+      "input_tokens": 15000,
+      "output_tokens": 8000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2000
+    }
+  },
+  "stored": {
+    "requests_total": 1500,
+    "errors_total": 12,
+    "avg_latency_ms": 305,
+    "models": { ... }
+  }
+}
+```
+
+- Top-level fields: current process session statistics
+- `stored` field: all-time cumulative data persisted in SQLite (survives restarts)
+- Dashboard automatically merges both layers to show totals
 
 ## Features
 
 - **Multi-Provider**: OpenAI, Anthropic, GitHub Copilot, and any OpenAI-compatible API
 - **Copilot Integration**: Full GitHub OAuth auth, VS Code impersonation, premium request optimization
 - **Auto Model Discovery**: Fetches available models when adding a provider, interactive default model selection
+- **TUI Config Interface**: Built-in terminal UI with keyboard navigation for config and provider management
 - **Rate Limiting**: Per-API-key rate limiting using token bucket algorithm
 - **Concurrency Control**: Semaphore-based concurrency limiting with timeout
 - **Config Hot-Reload**: Config file watcher + SIGUSR1 signal for live reload
 - **Daemon Mode**: Background process with PID file management (Unix)
 - **Model Cache Warmup**: Pre-fetches model lists from all providers on startup
+- **Token Usage Metrics**: Per-model input/output/cache token usage tracking with real-time session data and persistent all-time history
+- **Persistent Storage**: Usage data automatically stored in SQLite (`~/.config/claude-proxy/metrics.db`), survives restarts
+- **TUI Dashboard**: Terminal dashboard showing live request count, error rate, latency, and per-model token usage
+- **Config Migration**: Auto-migration from legacy `.env` to TOML config
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM for clean exit
+
+## Screenshots
+
+### TUI Dashboard
+![TUI Dashboard](images/metrics-dashboard.png)
+
+### Using with GitHub Copilot
+![Copilot Integration](images/copilot-usage.png)
 
 ## Build from Source
 
