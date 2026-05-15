@@ -152,7 +152,7 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
     // Ctrl+S saves anywhere
     if is_ctrl_key(key, 's') {
         if apply_pending_input(app) {
-            save_settings_with_feedback(app);
+            save_settings_with_message(app, "Saved");
         }
         return;
     }
@@ -1476,13 +1476,14 @@ fn oauth_provider(app: &mut App) {
 }
 
 fn save_settings_with_feedback(app: &mut App) -> bool {
+    save_settings_with_message(app, "Configuration saved")
+}
+
+fn save_settings_with_message(app: &mut App, success_message: &str) -> bool {
     match save_settings(app) {
-        Ok(SaveOutcome::Synced(path)) => {
+        Ok(SaveOutcome::Synced(_path)) => {
             app.dirty = false;
-            app.show_toast(Toast::success(format!(
-                "Configuration saved; Claude Code synced: {}",
-                path.display()
-            )));
+            app.show_toast(Toast::success(success_message));
             true
         }
         Ok(SaveOutcome::ConfigSavedSyncFailed(err)) => {

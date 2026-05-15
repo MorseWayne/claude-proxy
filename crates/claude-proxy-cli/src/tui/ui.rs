@@ -47,9 +47,6 @@ pub fn render(f: &mut Frame, app: &App) {
     let (nav_hints, act_hints) = get_footer_hints(app);
     widgets::render_footer(f, root[2], &nav_hints, &act_hints);
 
-    // Toast (floating, top-right of content area)
-    widgets::render_toast(f, body[1], app);
-
     // Overlay (centered over content)
     if let Some(ref overlay) = app.overlay {
         match overlay {
@@ -63,6 +60,9 @@ pub fn render(f: &mut Frame, app: &App) {
             Overlay::Help => widgets::render_help_overlay(f, body[1]),
         }
     }
+
+    // Toast (floating, top-right of content area)
+    widgets::render_toast(f, body[1], app);
 }
 
 fn render_content(f: &mut Frame, area: Rect, app: &App) {
