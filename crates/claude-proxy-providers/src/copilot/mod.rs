@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod headers;
 mod preprocess;
+mod responses;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -269,6 +270,52 @@ impl CopilotProvider {
         }
     }
 
+    async fn chat_via_responses(
+        &self,
+        request: MessagesRequest,
+        token: &str,
+        initiator: &str,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let url = format!("{}/responses", self.base_url);
+        let vision = Self::has_vision_content(&request.messages);
+        let headers = self.build_headers(token, vision, initiator);
+        let body = responses::convert_to_responses(&request);
+
+        debug!("Copilot responses API request to {url}");
+
+        let response = self
+            .http_client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Network(fmt_reqwest_err(&e))
+                }
+            })?;
+
+        if !response.status().is_success() {
+            return Err(self.map_upstream_error(response).await);
+        }
+
+        if request.stream {
+            Ok(responses::stream_responses_response(response))
+        } else {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
+            let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let events = responses::convert_non_streaming_response(&data);
+            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            Ok(Box::pin(stream))
+        }
+    }
+
     async fn map_upstream_error(&self, response: reqwest::Response) -> ProviderError {
         let status = response.status().as_u16();
         let retry_after = response
@@ -332,7 +379,10 @@ impl Provider for CopilotProvider {
             "user"
         };
 
-        if endpoints.iter().any(|e| e == "/v1/messages") {
+        if self.config.enable_responses_api && endpoints.iter().any(|e| e == "/responses") {
+            debug!("Using /responses path for model {}", request.model);
+            self.chat_via_responses(request, &token, initiator).await
+        } else if endpoints.iter().any(|e| e == "/v1/messages") {
             debug!("Using native /v1/messages path for model {}", request.model);
             self.chat_via_messages(request, &token, initiator).await
         } else {

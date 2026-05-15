@@ -84,6 +84,9 @@ pub struct CopilotProviderConfig {
     /// Enable subagent marker detection (x-initiator: agent).
     #[serde(default = "default_true")]
     pub enable_agent_marking: bool,
+    /// Enable /responses routing when Copilot reports model support.
+    #[serde(default = "default_true")]
+    pub enable_responses_api: bool,
 }
 
 fn default_oauth_app() -> String {
