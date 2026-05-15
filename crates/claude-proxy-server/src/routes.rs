@@ -121,25 +121,27 @@ pub async fn messages(
     let mut upstream_request = request.clone();
     upstream_request.model = upstream_model;
 
-    // Get or create provider
-    let mut registry = state.provider_registry.write().await;
-    let settings = state.settings.read().await;
-    let provider = match registry.get_or_create(&provider_id, &settings).await {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Provider error: {e}");
-            state.metrics.record_error();
-            state
-                .metrics
-                .record_latency(start.elapsed().as_millis() as u64);
-            return error_response(
-                StatusCode::NOT_FOUND,
-                &ErrorResponse::not_found(&format!("provider not available: {e}")),
-            );
+    // Get or create provider — lock is released after obtaining the Arc
+    let provider = {
+        let mut registry = state.provider_registry.write().await;
+        let settings = state.settings.read().await;
+        match registry.get_or_create(&provider_id, &settings).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Provider error: {e}");
+                state.metrics.record_error();
+                state
+                    .metrics
+                    .record_latency(start.elapsed().as_millis() as u64);
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    &ErrorResponse::not_found(&format!("provider not available: {e}")),
+                );
+            }
         }
     };
 
-    // Call provider
+    // Call provider (registry lock is no longer held)
     match provider.chat(upstream_request).await {
         Ok(mut stream) => {
             if request.stream {

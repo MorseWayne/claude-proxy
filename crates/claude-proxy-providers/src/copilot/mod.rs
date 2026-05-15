@@ -218,51 +218,7 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(64);
-
-            tokio::spawn(async move {
-                let mut converter = super::openai::StreamConverter::new();
-                let mut buffer = String::new();
-                let mut byte_stream = response.bytes_stream();
-
-                while let Some(chunk_result) = byte_stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let event_str = buffer[..pos].to_string();
-                                buffer = buffer[pos + 2..].to_string();
-
-                                if let Some(openai_chunk) =
-                                    crate::openai::parse_openai_chunk(&event_str)
-                                {
-                                    let events = converter.process_chunk(&openai_chunk);
-                                    for event in events {
-                                        if tx.send(Ok(event)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-
-                for event in converter.finish() {
-                    if tx.send(Ok(event)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            Ok(Box::pin(stream))
+            Ok(crate::openai::stream_openai_response(response))
         } else {
             let body = response
                 .text()

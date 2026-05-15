@@ -282,53 +282,7 @@ impl Provider for OpenAiProvider {
         }
 
         if request.stream {
-            let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
-
-            // Spawn a task to parse the SSE stream and convert to Anthropic format
-            tokio::spawn(async move {
-                let mut converter = StreamConverter::new();
-                let mut buffer = String::new();
-                let mut byte_stream = response.bytes_stream();
-
-                while let Some(chunk_result) = byte_stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                            // Process complete SSE events (separated by double newline)
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let event_str = buffer[..pos].to_string();
-                                buffer = buffer[pos + 2..].to_string();
-
-                                if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
-                                    let events = converter.process_chunk(&openai_chunk);
-                                    for event in events {
-                                        if tx.send(Ok(event)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-
-                // Send any remaining events
-                for event in converter.finish() {
-                    if tx.send(Ok(event)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            Ok(Box::pin(stream))
+            Ok(stream_openai_response(response))
         } else {
             // Non-streaming
             let body = response
@@ -429,6 +383,57 @@ struct OpenAiToolCall {
 struct OpenAiFunction {
     name: Option<String>,
     arguments: String,
+}
+
+/// Spawn a task that parses an OpenAI-format SSE byte stream and converts to Anthropic SSE events.
+/// Returns a pinned BoxStream. Used by both OpenAI and Copilot providers.
+pub fn stream_openai_response(
+    response: reqwest::Response,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+
+    tokio::spawn(async move {
+        let mut converter = StreamConverter::new();
+        let mut buffer = String::new();
+        let mut byte_stream = response.bytes_stream();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let event_str = buffer[..pos].to_string();
+                        buffer = buffer[pos + 2..].to_string();
+
+                        if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
+                            let events = converter.process_chunk(&openai_chunk);
+                            for event in events {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        for event in converter.finish() {
+            if tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Box::pin(stream)
 }
 
 /// Stateful converter from OpenAI streaming chunks to Anthropic SSE events.

@@ -108,7 +108,7 @@ impl Metrics {
     ) {
         self.record_token_usage(model, usage).await;
         if let Some(ref store) = self.store {
-            store.record_usage(model, usage, is_error, latency_ms).await;
+            store.record_usage(model, usage, is_error, latency_ms);
         }
     }
 
@@ -166,7 +166,7 @@ pub struct AppState {
 
 /// Registry of provider instances and cached model lists.
 pub struct ProviderRegistry {
-    providers: std::collections::HashMap<String, Box<dyn Provider>>,
+    providers: std::collections::HashMap<String, Arc<dyn Provider>>,
     model_cache: std::collections::HashMap<String, Vec<claude_proxy_core::ModelInfo>>,
 }
 
@@ -185,18 +185,19 @@ impl ProviderRegistry {
     }
 
     /// Get or create a provider for the given ID.
+    /// Returns an Arc clone so the caller can use the provider without holding the registry lock.
     pub async fn get_or_create(
         &mut self,
         provider_id: &str,
         settings: &Settings,
-    ) -> Result<&dyn Provider, String> {
+    ) -> Result<Arc<dyn Provider>, String> {
         if !self.providers.contains_key(provider_id) {
             let provider_config = settings
                 .providers
                 .get(provider_id)
                 .ok_or_else(|| format!("provider '{provider_id}' not configured"))?;
 
-            let provider: Box<dyn Provider> =
+            let provider: Arc<dyn Provider> =
                 claude_proxy_providers::create_provider(provider_id, provider_config, settings)
                     .await
                     .map_err(|e| format!("failed to create provider '{provider_id}': {e}"))?;
@@ -204,7 +205,7 @@ impl ProviderRegistry {
             self.providers.insert(provider_id.to_string(), provider);
         }
 
-        Ok(self.providers.get(provider_id).unwrap().as_ref())
+        Ok(Arc::clone(self.providers.get(provider_id).unwrap()))
     }
 
     /// Cache model list for a provider.

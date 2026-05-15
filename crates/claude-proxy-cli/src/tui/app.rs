@@ -396,6 +396,8 @@ pub struct App {
     pub tokio_handle: Option<tokio::runtime::Handle>,
     /// Live metrics fetched from the running server.
     pub live_metrics: Option<LiveMetrics>,
+    /// Channel for receiving metrics fetch results from background thread.
+    pub metrics_rx: Option<std::sync::mpsc::Receiver<Option<serde_json::Value>>>,
     /// Tick counter for metrics refresh (every N ticks).
     pub metrics_fetch_tick: u64,
     /// Pending provider types for the AddProvider picker.
@@ -431,6 +433,7 @@ impl App {
             pending_model_section: None,
             tokio_handle: tokio::runtime::Handle::try_current().ok(),
             live_metrics: None,
+            metrics_rx: None,
             metrics_fetch_tick: 0,
             pending_provider_types: None,
             oauth_rx: None,

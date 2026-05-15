@@ -78,6 +78,8 @@ where
 
         // Poll background fetch results
         poll_fetch(&mut app);
+        // Poll background metrics results
+        poll_metrics(&mut app);
 
         // Render
         terminal.draw(|f| ui::render(f, &app))?;
@@ -1413,54 +1415,122 @@ fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
     }
 }
 
-/// Fetch live metrics from the running server's admin API.
+/// Kick off a background thread to fetch live metrics (non-blocking).
 fn fetch_live_metrics(app: &mut App) {
-    let host = &app.settings.server.host;
+    // Don't spawn a new fetch if one is already in-flight
+    if app.metrics_rx.is_some() {
+        return;
+    }
+
+    let host = app.settings.server.host.clone();
     let port = app.settings.server.port;
     let admin_token = app.settings.admin_auth_token().to_string();
     let url = format!("http://{host}:{port}/admin/metrics");
 
-    // Non-blocking fetch using blocking reqwest in a thread
-    let metrics = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.metrics_rx = Some(rx);
+
+    std::thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
         let mut req = client.get(&url).timeout(Duration::from_secs(2));
         if !admin_token.is_empty() {
             req = req.header("Authorization", format!("Bearer {admin_token}"));
         }
-        req.send()
-            .ok()
-            .and_then(|r| r.json::<serde_json::Value>().ok())
-    })
-    .join()
-    .ok()
-    .flatten();
+        let result = req.send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
+        let _ = tx.send(result);
+    });
+}
 
-    if let Some(data) = metrics {
-        let mut live = LiveMetrics {
-            requests_total: data
+/// Poll for completed metrics fetch results (called every tick).
+fn poll_metrics(app: &mut App) {
+    let data = if let Some(ref rx) = app.metrics_rx {
+        match rx.try_recv() {
+            Ok(data) => {
+                // Got result, clear the channel
+                Some(data)
+            }
+            Err(TryRecvError::Empty) => return, // still in-flight
+            Err(TryRecvError::Disconnected) => Some(None), // thread died
+        }
+    } else {
+        return;
+    };
+    app.metrics_rx = None;
+
+    let Some(Some(data)) = data else { return };
+
+    let mut live = LiveMetrics {
+        requests_total: data
+            .get("requests_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        errors_total: data
+            .get("errors_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        avg_latency_ms: data
+            .get("avg_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        models: Vec::new(),
+        stored: None,
+    };
+
+    if let Some(models) = data.get("models").and_then(|v| v.as_object()) {
+        let mut model_list: Vec<(String, LiveModelMetrics)> = models
+            .iter()
+            .map(|(name, v)| {
+                let m = LiveModelMetrics {
+                    requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
+                    input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                    output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                    cache_creation_input_tokens: v
+                        .get("cache_creation_input_tokens")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                    cache_read_input_tokens: v
+                        .get("cache_read_input_tokens")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                };
+                (name.clone(), m)
+            })
+            .collect();
+        model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
+        live.models = model_list;
+    }
+
+    // Parse stored (all-time) metrics
+    if let Some(stored) = data.get("stored") {
+        let mut stored_metrics = StoredMetrics {
+            requests_total: stored
                 .get("requests_total")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            errors_total: data
+            errors_total: stored
                 .get("errors_total")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            avg_latency_ms: data
+            avg_latency_ms: stored
                 .get("avg_latency_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             models: Vec::new(),
-            stored: None,
         };
-
-        if let Some(models) = data.get("models").and_then(|v| v.as_object()) {
+        if let Some(models) = stored.get("models").and_then(|v| v.as_object()) {
             let mut model_list: Vec<(String, LiveModelMetrics)> = models
                 .iter()
                 .map(|(name, v)| {
                     let m = LiveModelMetrics {
                         requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                        input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                        output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                        input_tokens: v
+                            .get("input_tokens")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        output_tokens: v
+                            .get("output_tokens")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
                         cache_creation_input_tokens: v
                             .get("cache_creation_input_tokens")
                             .and_then(|x| x.as_u64())
@@ -1474,58 +1544,10 @@ fn fetch_live_metrics(app: &mut App) {
                 })
                 .collect();
             model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
-            live.models = model_list;
+            stored_metrics.models = model_list;
         }
-
-        // Parse stored (all-time) metrics
-        if let Some(stored) = data.get("stored") {
-            let mut stored_metrics = StoredMetrics {
-                requests_total: stored
-                    .get("requests_total")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                errors_total: stored
-                    .get("errors_total")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                avg_latency_ms: stored
-                    .get("avg_latency_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                models: Vec::new(),
-            };
-            if let Some(models) = stored.get("models").and_then(|v| v.as_object()) {
-                let mut model_list: Vec<(String, LiveModelMetrics)> = models
-                    .iter()
-                    .map(|(name, v)| {
-                        let m = LiveModelMetrics {
-                            requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                            input_tokens: v
-                                .get("input_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0),
-                            output_tokens: v
-                                .get("output_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0),
-                            cache_creation_input_tokens: v
-                                .get("cache_creation_input_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0),
-                            cache_read_input_tokens: v
-                                .get("cache_read_input_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0),
-                        };
-                        (name.clone(), m)
-                    })
-                    .collect();
-                model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
-                stored_metrics.models = model_list;
-            }
-            live.stored = Some(stored_metrics);
-        }
-
-        app.live_metrics = Some(live);
+        live.stored = Some(stored_metrics);
     }
+
+    app.live_metrics = Some(live);
 }

@@ -97,32 +97,33 @@ fn spawn_model_warmup(
         };
 
         for provider_id in &provider_ids {
-            // Create provider and fetch models
-            let result = {
+            // Create provider (lock released after obtaining Arc)
+            let provider = {
                 let mut reg = registry.write().await;
                 let s = settings.read().await;
                 match reg.get_or_create(provider_id, &s).await {
-                    Ok(provider) => {
-                        let models = provider.list_models().await;
-                        Some(models)
-                    }
+                    Ok(p) => p,
                     Err(e) => {
                         warn!("Failed to create provider '{provider_id}' for warmup: {e}");
-                        None
+                        continue;
                     }
                 }
             };
 
-            if let Some(Ok(models)) = result {
-                let mut reg = registry.write().await;
-                reg.cache_models(provider_id, models.clone());
-                info!(
-                    "Warmed up model cache for '{}': {} models",
-                    provider_id,
-                    models.len()
-                );
-            } else if let Some(Err(e)) = result {
-                warn!("Failed to fetch models for '{provider_id}': {e}");
+            // Fetch models without holding the registry lock
+            match provider.list_models().await {
+                Ok(models) => {
+                    let mut reg = registry.write().await;
+                    reg.cache_models(provider_id, models.clone());
+                    info!(
+                        "Warmed up model cache for '{}': {} models",
+                        provider_id,
+                        models.len()
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to fetch models for '{provider_id}': {e}");
+                }
             }
         }
 
