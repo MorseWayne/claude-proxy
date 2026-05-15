@@ -165,7 +165,7 @@ impl CopilotProvider {
             reqwest::header::HeaderValue::from_static("interleaved-thinking-2025-05-14"),
         );
 
-        // Serialize and inject tool_streaming=false to reduce streaming overhead
+        // Serialize and disable tool eager input streaming, which Copilot does not support.
         let model_info = self.get_model_info(&request.model).await;
         let mut request = request;
         apply_model_limits(
@@ -174,10 +174,10 @@ impl CopilotProvider {
             self.config.max_thinking_tokens,
         );
 
+        request.extra.clear();
         let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("serialize error: {e}")))?;
         if let Value::Object(ref mut obj) = body {
-            obj.insert("tool_streaming".to_string(), Value::Bool(false));
             disable_eager_input_streaming(obj);
         }
 
@@ -827,5 +827,24 @@ data:{"type":"message_delta"}"#,
         let thinking = request.thinking.expect("thinking inserted");
         assert_eq!(thinking.r#type.as_deref(), Some("enabled"));
         assert_eq!(thinking.budget_tokens, Some(2048));
+    }
+
+    #[test]
+    fn test_disable_eager_input_streaming_does_not_add_tool_streaming() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "tools": [
+                {
+                    "name": "example",
+                    "input_schema": {"type": "object"}
+                }
+            ]
+        });
+
+        let obj = body.as_object_mut().expect("object body");
+        disable_eager_input_streaming(obj);
+
+        assert!(obj.get("tool_streaming").is_none());
+        assert_eq!(obj["tools"][0]["eager_input_streaming"], false);
     }
 }
