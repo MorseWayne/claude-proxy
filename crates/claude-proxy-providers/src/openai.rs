@@ -208,6 +208,10 @@ pub(crate) struct RequestObservability {
     pub has_include: bool,
     pub has_instructions: bool,
     pub body_bytes: usize,
+    history_payload_budget_bytes: usize,
+    history_payload_bytes_after: usize,
+    history_payload_bytes_before: usize,
+    history_payload_budget_used_per_mille: usize,
     text_items: usize,
     thinking_items: usize,
     function_call_items: usize,
@@ -226,12 +230,18 @@ pub(crate) struct RequestObservability {
 
 pub(crate) fn request_observability(body: &Value) -> RequestObservability {
     let breakdown = payload_breakdown(body);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let history_payload_bytes_after = breakdown.text_bytes + breakdown.tool_output_bytes;
+    let history_payload_bytes_before = history_payload_bytes_after
+        + breakdown.truncated_text_bytes_saved
+        + breakdown.truncated_tool_output_bytes_saved;
+    let history_payload_budget_bytes = history_payload_budget_bytes_for_stats(&model);
     RequestObservability {
-        model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string(),
+        model,
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         input_items: body
             .get("input")
@@ -247,6 +257,11 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
         has_include: body.get("include").is_some(),
         has_instructions: body.get("instructions").is_some(),
         body_bytes: serde_json::to_vec(body).map_or(0, |bytes| bytes.len()),
+        history_payload_budget_bytes,
+        history_payload_bytes_after,
+        history_payload_bytes_before,
+        history_payload_budget_used_per_mille: history_payload_bytes_after * 1000
+            / history_payload_budget_bytes.max(1),
         text_items: breakdown.text_items,
         thinking_items: breakdown.thinking_items,
         function_call_items: breakdown.function_call_items,
@@ -261,6 +276,17 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
         truncated_text_bytes_saved: breakdown.truncated_text_bytes_saved,
         truncated_tool_output_items: breakdown.truncated_tool_output_items,
         truncated_tool_output_bytes_saved: breakdown.truncated_tool_output_bytes_saved,
+    }
+}
+
+fn history_payload_budget_bytes_for_stats(model: &str) -> usize {
+    let model = model.to_ascii_lowercase();
+    if model.contains("mini") || model.contains("small") || model.contains("flash") {
+        256 * 1024
+    } else if model.contains("gpt-5") || model.contains("o3") || model.contains("o4") {
+        1024 * 1024
+    } else {
+        512 * 1024
     }
 }
 
@@ -387,6 +413,10 @@ pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &V
         has_include = stats.has_include,
         has_instructions = stats.has_instructions,
         body_bytes = stats.body_bytes,
+        history_payload_budget_bytes = stats.history_payload_budget_bytes,
+        history_payload_bytes_after = stats.history_payload_bytes_after,
+        history_payload_bytes_before = stats.history_payload_bytes_before,
+        history_payload_budget_used_per_mille = stats.history_payload_budget_used_per_mille,
         text_items = stats.text_items,
         thinking_items = stats.thinking_items,
         function_call_items = stats.function_call_items,
@@ -1449,6 +1479,18 @@ mod tests {
                 .len()
         );
         assert_eq!(stats.instructions_bytes, "system text".len());
+        assert_eq!(stats.history_payload_budget_bytes, 256 * 1024);
+        assert_eq!(
+            stats.history_payload_bytes_after,
+            stats.text_bytes + stats.tool_output_bytes
+        );
+        assert_eq!(
+            stats.history_payload_bytes_before,
+            stats.history_payload_bytes_after
+                + stats.truncated_text_bytes_saved
+                + stats.truncated_tool_output_bytes_saved
+        );
+        assert_eq!(stats.history_payload_budget_used_per_mille, 0);
         assert!(stats.thinking_bytes > 0);
         assert!(stats.tool_call_bytes > 0);
         assert!(stats.largest_item_bytes > 0);

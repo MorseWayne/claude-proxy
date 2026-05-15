@@ -13,28 +13,58 @@ const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
 const RECENT_TEXT_ITEMS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TEXT_BYTES: usize = 32 * 1024;
+const SMALL_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 256 * 1024;
+const DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
+const LARGE_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct HistoryCompressionStats {
+    text_items: usize,
+    text_bytes: usize,
+    tool_outputs: usize,
+    tool_output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct HistoryCompressionState {
+    text_items_to_consider: usize,
+    tool_outputs_to_consider: usize,
+    excess_bytes: usize,
+}
 
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
-    let historical_messages = req.messages.iter().take(current_message_index);
-    let historical_tool_outputs = historical_messages
-        .clone()
-        .map(count_tool_results)
-        .sum::<usize>();
-    let historical_text_items = historical_messages.map(count_text_items).sum::<usize>();
-    let mut historical_tool_outputs_to_truncate =
-        historical_tool_outputs.saturating_sub(RECENT_TOOL_OUTPUTS_TO_KEEP);
-    let mut historical_text_items_to_truncate =
-        historical_text_items.saturating_sub(RECENT_TEXT_ITEMS_TO_KEEP);
+    let historical_stats = req
+        .messages
+        .iter()
+        .take(current_message_index)
+        .map(message_compression_stats)
+        .fold(HistoryCompressionStats::default(), |mut total, stats| {
+            total.text_items += stats.text_items;
+            total.text_bytes += stats.text_bytes;
+            total.tool_outputs += stats.tool_outputs;
+            total.tool_output_bytes += stats.tool_output_bytes;
+            total
+        });
+    let historical_payload_bytes = historical_stats.text_bytes + historical_stats.tool_output_bytes;
+    let mut compression = HistoryCompressionState {
+        text_items_to_consider: historical_stats
+            .text_items
+            .saturating_sub(RECENT_TEXT_ITEMS_TO_KEEP),
+        tool_outputs_to_consider: historical_stats
+            .tool_outputs
+            .saturating_sub(RECENT_TOOL_OUTPUTS_TO_KEEP),
+        excess_bytes: historical_payload_bytes
+            .saturating_sub(history_payload_budget_bytes(&req.model)),
+    };
 
     for (index, msg) in req.messages.iter().enumerate() {
         append_message_items(
             &mut input,
             msg,
             index == current_message_index,
-            &mut historical_tool_outputs_to_truncate,
-            &mut historical_text_items_to_truncate,
+            &mut compression,
         );
     }
 
@@ -125,38 +155,95 @@ fn should_include_encrypted_reasoning(req: &MessagesRequest) -> bool {
     })
 }
 
-fn count_tool_results(message: &Message) -> usize {
-    match &message.content {
-        MessageContent::Text(_) => 0,
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter(|block| matches!(block, Content::ToolResult { .. }))
-            .count(),
+fn history_payload_budget_bytes(model: &str) -> usize {
+    let model = model.to_ascii_lowercase();
+    if model.contains("mini") || model.contains("small") || model.contains("flash") {
+        SMALL_HISTORY_PAYLOAD_BUDGET_BYTES
+    } else if model.contains("gpt-5") || model.contains("o3") || model.contains("o4") {
+        LARGE_HISTORY_PAYLOAD_BUDGET_BYTES
+    } else {
+        DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES
     }
 }
 
-fn count_text_items(message: &Message) -> usize {
+fn message_compression_stats(message: &Message) -> HistoryCompressionStats {
     match &message.content {
-        MessageContent::Text(_) => 1,
-        MessageContent::Blocks(blocks) => {
-            let mut count = 0;
-            let mut has_pending_text = false;
-            for block in blocks {
-                match block {
-                    Content::Text { .. } | Content::Thinking { .. } => has_pending_text = true,
-                    Content::ToolUse { .. }
-                    | Content::ServerToolUse { .. }
-                    | Content::ToolResult { .. } => {
-                        if has_pending_text {
-                            count += 1;
-                            has_pending_text = false;
-                        }
-                    }
-                    Content::Unknown => {}
-                }
+        MessageContent::Text(text) => HistoryCompressionStats {
+            text_items: 1,
+            text_bytes: text.len(),
+            ..Default::default()
+        },
+        MessageContent::Blocks(blocks) => block_compression_stats(blocks),
+    }
+}
+
+fn block_compression_stats(blocks: &[Content]) -> HistoryCompressionStats {
+    let mut stats = HistoryCompressionStats::default();
+    let mut text_bytes = 0;
+    let mut has_pending_text = false;
+    let mut has_pending_thinking = false;
+
+    for block in blocks {
+        match block {
+            Content::Text { text } => {
+                has_pending_text = true;
+                text_bytes += text.len();
             }
-            count + usize::from(has_pending_text)
+            Content::Thinking { .. } => {
+                has_pending_text = true;
+                has_pending_thinking = true;
+            }
+            Content::ToolUse { .. } | Content::ServerToolUse { .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+            }
+            Content::ToolResult { content, .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+                stats.tool_outputs += 1;
+                stats.tool_output_bytes += raw_tool_result_text_len(content);
+            }
+            Content::Unknown => {}
         }
+    }
+
+    add_pending_text_stats(
+        &mut stats,
+        &mut text_bytes,
+        &mut has_pending_text,
+        &mut has_pending_thinking,
+    );
+    stats
+}
+
+fn add_pending_text_stats(
+    stats: &mut HistoryCompressionStats,
+    text_bytes: &mut usize,
+    has_pending_text: &mut bool,
+    has_pending_thinking: &mut bool,
+) {
+    if *has_pending_text && !*has_pending_thinking {
+        stats.text_items += 1;
+        stats.text_bytes += *text_bytes;
+    }
+    *text_bytes = 0;
+    *has_pending_text = false;
+    *has_pending_thinking = false;
+}
+
+fn raw_tool_result_text_len(content: &Option<Value>) -> usize {
+    match content {
+        Some(Value::String(text)) => text.len(),
+        Some(value) => value.to_string().len(),
+        None => 0,
     }
 }
 
@@ -164,20 +251,13 @@ fn append_message_items(
     input: &mut Vec<Value>,
     msg: &Message,
     is_current_message: bool,
-    historical_tool_outputs_to_truncate: &mut usize,
-    historical_text_items_to_truncate: &mut usize,
+    compression: &mut HistoryCompressionState,
 ) {
     match &msg.content {
         MessageContent::Text(text) => {
             input.push(message_item(
                 &msg.role,
-                text_item_text(
-                    text,
-                    should_truncate_text_item(
-                        is_current_message,
-                        historical_text_items_to_truncate,
-                    ),
-                ),
+                compressed_text_item(text, is_current_message, compression),
             ));
         }
         MessageContent::Blocks(blocks) => {
@@ -201,12 +281,10 @@ fn append_message_items(
                         if !text_parts.is_empty() {
                             input.push(message_item(
                                 &msg.role,
-                                text_item_text(
+                                compressed_text_item(
                                     &text_parts.join("\n"),
-                                    should_truncate_text_item(
-                                        is_current_message,
-                                        historical_text_items_to_truncate,
-                                    ),
+                                    is_current_message,
+                                    compression,
                                 ),
                             ));
                             text_parts.clear();
@@ -226,12 +304,10 @@ fn append_message_items(
                         if !text_parts.is_empty() {
                             input.push(message_item(
                                 &msg.role,
-                                text_item_text(
+                                compressed_text_item(
                                     &text_parts.join("\n"),
-                                    should_truncate_text_item(
-                                        is_current_message,
-                                        historical_text_items_to_truncate,
-                                    ),
+                                    is_current_message,
+                                    compression,
                                 ),
                             ));
                             text_parts.clear();
@@ -239,10 +315,7 @@ fn append_message_items(
                         let output = tool_result_text(
                             content,
                             *is_error,
-                            should_truncate_tool_output(
-                                is_current_message,
-                                historical_tool_outputs_to_truncate,
-                            ),
+                            should_truncate_tool_output(content, is_current_message, compression),
                         );
                         input.push(json!({
                             "type": "function_call_output",
@@ -256,39 +329,78 @@ fn append_message_items(
             if !text_parts.is_empty() {
                 input.push(message_item(
                     &msg.role,
-                    text_item_text(
-                        &text_parts.join("\n"),
-                        should_truncate_text_item(
-                            is_current_message,
-                            historical_text_items_to_truncate,
-                        ),
-                    ),
+                    compressed_text_item(&text_parts.join("\n"), is_current_message, compression),
                 ));
             }
         }
     }
 }
 
-fn should_truncate_tool_output(
+fn compressed_text_item(
+    text: &str,
     is_current_message: bool,
-    historical_tool_outputs_to_truncate: &mut usize,
+    compression: &mut HistoryCompressionState,
+) -> String {
+    text_item_text(
+        text,
+        should_truncate_text_item(text, is_current_message, compression),
+    )
+}
+
+fn should_truncate_tool_output(
+    content: &Option<Value>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
 ) -> bool {
-    if is_current_message || *historical_tool_outputs_to_truncate == 0 {
+    if is_current_message || compression.tool_outputs_to_consider == 0 {
         return false;
     }
-    *historical_tool_outputs_to_truncate -= 1;
+    compression.tool_outputs_to_consider -= 1;
+    let original_bytes = raw_tool_result_text_len(content);
+    if compression.excess_bytes == 0 || original_bytes <= MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
+        return false;
+    }
+    compression.excess_bytes = compression
+        .excess_bytes
+        .saturating_sub(truncated_tool_output_bytes_saved(original_bytes));
     true
 }
 
 fn should_truncate_text_item(
+    text: &str,
     is_current_message: bool,
-    historical_text_items_to_truncate: &mut usize,
+    compression: &mut HistoryCompressionState,
 ) -> bool {
-    if is_current_message || *historical_text_items_to_truncate == 0 {
+    if is_current_message || compression.text_items_to_consider == 0 || text.contains("[thinking]")
+    {
         return false;
     }
-    *historical_text_items_to_truncate -= 1;
+    compression.text_items_to_consider -= 1;
+    if compression.excess_bytes == 0 || text.len() <= MAX_HISTORICAL_TEXT_BYTES {
+        return false;
+    }
+    compression.excess_bytes = compression
+        .excess_bytes
+        .saturating_sub(truncated_text_bytes_saved(text.len()));
     true
+}
+
+fn truncated_tool_output_bytes_saved(original_bytes: usize) -> usize {
+    original_bytes.saturating_sub(
+        format!(
+            "[tool output truncated: original_bytes={original_bytes}, max_historical_tool_output_bytes={MAX_HISTORICAL_TOOL_OUTPUT_BYTES}]"
+        )
+        .len(),
+    )
+}
+
+fn truncated_text_bytes_saved(original_bytes: usize) -> usize {
+    original_bytes.saturating_sub(
+        format!(
+            "[text content truncated: original_bytes={original_bytes}, max_historical_text_bytes={MAX_HISTORICAL_TEXT_BYTES}]"
+        )
+        .len(),
+    )
 }
 
 fn text_item_text(text: &str, truncate_if_large: bool) -> String {
@@ -1211,7 +1323,7 @@ mod tests {
 
     #[test]
     fn test_convert_to_responses_truncates_old_large_tool_outputs() {
-        let large_output = "x".repeat(MAX_HISTORICAL_TOOL_OUTPUT_BYTES + 1);
+        let large_output = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
         let mut messages = Vec::new();
         for index in 0..(RECENT_TOOL_OUTPUTS_TO_KEEP + 2) {
             messages.push(Message {
@@ -1232,7 +1344,7 @@ mod tests {
             }]),
         });
         let req = MessagesRequest {
-            model: "gpt-5".to_string(),
+            model: "gpt-5.4-mini".to_string(),
             system: None,
             messages,
             max_tokens: None,
@@ -1270,7 +1382,7 @@ mod tests {
 
     #[test]
     fn test_convert_to_responses_truncates_old_large_text_items() {
-        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES + 1);
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
         let mut messages = Vec::new();
         for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 2) {
             messages.push(Message {
@@ -1283,7 +1395,7 @@ mod tests {
             content: MessageContent::Text(large_text.clone()),
         });
         let req = MessagesRequest {
-            model: "gpt-5".to_string(),
+            model: "gpt-5.4-mini".to_string(),
             system: None,
             messages,
             max_tokens: None,
@@ -1316,6 +1428,90 @@ mod tests {
         );
         assert_eq!(input[2]["content"], large_text);
         assert_eq!(input.last().unwrap()["content"], large_text);
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_large_model_history_within_budget() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Text(large_text.clone()),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("current".to_string()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+        let input = body["input"].as_array().expect("input items");
+
+        assert_eq!(input[0]["content"], large_text);
+        assert_eq!(input[1]["content"], large_text);
+    }
+
+    #[test]
+    fn test_convert_to_responses_does_not_truncate_thinking_text_items() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 20) {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![Content::Thinking {
+                    thinking: large_text.clone(),
+                    signature: None,
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("current".to_string()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+        let input = body["input"].as_array().expect("input items");
+
+        assert!(input[0]["content"].as_str().unwrap().contains("[thinking]"));
+        assert!(
+            !input[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("text content truncated")
+        );
     }
 
     #[test]
