@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 
 use axum::Json;
 use axum::body::Body;
@@ -9,10 +10,11 @@ use claude_proxy_core::*;
 use claude_proxy_providers::provider::ProviderError;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use std::collections::hash_map::DefaultHasher;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::app::{AppState, TokenUsage};
+use crate::app::{AppState, InflightEvent, TokenUsage};
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -121,6 +123,83 @@ pub async fn messages(
     let mut upstream_request = request.clone();
     upstream_request.model = upstream_model;
 
+    // --- Concurrent request deduplication ---
+    // Compute a hash of the full request to identify identical inflight requests.
+    let request_hash = compute_request_hash(&upstream_request);
+
+    // Check if an identical request is already in flight
+    {
+        let inflight = state.inflight.lock().await;
+        if let Some(sender) = inflight.get(&request_hash) {
+            let mut receiver = sender.subscribe();
+            drop(inflight);
+            debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
+
+            // Serve this request from the existing broadcast stream
+            if request.stream {
+                let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
+                tokio::spawn(async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok(InflightEvent::Event(event)) => {
+                                let sse_text = format_sse_event(&event);
+                                if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(InflightEvent::Done) | Err(_) => break,
+                            Ok(InflightEvent::Error(msg)) => {
+                                let error_event = SseEvent {
+                                    event: "error".to_string(),
+                                    data: json!({"error": {"type": "api_error", "message": msg}}),
+                                };
+                                let _ = tx.send(Ok(format_sse_event(&error_event).into_bytes())).await;
+                                break;
+                            }
+                        }
+                    }
+                });
+                state.metrics.record_latency(start.elapsed().as_millis() as u64);
+                let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
+                return Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .header("connection", "keep-alive")
+                    .body(Body::from_stream(stream_body))
+                    .unwrap();
+            } else {
+                // Non-streaming: collect from broadcast
+                let mut events = Vec::new();
+                loop {
+                    match receiver.recv().await {
+                        Ok(InflightEvent::Event(event)) => events.push(event),
+                        Ok(InflightEvent::Done) | Err(_) => break,
+                        Ok(InflightEvent::Error(msg)) => {
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                &ErrorResponse::api_error(&msg),
+                            );
+                        }
+                    }
+                }
+                let response_data = events
+                    .last()
+                    .map(|e| e.data.clone())
+                    .unwrap_or(json!({"error": "no response from provider"}));
+                state.metrics.record_latency(start.elapsed().as_millis() as u64);
+                return Json(response_data).into_response();
+            }
+        }
+    }
+
+    // Register this request as inflight (we are the "leader")
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<InflightEvent>(256);
+    {
+        let mut inflight = state.inflight.lock().await;
+        inflight.insert(request_hash, broadcast_tx.clone());
+    }
+
     // Get or create provider — lock is released after obtaining the Arc
     let provider = {
         let mut registry = state.provider_registry.write().await;
@@ -150,6 +229,7 @@ pub async fn messages(
 
                 let metrics = state.metrics.clone();
                 let model_name = request.model.clone();
+                let inflight_map = state.inflight.clone();
                 tokio::spawn(async move {
                     let task_start = std::time::Instant::now();
                     let mut usage = TokenUsage::default();
@@ -160,12 +240,15 @@ pub async fn messages(
                                 // Extract token usage from streaming events
                                 extract_usage_from_event(&event.data, &mut usage);
                                 let sse_text = format_sse_event(&event);
+                                // Broadcast to dedup subscribers (ignore errors = no subscribers)
+                                let _ = broadcast_tx.send(InflightEvent::Event(event));
                                 if sender.send(Ok(sse_text.into_bytes())).await.is_err() {
                                     break;
                                 }
                             }
                             Err(e) => {
                                 had_error = true;
+                                let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
                                 let error_event = SseEvent {
                                     event: "error".to_string(),
                                     data: json!({"error": {"type": "api_error", "message": e.to_string()}}),
@@ -176,6 +259,10 @@ pub async fn messages(
                             }
                         }
                     }
+                    // Signal completion to dedup subscribers
+                    let _ = broadcast_tx.send(InflightEvent::Done);
+                    // Remove from inflight map
+                    inflight_map.lock().await.remove(&request_hash);
                     // Record token usage after stream completes (persisted)
                     let latency_ms = task_start.elapsed().as_millis() as u64;
                     metrics
@@ -199,8 +286,14 @@ pub async fn messages(
                 let mut events = Vec::new();
                 while let Some(event_result) = stream.next().await {
                     match event_result {
-                        Ok(event) => events.push(event),
+                        Ok(event) => {
+                            let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
+                            events.push(event);
+                        }
                         Err(e) => {
+                            let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+                            let _ = broadcast_tx.send(InflightEvent::Done);
+                            state.inflight.lock().await.remove(&request_hash);
                             return error_response(
                                 StatusCode::BAD_GATEWAY,
                                 &ErrorResponse::api_error(&e.to_string()),
@@ -208,6 +301,9 @@ pub async fn messages(
                         }
                     }
                 }
+                let _ = broadcast_tx.send(InflightEvent::Done);
+                state.inflight.lock().await.remove(&request_hash);
+
                 let response_data = events
                     .last()
                     .map(|e| e.data.clone())
@@ -230,6 +326,11 @@ pub async fn messages(
             }
         }
         Err(e) => {
+            // Clean up inflight on error
+            let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+            let _ = broadcast_tx.send(InflightEvent::Done);
+            state.inflight.lock().await.remove(&request_hash);
+
             error!("Provider error: {e}");
             state.metrics.record_error();
             let latency_ms = start.elapsed().as_millis() as u64;
@@ -506,4 +607,16 @@ fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
             usage.cache_read_input_tokens += v;
         }
     }
+}
+
+/// Compute a hash of the request for deduplication purposes.
+/// Two requests with the same model, messages, system, tools, and parameters
+/// will produce the same hash.
+fn compute_request_hash(request: &MessagesRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // Hash the serialized request — this captures all fields deterministically
+    if let Ok(json) = serde_json::to_string(request) {
+        json.hash(&mut hasher);
+    }
+    hasher.finish()
 }

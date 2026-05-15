@@ -162,6 +162,20 @@ pub struct AppState {
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub concurrency_semaphore: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
+    /// Inflight request deduplication: maps request hash → broadcast sender.
+    /// Multiple identical concurrent requests share one upstream call.
+    pub inflight: Arc<Mutex<HashMap<u64, tokio::sync::broadcast::Sender<InflightEvent>>>>,
+}
+
+/// An event in the inflight broadcast channel.
+#[derive(Debug, Clone)]
+pub enum InflightEvent {
+    /// A successful SSE event from the provider stream.
+    Event(claude_proxy_core::SseEvent),
+    /// The stream completed (no more events).
+    Done,
+    /// An error occurred during streaming.
+    Error(String),
 }
 
 /// Registry of provider instances and cached model lists.
@@ -238,6 +252,7 @@ impl AppState {
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
             concurrency_semaphore: Arc::new(Semaphore::new(max_concurrency)),
             metrics: Arc::new(Metrics::new(store)),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

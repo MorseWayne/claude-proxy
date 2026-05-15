@@ -1,0 +1,21 @@
+&self,
+        request: MessagesRequest,
+        token: &str,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let vision = Self::has_vision_content(&request.messages);
+        let mut headers = self.build_headers(token, vision);
+
+        // Add anthropic-beta header for interleaved-thinking support
+        add_interleaved_thinking_header!(headers);
+
+        // Serialize and inject cache_control + disable tool streaming for efficiency
+        let mut body = serde_json::to_value(&request)
+            .map_err(|e| ProviderError::Network(format!("serialize error: {e}")))?;
+
+        Ok(BoxStream::new(
+            async_stream::stream! {
+                // ... rest of the body
+            }
+        ))
+    }

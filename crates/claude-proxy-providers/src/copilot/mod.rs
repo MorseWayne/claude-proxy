@@ -138,10 +138,20 @@ impl CopilotProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
-        let headers = self.build_headers(token, vision);
+        let mut headers = self.build_headers(token, vision);
 
-        let body = serde_json::to_value(&request)
+        // Add anthropic-beta header for interleaved-thinking support
+        headers.insert(
+            reqwest::header::HeaderName::from_static("anthropic-beta"),
+            reqwest::header::HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+
+        // Serialize and inject tool_streaming=false to reduce streaming overhead
+        let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("serialize error: {e}")))?;
+        if let Value::Object(ref mut obj) = body {
+            obj.insert("tool_streaming".to_string(), Value::Bool(false));
+        }
 
         debug!("Copilot messages API request to {url}");
 

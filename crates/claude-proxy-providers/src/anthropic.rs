@@ -83,9 +83,10 @@ impl Provider for AnthropicProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
 
-        // Serialize request as-is (passthrough)
-        let body = serde_json::to_value(&request)
+        // Serialize request and inject cache_control for prompt caching
+        let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("failed to serialize request: {e}")))?;
+        inject_cache_control(&mut body);
 
         debug!("Anthropic request to {url}");
 
@@ -184,4 +185,121 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
         event: event_type,
         data,
     }
+}
+
+/// Inject `cache_control: {"type": "ephemeral"}` into the request body to enable
+/// Anthropic's prompt caching. Marks (up to 4 breakpoints, the API max):
+///   1. Last system block
+///   2. Last tool definition
+///   3. Latest user message (most valuable during tool-use loops)
+///
+/// If the request already has cache_control annotations from the client, those
+/// count toward the cap so we don't exceed 4 total.
+fn inject_cache_control(body: &mut Value) {
+    let cache_control = serde_json::json!({"type": "ephemeral"});
+
+    // Count existing cache_control annotations to respect the 4-breakpoint cap.
+    let existing = count_existing_cache_controls(body);
+    let mut budget = 4u32.saturating_sub(existing);
+
+    // 1. Inject on the last system prompt block.
+    if budget > 0 && body.get("system").is_some() {
+        let system = body.get_mut("system").unwrap();
+        match system {
+            Value::String(text) => {
+                let block = serde_json::json!([{
+                    "type": "text",
+                    "text": text.clone(),
+                    "cache_control": cache_control.clone()
+                }]);
+                *system = block;
+                budget -= 1;
+            }
+            Value::Array(blocks) => {
+                if let Some(last) = blocks.last_mut()
+                    && let Value::Object(obj) = last
+                {
+                    obj.insert("cache_control".to_string(), cache_control.clone());
+                    budget -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Inject on the last tool definition.
+    if budget > 0
+        && let Some(Value::Array(tools)) = body.get_mut("tools")
+        && let Some(last_tool) = tools.last_mut()
+        && let Value::Object(obj) = last_tool
+    {
+        obj.insert("cache_control".to_string(), cache_control.clone());
+        budget -= 1;
+    }
+
+    // 3. Inject on the latest user message (most impactful during tool-use loops).
+    if budget > 0
+        && let Some(Value::Array(messages)) = body.get_mut("messages")
+        && let Some(last_user) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    {
+        match last_user.get_mut("content") {
+            Some(Value::Array(blocks)) => {
+                if let Some(last_block) = blocks.last_mut()
+                    && let Value::Object(obj) = last_block
+                {
+                    obj.insert("cache_control".to_string(), cache_control.clone());
+                }
+            }
+            Some(Value::String(text)) => {
+                let block = serde_json::json!([{
+                    "type": "text",
+                    "text": text.clone(),
+                    "cache_control": cache_control.clone()
+                }]);
+                *last_user.get_mut("content").unwrap() = block;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Count existing `cache_control` annotations in the request body.
+fn count_existing_cache_controls(body: &Value) -> u32 {
+    let mut count = 0u32;
+
+    // Check system blocks
+    if let Some(Value::Array(blocks)) = body.get("system") {
+        for block in blocks {
+            if block.get("cache_control").is_some() {
+                count += 1;
+            }
+        }
+    }
+
+    // Check tool definitions
+    if let Some(Value::Array(tools)) = body.get("tools") {
+        for tool in tools {
+            if tool.get("cache_control").is_some() {
+                count += 1;
+            }
+        }
+    }
+
+    // Check message content blocks
+    if let Some(Value::Array(messages)) = body.get("messages") {
+        for msg in messages {
+            if let Some(Value::Array(blocks)) = msg.get("content") {
+                for block in blocks {
+                    if block.get("cache_control").is_some() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    count
 }

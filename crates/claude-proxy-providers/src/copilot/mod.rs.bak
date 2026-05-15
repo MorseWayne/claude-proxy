@@ -1,0 +1,29 @@
+use reqwest::header::{HeaderValue, HeaderName};
+
+// Fix the type mismatch by using the correct path
+// if let Ok(value) = HeaderValue::from_static("interleaved-thinking-2025-05-14")
+// { ... }
+// becomes:
+// let value = HeaderValue::from_static("interleaved-thinking-2025-05-14");
+// if let Ok(value) = value { ... }
+// or more simply, just use the result directly
+
+// But the compiler still sees the enum type. Let's use a macro:
+
+macro_rules! add_interleaved_thinking_header {
+    ($headers:expr) => {
+        let value = HeaderValue::from_static("interleaved-thinking-2025-05-14");
+        if let Ok(value) = value {
+            $headers.insert(
+                HeaderName::from_static("anthropic-beta"),
+                value,
+            );
+        }
+    
+}
+
+// Now use it in the copilot module:
+
+// Add anthropic-beta header for interleaved-thinking support
+// add_interleaved_thinking_header!(headers);
+
