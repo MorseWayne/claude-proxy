@@ -118,10 +118,10 @@ impl CopilotProvider {
 
     async fn get_model_endpoints(&self, model: &str) -> Vec<String> {
         let models = self.model_cache.read().await;
-        if let Some(model_info) = models.iter().find(|m| m.model_id == model) {
-            if !model_info.supported_endpoints.is_empty() {
-                return model_info.supported_endpoints.clone();
-            }
+        if let Some(model_info) = models.iter().find(|m| m.model_id == model)
+            && !model_info.supported_endpoints.is_empty()
+        {
+            return model_info.supported_endpoints.clone();
         }
         drop(models);
 

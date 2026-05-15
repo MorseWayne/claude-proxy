@@ -21,9 +21,15 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
         "input": input,
         "stream": req.stream,
         "store": false,
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"],
     });
+
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        body["parallel_tool_calls"] = json!(true);
+    }
+
+    if should_include_encrypted_reasoning(req) {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
 
     if let Some(instructions) = system_to_text(&req.system) {
         body["instructions"] = json!(instructions);
@@ -68,6 +74,33 @@ fn system_to_text(system: &Option<SystemPrompt>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn should_include_encrypted_reasoning(req: &MessagesRequest) -> bool {
+    if req.extra.contains_key("reasoning") {
+        return true;
+    }
+    if req
+        .extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort != "none")
+    {
+        return true;
+    }
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.r#type.as_deref() != Some("disabled"))
+    {
+        return true;
+    }
+    req.messages.iter().any(|message| match &message.content {
+        MessageContent::Text(_) => false,
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|block| matches!(block, Content::Thinking { .. })),
+    })
 }
 
 fn append_message_items(input: &mut Vec<Value>, msg: &Message) {
@@ -190,6 +223,9 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
         return Some(reasoning.clone());
     }
     if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
+        if effort == "none" {
+            return Some(json!({"effort": "none"}));
+        }
         return Some(json!({"effort": effort, "summary": "detailed"}));
     }
     let thinking = req.thinking.as_ref()?;
@@ -929,6 +965,102 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "detailed");
         assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_include_without_reasoning() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert!(body.get("include").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_reasoning_summary_for_none_effort() {
+        let mut extra = HashMap::new();
+        extra.insert("reasoning_effort".to_string(), json!("none"));
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert!(body.get("include").is_none());
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+    }
+
+    #[test]
+    fn test_convert_to_responses_includes_reasoning_for_history_thinking() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![Content::Thinking {
+                    thinking: "prior thought".to_string(),
+                    signature: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn test_tool_result_text_prefixes_errors() {
+        let text = tool_result_text(&Some(Value::String("failed".to_string())), Some(true));
+
+        assert_eq!(text, "ERROR: failed");
     }
 
     #[test]

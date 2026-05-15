@@ -22,6 +22,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
+use crate::openai::{apply_openai_intent, openai_model_info};
 use crate::provider::{Provider, ProviderError};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -397,6 +398,7 @@ impl Provider for ChatGptProvider {
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
+        let request = apply_openai_intent(request);
         let mut body = crate::copilot::responses::convert_to_responses(&request);
         body.as_object_mut()
             .map(|object| object.remove("max_output_tokens"));
@@ -484,32 +486,15 @@ fn codex_responses_endpoint(base_url: &str) -> String {
 
 fn chatgpt_models() -> Vec<ModelInfo> {
     [
-        ("gpt-5.5", Some(128_000)),
-        ("gpt-5.4", None),
-        ("gpt-5.4-mini", None),
-        ("gpt-5.3-codex", None),
-        ("gpt-5.3-codex-spark", None),
-        ("gpt-5.2", None),
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.2",
     ]
     .into_iter()
-    .map(|(model_id, max_output_tokens)| ModelInfo {
-        model_id: model_id.to_string(),
-        supports_thinking: Some(true),
-        vendor: Some("openai".to_string()),
-        max_output_tokens,
-        supported_endpoints: vec!["/responses".to_string()],
-        is_chat_default: None,
-        supports_vision: Some(false),
-        supports_adaptive_thinking: None,
-        min_thinking_budget: None,
-        max_thinking_budget: None,
-        reasoning_effort_levels: vec![
-            "low".to_string(),
-            "medium".to_string(),
-            "high".to_string(),
-            "xhigh".to_string(),
-        ],
-    })
+    .map(openai_model_info)
     .collect()
 }
 
@@ -625,5 +610,58 @@ mod tests {
             codex_responses_endpoint("https://example.test/base/responses"),
             "https://example.test/base/responses"
         );
+    }
+
+    #[test]
+    fn chatgpt_models_include_reasoning_capabilities() {
+        let models = chatgpt_models();
+        let gpt55 = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.5")
+            .expect("gpt-5.5 model");
+
+        assert_eq!(gpt55.max_output_tokens, Some(128_000));
+        assert!(
+            gpt55
+                .supported_endpoints
+                .contains(&"/responses".to_string())
+        );
+        assert_eq!(
+            gpt55.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn chatgpt_intent_fast_affects_responses_body() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "fast"})),
+            extra: Default::default(),
+        };
+
+        let req = apply_openai_intent(req);
+        let mut body = crate::copilot::responses::convert_to_responses(&req);
+        body.as_object_mut()
+            .map(|object| object.remove("max_output_tokens"));
+
+        assert_eq!(body["model"], "gpt-5.4-mini");
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert!(body["reasoning"].get("summary").is_none());
+        assert!(body.get("max_output_tokens").is_none());
     }
 }

@@ -148,3 +148,64 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
 
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base_request(messages: Vec<Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: Some(SystemPrompt::Text("Be brief.".to_string())),
+            messages,
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn convert_request_maps_tools_results_and_reasoning() {
+        let req = base_request(vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    Content::Thinking {
+                        thinking: "plan".to_string(),
+                        signature: None,
+                    },
+                    Content::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        input: json!({"path": "README.md"}),
+                    },
+                ]),
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(Value::String("done".to_string())),
+                    is_error: None,
+                }]),
+            },
+        ]);
+
+        let body = convert_request(&req);
+
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["reasoning_content"], "plan");
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+}

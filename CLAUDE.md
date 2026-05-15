@@ -66,9 +66,13 @@ This project is indexed by GitNexus as **claude-proxy** (1363 symbols, 3143 rela
 
 ## Always Do
 
+- **MUST use GitNexus first for code exploration.** For any code exploration or architecture question, first use GitNexus to analyze the architecture, current execution flows, and potential modification impact before falling back to grep or manual file reads.
 - **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- **MUST provide a structured summary after code changes.** After completing user-requested code modifications, summarize changed files, validation performed, GitNexus findings, commit hash, and any follow-up notes.
+- **MUST commit completed code changes.** After completing user-requested code modifications and verification, create a git commit for the change unless the user explicitly says not to commit.
+- **MUST update the GitNexus index after committing.** After committing completed code changes, run `npx gitnexus analyze` so the code intelligence index reflects the latest repository state.
 - When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
 - When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
 

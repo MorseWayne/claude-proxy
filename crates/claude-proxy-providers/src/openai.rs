@@ -14,7 +14,7 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{Level, debug, enabled};
 
 use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
 use crate::provider::{Provider, ProviderError};
@@ -23,6 +23,160 @@ pub struct OpenAiProvider {
     id: String,
     client: Client,
     base_url: String,
+}
+
+const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+fn intent(req: &MessagesRequest) -> Option<&str> {
+    req.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("intent"))
+        .and_then(Value::as_str)
+}
+
+pub(crate) fn apply_openai_intent(mut request: MessagesRequest) -> MessagesRequest {
+    let intent = intent(&request).map(str::to_string);
+    if let Some(fast_model) = intent
+        .as_deref()
+        .and_then(|intent| fast_model_for(intent, &request.model))
+    {
+        request.model = fast_model.to_string();
+    }
+    apply_reasoning_effort(&mut request, intent.as_deref());
+    request
+}
+
+fn fast_model_for(intent: &str, model: &str) -> Option<&'static str> {
+    if !matches!(intent, "fast" | "quick_reply" | "summarization") {
+        return None;
+    }
+    if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.4") || model.starts_with("gpt-5") {
+        Some("gpt-5.4-mini")
+    } else {
+        None
+    }
+}
+
+fn apply_reasoning_effort(request: &mut MessagesRequest, intent: Option<&str>) {
+    if request.extra.contains_key("reasoning")
+        || request.extra.contains_key("reasoning_effort")
+        || request.thinking.is_some()
+    {
+        return;
+    }
+
+    let effort = match intent {
+        Some("fast" | "quick_reply" | "summarization") => Some("none"),
+        Some("deep_think" | "reasoning") => highest_reasoning_effort(&request.model),
+        Some("tool_use" | "agent") if supports_reasoning_effort(&request.model, "medium") => {
+            Some("medium")
+        }
+        _ => None,
+    };
+
+    if let Some(effort) = effort {
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!(effort));
+    }
+}
+
+fn highest_reasoning_effort(model: &str) -> Option<&'static str> {
+    if supports_reasoning_effort(model, "xhigh") {
+        Some("xhigh")
+    } else if supports_reasoning_effort(model, "high") {
+        Some("high")
+    } else {
+        None
+    }
+}
+
+fn supports_reasoning_effort(model: &str, effort: &str) -> bool {
+    model_reasoning_efforts(model).contains(&effort)
+}
+
+fn model_reasoning_efforts(model: &str) -> Vec<&'static str> {
+    if is_reasoning_model(model) || model.starts_with("gpt-5") {
+        REASONING_EFFORTS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
+}
+
+fn supports_responses(model: &str) -> bool {
+    model.starts_with("gpt-5") || is_reasoning_model(model)
+}
+
+fn is_codex_model(model: &str) -> bool {
+    model.contains("codex")
+}
+
+fn supported_endpoints_for(model: &str) -> Vec<String> {
+    if supports_responses(model) {
+        if is_codex_model(model) {
+            vec!["/responses".to_string()]
+        } else {
+            vec!["/chat/completions".to_string(), "/responses".to_string()]
+        }
+    } else {
+        vec!["/chat/completions".to_string()]
+    }
+}
+
+fn prefers_responses(model: &str) -> bool {
+    supports_responses(model)
+}
+
+pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
+    let reasoning_efforts = model_reasoning_efforts(model_id)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let supported_endpoints = supported_endpoints_for(model_id);
+
+    ModelInfo {
+        model_id: model_id.to_string(),
+        supports_thinking: (!reasoning_efforts.is_empty()).then_some(true),
+        vendor: Some("openai".to_string()),
+        max_output_tokens: if model_id.starts_with("gpt-5.5") {
+            Some(128_000)
+        } else if model_id.contains("mini") {
+            Some(16_384)
+        } else {
+            None
+        },
+        supported_endpoints,
+        is_chat_default: None,
+        supports_vision: None,
+        supports_adaptive_thinking: None,
+        min_thinking_budget: None,
+        max_thinking_budget: None,
+        reasoning_effort_levels: reasoning_efforts,
+    }
+}
+
+fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
+    let known = openai_model_info(&upstream.model_id);
+    if upstream.supports_thinking.is_none() {
+        upstream.supports_thinking = known.supports_thinking;
+    }
+    if upstream.vendor.is_none() {
+        upstream.vendor = known.vendor;
+    }
+    if upstream.max_output_tokens.is_none() {
+        upstream.max_output_tokens = known.max_output_tokens;
+    }
+    if upstream.supported_endpoints.is_empty() || supports_responses(&upstream.model_id) {
+        upstream.supported_endpoints = known.supported_endpoints;
+    }
+    if upstream.reasoning_effort_levels.is_empty() {
+        upstream.reasoning_effort_levels = known.reasoning_effort_levels;
+    }
+    upstream
 }
 
 impl OpenAiProvider {
@@ -72,15 +226,8 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
-}
 
-#[async_trait]
-impl Provider for OpenAiProvider {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    async fn chat(
+    async fn chat_via_completions(
         &self,
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
@@ -118,7 +265,6 @@ impl Provider for OpenAiProvider {
         if request.stream {
             Ok(stream_openai_response(response))
         } else {
-            // Non-streaming
             let body = response
                 .text()
                 .await
@@ -127,6 +273,76 @@ impl Provider for OpenAiProvider {
             let events = convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
+        }
+    }
+
+    async fn chat_via_responses(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let body = crate::copilot::responses::convert_to_responses(&request);
+        let url = format!("{}/responses", self.base_url);
+
+        debug!(
+            "OpenAI responses request: model={} stream={} input_items={}",
+            body.get("model").and_then(|v| v.as_str()).unwrap_or("?"),
+            request.stream,
+            body.get("input")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Network(fmt_reqwest_err(&e))
+                }
+            })?;
+
+        if !response.status().is_success() {
+            return Err(map_upstream_response(response).await);
+        }
+
+        if request.stream {
+            Ok(crate::copilot::responses::stream_responses_response(
+                response,
+            ))
+        } else {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
+            let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let events = crate::copilot::responses::convert_non_streaming_response(&data);
+            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            Ok(Box::pin(stream))
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn chat(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let request = apply_openai_intent(request);
+        if prefers_responses(&request.model) {
+            self.chat_via_responses(request).await
+        } else {
+            self.chat_via_completions(request).await
         }
     }
 
@@ -155,18 +371,20 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&[])
             .iter()
             .filter_map(|m| {
-                m["id"].as_str().map(|id| ModelInfo {
-                    model_id: id.to_string(),
-                    supports_thinking: None,
-                    vendor: Some("openai".to_string()),
-                    max_output_tokens: None,
-                    supported_endpoints: vec!["/chat/completions".to_string()],
-                    is_chat_default: None,
-                    supports_vision: None,
-                    supports_adaptive_thinking: None,
-                    min_thinking_budget: None,
-                    max_thinking_budget: None,
-                    reasoning_effort_levels: Vec::new(),
+                m["id"].as_str().map(|id| {
+                    merge_model_info(ModelInfo {
+                        model_id: id.to_string(),
+                        supports_thinking: None,
+                        vendor: Some("openai".to_string()),
+                        max_output_tokens: None,
+                        supported_endpoints: vec!["/chat/completions".to_string()],
+                        is_chat_default: None,
+                        supports_vision: None,
+                        supports_adaptive_thinking: None,
+                        min_thinking_budget: None,
+                        max_thinking_budget: None,
+                        reasoning_effort_levels: Vec::new(),
+                    })
                 })
             })
             .collect();
@@ -870,7 +1088,6 @@ mod tests {
     fn test_stream_converter_thinking() {
         let mut converter = StreamConverter::new();
 
-        // First chunk with role
         let chunk = OpenAiChunk {
             id: "test".to_string(),
             model: "deepseek-r1".to_string(),
@@ -888,7 +1105,6 @@ mod tests {
         };
         converter.process_chunk(&chunk);
 
-        // Reasoning content
         let chunk2 = OpenAiChunk {
             id: "test".to_string(),
             model: "deepseek-r1".to_string(),
@@ -905,8 +1121,124 @@ mod tests {
             usage: None,
         };
         let events = converter.process_chunk(&chunk2);
-        assert_eq!(events.len(), 2); // content_block_start (thinking) + content_block_delta
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].event, "content_block_start");
         assert_eq!(events[1].event, "content_block_delta");
+    }
+
+    #[test]
+    fn known_gpt5_model_prefers_responses() {
+        let info = openai_model_info("gpt-5.5");
+
+        assert!(prefers_responses("gpt-5.5"));
+        assert_eq!(info.max_output_tokens, Some(128_000));
+        assert_eq!(
+            info.supported_endpoints,
+            vec!["/chat/completions", "/responses"]
+        );
+        assert_eq!(
+            info.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn non_reasoning_model_keeps_chat_completions() {
+        let info = openai_model_info("gpt-4.1");
+
+        assert!(!prefers_responses("gpt-4.1"));
+        assert_eq!(info.supported_endpoints, vec!["/chat/completions"]);
+        assert!(info.reasoning_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn codex_model_uses_responses_endpoint_only() {
+        let info = openai_model_info("gpt-5.3-codex");
+
+        assert!(prefers_responses("gpt-5.3-codex"));
+        assert_eq!(info.supported_endpoints, vec!["/responses"]);
+    }
+
+    #[test]
+    fn merge_model_info_adds_known_responses_endpoint() {
+        let info = merge_model_info(ModelInfo {
+            model_id: "gpt-5.5".to_string(),
+            supports_thinking: None,
+            vendor: Some("openai".to_string()),
+            max_output_tokens: None,
+            supported_endpoints: vec!["/chat/completions".to_string()],
+            is_chat_default: None,
+            supports_vision: None,
+            supports_adaptive_thinking: None,
+            min_thinking_budget: None,
+            max_thinking_budget: None,
+            reasoning_effort_levels: Vec::new(),
+        });
+
+        assert_eq!(
+            info.supported_endpoints,
+            vec!["/chat/completions", "/responses"]
+        );
+    }
+
+    #[test]
+    fn intent_fast_selects_fast_model_and_disables_reasoning() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "fast"})),
+            extra: Default::default(),
+        };
+
+        let req = apply_openai_intent(req);
+
+        assert_eq!(req.model, "gpt-5.4-mini");
+        assert_eq!(
+            req.extra.get("reasoning_effort").and_then(Value::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn intent_deep_think_uses_highest_effort() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("think".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "deep_think"})),
+            extra: Default::default(),
+        };
+
+        let req = apply_openai_intent(req);
+
+        assert_eq!(
+            req.extra.get("reasoning_effort").and_then(Value::as_str),
+            Some("xhigh")
+        );
     }
 }

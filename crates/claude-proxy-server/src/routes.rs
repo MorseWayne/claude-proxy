@@ -170,8 +170,10 @@ pub async fn messages(
                     request_hash,
                     broadcast_tx,
                     stream,
-                    request_permit,
-                    provider_permit,
+                    StreamPermits {
+                        _request: request_permit,
+                        _provider: Some(provider_permit),
+                    },
                     start,
                 )
                 .await
@@ -460,8 +462,7 @@ async fn collect_leader_response(
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
-    _request_permit: OwnedSemaphorePermit,
-    _provider_permit: OwnedSemaphorePermit,
+    _permits: StreamPermits,
     start: std::time::Instant,
 ) -> Response {
     let mut last_event = None;
