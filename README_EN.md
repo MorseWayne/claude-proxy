@@ -139,6 +139,7 @@ auth_token = ""                         # Admin API token (empty = fallback to s
 rate_limit = 40                         # Max requests per window
 rate_window = 60                        # Window in seconds
 max_concurrency = 5                     # Max concurrent requests
+provider_max_concurrency = 4            # Max concurrent upstream requests per provider
 
 [http]
 read_timeout = 300                      # Upstream read timeout (seconds)

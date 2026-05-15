@@ -16,7 +16,10 @@
 use std::path::Path;
 
 use crate::provider::ProviderError;
+use futures::StreamExt;
 use serde_json::Value;
+
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
 /// callers see the real root cause (TLS handshake error, DNS failure, …)
@@ -49,7 +52,7 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let body = response.text().await.unwrap_or_default();
+    let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let message = extract_upstream_error_message(&body);
 
     match status {
@@ -64,6 +67,36 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         },
         _ => ProviderError::UpstreamError { status, body },
     }
+}
+
+async fn read_limited_response_text(response: reqwest::Response, limit: usize) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut truncated = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => break,
+        };
+        let remaining = limit.saturating_sub(body.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str("\n[upstream error body truncated]");
+    }
+    text
 }
 
 pub fn extract_upstream_error_message(body: &str) -> String {

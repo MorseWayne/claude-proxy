@@ -184,6 +184,10 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
             .get("PROVIDER_MAX_CONCURRENCY")
             .and_then(|s| s.parse().ok())
             .unwrap_or(5),
+        provider_max_concurrency: env
+            .get("PROVIDER_MAX_CONCURRENCY_PER_PROVIDER")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4),
     };
 
     let http = crate::settings::HttpConfig {

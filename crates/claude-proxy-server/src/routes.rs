@@ -1,5 +1,6 @@
 use std::convert::Infallible;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
+use std::io;
 use std::sync::Arc;
 
 use axum::Json;
@@ -14,6 +15,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, info, warn};
 
 use crate::app::{AppState, InflightEvent, TokenUsage};
@@ -73,29 +75,9 @@ pub async fn messages(
     }
 
     // Concurrency limiting
-    let _permit = match tokio::time::timeout(
-        Duration::from_secs(10),
-        state.concurrency_semaphore.acquire(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => {
-            error!("Semaphore closed unexpectedly");
-            record_request_error(&state, start);
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("service unavailable"),
-            );
-        }
-        Err(_) => {
-            warn!("Concurrency limit reached, request timed out");
-            record_request_error(&state, start);
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("too many concurrent requests"),
-            );
-        }
+    let request_permit = match acquire_request_permit(&state, start).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
 
     let resolved = resolve_upstream_request(&state, &request).await;
@@ -110,8 +92,21 @@ pub async fn messages(
     let request_hash = compute_request_hash(&resolved.request);
 
     // Check if an identical request is already in flight
-    if let Some(response) = join_inflight_request(&state, request_hash, request.stream, start).await
-    {
+    if let Some(receiver) = subscribe_inflight_request(&state, request_hash).await {
+        let response = if request.stream {
+            join_inflight_stream(
+                receiver,
+                StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+            )
+        } else {
+            join_inflight_non_stream(receiver, request_permit).await
+        };
+        state
+            .metrics
+            .record_latency(start.elapsed().as_millis() as u64);
         return response;
     }
 
@@ -127,6 +122,9 @@ pub async fn messages(
         Ok(provider) => provider,
         Err(e) => {
             error!("Provider error: {e}");
+            let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+            let _ = broadcast_tx.send(InflightEvent::Done);
+            state.inflight.lock().await.remove(&request_hash);
             record_request_error(&state, start);
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -135,15 +133,47 @@ pub async fn messages(
         }
     };
 
+    let provider_permit = match acquire_provider_permit(&state, &resolved.provider_id, start).await
+    {
+        Ok(permit) => permit,
+        Err(response) => {
+            let msg = "provider concurrency limit reached";
+            let _ = broadcast_tx.send(InflightEvent::Error(msg.to_string()));
+            let _ = broadcast_tx.send(InflightEvent::Done);
+            state.inflight.lock().await.remove(&request_hash);
+            return response;
+        }
+    };
+
     // Call provider (registry lock is no longer held)
     match provider.chat(resolved.request).await {
         Ok(stream) => {
             if request.stream {
-                stream_leader_response(&state, &request, request_hash, broadcast_tx, stream, start)
-                    .await
+                stream_leader_response(
+                    &state,
+                    &request,
+                    request_hash,
+                    broadcast_tx,
+                    stream,
+                    StreamPermits {
+                        _request: request_permit,
+                        _provider: Some(provider_permit),
+                    },
+                    start,
+                )
+                .await
             } else {
-                collect_leader_response(&state, &request, request_hash, broadcast_tx, stream, start)
-                    .await
+                collect_leader_response(
+                    &state,
+                    &request,
+                    request_hash,
+                    broadcast_tx,
+                    stream,
+                    request_permit,
+                    provider_permit,
+                    start,
+                )
+                .await
             }
         }
         Err(e) => {
@@ -190,33 +220,96 @@ fn record_request_error(state: &AppState, start: std::time::Instant) {
         .record_latency(start.elapsed().as_millis() as u64);
 }
 
-async fn join_inflight_request(
+struct StreamPermits {
+    _request: OwnedSemaphorePermit,
+    _provider: Option<OwnedSemaphorePermit>,
+}
+
+async fn acquire_request_permit(
+    state: &AppState,
+    start: std::time::Instant,
+) -> Result<OwnedSemaphorePermit, Response> {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        state.concurrency_semaphore.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => {
+            error!("Semaphore closed unexpectedly");
+            record_request_error(state, start);
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error("service unavailable"),
+            ))
+        }
+        Err(_) => {
+            warn!("Concurrency limit reached, request timed out");
+            record_request_error(state, start);
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error("too many concurrent requests"),
+            ))
+        }
+    }
+}
+
+async fn acquire_provider_permit(
+    state: &AppState,
+    provider_id: &str,
+    start: std::time::Instant,
+) -> Result<OwnedSemaphorePermit, Response> {
+    let max_concurrency = state.settings.read().await.limits.provider_max_concurrency as usize;
+    let semaphore = {
+        let mut semaphores = state.provider_concurrency_semaphores.lock().await;
+        semaphores
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max_concurrency)))
+            .clone()
+    };
+
+    match tokio::time::timeout(Duration::from_secs(10), semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => {
+            error!("Provider semaphore closed unexpectedly");
+            record_request_error(state, start);
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error("service unavailable"),
+            ))
+        }
+        Err(_) => {
+            warn!("Provider concurrency limit reached for {provider_id}");
+            record_request_error(state, start);
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error("provider concurrency limit reached"),
+            ))
+        }
+    }
+}
+
+async fn subscribe_inflight_request(
     state: &AppState,
     request_hash: u64,
-    stream: bool,
-    start: std::time::Instant,
-) -> Option<Response> {
+) -> Option<tokio::sync::broadcast::Receiver<InflightEvent>> {
     let inflight = state.inflight.lock().await;
     let sender = inflight.get(&request_hash)?;
     let receiver = sender.subscribe();
     drop(inflight);
 
     debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
-
-    let response = if stream {
-        join_inflight_stream(receiver)
-    } else {
-        join_inflight_non_stream(receiver).await
-    };
-    state
-        .metrics
-        .record_latency(start.elapsed().as_millis() as u64);
-    Some(response)
+    Some(receiver)
 }
 
-fn join_inflight_stream(mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>) -> Response {
+fn join_inflight_stream(
+    mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
+    permits: StreamPermits,
+) -> Response {
     let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
     tokio::spawn(async move {
+        let _permits = permits;
         loop {
             match receiver.recv().await {
                 Ok(InflightEvent::Event(event)) => {
@@ -245,11 +338,12 @@ fn join_inflight_stream(mut receiver: tokio::sync::broadcast::Receiver<InflightE
 
 async fn join_inflight_non_stream(
     mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
+    _request_permit: OwnedSemaphorePermit,
 ) -> Response {
-    let mut events = Vec::new();
+    let mut last_event = None;
     loop {
         match receiver.recv().await {
-            Ok(InflightEvent::Event(event)) => events.push(event),
+            Ok(InflightEvent::Event(event)) => last_event = Some(event),
             Ok(InflightEvent::Done) | Err(_) => break,
             Ok(InflightEvent::Error(msg)) => {
                 return error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&msg));
@@ -257,9 +351,8 @@ async fn join_inflight_non_stream(
         }
     }
 
-    let response_data = events
-        .last()
-        .map(|e| e.data.clone())
+    let response_data = last_event
+        .map(|e| e.data)
         .unwrap_or(json!({"error": "no response from provider"}));
     Json(response_data).into_response()
 }
@@ -270,6 +363,7 @@ async fn stream_leader_response(
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    permits: StreamPermits,
     start: std::time::Instant,
 ) -> Response {
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
@@ -278,6 +372,7 @@ async fn stream_leader_response(
     let model_name = request.model.clone();
     let inflight_map = state.inflight.clone();
     tokio::spawn(async move {
+        let _permits = permits;
         let task_start = std::time::Instant::now();
         let mut usage = TokenUsage::default();
         let mut had_error = false;
@@ -324,14 +419,18 @@ async fn collect_leader_response(
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    _request_permit: OwnedSemaphorePermit,
+    _provider_permit: OwnedSemaphorePermit,
     start: std::time::Instant,
 ) -> Response {
-    let mut events = Vec::new();
+    let mut last_event = None;
+    let mut usage = TokenUsage::default();
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => {
+                extract_usage_from_event(&event.data, &mut usage);
                 let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
-                events.push(event);
+                last_event = Some(event);
             }
             Err(e) => {
                 let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
@@ -347,15 +446,10 @@ async fn collect_leader_response(
     let _ = broadcast_tx.send(InflightEvent::Done);
     state.inflight.lock().await.remove(&request_hash);
 
-    let response_data = events
-        .last()
-        .map(|e| e.data.clone())
+    let response_data = last_event
+        .map(|e| e.data)
         .unwrap_or(json!({"error": "no response from provider"}));
 
-    let mut usage = TokenUsage::default();
-    for event in &events {
-        extract_usage_from_event(&event.data, &mut usage);
-    }
     let latency_ms = start.elapsed().as_millis() as u64;
     state
         .metrics
@@ -484,6 +578,7 @@ pub async fn admin_update_config(
             *settings = new_settings.clone();
             let mut registry = state.provider_registry.write().await;
             registry.clear();
+            state.provider_concurrency_semaphores.lock().await.clear();
 
             if let Some(path) = claude_proxy_config::Settings::config_file_path()
                 && let Err(e) = std::fs::write(&path, new_settings.to_toml())
@@ -519,6 +614,7 @@ pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) ->
                 *settings = new_settings;
                 let mut registry = state.provider_registry.write().await;
                 registry.clear();
+                state.provider_concurrency_semaphores.lock().await.clear();
                 info!("Config reloaded via admin restart");
                 Json(json!({"status": "reloaded"})).into_response()
             }
@@ -742,11 +838,22 @@ fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
 /// will produce the same hash.
 fn compute_request_hash(request: &MessagesRequest) -> u64 {
     let mut hasher = DefaultHasher::new();
-    // Hash the serialized request — this captures all fields deterministically
-    if let Ok(json) = serde_json::to_string(request) {
-        json.hash(&mut hasher);
-    }
+    let mut writer = HashWriter(&mut hasher);
+    let _ = serde_json::to_writer(&mut writer, request);
     hasher.finish()
+}
+
+struct HashWriter<'a, H>(&'a mut H);
+
+impl<H: Hasher> io::Write for HashWriter<'_, H> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

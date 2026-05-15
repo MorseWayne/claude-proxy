@@ -280,6 +280,8 @@ pub struct LimitsConfig {
     pub rate_window: u32,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
+    #[serde(default = "default_provider_max_concurrency")]
+    pub provider_max_concurrency: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +348,9 @@ fn default_rate_window() -> u32 {
 fn default_max_concurrency() -> u32 {
     5
 }
+fn default_provider_max_concurrency() -> u32 {
+    4
+}
 fn default_read_timeout() -> u64 {
     300
 }
@@ -386,6 +391,7 @@ impl Default for LimitsConfig {
             rate_limit: default_rate_limit(),
             rate_window: default_rate_window(),
             max_concurrency: default_max_concurrency(),
+            provider_max_concurrency: default_provider_max_concurrency(),
         }
     }
 }
@@ -519,6 +525,11 @@ impl Settings {
         if self.limits.max_concurrency == 0 {
             return Err(ConfigError::Validation(
                 "limits.max_concurrency must be > 0".to_string(),
+            ));
+        }
+        if self.limits.provider_max_concurrency == 0 {
+            return Err(ConfigError::Validation(
+                "limits.provider_max_concurrency must be > 0".to_string(),
             ));
         }
         // Validate model format: must contain provider_id/model_name

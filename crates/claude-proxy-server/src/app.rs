@@ -161,6 +161,7 @@ pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     pub concurrency_semaphore: Arc<Semaphore>,
+    pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub metrics: Arc<Metrics>,
     /// Inflight request deduplication: maps request hash → broadcast sender.
     /// Multiple identical concurrent requests share one upstream call.
@@ -251,6 +252,7 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
             concurrency_semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            provider_concurrency_semaphores: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new(store)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }

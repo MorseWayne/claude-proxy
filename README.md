@@ -141,6 +141,7 @@ auth_token = ""                         # 管理接口 token（留空则使用 s
 rate_limit = 40                         # 时间窗口内最大请求数
 rate_window = 60                        # 时间窗口（秒）
 max_concurrency = 5                     # 最大并发请求数
+provider_max_concurrency = 4            # 单个上游 provider 最大并发请求数
 
 [http]
 read_timeout = 300                      # 上游读取超时（秒）
