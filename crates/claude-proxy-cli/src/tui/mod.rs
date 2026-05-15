@@ -150,8 +150,10 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
     }
 
     // Ctrl+S saves anywhere
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
-        save_settings_with_feedback(app);
+    if is_ctrl_key(key, 's') {
+        if apply_pending_input(app) {
+            save_settings_with_feedback(app);
+        }
         return;
     }
 
@@ -182,6 +184,22 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
         Focus::Content => handle_content_key(app, code, key),
         Focus::Overlay => {} // handled above
     }
+}
+
+fn is_ctrl_key(key: event::KeyEvent, c: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+fn apply_pending_input(app: &mut App) -> bool {
+    let Some(Overlay::Input(input)) = app.overlay.as_ref() else {
+        return true;
+    };
+
+    let value = input.value.clone();
+    let action = input.action.clone();
+    app.overlay = None;
+    app.focus = Focus::Content;
+    apply_input_action(app, &action, &value)
 }
 
 fn handle_nav_key(app: &mut App, code: KeyCode) {
@@ -421,11 +439,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
         }
         Overlay::Input(input) => match key.code {
             KeyCode::Enter => {
-                let value = input.value.clone();
-                let action = input.action.clone();
-                app.overlay = None;
-                app.focus = Focus::Content;
-                apply_input_action(app, &action, &value);
+                apply_pending_input(app);
             }
             KeyCode::Esc => {
                 app.overlay = None;
@@ -870,7 +884,7 @@ fn get_section_label(section: &EditableSection) -> &'static str {
     }
 }
 
-fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
+fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool {
     match action {
         InputAction::EditSetting { section } => {
             let v = value.to_string();
@@ -881,7 +895,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.server.port = p;
                     } else {
                         app.show_toast(Toast::error("Invalid port"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::ServerAuthToken => app.settings.server.auth_token = v,
@@ -893,7 +907,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.limits.rate_limit = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::RateWindow => {
@@ -901,7 +915,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.limits.rate_window = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::MaxConcurrency => {
@@ -909,7 +923,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.limits.max_concurrency = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::HttpReadTimeout => {
@@ -917,7 +931,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.http.read_timeout = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::HttpWriteTimeout => {
@@ -925,7 +939,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.http.write_timeout = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::HttpConnectTimeout => {
@@ -933,7 +947,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                         app.settings.http.connect_timeout = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
-                        return;
+                        return false;
                     }
                 }
                 EditableSection::LogLevel => app.settings.log.level = v,
@@ -953,6 +967,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
             }
             app.mark_dirty();
             app.show_toast(Toast::success("Updated"));
+            true
         }
         InputAction::SetModelDefault { provider_id } => {
             app.settings.model.default = format!("{provider_id}/{value}");
@@ -960,6 +975,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
             app.show_toast(Toast::success(format!(
                 "Default model: {provider_id}/{value}"
             )));
+            true
         }
         InputAction::EditProviderField {
             provider_id, field, ..
@@ -973,6 +989,9 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                 app.provider_statuses.remove(provider_id);
                 app.mark_dirty();
                 app.show_toast(Toast::success("Updated"));
+                true
+            } else {
+                false
             }
         }
     }
@@ -1883,5 +1902,49 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    }
+
+    #[test]
+    fn ctrl_s_applies_pending_model_input_before_save() {
+        let mut app = App::new(Settings::default());
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "Default Model",
+                "Model",
+                InputAction::EditSetting {
+                    section: EditableSection::ModelDefault,
+                },
+            )
+            .with_value("openai/gpt-5"),
+        ));
+        app.focus = Focus::Overlay;
+
+        assert!(apply_pending_input(&mut app));
+
+        assert_eq!(app.settings.model.default, "openai/gpt-5");
+        assert!(app.overlay.is_none());
+        assert_eq!(app.focus, Focus::Content);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn pending_input_failure_keeps_settings_unsaved() {
+        let mut app = App::new(Settings::default());
+        let original_port = app.settings.server.port;
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "Port",
+                "Port",
+                InputAction::EditSetting {
+                    section: EditableSection::ServerPort,
+                },
+            )
+            .with_value("not-a-port"),
+        ));
+
+        assert!(!apply_pending_input(&mut app));
+
+        assert_eq!(app.settings.server.port, original_port);
+        assert!(!app.dirty);
     }
 }
