@@ -198,10 +198,7 @@ pub enum OAuthStep {
     /// Requesting device code from GitHub...
     Requesting,
     /// Show the URL and user code to the user.
-    ShowCode {
-        url: String,
-        code: String,
-    },
+    ShowCode { url: String, code: String },
     /// Polling for user authorization.
     Polling,
     /// Authorization succeeded.

@@ -188,7 +188,9 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_field(f, rows[4], "Status", &status, false, false);
 
     // Copilot info (read-only)
-    if pt == ProviderType::Copilot && let Some(ref cc) = cfg.copilot {
+    if pt == ProviderType::Copilot
+        && let Some(ref cc) = cfg.copilot
+    {
         let info = format!(
             "oauth={} small={} warmup={}",
             cc.oauth_app, cc.small_model, cc.enable_warmup
@@ -271,18 +273,20 @@ fn provider_status_detail(app: &App, id: &str, cfg: &ProviderConfig) -> (String,
     }
 
     match app.provider_statuses.get(id) {
-        Some(ProviderCheckStatus::Checking) => {
-            ("Checking connectivity/auth...".into(), Style::default().fg(theme::WARN))
-        }
+        Some(ProviderCheckStatus::Checking) => (
+            "Checking connectivity/auth...".into(),
+            Style::default().fg(theme::WARN),
+        ),
         Some(ProviderCheckStatus::Ok(message)) => {
             (message.clone(), Style::default().fg(theme::ACCENT2))
         }
         Some(ProviderCheckStatus::Warning(message)) => {
             (message.clone(), Style::default().fg(theme::WARN))
         }
-        Some(ProviderCheckStatus::Failed(message)) => {
-            (format!("Failed: {message}"), Style::default().fg(theme::ERR))
-        }
+        Some(ProviderCheckStatus::Failed(message)) => (
+            format!("Failed: {message}"),
+            Style::default().fg(theme::ERR),
+        ),
         None => ("Not checked".into(), Style::default().fg(theme::FG_DIM)),
     }
 }

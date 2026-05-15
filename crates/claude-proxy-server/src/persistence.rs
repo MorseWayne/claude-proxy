@@ -147,13 +147,7 @@ impl MetricsStore {
     }
 
     /// Record a completed request with its token usage (non-blocking).
-    pub fn record_usage(
-        &self,
-        model: &str,
-        usage: &TokenUsage,
-        is_error: bool,
-        latency_ms: u64,
-    ) {
+    pub fn record_usage(&self, model: &str, usage: &TokenUsage, is_error: bool, latency_ms: u64) {
         let event = UsageEvent {
             model: model.to_string(),
             input_tokens: usage.input_tokens as i64,

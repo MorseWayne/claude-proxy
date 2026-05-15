@@ -153,13 +153,17 @@ pub async fn messages(
                                     event: "error".to_string(),
                                     data: json!({"error": {"type": "api_error", "message": msg}}),
                                 };
-                                let _ = tx.send(Ok(format_sse_event(&error_event).into_bytes())).await;
+                                let _ = tx
+                                    .send(Ok(format_sse_event(&error_event).into_bytes()))
+                                    .await;
                                 break;
                             }
                         }
                     }
                 });
-                state.metrics.record_latency(start.elapsed().as_millis() as u64);
+                state
+                    .metrics
+                    .record_latency(start.elapsed().as_millis() as u64);
                 let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
                 return Response::builder()
                     .status(200)
@@ -187,7 +191,9 @@ pub async fn messages(
                     .last()
                     .map(|e| e.data.clone())
                     .unwrap_or(json!({"error": "no response from provider"}));
-                state.metrics.record_latency(start.elapsed().as_millis() as u64);
+                state
+                    .metrics
+                    .record_latency(start.elapsed().as_millis() as u64);
                 return Json(response_data).into_response();
             }
         }

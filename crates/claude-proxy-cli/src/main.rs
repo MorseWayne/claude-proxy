@@ -841,8 +841,7 @@ fn build_oauth_http_client(
 
     if !proxy.trim().is_empty() {
         builder = builder.proxy(
-            reqwest::Proxy::all(proxy)
-                .map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
+            reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
         );
     }
 

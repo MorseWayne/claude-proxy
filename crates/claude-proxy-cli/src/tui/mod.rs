@@ -22,8 +22,8 @@ use ratatui::backend::{Backend, CrosstermBackend};
 
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
-    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem, OAuthOverlay,
-    OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
+    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem,
+    OAuthOverlay, OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
     ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus, StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
@@ -1086,12 +1086,11 @@ fn check_selected_provider(app: &mut App) {
     app.show_toast(Toast::info(format!("Checking {id}...")));
 
     std::thread::spawn(move || {
-        let result =
-            fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
-                ProviderCheckOk {
-                    message: format!("OK, {} models available", models.len()),
-                }
-            });
+        let result = fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
+            ProviderCheckOk {
+                message: format!("OK, {} models available", models.len()),
+            }
+        });
         let _ = tx.send(ProviderCheckResult {
             provider_id: id,
             result,
@@ -1170,8 +1169,7 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
                     return;
                 }
             };
-            match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await
-            {
+            match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await {
                 Ok(auth) => match auth.start_device_code().await {
                     Ok(info) => {
                         let _ = tx.send(OAuthResult::CodeInfo {
@@ -1219,8 +1217,7 @@ fn build_tui_oauth_http_client(
         && !proxy.is_empty()
     {
         builder = builder.proxy(
-            reqwest::Proxy::all(proxy)
-                .map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
+            reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
         );
     }
 
@@ -1377,11 +1374,19 @@ fn oauth_provider(app: &mut App) {
     if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
         let id = id.clone();
         if cfg.resolve_type(&id).needs_api_key() {
-            app.show_toast(Toast::info("This provider uses API key authentication, not OAuth"));
+            app.show_toast(Toast::info(
+                "This provider uses API key authentication, not OAuth",
+            ));
             return;
         }
-        if cfg.copilot.as_ref().is_some_and(|c| c.oauth_app == "opencode") {
-            app.show_toast(Toast::info("OpenCode Zen uses direct GitHub token authentication"));
+        if cfg
+            .copilot
+            .as_ref()
+            .is_some_and(|c| c.oauth_app == "opencode")
+        {
+            app.show_toast(Toast::info(
+                "OpenCode Zen uses direct GitHub token authentication",
+            ));
             return;
         }
         start_oauth_flow(app, &id);
@@ -1436,7 +1441,10 @@ fn fetch_live_metrics(app: &mut App) {
         if !admin_token.is_empty() {
             req = req.header("Authorization", format!("Bearer {admin_token}"));
         }
-        let result = req.send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
+        let result = req
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok());
         let _ = tx.send(result);
     });
 }
@@ -1523,14 +1531,8 @@ fn poll_metrics(app: &mut App) {
                 .map(|(name, v)| {
                     let m = LiveModelMetrics {
                         requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                        input_tokens: v
-                            .get("input_tokens")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                        output_tokens: v
-                            .get("output_tokens")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
+                        input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                        output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
                         cache_creation_input_tokens: v
                             .get("cache_creation_input_tokens")
                             .and_then(|x| x.as_u64())

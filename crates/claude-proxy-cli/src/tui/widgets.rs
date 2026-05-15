@@ -707,11 +707,7 @@ pub fn render_loading_overlay(f: &mut Frame, area: Rect, overlay: &super::app::L
 
 // ── OAuth overlay ──
 
-pub fn render_oauth_overlay(
-    f: &mut Frame,
-    area: Rect,
-    overlay: &super::app::OAuthOverlay,
-) {
+pub fn render_oauth_overlay(f: &mut Frame, area: Rect, overlay: &super::app::OAuthOverlay) {
     use super::app::OAuthStep;
 
     let width = 54;
@@ -738,18 +734,16 @@ pub fn render_oauth_overlay(
 
     let block = Block::default()
         .title(title)
-        .title_style(
-            Style::default()
-                .fg(title_fg)
-                .add_modifier(Modifier::BOLD),
-        )
+        .title_style(Style::default().fg(title_fg).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if matches!(overlay.step, OAuthStep::Failed(_)) {
-            theme::ERR
-        } else {
-            theme::ACCENT
-        }))
+        .border_style(
+            Style::default().fg(if matches!(overlay.step, OAuthStep::Failed(_)) {
+                theme::ERR
+            } else {
+                theme::ACCENT
+            }),
+        )
         .style(Style::default().bg(theme::BG_DARK));
     let inner = block.inner(dialog);
     f.render_widget(block, dialog);
@@ -763,14 +757,14 @@ pub fn render_oauth_overlay(
             Line::from(""),
             Line::from(Span::styled(
                 format!("  Open: {url}"),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 format!("  Enter code: {code}"),
-                Style::default()
-                    .fg(theme::FG)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -801,10 +795,7 @@ pub fn render_oauth_overlay(
         ],
     };
 
-    f.render_widget(
-        Paragraph::new(lines).centered(),
-        inner,
-    );
+    f.render_widget(Paragraph::new(lines).centered(), inner);
 }
 
 // ── Helpers ──
