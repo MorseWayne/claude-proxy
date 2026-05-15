@@ -160,6 +160,7 @@ impl Provider for AnthropicProvider {
                 supports_adaptive_thinking: None,
                 min_thinking_budget: None,
                 max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
             },
             ModelInfo {
                 model_id: "claude-sonnet-4-20250514".to_string(),
@@ -172,6 +173,7 @@ impl Provider for AnthropicProvider {
                 supports_adaptive_thinking: None,
                 min_thinking_budget: None,
                 max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
             },
             ModelInfo {
                 model_id: "claude-3-5-haiku-20241022".to_string(),
@@ -184,6 +186,7 @@ impl Provider for AnthropicProvider {
                 supports_adaptive_thinking: None,
                 min_thinking_budget: None,
                 max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
             },
         ])
     }

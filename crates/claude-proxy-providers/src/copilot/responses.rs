@@ -22,6 +22,7 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
         "stream": req.stream,
         "store": false,
         "parallel_tool_calls": true,
+        "include": ["reasoning.encrypted_content"],
     });
 
     if let Some(instructions) = system_to_text(&req.system) {
@@ -193,14 +194,16 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
         return Some(reasoning.clone());
     }
     if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
-        return Some(json!({"effort": effort}));
+        return Some(json!({"effort": effort, "summary": "detailed"}));
     }
     let thinking = req.thinking.as_ref()?;
     if thinking.r#type.as_deref() == Some("disabled") {
         return Some(json!({"effort": "none"}));
     }
-    if thinking.r#type.as_deref() == Some("enabled") || thinking.budget_tokens.is_some() {
-        return Some(json!({"effort": "medium"}));
+    if matches!(thinking.r#type.as_deref(), Some("enabled" | "adaptive"))
+        || thinking.budget_tokens.is_some()
+    {
+        return Some(json!({"effort": "medium", "summary": "detailed"}));
     }
     None
 }
@@ -897,7 +900,9 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "weather");
         assert_eq!(body["input"][1]["type"], "function_call");
         assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]

@@ -157,16 +157,17 @@ impl CopilotProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
+        let model_info = self.get_model_info(&request.model).await;
         let mut headers = self.build_headers(token, vision, initiator);
 
-        // Add anthropic-beta header for interleaved-thinking support
-        headers.insert(
-            reqwest::header::HeaderName::from_static("anthropic-beta"),
-            reqwest::header::HeaderValue::from_static("interleaved-thinking-2025-05-14"),
-        );
+        if should_use_interleaved_thinking_beta(model_info.as_ref()) {
+            headers.insert(
+                reqwest::header::HeaderName::from_static("anthropic-beta"),
+                reqwest::header::HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+            );
+        }
 
         // Serialize and disable tool eager input streaming, which Copilot does not support.
-        let model_info = self.get_model_info(&request.model).await;
         let mut request = request;
         apply_model_limits(
             &mut request,
@@ -174,10 +175,12 @@ impl CopilotProvider {
             self.config.max_thinking_tokens,
         );
 
+        let output_effort = copilot_messages_effort(&request, model_info.as_ref());
         request.extra.clear();
         let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("serialize error: {e}")))?;
         if let Value::Object(ref mut obj) = body {
+            normalize_copilot_messages_thinking(obj, output_effort.as_deref());
             disable_eager_input_streaming(obj);
         }
 
@@ -379,12 +382,12 @@ impl Provider for CopilotProvider {
             "user"
         };
 
-        if self.config.enable_responses_api && endpoints.iter().any(|e| e == "/responses") {
-            debug!("Using /responses path for model {}", request.model);
-            self.chat_via_responses(request, &token, initiator).await
-        } else if endpoints.iter().any(|e| e == "/v1/messages") {
+        if endpoints.iter().any(|e| e == "/v1/messages") {
             debug!("Using native /v1/messages path for model {}", request.model);
             self.chat_via_messages(request, &token, initiator).await
+        } else if self.config.enable_responses_api && supports_responses_only(&endpoints) {
+            debug!("Using /responses path for model {}", request.model);
+            self.chat_via_responses(request, &token, initiator).await
         } else {
             debug!(
                 "Falling back to /chat/completions for model {}",
@@ -489,7 +492,8 @@ fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
         model_id: model_id.to_string(),
         supports_thinking: model["supports_thinking"]
             .as_bool()
-            .or_else(|| capabilities["supports_thinking"].as_bool()),
+            .or_else(|| capabilities["supports_thinking"].as_bool())
+            .or_else(|| supports["thinking"].as_bool()),
         vendor: model["vendor"]
             .get("name")
             .and_then(Value::as_str)
@@ -503,19 +507,46 @@ fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
         supports_vision: supports["vision"]
             .as_bool()
             .or_else(|| capabilities["supports_vision"].as_bool()),
-        supports_adaptive_thinking: model["supports_adaptive_thinking"].as_bool(),
+        supports_adaptive_thinking: model["supports_adaptive_thinking"]
+            .as_bool()
+            .or_else(|| capabilities["supports_adaptive_thinking"].as_bool())
+            .or_else(|| supports["adaptive_thinking"].as_bool()),
         min_thinking_budget: model["min_thinking_budget"]
             .as_u64()
-            .and_then(|n| u32::try_from(n).ok()),
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| {
+                supports["min_thinking_budget"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+            }),
         max_thinking_budget: model["max_thinking_budget"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| {
+                supports["max_thinking_budget"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+            })
             .or_else(|| {
                 billing["max_thinking_budget"]
                     .as_u64()
                     .and_then(|n| u32::try_from(n).ok())
             }),
+        reasoning_effort_levels: supports["reasoning_effort"]
+            .as_array()
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| level.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+fn supports_responses_only(endpoints: &[String]) -> bool {
+    endpoints.iter().any(|e| e == "/responses")
+        && !endpoints.iter().any(|e| e == "/chat/completions")
 }
 
 fn parse_supported_endpoints(value: &Value) -> Vec<String> {
@@ -554,9 +585,16 @@ fn apply_model_limits(
         );
     }
 
-    if request.thinking.is_none() && model_info.supports_thinking == Some(true) {
+    if request.thinking.is_none() && model_can_think(model_info) {
         request.thinking = Some(ThinkingConfig {
-            r#type: Some("enabled".to_string()),
+            r#type: Some(
+                if model_info.supports_adaptive_thinking == Some(true) {
+                    "adaptive"
+                } else {
+                    "enabled"
+                }
+                .to_string(),
+            ),
             budget_tokens: if model_info.supports_adaptive_thinking == Some(true) {
                 None
             } else {
@@ -595,12 +633,120 @@ fn compute_thinking_budget(
     Some((available / 2).clamp(lower, upper))
 }
 
+fn model_can_think(model_info: &ModelInfo) -> bool {
+    model_info.supports_thinking == Some(true)
+        || model_info.supports_adaptive_thinking == Some(true)
+        || model_info.max_thinking_budget.is_some()
+}
+
+fn should_use_interleaved_thinking_beta(model_info: Option<&ModelInfo>) -> bool {
+    model_info.is_some_and(|model| {
+        model.supports_adaptive_thinking != Some(true) && model_can_think(model)
+    })
+}
+
 fn disable_eager_input_streaming(body: &mut serde_json::Map<String, Value>) {
     if let Some(Value::Array(tools)) = body.get_mut("tools") {
         for tool in tools {
             if let Value::Object(tool_obj) = tool {
                 tool_obj.insert("eager_input_streaming".to_string(), Value::Bool(false));
             }
+        }
+    }
+}
+
+fn copilot_messages_effort(
+    request: &MessagesRequest,
+    model_info: Option<&ModelInfo>,
+) -> Option<String> {
+    let requested_effort = if let Some(effort) = request
+        .extra
+        .get("output_config")
+        .and_then(|v| v.get("effort"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+        }) {
+        effort.to_string()
+    } else {
+        let has_thinking = request.thinking.is_some() || model_info.is_some_and(model_can_think);
+        if !has_thinking {
+            return None;
+        }
+
+        request
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens)
+            .map(thinking_budget_to_effort)
+            .unwrap_or_else(|| "medium".to_string())
+    };
+
+    Some(select_supported_reasoning_effort(
+        &requested_effort,
+        model_info,
+    ))
+}
+
+fn thinking_budget_to_effort(budget_tokens: u32) -> String {
+    match budget_tokens {
+        0..=2048 => "low",
+        2049..=8192 => "medium",
+        _ => "high",
+    }
+    .to_string()
+}
+
+fn select_supported_reasoning_effort(
+    requested_effort: &str,
+    model_info: Option<&ModelInfo>,
+) -> String {
+    let Some(model_info) = model_info else {
+        return requested_effort.to_string();
+    };
+
+    let supported = &model_info.reasoning_effort_levels;
+    if supported.is_empty() || supported.iter().any(|level| level == requested_effort) {
+        return requested_effort.to_string();
+    }
+
+    if supported.iter().any(|level| level == "medium") {
+        return "medium".to_string();
+    }
+
+    supported
+        .first()
+        .cloned()
+        .unwrap_or_else(|| requested_effort.to_string())
+}
+
+fn normalize_copilot_messages_thinking(
+    body: &mut serde_json::Map<String, Value>,
+    effort: Option<&str>,
+) {
+    let needs_output_effort = if let Some(Value::Object(thinking)) = body.get_mut("thinking") {
+        match thinking.get("type").and_then(Value::as_str) {
+            Some("enabled") | Some("adaptive") => {
+                thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
+                thinking.remove("budget_tokens");
+                true
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    if needs_output_effort {
+        let effort = effort.unwrap_or("medium");
+        let output_config = body
+            .entry("output_config".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Value::Object(config) = output_config {
+            config.insert("effort".to_string(), Value::String(effort.to_string()));
         }
     }
 }
@@ -773,7 +919,13 @@ data:{"type":"message_delta"}"#,
             "supported_endpoints": ["/v1/messages", {"path": "/chat/completions"}],
             "capabilities": {
                 "limits": {"max_output_tokens": 16384},
-                "supports": {"vision": true}
+                "supports": {
+                    "vision": true,
+                    "adaptive_thinking": true,
+                    "min_thinking_budget": 2048,
+                    "max_thinking_budget": 12000,
+                    "reasoning_effort": ["low", "medium", "high", "xhigh"]
+                }
             }
         });
 
@@ -788,6 +940,23 @@ data:{"type":"message_delta"}"#,
         assert_eq!(model.is_chat_default, Some(true));
         assert_eq!(model.supports_vision, Some(true));
         assert_eq!(model.supports_thinking, Some(true));
+        assert_eq!(model.supports_adaptive_thinking, Some(false));
+        assert_eq!(model.min_thinking_budget, Some(1024));
+        assert_eq!(model.max_thinking_budget, Some(8192));
+        assert_eq!(
+            model.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn test_responses_route_only_when_chat_completions_absent() {
+        assert!(supports_responses_only(&["/responses".to_string()]));
+        assert!(!supports_responses_only(&[
+            "/responses".to_string(),
+            "/chat/completions".to_string()
+        ]));
+        assert!(!supports_responses_only(&["/v1/messages".to_string()]));
     }
 
     #[test]
@@ -803,6 +972,7 @@ data:{"type":"message_delta"}"#,
             supports_adaptive_thinking: Some(false),
             min_thinking_budget: Some(1024),
             max_thinking_budget: Some(2048),
+            reasoning_effort_levels: Vec::new(),
         };
         let mut request = MessagesRequest {
             model: model.model_id.clone(),
@@ -830,6 +1000,101 @@ data:{"type":"message_delta"}"#,
     }
 
     #[test]
+    fn test_apply_model_limits_uses_adaptive_thinking_without_budget() {
+        let model = ModelInfo {
+            model_id: "claude-opus-4.7".to_string(),
+            supports_thinking: Some(true),
+            vendor: Some("anthropic".to_string()),
+            max_output_tokens: Some(8192),
+            supported_endpoints: vec!["/v1/messages".to_string()],
+            is_chat_default: None,
+            supports_vision: None,
+            supports_adaptive_thinking: Some(true),
+            min_thinking_budget: Some(1024),
+            max_thinking_budget: Some(4096),
+            reasoning_effort_levels: vec!["low".to_string(), "medium".to_string()],
+        };
+        let mut request = MessagesRequest {
+            model: model.model_id.clone(),
+            system: None,
+            messages: vec![],
+            max_tokens: Some(8192),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        apply_model_limits(&mut request, Some(&model), 16_000);
+
+        let thinking = request.thinking.expect("thinking inserted");
+        assert_eq!(thinking.r#type.as_deref(), Some("adaptive"));
+        assert_eq!(thinking.budget_tokens, None);
+        assert!(!should_use_interleaved_thinking_beta(Some(&model)));
+    }
+
+    #[test]
+    fn test_copilot_messages_effort_clamps_to_supported_model_levels() {
+        let model = ModelInfo {
+            model_id: "claude-opus-4.7".to_string(),
+            supports_thinking: Some(true),
+            vendor: Some("anthropic".to_string()),
+            max_output_tokens: Some(8192),
+            supported_endpoints: vec!["/v1/messages".to_string()],
+            is_chat_default: None,
+            supports_vision: None,
+            supports_adaptive_thinking: Some(true),
+            min_thinking_budget: None,
+            max_thinking_budget: None,
+            reasoning_effort_levels: vec!["medium".to_string()],
+        };
+        let mut request = MessagesRequest {
+            model: model.model_id.clone(),
+            system: None,
+            messages: vec![],
+            max_tokens: Some(8192),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("adaptive".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::from([(
+                "output_config".to_string(),
+                serde_json::json!({"effort": "high"}),
+            )]),
+        };
+
+        assert_eq!(
+            copilot_messages_effort(&request, Some(&model)).as_deref(),
+            Some("medium")
+        );
+
+        request.extra.clear();
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("enabled".to_string()),
+            budget_tokens: Some(12_000),
+        });
+
+        assert_eq!(
+            copilot_messages_effort(&request, Some(&model)).as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
     fn test_disable_eager_input_streaming_does_not_add_tool_streaming() {
         let mut body = serde_json::json!({
             "model": "claude-sonnet-4",
@@ -846,5 +1111,23 @@ data:{"type":"message_delta"}"#,
 
         assert!(obj.get("tool_streaming").is_none());
         assert_eq!(obj["tools"][0]["eager_input_streaming"], false);
+    }
+
+    #[test]
+    fn test_normalize_copilot_messages_thinking_uses_adaptive_effort() {
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4.7",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 8192
+            }
+        });
+
+        let obj = body.as_object_mut().expect("object body");
+        normalize_copilot_messages_thinking(obj, Some("high"));
+
+        assert_eq!(obj["thinking"]["type"], "adaptive");
+        assert!(obj["thinking"].get("budget_tokens").is_none());
+        assert_eq!(obj["output_config"]["effort"], "high");
     }
 }

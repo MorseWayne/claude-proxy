@@ -141,6 +141,8 @@ pub struct ModelInfo {
     pub min_thinking_budget: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_thinking_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_effort_levels: Vec<String>,
 }
 
 /// Errors from provider interactions.

@@ -370,6 +370,7 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
                 "supports_adaptive_thinking": m.supports_adaptive_thinking,
                 "min_thinking_budget": m.min_thinking_budget,
                 "max_thinking_budget": m.max_thinking_budget,
+                "reasoning_effort_levels": m.reasoning_effort_levels,
             })
         })
         .collect();

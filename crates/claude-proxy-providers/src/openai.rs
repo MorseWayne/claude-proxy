@@ -337,6 +337,7 @@ impl Provider for OpenAiProvider {
                     supports_adaptive_thinking: None,
                     min_thinking_budget: None,
                     max_thinking_budget: None,
+                    reasoning_effort_levels: Vec::new(),
                 })
             })
             .collect();
