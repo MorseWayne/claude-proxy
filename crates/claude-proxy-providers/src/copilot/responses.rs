@@ -11,18 +11,22 @@ use crate::provider::ProviderError;
 
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
+const RECENT_TEXT_ITEMS_TO_KEEP: usize = 12;
+const MAX_HISTORICAL_TEXT_BYTES: usize = 32 * 1024;
 
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
-    let historical_tool_outputs = req
-        .messages
-        .iter()
-        .take(current_message_index)
+    let historical_messages = req.messages.iter().take(current_message_index);
+    let historical_tool_outputs = historical_messages
+        .clone()
         .map(count_tool_results)
         .sum::<usize>();
+    let historical_text_items = historical_messages.map(count_text_items).sum::<usize>();
     let mut historical_tool_outputs_to_truncate =
         historical_tool_outputs.saturating_sub(RECENT_TOOL_OUTPUTS_TO_KEEP);
+    let mut historical_text_items_to_truncate =
+        historical_text_items.saturating_sub(RECENT_TEXT_ITEMS_TO_KEEP);
 
     for (index, msg) in req.messages.iter().enumerate() {
         append_message_items(
@@ -30,6 +34,7 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
             msg,
             index == current_message_index,
             &mut historical_tool_outputs_to_truncate,
+            &mut historical_text_items_to_truncate,
         );
     }
 
@@ -130,15 +135,50 @@ fn count_tool_results(message: &Message) -> usize {
     }
 }
 
+fn count_text_items(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::Text(_) => 1,
+        MessageContent::Blocks(blocks) => {
+            let mut count = 0;
+            let mut has_pending_text = false;
+            for block in blocks {
+                match block {
+                    Content::Text { .. } | Content::Thinking { .. } => has_pending_text = true,
+                    Content::ToolUse { .. }
+                    | Content::ServerToolUse { .. }
+                    | Content::ToolResult { .. } => {
+                        if has_pending_text {
+                            count += 1;
+                            has_pending_text = false;
+                        }
+                    }
+                    Content::Unknown => {}
+                }
+            }
+            count + usize::from(has_pending_text)
+        }
+    }
+}
+
 fn append_message_items(
     input: &mut Vec<Value>,
     msg: &Message,
     is_current_message: bool,
     historical_tool_outputs_to_truncate: &mut usize,
+    historical_text_items_to_truncate: &mut usize,
 ) {
     match &msg.content {
         MessageContent::Text(text) => {
-            input.push(message_item(&msg.role, text.clone()));
+            input.push(message_item(
+                &msg.role,
+                text_item_text(
+                    text,
+                    should_truncate_text_item(
+                        is_current_message,
+                        historical_text_items_to_truncate,
+                    ),
+                ),
+            ));
         }
         MessageContent::Blocks(blocks) => {
             let mut text_parts = Vec::new();
@@ -159,7 +199,16 @@ fn append_message_items(
                         input: args,
                     } => {
                         if !text_parts.is_empty() {
-                            input.push(message_item(&msg.role, text_parts.join("\n")));
+                            input.push(message_item(
+                                &msg.role,
+                                text_item_text(
+                                    &text_parts.join("\n"),
+                                    should_truncate_text_item(
+                                        is_current_message,
+                                        historical_text_items_to_truncate,
+                                    ),
+                                ),
+                            ));
                             text_parts.clear();
                         }
                         input.push(json!({
@@ -175,7 +224,16 @@ fn append_message_items(
                         is_error,
                     } => {
                         if !text_parts.is_empty() {
-                            input.push(message_item(&msg.role, text_parts.join("\n")));
+                            input.push(message_item(
+                                &msg.role,
+                                text_item_text(
+                                    &text_parts.join("\n"),
+                                    should_truncate_text_item(
+                                        is_current_message,
+                                        historical_text_items_to_truncate,
+                                    ),
+                                ),
+                            ));
                             text_parts.clear();
                         }
                         let output = tool_result_text(
@@ -196,7 +254,16 @@ fn append_message_items(
                 }
             }
             if !text_parts.is_empty() {
-                input.push(message_item(&msg.role, text_parts.join("\n")));
+                input.push(message_item(
+                    &msg.role,
+                    text_item_text(
+                        &text_parts.join("\n"),
+                        should_truncate_text_item(
+                            is_current_message,
+                            historical_text_items_to_truncate,
+                        ),
+                    ),
+                ));
             }
         }
     }
@@ -211,6 +278,29 @@ fn should_truncate_tool_output(
     }
     *historical_tool_outputs_to_truncate -= 1;
     true
+}
+
+fn should_truncate_text_item(
+    is_current_message: bool,
+    historical_text_items_to_truncate: &mut usize,
+) -> bool {
+    if is_current_message || *historical_text_items_to_truncate == 0 {
+        return false;
+    }
+    *historical_text_items_to_truncate -= 1;
+    true
+}
+
+fn text_item_text(text: &str, truncate_if_large: bool) -> String {
+    if truncate_if_large && text.len() > MAX_HISTORICAL_TEXT_BYTES {
+        format!(
+            "[text content truncated: original_bytes={}, max_historical_text_bytes={}]",
+            text.len(),
+            MAX_HISTORICAL_TEXT_BYTES
+        )
+    } else {
+        text.to_string()
+    }
 }
 
 fn message_item(role: &Role, text: String) -> Value {
@@ -1176,6 +1266,56 @@ mod tests {
         );
         assert_eq!(input[2]["output"], large_output);
         assert_eq!(input.last().unwrap()["output"], large_output);
+    }
+
+    #[test]
+    fn test_convert_to_responses_truncates_old_large_text_items() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES + 1);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Text(large_text.clone()),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text(large_text.clone()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+        let input = body["input"].as_array().expect("input items");
+
+        assert!(
+            input[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[text content truncated:")
+        );
+        assert!(
+            input[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[text content truncated:")
+        );
+        assert_eq!(input[2]["content"], large_text);
+        assert_eq!(input.last().unwrap()["content"], large_text);
     }
 
     #[test]

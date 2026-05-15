@@ -191,6 +191,10 @@ struct PayloadBreakdown {
     tool_call_bytes: usize,
     tool_output_bytes: usize,
     instructions_bytes: usize,
+    truncated_text_items: usize,
+    truncated_text_bytes_saved: usize,
+    truncated_tool_output_items: usize,
+    truncated_tool_output_bytes_saved: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -214,6 +218,10 @@ pub(crate) struct RequestObservability {
     tool_call_bytes: usize,
     tool_output_bytes: usize,
     instructions_bytes: usize,
+    truncated_text_items: usize,
+    truncated_text_bytes_saved: usize,
+    truncated_tool_output_items: usize,
+    truncated_tool_output_bytes_saved: usize,
 }
 
 pub(crate) fn request_observability(body: &Value) -> RequestObservability {
@@ -249,6 +257,10 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
         tool_call_bytes: breakdown.tool_call_bytes,
         tool_output_bytes: breakdown.tool_output_bytes,
         instructions_bytes: breakdown.instructions_bytes,
+        truncated_text_items: breakdown.truncated_text_items,
+        truncated_text_bytes_saved: breakdown.truncated_text_bytes_saved,
+        truncated_tool_output_items: breakdown.truncated_tool_output_items,
+        truncated_tool_output_bytes_saved: breakdown.truncated_tool_output_bytes_saved,
     }
 }
 
@@ -290,10 +302,10 @@ fn add_responses_item_breakdown(item: &Value, breakdown: &mut PayloadBreakdown) 
         }
         Some("function_call_output") => {
             breakdown.function_output_items += 1;
-            breakdown.tool_output_bytes += item
-                .get("output")
-                .and_then(Value::as_str)
-                .map_or(0, str::len);
+            if let Some(output) = item.get("output").and_then(Value::as_str) {
+                breakdown.tool_output_bytes += output.len();
+                add_truncation_breakdown(output, breakdown);
+            }
         }
         _ => add_message_content_breakdown(item, breakdown),
     }
@@ -323,6 +335,7 @@ fn add_message_content_breakdown(item: &Value, breakdown: &mut PayloadBreakdown)
 }
 
 fn add_text_or_thinking_bytes(text: &str, breakdown: &mut PayloadBreakdown) {
+    add_truncation_breakdown(text, breakdown);
     if text.contains("[thinking]") {
         breakdown.thinking_items += 1;
         breakdown.thinking_bytes += text.len();
@@ -330,6 +343,30 @@ fn add_text_or_thinking_bytes(text: &str, breakdown: &mut PayloadBreakdown) {
         breakdown.text_items += 1;
         breakdown.text_bytes += text.len();
     }
+}
+
+fn add_truncation_breakdown(text: &str, breakdown: &mut PayloadBreakdown) {
+    if text.starts_with("[text content truncated:") {
+        breakdown.truncated_text_items += 1;
+        if let Some(original_bytes) = truncated_original_bytes(text) {
+            breakdown.truncated_text_bytes_saved += original_bytes.saturating_sub(text.len());
+        }
+    } else if text.starts_with("[tool output truncated:")
+        || text.starts_with("ERROR: [tool output truncated:")
+    {
+        breakdown.truncated_tool_output_items += 1;
+        if let Some(original_bytes) = truncated_original_bytes(text) {
+            breakdown.truncated_tool_output_bytes_saved +=
+                original_bytes.saturating_sub(text.len());
+        }
+    }
+}
+
+fn truncated_original_bytes(text: &str) -> Option<usize> {
+    text.split("original_bytes=")
+        .nth(1)
+        .and_then(|rest| rest.split([',', ']']).next())
+        .and_then(|bytes| bytes.parse().ok())
 }
 
 pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &Value) {
@@ -360,6 +397,10 @@ pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &V
         tool_call_bytes = stats.tool_call_bytes,
         tool_output_bytes = stats.tool_output_bytes,
         instructions_bytes = stats.instructions_bytes,
+        truncated_text_items = stats.truncated_text_items,
+        truncated_text_bytes_saved = stats.truncated_text_bytes_saved,
+        truncated_tool_output_items = stats.truncated_tool_output_items,
+        truncated_tool_output_bytes_saved = stats.truncated_tool_output_bytes_saved,
         "Provider request payload stats"
     );
 }
@@ -1356,9 +1397,10 @@ mod tests {
             "model": "gpt-5.4-mini",
             "input": [
                 {"role": "user", "content": "secret prompt"},
+                {"role": "user", "content": "[text content truncated: original_bytes=1000, max_historical_text_bytes=32768]"},
                 {"role": "assistant", "content": "[thinking]\nprivate chain\n[/thinking]"},
                 {"type": "function_call", "name": "read", "arguments": "{\"path\":\"README.md\"}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"}
+                {"type": "function_call_output", "call_id": "call_1", "output": "[tool output truncated: original_bytes=2000, max_historical_tool_output_bytes=4096]"}
             ],
             "stream": true,
             "tools": [{"type": "function", "name": "read", "parameters": {}}],
@@ -1372,19 +1414,40 @@ mod tests {
 
         assert_eq!(stats.model, "gpt-5.4-mini");
         assert!(stats.stream);
-        assert_eq!(stats.input_items, 4);
+        assert_eq!(stats.input_items, 5);
         assert!(stats.has_tools);
         assert!(stats.has_parallel_tool_calls);
         assert!(stats.has_reasoning);
         assert!(stats.has_include);
         assert!(stats.has_instructions);
         assert!(stats.body_bytes > 0);
-        assert_eq!(stats.text_items, 1);
+        assert_eq!(stats.text_items, 2);
         assert_eq!(stats.thinking_items, 1);
         assert_eq!(stats.function_call_items, 1);
         assert_eq!(stats.function_output_items, 1);
-        assert_eq!(stats.text_bytes, "secret prompt".len());
-        assert_eq!(stats.tool_output_bytes, "tool output".len());
+        assert_eq!(
+            stats.text_bytes,
+            "secret prompt".len()
+                + "[text content truncated: original_bytes=1000, max_historical_text_bytes=32768]"
+                    .len()
+        );
+        assert_eq!(
+            stats.tool_output_bytes,
+            "[tool output truncated: original_bytes=2000, max_historical_tool_output_bytes=4096]"
+                .len()
+        );
+        assert_eq!(stats.truncated_text_items, 1);
+        assert_eq!(
+            stats.truncated_text_bytes_saved,
+            1000 - "[text content truncated: original_bytes=1000, max_historical_text_bytes=32768]"
+                .len()
+        );
+        assert_eq!(stats.truncated_tool_output_items, 1);
+        assert_eq!(
+            stats.truncated_tool_output_bytes_saved,
+            2000 - "[tool output truncated: original_bytes=2000, max_historical_tool_output_bytes=4096]"
+                .len()
+        );
         assert_eq!(stats.instructions_bytes, "system text".len());
         assert!(stats.thinking_bytes > 0);
         assert!(stats.tool_call_bytes > 0);
