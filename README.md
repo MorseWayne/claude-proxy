@@ -1,6 +1,6 @@
 # claude-proxy
 
-Claude 兼容代理服务器，将请求路由到 OpenAI、Anthropic 或 **GitHub Copilot** 等上游服务。
+Claude 兼容代理服务器，将请求路由到 OpenAI、Anthropic、**GitHub Copilot** 或 **ChatGPT** 等上游服务。
 
 单个原生二进制文件，零运行时依赖。
 
@@ -30,6 +30,9 @@ claude-proxy provider add openai
 
 # 添加 GitHub Copilot（自动引导 OAuth 认证）
 claude-proxy provider add copilot
+
+# 添加 ChatGPT（使用 ChatGPT Pro/Plus 账号 OAuth 认证）
+claude-proxy provider add chatgpt
 
 # 启动服务
 claude-proxy server start
@@ -123,8 +126,13 @@ enable_tool_result_merge = true         # 启用 tool_result 合并（减少 pre
 enable_compact_detection = true         # 启用 compact/auto-continue 检测
 enable_agent_marking = true             # 启用子 agent 流量标记
 
+# ChatGPT provider（OAuth 自动认证，无需 api_key）
+[providers.chatgpt]
+base_url = "https://chatgpt.com/backend-api/codex"
+
 [model]
 default = "openai/gpt-4.1"
+reasoning = "openai/o4-mini"                    # 可选，同步为 ANTHROPIC_REASONING_MODEL
 opus = "anthropic/claude-opus-4-20250514"      # 可选，模型别名
 sonnet = "anthropic/claude-sonnet-4-20250514"
 haiku = "anthropic/claude-haiku-4-5-20251001"

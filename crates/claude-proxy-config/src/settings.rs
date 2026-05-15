@@ -117,6 +117,7 @@ pub enum ProviderType {
     OpenAI,
     Anthropic,
     Copilot,
+    ChatGPT,
     OpenRouter,
     Google,
     /// Custom OpenAI-compatible endpoint.
@@ -133,6 +134,7 @@ impl std::str::FromStr for ProviderType {
             "openai" => ProviderType::OpenAI,
             "anthropic" => ProviderType::Anthropic,
             "copilot" | "github-copilot" => ProviderType::Copilot,
+            "chatgpt" | "openai-chatgpt" => ProviderType::ChatGPT,
             "openrouter" => ProviderType::OpenRouter,
             "google" => ProviderType::Google,
             "custom-anthropic" => ProviderType::CustomAnthropic(String::new()),
@@ -153,6 +155,7 @@ impl ProviderType {
             ProviderType::OpenAI => "openai",
             ProviderType::Anthropic => "anthropic",
             ProviderType::Copilot => "copilot",
+            ProviderType::ChatGPT => "chatgpt",
             ProviderType::OpenRouter => "openrouter",
             ProviderType::Google => "google",
             ProviderType::Custom(s) => s.as_str(),
@@ -166,6 +169,7 @@ impl ProviderType {
             ProviderType::OpenAI => "OpenAI",
             ProviderType::Anthropic => "Anthropic",
             ProviderType::Copilot => "GitHub Copilot",
+            ProviderType::ChatGPT => "ChatGPT",
             ProviderType::OpenRouter => "OpenRouter",
             ProviderType::Google => "Google",
             ProviderType::Custom(_) => "Custom (OpenAI-compatible)",
@@ -179,6 +183,7 @@ impl ProviderType {
             ProviderType::OpenAI => "https://api.openai.com/v1",
             ProviderType::Anthropic => "https://api.anthropic.com",
             ProviderType::Copilot => "https://api.githubcopilot.com",
+            ProviderType::ChatGPT => "https://chatgpt.com/backend-api/codex",
             ProviderType::OpenRouter => "https://openrouter.ai/api/v1",
             ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta",
             ProviderType::Custom(_) => "",
@@ -189,7 +194,7 @@ impl ProviderType {
     /// How this provider authenticates.
     pub fn auth_method(&self) -> AuthMethod {
         match self {
-            ProviderType::Copilot => AuthMethod::OAuth,
+            ProviderType::Copilot | ProviderType::ChatGPT => AuthMethod::OAuth,
             _ => AuthMethod::ApiKey,
         }
     }
@@ -203,6 +208,7 @@ impl ProviderType {
     pub fn default_model_name(&self) -> &str {
         match self {
             ProviderType::Copilot => "gpt-5",
+            ProviderType::ChatGPT => "gpt-5.3-codex",
             _ => "",
         }
     }
@@ -213,6 +219,7 @@ impl ProviderType {
             ProviderType::OpenAI,
             ProviderType::Anthropic,
             ProviderType::Copilot,
+            ProviderType::ChatGPT,
             ProviderType::OpenRouter,
             ProviderType::Google,
             ProviderType::Custom(String::new()),
@@ -252,6 +259,7 @@ impl<'de> Deserialize<'de> for ProviderType {
 pub struct ModelConfig {
     #[serde(default = "default_model")]
     pub default: String,
+    pub reasoning: Option<String>,
     pub opus: Option<String>,
     pub sonnet: Option<String>,
     pub haiku: Option<String>,
@@ -368,6 +376,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             default: default_model(),
+            reasoning: None,
             opus: None,
             sonnet: None,
             haiku: None,
@@ -579,6 +588,7 @@ mod tests {
         let settings = Settings {
             model: ModelConfig {
                 default: "openai/gpt-4.1".to_string(),
+                reasoning: None,
                 opus: Some("anthropic/claude-opus-4-20250514".to_string()),
                 sonnet: None,
                 haiku: Some("openai/gpt-4.1-mini".to_string()),
@@ -629,6 +639,8 @@ auth_token = "test-token"
         assert_eq!(ProviderType::parse("anthropic"), ProviderType::Anthropic);
         assert_eq!(ProviderType::parse("copilot"), ProviderType::Copilot);
         assert_eq!(ProviderType::parse("github-copilot"), ProviderType::Copilot);
+        assert_eq!(ProviderType::parse("chatgpt"), ProviderType::ChatGPT);
+        assert_eq!(ProviderType::parse("openai-chatgpt"), ProviderType::ChatGPT);
         assert_eq!(ProviderType::parse("openrouter"), ProviderType::OpenRouter);
         assert_eq!(ProviderType::parse("google"), ProviderType::Google);
         assert!(matches!(
@@ -646,6 +658,7 @@ auth_token = "test-token"
         assert_eq!(ProviderType::OpenAI.as_str(), "openai");
         assert_eq!(ProviderType::Anthropic.as_str(), "anthropic");
         assert_eq!(ProviderType::Copilot.as_str(), "copilot");
+        assert_eq!(ProviderType::ChatGPT.as_str(), "chatgpt");
         assert_eq!(ProviderType::Custom("foo".into()).as_str(), "foo");
         assert_eq!(ProviderType::CustomAnthropic("bar".into()).as_str(), "bar");
     }
@@ -668,6 +681,11 @@ auth_token = "test-token"
                 .contains("githubcopilot.com")
         );
         assert!(
+            ProviderType::ChatGPT
+                .default_base_url()
+                .contains("chatgpt.com")
+        );
+        assert!(
             ProviderType::OpenRouter
                 .default_base_url()
                 .contains("openrouter.ai")
@@ -683,8 +701,10 @@ auth_token = "test-token"
     fn test_provider_type_auth_method() {
         assert_eq!(ProviderType::OpenAI.auth_method(), AuthMethod::ApiKey);
         assert_eq!(ProviderType::Copilot.auth_method(), AuthMethod::OAuth);
+        assert_eq!(ProviderType::ChatGPT.auth_method(), AuthMethod::OAuth);
         assert!(ProviderType::OpenAI.needs_api_key());
         assert!(!ProviderType::Copilot.needs_api_key());
+        assert!(!ProviderType::ChatGPT.needs_api_key());
     }
 
     #[test]
@@ -693,6 +713,7 @@ auth_token = "test-token"
             ProviderType::OpenAI,
             ProviderType::Anthropic,
             ProviderType::Copilot,
+            ProviderType::ChatGPT,
             ProviderType::OpenRouter,
             ProviderType::Google,
             ProviderType::Custom("my-provider".into()),
@@ -749,6 +770,6 @@ base_url = "https://custom.example.com"
     #[test]
     fn test_known_types_count() {
         let types = ProviderType::known_types();
-        assert_eq!(types.len(), 7);
+        assert_eq!(types.len(), 8);
     }
 }

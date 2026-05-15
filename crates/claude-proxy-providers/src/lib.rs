@@ -1,6 +1,7 @@
 //! Provider trait and implementations for upstream API adapters.
 
 pub mod anthropic;
+pub mod chatgpt;
 pub mod copilot;
 pub mod http;
 pub mod openai;
@@ -55,6 +56,10 @@ pub async fn create_provider(
         )?)),
         ProviderType::Copilot => Ok(Arc::new(
             copilot::CopilotProvider::new(provider_id, config, settings).await?,
+        )),
+        ProviderType::ChatGPT => Ok(Arc::new(
+            chatgpt::ChatGptProvider::new(provider_id, &config.base_url, &config.proxy, settings)
+                .await?,
         )),
         ProviderType::OpenRouter | ProviderType::Google | ProviderType::Custom(_) => {
             Ok(Arc::new(openai::OpenAiProvider::new(

@@ -717,13 +717,14 @@ pub fn render_oauth_overlay(f: &mut Frame, area: Rect, overlay: &super::app::OAu
 
     let spinners = ["◜", "◝", "◞", "◟"];
     let spinner = spinners[(overlay.spinner_tick % 4) as usize];
+    let provider = overlay.provider_id.as_str();
 
     let title = match &overlay.step {
-        OAuthStep::Requesting => format!(" {spinner} GitHub Copilot Auth "),
-        OAuthStep::Polling => format!(" {spinner} GitHub Copilot Auth "),
-        OAuthStep::ShowCode { .. } => format!(" {spinner} GitHub Copilot Auth "),
-        OAuthStep::Success => " ✓ GitHub Copilot Auth ".to_string(),
-        OAuthStep::Failed(_) => " ✗ GitHub Copilot Auth ".to_string(),
+        OAuthStep::Requesting => format!(" {spinner} {provider} Auth "),
+        OAuthStep::Polling => format!(" {spinner} {provider} Auth "),
+        OAuthStep::ShowCode { .. } => format!(" {spinner} {provider} Auth "),
+        OAuthStep::Success => format!(" ✓ {provider} Auth "),
+        OAuthStep::Failed(_) => format!(" ✗ {provider} Auth "),
     };
 
     let title_fg = match &overlay.step {
@@ -780,7 +781,7 @@ pub fn render_oauth_overlay(f: &mut Frame, area: Rect, overlay: &super::app::OAu
         OAuthStep::Success => vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Copilot authenticated successfully!",
+                format!("  {provider} authenticated successfully!"),
                 Style::default().fg(theme::ACCENT),
             )),
         ],

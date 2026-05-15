@@ -181,7 +181,7 @@ fn render_log_page(f: &mut Frame, app: &App, area: Rect) {
 fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     let inner = widgets::render_content_frame(f, area, app, "Model Aliases");
     let is_focused = matches!(app.focus, Focus::Content);
-    let rows = widgets::field_rows(inner, 5);
+    let rows = widgets::field_rows(inner, 6);
 
     widgets::render_field(
         f,
@@ -194,31 +194,39 @@ fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_field(
         f,
         rows[1],
-        "Opus Alias",
-        &app.settings.model.opus.clone().unwrap_or_default(),
+        "Reasoning",
+        &app.settings.model.reasoning.clone().unwrap_or_default(),
         is_focused && app.content_idx == 1,
         false,
     );
     widgets::render_field(
         f,
         rows[2],
-        "Sonnet Alias",
-        &app.settings.model.sonnet.clone().unwrap_or_default(),
+        "Opus Alias",
+        &app.settings.model.opus.clone().unwrap_or_default(),
         is_focused && app.content_idx == 2,
         false,
     );
     widgets::render_field(
         f,
         rows[3],
+        "Sonnet Alias",
+        &app.settings.model.sonnet.clone().unwrap_or_default(),
+        is_focused && app.content_idx == 3,
+        false,
+    );
+    widgets::render_field(
+        f,
+        rows[4],
         "Haiku Alias",
         &app.settings.model.haiku.clone().unwrap_or_default(),
-        is_focused && app.content_idx == 3,
+        is_focused && app.content_idx == 4,
         false,
     );
 
     render_hint(
         f,
-        rows[4],
+        rows[5],
         "Format: provider_id/model_name. Empty = uses default",
     );
 }

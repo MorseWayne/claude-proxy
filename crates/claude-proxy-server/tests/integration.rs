@@ -35,6 +35,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
         providers,
         model: ModelConfig {
             default: "openai/gpt-4".to_string(),
+            reasoning: None,
             opus: None,
             sonnet: None,
             haiku: None,

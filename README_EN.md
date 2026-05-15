@@ -1,6 +1,6 @@
 # claude-proxy
 
-A Claude-compatible proxy that routes requests to OpenAI, Anthropic, **GitHub Copilot**, or any OpenAI-compatible upstream provider.
+A Claude-compatible proxy that routes requests to OpenAI, Anthropic, **GitHub Copilot**, **ChatGPT**, or any OpenAI-compatible upstream provider.
 
 Single native binary, zero runtime dependencies.
 
@@ -28,6 +28,9 @@ claude-proxy provider add openai
 
 # Add GitHub Copilot (auto OAuth authentication)
 claude-proxy provider add copilot
+
+# Add ChatGPT (OAuth with a ChatGPT Pro/Plus account)
+claude-proxy provider add chatgpt
 
 # Start the server
 claude-proxy server start
@@ -121,8 +124,13 @@ enable_tool_result_merge = true         # Enable tool_result merging (reduce pre
 enable_compact_detection = true         # Enable compact/auto-continue detection
 enable_agent_marking = true             # Enable sub-agent traffic marking
 
+# ChatGPT provider (OAuth auto-authentication, no api_key needed)
+[providers.chatgpt]
+base_url = "https://chatgpt.com/backend-api/codex"
+
 [model]
 default = "openai/gpt-4.1"
+reasoning = "openai/o4-mini"                    # Optional, synced as ANTHROPIC_REASONING_MODEL
 opus = "anthropic/claude-opus-4-20250514"      # Optional model aliases
 sonnet = "anthropic/claude-sonnet-4-20250514"
 haiku = "anthropic/claude-haiku-4-5-20251001"

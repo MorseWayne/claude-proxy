@@ -296,6 +296,7 @@ pub enum EditableSection {
     HttpConnectTimeout,
     LogLevel,
     ModelDefault,
+    ModelReasoning,
     ModelOpus,
     ModelSonnet,
     ModelHaiku,
@@ -457,7 +458,7 @@ impl App {
             NavItem::Limits => 3,
             NavItem::Http => 3,
             NavItem::Log => 3,
-            NavItem::Model => 4,
+            NavItem::Model => 5,
             NavItem::System => 0, // read-only info page
         }
     }

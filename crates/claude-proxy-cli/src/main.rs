@@ -357,10 +357,13 @@ async fn handle_provider(action: ProviderAction) {
                 provider_type.display_name()
             );
 
-            // Authenticate if OAuth (copilot)
-            if provider_type == ProviderType::Copilot {
+            // Authenticate if OAuth.
+            if provider_type == ProviderType::Copilot || provider_type == ProviderType::ChatGPT {
                 println!();
-                println!("{}", "Authenticating with GitHub Copilot...".bold());
+                println!(
+                    "{}",
+                    format!("Authenticating with {}...", provider_type.display_name()).bold()
+                );
                 let provider_proxy = settings
                     .providers
                     .get(&provider_id)
@@ -378,39 +381,57 @@ async fn handle_provider(action: ProviderAction) {
                         return;
                     }
                 };
-                match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode")
-                    .await
-                {
-                    Ok(auth) => {
-                        if let Err(e) = auth.run_device_flow().await {
-                            eprintln!("{} Authentication failed: {e}", "✗".red().bold());
-                            if matches!(e, claude_proxy_providers::ProviderError::Network(_)) {
-                                let cfg_path = claude_proxy_config::Settings::config_file_path()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
-                                let err_text = e.to_string();
-                                if err_text.contains("dns error")
-                                    || err_text.contains("lookup address")
-                                {
-                                    eprintln!(
-                                        "  hint: DNS lookup failed before TLS. Check your DNS/network,\n        or set this provider's proxy in {cfg_path}\n        example: proxy = \"http://127.0.0.1:7890\""
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
-                                    );
+                let auth_result = match &provider_type {
+                    ProviderType::Copilot => {
+                        match claude_proxy_providers::copilot::auth::CopilotAuth::new(
+                            client, "vscode",
+                        )
+                        .await
+                        {
+                            Ok(auth) => match auth.run_device_flow().await {
+                                Ok(_) => {
+                                    let _ = auth.refresh_copilot_token().await;
+                                    Ok(())
                                 }
-                            }
-                            return;
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(e),
                         }
-                        let _ = auth.refresh_copilot_token().await;
-                        println!("{} Copilot authentication successful!", "✓".green().bold());
                     }
-                    Err(e) => {
-                        eprintln!("{} Auth init failed: {e}", "✗".red().bold());
-                        return;
+                    ProviderType::ChatGPT => {
+                        match claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await {
+                            Ok(auth) => auth.run_device_flow().await.map(|_| ()),
+                            Err(e) => Err(e),
+                        }
                     }
+                    _ => Ok(()),
+                };
+
+                if let Err(e) = auth_result {
+                    eprintln!("{} Authentication failed: {e}", "✗".red().bold());
+                    if matches!(e, claude_proxy_providers::ProviderError::Network(_)) {
+                        let cfg_path = claude_proxy_config::Settings::config_file_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
+                        let err_text = e.to_string();
+                        if err_text.contains("dns error") || err_text.contains("lookup address") {
+                            eprintln!(
+                                "  hint: DNS lookup failed before TLS. Check your DNS/network,\n        or set this provider's proxy in {cfg_path}\n        example: proxy = \"http://127.0.0.1:7890\""
+                            );
+                        } else {
+                            eprintln!(
+                                "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
+                            );
+                        }
+                    }
+                    return;
                 }
+
+                println!(
+                    "{} {} authentication successful!",
+                    "✓".green().bold(),
+                    provider_type.display_name()
+                );
             }
 
             // Try to fetch models and let user pick

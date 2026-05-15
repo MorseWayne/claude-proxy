@@ -4,7 +4,7 @@ pub mod headers;
 mod messages;
 mod model;
 mod preprocess;
-mod responses;
+pub(crate) mod responses;
 mod sse;
 mod thinking;
 

@@ -154,6 +154,10 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
             .get("MODEL")
             .cloned()
             .unwrap_or_else(|| "openai/gpt-4.1".to_string()),
+        reasoning: env
+            .get("MODEL_REASONING")
+            .cloned()
+            .filter(|s| !s.is_empty()),
         opus: env.get("MODEL_OPUS").cloned().filter(|s| !s.is_empty()),
         sonnet: env.get("MODEL_SONNET").cloned().filter(|s| !s.is_empty()),
         haiku: env.get("MODEL_HAIKU").cloned().filter(|s| !s.is_empty()),

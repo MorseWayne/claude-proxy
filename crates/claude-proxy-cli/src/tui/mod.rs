@@ -19,6 +19,7 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use serde_json::{Map, Value};
 
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
@@ -150,8 +151,7 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
 
     // Ctrl+S saves anywhere
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('s')) {
-        save_settings(app);
-        app.show_toast(Toast::success("Configuration saved"));
+        save_settings_with_feedback(app);
         return;
     }
 
@@ -383,14 +383,16 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 )));
                             }
                             ConfirmAction::SaveAndQuit => {
-                                save_settings(app);
-                                app.should_quit = true;
+                                if save_settings_with_feedback(app) {
+                                    app.should_quit = true;
+                                }
                             }
                         },
                         ConfirmKind::DirtyQuit => {
                             // Enter = Save & Quit
-                            save_settings(app);
-                            app.should_quit = true;
+                            if save_settings_with_feedback(app) {
+                                app.should_quit = true;
+                            }
                         }
                         ConfirmKind::Info => {}
                     }
@@ -700,9 +702,10 @@ fn start_editing(app: &mut App) {
     if app.nav == NavItem::Model {
         let section = match app.content_idx {
             0 => EditableSection::ModelDefault,
-            1 => EditableSection::ModelOpus,
-            2 => EditableSection::ModelSonnet,
-            3 => EditableSection::ModelHaiku,
+            1 => EditableSection::ModelReasoning,
+            2 => EditableSection::ModelOpus,
+            3 => EditableSection::ModelSonnet,
+            4 => EditableSection::ModelHaiku,
             _ => return,
         };
         // Build provider list for picker
@@ -825,14 +828,18 @@ fn get_editable_section(app: &App) -> (Option<EditableSection>, String) {
                 app.settings.model.default.clone(),
             ),
             1 => (
+                Some(EditableSection::ModelReasoning),
+                app.settings.model.reasoning.clone().unwrap_or_default(),
+            ),
+            2 => (
                 Some(EditableSection::ModelOpus),
                 app.settings.model.opus.clone().unwrap_or_default(),
             ),
-            2 => (
+            3 => (
                 Some(EditableSection::ModelSonnet),
                 app.settings.model.sonnet.clone().unwrap_or_default(),
             ),
-            3 => (
+            4 => (
                 Some(EditableSection::ModelHaiku),
                 app.settings.model.haiku.clone().unwrap_or_default(),
             ),
@@ -856,6 +863,7 @@ fn get_section_label(section: &EditableSection) -> &'static str {
         EditableSection::HttpConnectTimeout => "Connect Timeout (seconds)",
         EditableSection::LogLevel => "Log Level",
         EditableSection::ModelDefault => "Default Model",
+        EditableSection::ModelReasoning => "Reasoning Model",
         EditableSection::ModelOpus => "Opus Alias",
         EditableSection::ModelSonnet => "Sonnet Alias",
         EditableSection::ModelHaiku => "Haiku Alias",
@@ -930,6 +938,9 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                 }
                 EditableSection::LogLevel => app.settings.log.level = v,
                 EditableSection::ModelDefault => app.settings.model.default = v,
+                EditableSection::ModelReasoning => {
+                    app.settings.model.reasoning = if v.is_empty() { None } else { Some(v) };
+                }
                 EditableSection::ModelOpus => {
                     app.settings.model.opus = if v.is_empty() { None } else { Some(v) };
                 }
@@ -1006,6 +1017,7 @@ fn add_provider(app: &mut App) {
         .map(|t| {
             let desc = match t {
                 ProviderType::Copilot => " — OAuth, no API key needed",
+                ProviderType::ChatGPT => " — ChatGPT OAuth",
                 ProviderType::OpenAI => " — API key",
                 ProviderType::Anthropic => " — API key",
                 ProviderType::OpenRouter => " — API key, OpenAI-compatible",
@@ -1146,6 +1158,11 @@ fn fetch_models_via_provider(
 fn start_oauth_flow(app: &mut App, provider_id: &str) {
     let pid = provider_id.to_string();
     let settings = app.settings.clone();
+    let provider_type = settings
+        .providers
+        .get(&pid)
+        .map(|cfg| cfg.resolve_type(&pid))
+        .unwrap_or_else(|| ProviderType::parse(&pid));
     let (tx, rx) = std::sync::mpsc::channel();
     app.oauth_rx = Some(rx);
     app.oauth_pending_id = Some(pid.clone());
@@ -1169,32 +1186,71 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
                     return;
                 }
             };
-            match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await {
-                Ok(auth) => match auth.start_device_code().await {
-                    Ok(info) => {
-                        let _ = tx.send(OAuthResult::CodeInfo {
-                            url: info.verification_uri.clone(),
-                            code: info.user_code.clone(),
-                            device_code: info.device_code.clone(),
-                            interval: info.interval,
-                        });
-                        // Poll for completion
-                        match auth.complete_device_code(&info).await {
-                            Ok(_token) => {
-                                let _ = auth.refresh_copilot_token().await;
-                                let _ = tx.send(OAuthResult::Token(_token));
+
+            match provider_type {
+                ProviderType::Copilot => {
+                    match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode")
+                        .await
+                    {
+                        Ok(auth) => match auth.start_device_code().await {
+                            Ok(info) => {
+                                let _ = tx.send(OAuthResult::CodeInfo {
+                                    url: info.verification_uri.clone(),
+                                    code: info.user_code.clone(),
+                                    device_code: info.device_code.clone(),
+                                    interval: info.interval,
+                                });
+                                match auth.complete_device_code(&info).await {
+                                    Ok(token) => {
+                                        let _ = auth.refresh_copilot_token().await;
+                                        let _ = tx.send(OAuthResult::Token(token));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = tx.send(OAuthResult::Error(e.to_string()));
                             }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(OAuthResult::Error(e.to_string()));
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                }
+                ProviderType::ChatGPT => {
+                    match claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await {
+                        Ok(auth) => match auth.start_device_code().await {
+                            Ok(info) => {
+                                let _ = tx.send(OAuthResult::CodeInfo {
+                                    url: info.verification_uri.clone(),
+                                    code: info.user_code.clone(),
+                                    device_code: info.device_auth_id.clone(),
+                                    interval: info.interval,
+                                });
+                                match auth.complete_device_code(&info).await {
+                                    Ok(token) => {
+                                        let _ = tx.send(OAuthResult::Token(token));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(OAuthResult::Error(e.to_string()));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(OAuthResult::Error(e.to_string()));
+                        }
                     }
-                },
-                Err(e) => {
-                    let _ = tx.send(OAuthResult::Error(e.to_string()));
+                }
+                _ => {
+                    let _ = tx.send(OAuthResult::Error(
+                        "selected provider does not support OAuth".to_string(),
+                    ));
                 }
             }
         });
@@ -1258,6 +1314,10 @@ fn poll_oauth(app: &mut App) {
                 }
             }
             OAuthResult::Token(_) => {
+                let provider_id = app
+                    .oauth_pending_id
+                    .clone()
+                    .unwrap_or_else(|| "Provider".to_string());
                 app.oauth_rx = None;
                 if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
                     oa.step = OAuthStep::Success;
@@ -1267,7 +1327,9 @@ fn poll_oauth(app: &mut App) {
                 app.focus = Focus::Content;
                 app.oauth_pending_id = None;
                 app.oauth_device_info = None;
-                app.show_toast(Toast::success("Copilot authenticated successfully"));
+                app.show_toast(Toast::success(format!(
+                    "{provider_id} authenticated successfully"
+                )));
             }
             OAuthResult::Error(err) => {
                 app.oauth_rx = None;
@@ -1379,10 +1441,11 @@ fn oauth_provider(app: &mut App) {
             ));
             return;
         }
-        if cfg
-            .copilot
-            .as_ref()
-            .is_some_and(|c| c.oauth_app == "opencode")
+        if cfg.resolve_type(&id) == ProviderType::Copilot
+            && cfg
+                .copilot
+                .as_ref()
+                .is_some_and(|c| c.oauth_app == "opencode")
         {
             app.show_toast(Toast::info(
                 "OpenCode Zen uses direct GitHub token authentication",
@@ -1393,20 +1456,178 @@ fn oauth_provider(app: &mut App) {
     }
 }
 
-fn save_settings(app: &App) {
+fn save_settings_with_feedback(app: &mut App) -> bool {
+    match save_settings(app) {
+        Ok(SaveOutcome::Synced(path)) => {
+            app.dirty = false;
+            app.show_toast(Toast::success(format!(
+                "Configuration saved; Claude Code synced: {}",
+                path.display()
+            )));
+            true
+        }
+        Ok(SaveOutcome::ConfigSavedSyncFailed(err)) => {
+            app.dirty = false;
+            app.show_toast(Toast::warning(format!(
+                "Config saved; Claude Code sync failed: {err}"
+            )));
+            false
+        }
+        Err(err) => {
+            app.show_toast(Toast::error(format!("Save failed: {err}")));
+            false
+        }
+    }
+}
+
+enum SaveOutcome {
+    Synced(PathBuf),
+    ConfigSavedSyncFailed(String),
+}
+
+fn save_settings(app: &App) -> Result<SaveOutcome, String> {
     let path = Settings::config_file_path().unwrap_or_else(|| PathBuf::from("config.toml"));
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create config directory: {e}"))?;
     }
-    if let Err(e) = std::fs::write(&path, app.settings.to_toml()) {
-        eprintln!("Failed to save config: {e}");
+    std::fs::write(&path, app.settings.to_toml())
+        .map_err(|e| format!("failed to save config: {e}"))?;
+    match sync_claude_code_settings(&app.settings) {
+        Ok(path) => Ok(SaveOutcome::Synced(path)),
+        Err(err) => Ok(SaveOutcome::ConfigSavedSyncFailed(err)),
     }
+}
+
+fn sync_claude_code_settings(settings: &Settings) -> Result<PathBuf, String> {
+    let path = claude_code_settings_path()?;
+    let mut value = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read Claude Code settings: {e}"))?;
+        if content.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse Claude Code settings JSON: {e}"))?
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    apply_claude_code_env(&mut value, settings);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create Claude Code config directory: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to serialize Claude Code settings: {e}"))?;
+    std::fs::write(&path, format!("{content}\n"))
+        .map_err(|e| format!("failed to write Claude Code settings: {e}"))?;
+    Ok(path)
+}
+
+fn claude_code_settings_path() -> Result<PathBuf, String> {
+    let dir = claude_code_config_dir()?;
+    let settings = dir.join("settings.json");
+    if settings.exists() {
+        return Ok(settings);
+    }
+    let legacy = dir.join("claude.json");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(settings)
+}
+
+fn claude_code_config_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && !dir.to_string_lossy().trim().is_empty() {
+            return Ok(dir);
+        }
+    }
+    home_dir()
+        .map(|home| home.join(".claude"))
+        .ok_or_else(|| "could not determine home directory for Claude Code settings".to_string())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    let root = value.as_object_mut().expect("value is an object");
+    let env_value = root
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !env_value.is_object() {
+        *env_value = Value::Object(Map::new());
+    }
+    let env = env_value.as_object_mut().expect("env is an object");
+
+    set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
+    set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
+    set_env(env, "ANTHROPIC_MODEL", &settings.model.default);
+    set_optional_env(
+        env,
+        "ANTHROPIC_REASONING_MODEL",
+        settings.model.reasoning.as_deref(),
+    );
+    set_optional_env(
+        env,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        settings.model.haiku.as_deref(),
+    );
+    set_optional_env(
+        env,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        settings.model.sonnet.as_deref(),
+    );
+    set_optional_env(
+        env,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        settings.model.opus.as_deref(),
+    );
+    env.remove("ANTHROPIC_SMALL_FAST_MODEL");
+}
+
+fn claude_code_base_url(settings: &Settings) -> String {
+    let host = match settings.server.host.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+        host => host.to_string(),
+    };
+    format!("http://{}:{}", host, settings.server.port)
+}
+
+fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            env.insert(key.to_string(), Value::String(value.to_string()));
+        }
+        None => {
+            env.remove(key);
+        }
+    }
+}
+
+fn set_env(env: &mut Map<String, Value>, key: &str, value: &str) {
+    env.insert(key.to_string(), Value::String(value.trim().to_string()));
 }
 
 fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
     let v = value.to_string();
     match section {
         EditableSection::ModelDefault => app.settings.model.default = v,
+        EditableSection::ModelReasoning => {
+            app.settings.model.reasoning = if v.is_empty() { None } else { Some(v) }
+        }
         EditableSection::ModelOpus => {
             app.settings.model.opus = if v.is_empty() { None } else { Some(v) }
         }
@@ -1552,4 +1773,112 @@ fn poll_metrics(app: &mut App) {
     }
 
     app.live_metrics = Some(live);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_proxy_config::settings::{ModelConfig, ServerConfig};
+    use serde_json::json;
+
+    #[test]
+    fn claude_code_env_sync_sets_proxy_and_model_keys() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: "copilot/claude-sonnet-4".to_string(),
+                reasoning: Some("copilot/deepseek-v4-flash".to_string()),
+                opus: Some("copilot/claude-opus-4".to_string()),
+                sonnet: Some("openai/gpt-5".to_string()),
+                haiku: Some("openai/gpt-5-mini".to_string()),
+            },
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 18082,
+                auth_token: "proxy-token".to_string(),
+            },
+            ..Settings::default()
+        };
+        settings.infer_provider_types();
+
+        let mut value = json!({
+            "theme": "dark",
+            "env": {
+                "KEEP_ME": "yes",
+                "ANTHROPIC_SMALL_FAST_MODEL": "legacy"
+            }
+        });
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:18082")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").and_then(|v| v.as_str()),
+            Some("proxy-token")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("copilot/claude-sonnet-4")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_REASONING_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("copilot/deepseek-v4-flash")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("copilot/claude-opus-4")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("openai/gpt-5-mini")
+        );
+        assert_eq!(env.get("KEEP_ME").and_then(|v| v.as_str()), Some("yes"));
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn claude_code_env_sync_removes_empty_optional_model_keys() {
+        let settings = Settings {
+            model: ModelConfig {
+                default: "openai/gpt-5".to_string(),
+                reasoning: Some("   ".to_string()),
+                opus: None,
+                sonnet: Some("   ".to_string()),
+                haiku: None,
+            },
+            ..Settings::default()
+        };
+        let mut value = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "old-opus",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "old-sonnet",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "old-haiku",
+                "ANTHROPIC_REASONING_MODEL": "old-reasoning"
+            }
+        });
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    }
 }
