@@ -362,6 +362,14 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
                 "id": m.model_id,
                 "object": "model",
                 "supports_thinking": m.supports_thinking,
+                "vendor": m.vendor,
+                "max_output_tokens": m.max_output_tokens,
+                "supported_endpoints": m.supported_endpoints,
+                "is_chat_default": m.is_chat_default,
+                "supports_vision": m.supports_vision,
+                "supports_adaptive_thinking": m.supports_adaptive_thinking,
+                "min_thinking_budget": m.min_thinking_budget,
+                "max_thinking_budget": m.max_thinking_budget,
             })
         })
         .collect();

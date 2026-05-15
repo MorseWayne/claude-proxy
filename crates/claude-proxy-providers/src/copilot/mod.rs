@@ -16,7 +16,7 @@ use futures::stream::BoxStream;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::http::{apply_extra_ca_certs, fmt_reqwest_err};
 use crate::provider::{Provider, ProviderError};
@@ -92,9 +92,9 @@ impl CopilotProvider {
         })
     }
 
-    fn build_headers(&self, token: &str, vision: bool) -> HeaderMap {
+    fn build_headers(&self, token: &str, vision: bool, initiator: &str) -> HeaderMap {
         let hb = self.header_builder.try_read().expect("header_builder lock");
-        let headers_vec = hb.build_headers(token, None, vision);
+        let headers_vec = hb.build_headers(token, None, vision, initiator, "conversation-agent");
         let mut map = HeaderMap::new();
         for (k, v) in &headers_vec {
             if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes())
@@ -107,6 +107,14 @@ impl CopilotProvider {
     }
 
     async fn get_model_endpoints(&self, model: &str) -> Vec<String> {
+        let models = self.model_cache.read().await;
+        if let Some(model_info) = models.iter().find(|m| m.model_id == model) {
+            if !model_info.supported_endpoints.is_empty() {
+                return model_info.supported_endpoints.clone();
+            }
+        }
+        drop(models);
+
         let endpoints = self.model_endpoints.read().await;
         if let Some(eps) = endpoints.get(model) {
             return eps.clone();
@@ -124,6 +132,15 @@ impl CopilotProvider {
             )
     }
 
+    async fn get_model_info(&self, model: &str) -> Option<ModelInfo> {
+        self.model_cache
+            .read()
+            .await
+            .iter()
+            .find(|m| m.model_id == model)
+            .cloned()
+    }
+
     fn has_vision_content(messages: &[Message]) -> bool {
         messages.iter().any(|m| match &m.content {
             MessageContent::Blocks(blocks) => blocks.iter().any(|b| matches!(b, Content::Unknown)),
@@ -135,10 +152,11 @@ impl CopilotProvider {
         &self,
         request: MessagesRequest,
         token: &str,
+        initiator: &str,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
-        let mut headers = self.build_headers(token, vision);
+        let mut headers = self.build_headers(token, vision, initiator);
 
         // Add anthropic-beta header for interleaved-thinking support
         headers.insert(
@@ -147,10 +165,19 @@ impl CopilotProvider {
         );
 
         // Serialize and inject tool_streaming=false to reduce streaming overhead
+        let model_info = self.get_model_info(&request.model).await;
+        let mut request = request;
+        apply_model_limits(
+            &mut request,
+            model_info.as_ref(),
+            self.config.max_thinking_tokens,
+        );
+
         let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("serialize error: {e}")))?;
         if let Value::Object(ref mut obj) = body {
             obj.insert("tool_streaming".to_string(), Value::Bool(false));
+            disable_eager_input_streaming(obj);
         }
 
         debug!("Copilot messages API request to {url}");
@@ -200,10 +227,11 @@ impl CopilotProvider {
         &self,
         request: MessagesRequest,
         token: &str,
+        initiator: &str,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
-        let headers = self.build_headers(token, vision);
+        let headers = self.build_headers(token, vision, initiator);
         let body = convert_to_openai_chat(&request);
 
         debug!("Copilot chat completions API request to {url}");
@@ -298,16 +326,21 @@ impl Provider for CopilotProvider {
 
         // Step 5: Choose API path based on model capabilities
         let endpoints = self.get_model_endpoints(&request.model).await;
+        let initiator = if prep_result.is_subagent {
+            "agent"
+        } else {
+            "user"
+        };
 
         if endpoints.iter().any(|e| e == "/v1/messages") {
             debug!("Using native /v1/messages path for model {}", request.model);
-            self.chat_via_messages(request, &token).await
+            self.chat_via_messages(request, &token, initiator).await
         } else {
             debug!(
                 "Falling back to /chat/completions for model {}",
                 request.model
             );
-            self.chat_via_completions(request, &token).await
+            self.chat_via_completions(request, &token, initiator).await
         }
     }
 
@@ -352,33 +385,8 @@ impl Provider for CopilotProvider {
 
         let models: Vec<ModelInfo> = data["data"]
             .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter(|m| {
-                m["model_picker_enabled"].as_bool() == Some(true)
-                    || m["capabilities"]["embeddings"].as_str().is_some()
-            })
-            .map(|m| {
-                let model_id = m["id"].as_str().unwrap_or("unknown").to_string();
-                let supports_thinking = m["capabilities"]
-                    .get("supports_tool_calls")
-                    .and_then(|v| v.as_bool());
-
-                let _endpoints: Vec<String> = m["supported_endpoints"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                ModelInfo {
-                    model_id,
-                    supports_thinking,
-                }
-            })
-            .collect();
+            .map(|items| items.iter().filter_map(parse_copilot_model).collect())
+            .unwrap_or_default();
 
         let mut cache = self.model_cache.write().await;
         *cache = models.clone();
@@ -395,7 +403,9 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("event: ") {
             event_type = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ")
+        } else if let Some(rest) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
             && let Ok(parsed) = serde_json::from_str::<Value>(rest.trim())
         {
             data = parsed;
@@ -405,6 +415,143 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
     SseEvent {
         event: event_type,
         data,
+    }
+}
+
+fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
+    if !(model["model_picker_enabled"].as_bool() == Some(true)
+        || model["capabilities"]["embeddings"].as_str().is_some())
+    {
+        return None;
+    }
+
+    let Some(model_id) = model["id"].as_str().filter(|id| !id.is_empty()) else {
+        warn!("Skipping Copilot model without an id: {model:?}");
+        return None;
+    };
+
+    let capabilities = &model["capabilities"];
+    let limits = &capabilities["limits"];
+    let billing = &model["billing"];
+    let supports = &capabilities["supports"];
+
+    Some(ModelInfo {
+        model_id: model_id.to_string(),
+        supports_thinking: model["supports_thinking"]
+            .as_bool()
+            .or_else(|| capabilities["supports_thinking"].as_bool()),
+        vendor: model["vendor"]
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| model["vendor"].as_str())
+            .map(|s| s.to_ascii_lowercase()),
+        max_output_tokens: limits["max_output_tokens"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok()),
+        supported_endpoints: parse_supported_endpoints(&model["supported_endpoints"]),
+        is_chat_default: model["is_chat_default"].as_bool(),
+        supports_vision: supports["vision"]
+            .as_bool()
+            .or_else(|| capabilities["supports_vision"].as_bool()),
+        supports_adaptive_thinking: model["supports_adaptive_thinking"].as_bool(),
+        min_thinking_budget: model["min_thinking_budget"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok()),
+        max_thinking_budget: model["max_thinking_budget"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| {
+                billing["max_thinking_budget"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+            }),
+    })
+}
+
+fn parse_supported_endpoints(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|endpoints| {
+            endpoints
+                .iter()
+                .filter_map(|endpoint| {
+                    endpoint
+                        .as_str()
+                        .or_else(|| endpoint.get("path").and_then(Value::as_str))
+                        .or_else(|| endpoint.get("url").and_then(Value::as_str))
+                        .or_else(|| endpoint.get("endpoint").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_model_limits(
+    request: &mut MessagesRequest,
+    model_info: Option<&ModelInfo>,
+    configured_max_thinking_tokens: u32,
+) {
+    let Some(model_info) = model_info else {
+        return;
+    };
+
+    if let Some(model_max) = model_info.max_output_tokens {
+        request.max_tokens = Some(
+            request
+                .max_tokens
+                .map_or(model_max, |max| max.min(model_max)),
+        );
+    }
+
+    if request.thinking.is_none() && model_info.supports_thinking == Some(true) {
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("enabled".to_string()),
+            budget_tokens: if model_info.supports_adaptive_thinking == Some(true) {
+                None
+            } else {
+                compute_thinking_budget(
+                    model_info.min_thinking_budget,
+                    model_info.max_thinking_budget,
+                    request.max_tokens.or(model_info.max_output_tokens),
+                    configured_max_thinking_tokens,
+                )
+            },
+        });
+    }
+}
+
+fn compute_thinking_budget(
+    min_thinking_budget: Option<u32>,
+    max_thinking_budget: Option<u32>,
+    max_output_tokens: Option<u32>,
+    configured_max_thinking_tokens: u32,
+) -> Option<u32> {
+    let available = max_output_tokens.unwrap_or(configured_max_thinking_tokens);
+    if available < 2 {
+        return None;
+    }
+
+    let hard_upper = available.saturating_sub(1);
+    let upper = max_thinking_budget
+        .unwrap_or(configured_max_thinking_tokens)
+        .min(configured_max_thinking_tokens)
+        .min(hard_upper);
+    if upper == 0 {
+        return None;
+    }
+
+    let lower = min_thinking_budget.unwrap_or(1024).min(upper);
+    Some((available / 2).clamp(lower, upper))
+}
+
+fn disable_eager_input_streaming(body: &mut serde_json::Map<String, Value>) {
+    if let Some(Value::Array(tools)) = body.get_mut("tools") {
+        for tool in tools {
+            if let Value::Object(tool_obj) = tool {
+                tool_obj.insert("eager_input_streaming".to_string(), Value::Bool(false));
+            }
+        }
     }
 }
 
@@ -545,4 +692,90 @@ fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
     }
 
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_anthropic_sse_accepts_data_without_space() {
+        let event = parse_anthropic_sse(
+            br#"event: message_delta
+data:{"type":"message_delta"}"#,
+        );
+
+        assert_eq!(event.event, "message_delta");
+        assert_eq!(event.data["type"], "message_delta");
+    }
+
+    #[test]
+    fn test_parse_copilot_model_extracts_capabilities() {
+        let raw = serde_json::json!({
+            "id": "claude-sonnet-4",
+            "vendor": {"name": "Anthropic"},
+            "is_chat_default": true,
+            "model_picker_enabled": true,
+            "supports_thinking": true,
+            "supports_adaptive_thinking": false,
+            "min_thinking_budget": 1024,
+            "max_thinking_budget": 8192,
+            "supported_endpoints": ["/v1/messages", {"path": "/chat/completions"}],
+            "capabilities": {
+                "limits": {"max_output_tokens": 16384},
+                "supports": {"vision": true}
+            }
+        });
+
+        let model = parse_copilot_model(&raw).expect("valid model");
+        assert_eq!(model.model_id, "claude-sonnet-4");
+        assert_eq!(model.vendor.as_deref(), Some("anthropic"));
+        assert_eq!(model.max_output_tokens, Some(16384));
+        assert_eq!(
+            model.supported_endpoints,
+            vec!["/v1/messages", "/chat/completions"]
+        );
+        assert_eq!(model.is_chat_default, Some(true));
+        assert_eq!(model.supports_vision, Some(true));
+        assert_eq!(model.supports_thinking, Some(true));
+    }
+
+    #[test]
+    fn test_apply_model_limits_clamps_and_adds_thinking() {
+        let model = ModelInfo {
+            model_id: "claude-sonnet-4".to_string(),
+            supports_thinking: Some(true),
+            vendor: Some("anthropic".to_string()),
+            max_output_tokens: Some(4096),
+            supported_endpoints: vec!["/v1/messages".to_string()],
+            is_chat_default: None,
+            supports_vision: None,
+            supports_adaptive_thinking: Some(false),
+            min_thinking_budget: Some(1024),
+            max_thinking_budget: Some(2048),
+        };
+        let mut request = MessagesRequest {
+            model: model.model_id.clone(),
+            system: None,
+            messages: vec![],
+            max_tokens: Some(8192),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        apply_model_limits(&mut request, Some(&model), 16_000);
+
+        assert_eq!(request.max_tokens, Some(4096));
+        let thinking = request.thinking.expect("thinking inserted");
+        assert_eq!(thinking.r#type.as_deref(), Some("enabled"));
+        assert_eq!(thinking.budget_tokens, Some(2048));
+    }
 }

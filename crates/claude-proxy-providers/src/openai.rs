@@ -329,6 +329,14 @@ impl Provider for OpenAiProvider {
                 m["id"].as_str().map(|id| ModelInfo {
                     model_id: id.to_string(),
                     supports_thinking: None,
+                    vendor: Some("openai".to_string()),
+                    max_output_tokens: None,
+                    supported_endpoints: vec!["/chat/completions".to_string()],
+                    is_chat_default: None,
+                    supports_vision: None,
+                    supports_adaptive_thinking: None,
+                    min_thinking_budget: None,
+                    max_thinking_budget: None,
                 })
             })
             .collect();

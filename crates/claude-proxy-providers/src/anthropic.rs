@@ -152,14 +152,38 @@ impl Provider for AnthropicProvider {
             ModelInfo {
                 model_id: "claude-opus-4-20250514".to_string(),
                 supports_thinking: Some(true),
+                vendor: Some("anthropic".to_string()),
+                max_output_tokens: None,
+                supported_endpoints: vec!["/v1/messages".to_string()],
+                is_chat_default: None,
+                supports_vision: Some(true),
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
             },
             ModelInfo {
                 model_id: "claude-sonnet-4-20250514".to_string(),
                 supports_thinking: Some(true),
+                vendor: Some("anthropic".to_string()),
+                max_output_tokens: None,
+                supported_endpoints: vec!["/v1/messages".to_string()],
+                is_chat_default: None,
+                supports_vision: Some(true),
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
             },
             ModelInfo {
                 model_id: "claude-3-5-haiku-20241022".to_string(),
                 supports_thinking: Some(false),
+                vendor: Some("anthropic".to_string()),
+                max_output_tokens: None,
+                supported_endpoints: vec!["/v1/messages".to_string()],
+                is_chat_default: None,
+                supports_vision: Some(true),
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
             },
         ])
     }
@@ -174,7 +198,9 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("event: ") {
             event_type = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ")
+        } else if let Some(rest) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
             && let Ok(parsed) = serde_json::from_str::<Value>(rest.trim())
         {
             data = parsed;

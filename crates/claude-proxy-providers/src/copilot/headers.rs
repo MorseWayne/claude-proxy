@@ -64,6 +64,8 @@ impl HeaderBuilder {
         token: &str,
         request_id: Option<&str>,
         vision: bool,
+        initiator: &str,
+        interaction_type: &str,
     ) -> Vec<(&'static str, String)> {
         let request_id = request_id
             .map(|s| s.to_string())
@@ -77,11 +79,12 @@ impl HeaderBuilder {
             ("editor-version", format!("vscode/{VSCODE_VERSION}")),
             ("editor-plugin-version", self.editor_plugin_version.clone()),
             ("User-Agent", self.user_agent.clone()),
-            ("openai-intent", "conversation-agent".to_string()),
+            ("openai-intent", interaction_type.to_string()),
             ("x-github-api-version", API_VERSION.to_string()),
             ("x-request-id", request_id.clone()),
             ("x-agent-task-id", request_id),
-            ("x-interaction-type", "conversation-agent".to_string()),
+            ("x-initiator", initiator.to_string()),
+            ("x-interaction-type", interaction_type.to_string()),
             (
                 "x-vscode-user-agent-library-version",
                 "electron-fetch".to_string(),
@@ -99,7 +102,7 @@ impl HeaderBuilder {
     }
 
     pub fn build_models_headers(&self, token: &str) -> Vec<(&'static str, String)> {
-        let mut headers = self.build_headers(token, None, false);
+        let mut headers = self.build_headers(token, None, false, "user", "conversation-agent");
         // Override intent headers for model listing
         headers.retain(|(k, _)| {
             *k != "openai-intent"
