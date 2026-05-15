@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use claude_proxy_config::settings::ProviderType;
 use claude_proxy_core::*;
 use claude_proxy_providers::provider::{Provider, ProviderError};
 use futures::StreamExt;
@@ -83,8 +84,8 @@ pub async fn messages(
     let resolved = resolve_upstream_request(&state, &request).await;
 
     info!(
-        "Request: model={} → {}/{}",
-        request.model, resolved.provider_id, resolved.upstream_model
+        "Request: initiator={} model={} → {}/{}",
+        resolved.initiator, request.model, resolved.provider_id, resolved.upstream_model
     );
 
     // --- Concurrent request deduplication ---
@@ -185,6 +186,7 @@ pub async fn messages(
 struct ResolvedUpstreamRequest {
     provider_id: String,
     upstream_model: String,
+    initiator: &'static str,
     request: MessagesRequest,
 }
 
@@ -196,6 +198,7 @@ async fn resolve_upstream_request(
     let model_ref = settings.resolve_model(&request.model).to_string();
     let provider_id = claude_proxy_config::Settings::parse_provider_id(&model_ref).to_string();
     let upstream_model = claude_proxy_config::Settings::parse_model_name(&model_ref).to_string();
+    let initiator = resolve_request_initiator(&settings, &provider_id, request);
 
     let mut request = request.clone();
     request.model = upstream_model.clone();
@@ -203,8 +206,46 @@ async fn resolve_upstream_request(
     ResolvedUpstreamRequest {
         provider_id,
         upstream_model,
+        initiator,
         request,
     }
+}
+
+fn resolve_request_initiator(
+    settings: &claude_proxy_config::Settings,
+    provider_id: &str,
+    request: &MessagesRequest,
+) -> &'static str {
+    let agent_marking_enabled = settings
+        .providers
+        .get(provider_id)
+        .filter(|config| config.resolve_type(provider_id) == ProviderType::Copilot)
+        .map(|config| {
+            config
+                .copilot
+                .as_ref()
+                .is_none_or(|copilot| copilot.enable_agent_marking)
+        })
+        .unwrap_or(false);
+
+    if agent_marking_enabled && has_subagent_marker(&request.system) {
+        "agent"
+    } else {
+        "user"
+    }
+}
+
+fn has_subagent_marker(system: &Option<SystemPrompt>) -> bool {
+    let text = match system {
+        Some(SystemPrompt::Text(text)) => text.as_str(),
+        Some(SystemPrompt::Blocks(blocks)) => blocks.first().map_or("", |block| match block {
+            Content::Text { text } => text.as_str(),
+            _ => "",
+        }),
+        None => return false,
+    };
+
+    text.contains("__SUBAGENT_MARKER__")
 }
 
 async fn get_provider(state: &AppState, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
