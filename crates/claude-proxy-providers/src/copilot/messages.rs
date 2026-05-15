@@ -29,6 +29,7 @@ pub(super) fn prepare_messages_request(
 
     let mut body = serde_json::to_value(request)?;
     if let Value::Object(ref mut obj) = body {
+        obj.remove("metadata");
         normalize_thinking(obj, effort);
         disable_eager_input_streaming(obj);
     }
@@ -315,6 +316,7 @@ mod tests {
             "output_config".to_string(),
             serde_json::json!({"effort": "high"}),
         )]);
+        request.metadata = Some(serde_json::json!({"user_id": "client-user"}));
 
         let (body, stats) = prepare_messages_request(&mut request, Some("high")).expect("body");
 
@@ -324,6 +326,7 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(body["tools"][0]["eager_input_streaming"], false);
         assert!(body.get("tool_streaming").is_none());
+        assert!(body.get("metadata").is_none());
         assert!(body.get("extra").is_none());
     }
 }

@@ -1573,6 +1573,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
 
     set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
+    env.remove("ANTHROPIC_AUTH_TOKEN");
     set_env(env, "ANTHROPIC_MODEL", &settings.model.default);
     set_optional_env(
         env,
@@ -1804,6 +1805,7 @@ mod tests {
             "theme": "dark",
             "env": {
                 "KEEP_ME": "yes",
+                "ANTHROPIC_AUTH_TOKEN": "legacy-token",
                 "ANTHROPIC_SMALL_FAST_MODEL": "legacy"
             }
         });
@@ -1844,6 +1846,7 @@ mod tests {
             Some("openai/gpt-5-mini")
         );
         assert_eq!(env.get("KEEP_ME").and_then(|v| v.as_str()), Some("yes"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(value["theme"].as_str(), Some("dark"));
     }

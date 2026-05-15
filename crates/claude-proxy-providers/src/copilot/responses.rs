@@ -49,10 +49,6 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     if let Some(reasoning) = convert_reasoning(req) {
         body["reasoning"] = reasoning;
     }
-    if let Some(metadata) = &req.metadata {
-        body["metadata"] = metadata.clone();
-    }
-
     body
 }
 
@@ -916,7 +912,7 @@ mod tests {
                 r#type: Some("enabled".to_string()),
                 budget_tokens: None,
             }),
-            metadata: None,
+            metadata: Some(json!({"user_id": "client-user"})),
             extra: HashMap::new(),
         };
 
@@ -932,6 +928,7 @@ mod tests {
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert!(body.get("metadata").is_none());
     }
 
     #[test]
