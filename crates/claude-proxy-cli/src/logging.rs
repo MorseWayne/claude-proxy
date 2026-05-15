@@ -69,11 +69,17 @@ pub fn init_logging(log_config: &LogConfig, tui_mode: bool) -> anyhow::Result<()
 }
 
 fn build_filter(log_config: &LogConfig) -> EnvFilter {
-    // Respect RUST_LOG env var first, then fall back to config
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    let base = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = &log_config.level;
-        EnvFilter::new(format!("{level},hyper=warn,reqwest=warn,tower_http=info"))
-    })
+        EnvFilter::new(level)
+    });
+
+    base.add_directive("hickory_proto=warn".parse().expect("valid filter"))
+        .add_directive("hickory_resolver=warn".parse().expect("valid filter"))
+        .add_directive("hyper=warn".parse().expect("valid filter"))
+        .add_directive("hyper_util=warn".parse().expect("valid filter"))
+        .add_directive("reqwest=warn".parse().expect("valid filter"))
+        .add_directive("tower_http=info".parse().expect("valid filter"))
 }
 
 fn log_dir() -> PathBuf {

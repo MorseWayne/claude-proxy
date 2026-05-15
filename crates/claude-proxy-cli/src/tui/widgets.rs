@@ -592,6 +592,10 @@ pub fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled("  o           ", key_style),
             Span::raw("  Authenticate / re-authenticate OAuth provider"),
         ]),
+        Line::from(vec![
+            Span::styled("  t           ", key_style),
+            Span::raw("  Test provider connectivity/auth"),
+        ]),
         Line::from(""),
         Line::from(Span::styled(" General", section_style)),
         Line::from(""),

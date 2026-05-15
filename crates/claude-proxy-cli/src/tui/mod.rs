@@ -23,8 +23,8 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
     InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem, OAuthOverlay,
-    OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderField, ProviderFocus,
-    StoredMetrics, Toast,
+    OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
+    ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus, StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{CopilotProviderConfig, ProviderConfig, ProviderType};
@@ -135,6 +135,8 @@ fn on_tick(app: &mut App) {
     }
     // Poll OAuth results
     poll_oauth(app);
+    // Poll provider connectivity/auth checks
+    poll_provider_check(app);
 }
 
 fn handle_key(app: &mut App, key: event::KeyEvent) {
@@ -298,6 +300,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('o') => {
                 oauth_provider(app);
             }
+            KeyCode::Char('t') => {
+                check_selected_provider(app);
+            }
             KeyCode::Esc => {
                 app.focus = Focus::Nav;
             }
@@ -335,6 +340,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('o') => {
                 oauth_provider(app);
             }
+            KeyCode::Char('t') => {
+                check_selected_provider(app);
+            }
             KeyCode::Char('q') => {
                 request_quit(app);
             }
@@ -365,6 +373,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             ConfirmAction::Quit => app.should_quit = true,
                             ConfirmAction::DeleteProvider(id) => {
                                 app.settings.providers.remove(&id);
+                                app.provider_statuses.remove(&id);
                                 app.mark_dirty();
                                 app.clamp_content_idx();
                                 app.show_toast(Toast::success(format!(
@@ -948,6 +957,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) {
                     ProviderField::BaseUrl => cfg.base_url = value.to_string(),
                     ProviderField::Proxy => cfg.proxy = value.to_string(),
                 }
+                app.provider_statuses.remove(provider_id);
                 app.mark_dirty();
                 app.show_toast(Toast::success("Updated"));
             }
@@ -1030,6 +1040,63 @@ fn provider_type_with_id(provider_type: ProviderType, id: &str) -> ProviderType 
     }
 }
 
+fn check_selected_provider(app: &mut App) {
+    let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) else {
+        app.show_toast(Toast::info("No provider selected"));
+        return;
+    };
+
+    if app.provider_check_rx.is_some() {
+        app.show_toast(Toast::info("Provider check already running"));
+        return;
+    }
+
+    let id = id.clone();
+    let provider_type = cfg.resolve_type(&id);
+
+    if provider_type.needs_api_key() && cfg.api_key.trim().is_empty() {
+        app.provider_statuses.insert(
+            id.clone(),
+            ProviderCheckStatus::Failed("Missing API key".into()),
+        );
+        app.show_toast(Toast::error(format!("{id}: missing API key")));
+        return;
+    }
+
+    if matches!(
+        provider_type,
+        ProviderType::Anthropic | ProviderType::CustomAnthropic(_)
+    ) {
+        let message = "Configured; auth not verified by model list".to_string();
+        app.provider_statuses
+            .insert(id.clone(), ProviderCheckStatus::Warning(message));
+        app.show_toast(Toast::warning(format!("{id}: Anthropic auth not verified")));
+        return;
+    }
+
+    let settings = app.settings.clone();
+    let handle = app.tokio_handle.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    app.provider_statuses
+        .insert(id.clone(), ProviderCheckStatus::Checking);
+    app.provider_check_rx = Some(rx);
+    app.show_toast(Toast::info(format!("Checking {id}...")));
+
+    std::thread::spawn(move || {
+        let result =
+            fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
+                ProviderCheckOk {
+                    message: format!("OK, {} models available", models.len()),
+                }
+            });
+        let _ = tx.send(ProviderCheckResult {
+            provider_id: id,
+            result,
+        });
+    });
+}
+
 /// Fetch models using the provider trait (handles OAuth, API keys, etc. correctly).
 fn fetch_models_via_provider(
     provider_id: &str,
@@ -1094,7 +1161,7 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
             .build()
             .expect("oauth runtime");
         rt.block_on(async {
-            let client = match build_tui_oauth_http_client(&settings) {
+            let client = match build_tui_oauth_http_client(&settings, &pid) {
                 Ok(client) => client,
                 Err(e) => {
                     let _ = tx.send(OAuthResult::Error(e));
@@ -1134,10 +1201,26 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
     });
 }
 
-fn build_tui_oauth_http_client(settings: &Settings) -> Result<reqwest::Client, String> {
+fn build_tui_oauth_http_client(
+    settings: &Settings,
+    provider_id: &str,
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
+        .hickory_dns(true)
         .connect_timeout(Duration::from_secs(settings.http.connect_timeout))
         .read_timeout(Duration::from_secs(settings.http.read_timeout));
+
+    if let Some(proxy) = settings
+        .providers
+        .get(provider_id)
+        .map(|cfg| cfg.proxy.trim())
+        && !proxy.is_empty()
+    {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
+        );
+    }
 
     builder = claude_proxy_providers::apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)
         .map_err(|e| e.to_string())?;
@@ -1194,6 +1277,46 @@ fn poll_oauth(app: &mut App) {
                 }
                 // Keep overlay open so user can see the error; Esc to dismiss
             }
+        }
+    }
+}
+
+fn poll_provider_check(app: &mut App) {
+    let Some(ref rx) = app.provider_check_rx else {
+        return;
+    };
+
+    let result = match rx.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            app.provider_check_rx = None;
+            app.show_toast(Toast::error("Provider check worker exited"));
+            return;
+        }
+    };
+
+    app.provider_check_rx = None;
+    match result.result {
+        Ok(ok) => {
+            app.provider_statuses.insert(
+                result.provider_id.clone(),
+                ProviderCheckStatus::Ok(ok.message.clone()),
+            );
+            app.show_toast(Toast::success(format!(
+                "{}: {}",
+                result.provider_id, ok.message
+            )));
+        }
+        Err(err) => {
+            app.provider_statuses.insert(
+                result.provider_id.clone(),
+                ProviderCheckStatus::Failed(err.clone()),
+            );
+            app.show_toast(Toast::error(format!(
+                "{} check failed: {}",
+                result.provider_id, err
+            )));
         }
     }
 }

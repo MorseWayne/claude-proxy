@@ -6,9 +6,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
 };
 
-use claude_proxy_config::settings::ProviderType;
+use claude_proxy_config::settings::{ProviderConfig, ProviderType};
 
-use super::super::app::{App, Focus, ProviderFocus};
+use super::super::app::{App, Focus, ProviderCheckStatus, ProviderFocus};
 use super::super::{theme, widgets};
 
 pub fn render_providers(f: &mut Frame, app: &App, area: Rect) {
@@ -75,13 +75,15 @@ fn render_provider_list(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .settings
         .providers
-        .keys()
-        .map(|id| {
+        .iter()
+        .map(|(id, cfg)| {
             let is_default = app.settings.model.default.starts_with(&format!("{id}/"));
             let marker = if is_default { " ★" } else { "" };
+            let (status, status_style) = provider_status_label(app, id, cfg);
             let line = Line::from(vec![
                 Span::styled(format!("  {id}"), Style::default().fg(theme::FG)),
                 Span::styled(marker, Style::default().fg(theme::WARN)),
+                Span::styled(format!("  [{status}]"), status_style),
             ]);
             ListItem::new(line)
         })
@@ -130,7 +132,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     let (id, cfg) = app.settings.providers.iter().nth(idx).unwrap();
     let pt = cfg.resolve_type(id);
 
-    let rows = widgets::field_rows(inner, 7);
+    let rows = widgets::field_rows(inner, 8);
 
     // API Key (detail_idx == 0)
     let key_display = if !pt.needs_api_key() {
@@ -172,6 +174,10 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         false,
     );
 
+    // Connectivity/auth check (read-only)
+    let (check_status, _) = provider_status_detail(app, id, cfg);
+    widgets::render_field(f, rows[3], "Check", &check_status, false, false);
+
     // Status (read-only)
     let is_default = app.settings.model.default.starts_with(&format!("{id}/"));
     let status = if is_default {
@@ -179,7 +185,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Not default".into()
     };
-    widgets::render_field(f, rows[3], "Status", &status, false, false);
+    widgets::render_field(f, rows[4], "Status", &status, false, false);
 
     // Copilot info (read-only)
     if pt == ProviderType::Copilot && let Some(ref cc) = cfg.copilot {
@@ -187,7 +193,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             "oauth={} small={} warmup={}",
             cc.oauth_app, cc.small_model, cc.enable_warmup
         );
-        widgets::render_field(f, rows[4], "Copilot", &info, false, false);
+        widgets::render_field(f, rows[5], "Copilot", &info, false, false);
     }
 
     // Actions hint at bottom
@@ -201,6 +207,14 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" Edit  ", widgets::dim_style()),
+            Span::styled(
+                " t ",
+                Style::default()
+                    .fg(theme::BG_DARK)
+                    .bg(theme::ACCENT2)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Test  ", widgets::dim_style()),
             Span::styled(
                 " ← ",
                 Style::default()
@@ -223,7 +237,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         hints
     } else {
         let mut hints = vec![Span::styled(
-            "  Press → or Enter to edit fields",
+            "  Press → or Enter to edit fields, t to test",
             widgets::dim_style(),
         )];
         if !pt.needs_api_key() {
@@ -232,5 +246,43 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         }
         hints
     };
-    f.render_widget(Paragraph::new(Line::from(hints)), rows[6]);
+    f.render_widget(Paragraph::new(Line::from(hints)), rows[7]);
+}
+
+fn provider_status_label(app: &App, id: &str, cfg: &ProviderConfig) -> (&'static str, Style) {
+    let pt = cfg.resolve_type(id);
+    if pt.needs_api_key() && cfg.api_key.trim().is_empty() {
+        return ("missing", Style::default().fg(theme::ERR));
+    }
+
+    match app.provider_statuses.get(id) {
+        Some(ProviderCheckStatus::Checking) => ("checking", Style::default().fg(theme::WARN)),
+        Some(ProviderCheckStatus::Ok(_)) => ("ok", Style::default().fg(theme::ACCENT2)),
+        Some(ProviderCheckStatus::Warning(_)) => ("config", Style::default().fg(theme::WARN)),
+        Some(ProviderCheckStatus::Failed(_)) => ("failed", Style::default().fg(theme::ERR)),
+        None => ("unknown", Style::default().fg(theme::FG_DIM)),
+    }
+}
+
+fn provider_status_detail(app: &App, id: &str, cfg: &ProviderConfig) -> (String, Style) {
+    let pt = cfg.resolve_type(id);
+    if pt.needs_api_key() && cfg.api_key.trim().is_empty() {
+        return ("Missing API key".into(), Style::default().fg(theme::ERR));
+    }
+
+    match app.provider_statuses.get(id) {
+        Some(ProviderCheckStatus::Checking) => {
+            ("Checking connectivity/auth...".into(), Style::default().fg(theme::WARN))
+        }
+        Some(ProviderCheckStatus::Ok(message)) => {
+            (message.clone(), Style::default().fg(theme::ACCENT2))
+        }
+        Some(ProviderCheckStatus::Warning(message)) => {
+            (message.clone(), Style::default().fg(theme::WARN))
+        }
+        Some(ProviderCheckStatus::Failed(message)) => {
+            (format!("Failed: {message}"), Style::default().fg(theme::ERR))
+        }
+        None => ("Not checked".into(), Style::default().fg(theme::FG_DIM)),
+    }
 }

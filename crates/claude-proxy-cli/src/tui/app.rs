@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use std::collections::HashMap;
+
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::ProviderType;
 
@@ -310,6 +312,25 @@ pub struct FetchResult {
     pub models: Result<Vec<String>, String>,
 }
 
+/// Result of a background provider health check.
+pub struct ProviderCheckResult {
+    pub provider_id: String,
+    pub result: Result<ProviderCheckOk, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderCheckOk {
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProviderCheckStatus {
+    Checking,
+    Ok(String),
+    Warning(String),
+    Failed(String),
+}
+
 /// Live metrics fetched from a running server.
 #[derive(Debug, Clone, Default)]
 pub struct LiveMetrics {
@@ -385,6 +406,10 @@ pub struct App {
     pub oauth_pending_id: Option<String>,
     /// Stashed device code info for polling phase.
     pub oauth_device_info: Option<(String, u64)>,
+    /// Channel for provider connectivity/auth check results.
+    pub provider_check_rx: Option<std::sync::mpsc::Receiver<ProviderCheckResult>>,
+    /// Last known provider connectivity/auth status by provider ID.
+    pub provider_statuses: HashMap<String, ProviderCheckStatus>,
 }
 
 impl App {
@@ -411,6 +436,8 @@ impl App {
             oauth_rx: None,
             oauth_pending_id: None,
             oauth_device_info: None,
+            provider_check_rx: None,
+            provider_statuses: HashMap::new(),
         }
     }
 

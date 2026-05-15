@@ -21,6 +21,7 @@ const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/toke
 
 const POLL_INTERVAL_SECS: u64 = 5;
 const MAX_POLL_ATTEMPTS: u32 = 60;
+const DEVICE_CODE_REQUEST_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopilotToken {
@@ -138,6 +139,21 @@ impl CopilotAuth {
         self.github_token.read().await.is_some()
     }
 
+    async fn reload_github_token_from_disk(&self) -> bool {
+        let Some(token) = Self::load_github_token(&self.token_dir) else {
+            return false;
+        };
+
+        let mut current = self.github_token.write().await;
+        if current.as_deref() == Some(token.as_str()) {
+            return true;
+        }
+
+        *current = Some(token);
+        info!("Reloaded GitHub token from disk");
+        true
+    }
+
     /// Request a device code from GitHub and return info for display.
     /// Caller should show the URL + user_code to the user, then call
     /// `complete_device_code` to poll for completion.
@@ -190,36 +206,51 @@ impl CopilotAuth {
 
     async fn request_device_code(&self) -> Result<DeviceCodeResponse, ProviderError> {
         let client = &self.http_client;
-        let resp = client
-            .post(GITHUB_DEVICE_CODE_URL)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "client_id": GITHUB_CLIENT_ID,
-                "scope": GITHUB_SCOPES,
-            }))
-            .send()
-            .await
-            .map_err(|e| {
+        for attempt in 1..=DEVICE_CODE_REQUEST_ATTEMPTS {
+            let resp = client
+                .post(GITHUB_DEVICE_CODE_URL)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "client_id": GITHUB_CLIENT_ID,
+                    "scope": GITHUB_SCOPES,
+                }))
+                .send()
+                .await;
+
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err = fmt_reqwest_err(&e);
+                    if attempt == DEVICE_CODE_REQUEST_ATTEMPTS {
+                        return Err(ProviderError::Network(format!(
+                            "device code request failed after {attempt} attempts: {err}"
+                        )));
+                    }
+                    warn!(
+                        "device code request failed (attempt {attempt}/{DEVICE_CODE_REQUEST_ATTEMPTS}): {err}; retrying"
+                    );
+                    sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ProviderError::Authentication(format!(
+                    "device code request rejected: {body}"
+                )));
+            }
+
+            return resp.json::<DeviceCodeResponse>().await.map_err(|e| {
                 ProviderError::Network(format!(
-                    "device code request failed: {}",
+                    "invalid device code response: {}",
                     fmt_reqwest_err(&e)
                 ))
-            })?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Authentication(format!(
-                "device code request rejected: {body}"
-            )));
+            });
         }
 
-        resp.json::<DeviceCodeResponse>().await.map_err(|e| {
-            ProviderError::Network(format!(
-                "invalid device code response: {}",
-                fmt_reqwest_err(&e)
-            ))
-        })
+        unreachable!("device code request loop must return");
     }
 
     async fn poll_for_token(&self, dc: &DeviceCodeResponse) -> Result<String, ProviderError> {
@@ -373,6 +404,10 @@ impl CopilotAuth {
 
     /// Get a valid Copilot token, refreshing if needed.
     pub async fn get_token(&self) -> Result<String, ProviderError> {
+        if !self.has_github_token().await {
+            self.reload_github_token_from_disk().await;
+        }
+
         // If no GitHub token, run device flow
         if !self.has_github_token().await {
             let _token = self.run_device_flow().await?;

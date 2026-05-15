@@ -361,7 +361,12 @@ async fn handle_provider(action: ProviderAction) {
             if provider_type == ProviderType::Copilot {
                 println!();
                 println!("{}", "Authenticating with GitHub Copilot...".bold());
-                let client = match build_oauth_http_client(&settings) {
+                let provider_proxy = settings
+                    .providers
+                    .get(&provider_id)
+                    .map(|cfg| cfg.proxy.as_str())
+                    .unwrap_or("");
+                let client = match build_oauth_http_client(&settings, provider_proxy) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("{} Failed to build HTTP client: {e}", "✗".red().bold());
@@ -383,9 +388,18 @@ async fn handle_provider(action: ProviderAction) {
                                 let cfg_path = claude_proxy_config::Settings::config_file_path()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
-                                eprintln!(
-                                    "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
-                                );
+                                let err_text = e.to_string();
+                                if err_text.contains("dns error")
+                                    || err_text.contains("lookup address")
+                                {
+                                    eprintln!(
+                                        "  hint: DNS lookup failed before TLS. Check your DNS/network,\n        or set this provider's proxy in {cfg_path}\n        example: proxy = \"http://127.0.0.1:7890\""
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
+                                    );
+                                }
                             }
                             return;
                         }
@@ -812,18 +826,25 @@ async fn handle_server(action: ServerAction) {
 
 /// Build the reqwest client used by the interactive Copilot OAuth device
 /// flow. Honours `http.connect_timeout`, `http.read_timeout`, and
-/// `http.extra_ca_certs` so the CLI behaves the same as the server-side
-/// providers — important when the user is behind a TLS-intercepting firewall
-/// (Fortinet, Zscaler, ...) where the corporate root CA must be added
-/// explicitly because rustls-tls does not consult the system trust store.
+/// provider proxy, `http.extra_ca_certs`, and HTTP timeouts so the CLI behaves
+/// the same as the server-side providers.
 fn build_oauth_http_client(
     settings: &claude_proxy_config::Settings,
+    proxy: &str,
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
+        .hickory_dns(true)
         .connect_timeout(std::time::Duration::from_secs(
             settings.http.connect_timeout,
         ))
         .read_timeout(std::time::Duration::from_secs(settings.http.read_timeout));
+
+    if !proxy.trim().is_empty() {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
+        );
+    }
 
     builder = claude_proxy_providers::apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)
         .map_err(|e| e.to_string())?;
