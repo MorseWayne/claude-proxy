@@ -179,6 +179,191 @@ fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
     upstream
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PayloadBreakdown {
+    text_items: usize,
+    thinking_items: usize,
+    function_call_items: usize,
+    function_output_items: usize,
+    largest_item_bytes: usize,
+    text_bytes: usize,
+    thinking_bytes: usize,
+    tool_call_bytes: usize,
+    tool_output_bytes: usize,
+    instructions_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RequestObservability {
+    pub model: String,
+    pub stream: bool,
+    pub input_items: usize,
+    pub has_tools: bool,
+    pub has_parallel_tool_calls: bool,
+    pub has_reasoning: bool,
+    pub has_include: bool,
+    pub has_instructions: bool,
+    pub body_bytes: usize,
+    text_items: usize,
+    thinking_items: usize,
+    function_call_items: usize,
+    function_output_items: usize,
+    largest_item_bytes: usize,
+    text_bytes: usize,
+    thinking_bytes: usize,
+    tool_call_bytes: usize,
+    tool_output_bytes: usize,
+    instructions_bytes: usize,
+}
+
+pub(crate) fn request_observability(body: &Value) -> RequestObservability {
+    let breakdown = payload_breakdown(body);
+    RequestObservability {
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        input_items: body
+            .get("input")
+            .or_else(|| body.get("messages"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        has_tools: body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        has_parallel_tool_calls: body.get("parallel_tool_calls").is_some(),
+        has_reasoning: body.get("reasoning").is_some(),
+        has_include: body.get("include").is_some(),
+        has_instructions: body.get("instructions").is_some(),
+        body_bytes: serde_json::to_vec(body).map_or(0, |bytes| bytes.len()),
+        text_items: breakdown.text_items,
+        thinking_items: breakdown.thinking_items,
+        function_call_items: breakdown.function_call_items,
+        function_output_items: breakdown.function_output_items,
+        largest_item_bytes: breakdown.largest_item_bytes,
+        text_bytes: breakdown.text_bytes,
+        thinking_bytes: breakdown.thinking_bytes,
+        tool_call_bytes: breakdown.tool_call_bytes,
+        tool_output_bytes: breakdown.tool_output_bytes,
+        instructions_bytes: breakdown.instructions_bytes,
+    }
+}
+
+fn payload_breakdown(body: &Value) -> PayloadBreakdown {
+    let mut breakdown = PayloadBreakdown {
+        instructions_bytes: body
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map_or(0, str::len),
+        ..Default::default()
+    };
+
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            add_responses_item_breakdown(item, &mut breakdown);
+        }
+    }
+
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            add_chat_message_breakdown(message, &mut breakdown);
+        }
+    }
+
+    breakdown
+}
+
+fn add_item_size(item: &Value, breakdown: &mut PayloadBreakdown) {
+    let bytes = serde_json::to_vec(item).map_or(0, |bytes| bytes.len());
+    breakdown.largest_item_bytes = breakdown.largest_item_bytes.max(bytes);
+}
+
+fn add_responses_item_breakdown(item: &Value, breakdown: &mut PayloadBreakdown) {
+    add_item_size(item, breakdown);
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            breakdown.function_call_items += 1;
+            breakdown.tool_call_bytes += serde_json::to_vec(item).map_or(0, |bytes| bytes.len());
+        }
+        Some("function_call_output") => {
+            breakdown.function_output_items += 1;
+            breakdown.tool_output_bytes += item
+                .get("output")
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+        }
+        _ => add_message_content_breakdown(item, breakdown),
+    }
+}
+
+fn add_chat_message_breakdown(message: &Value, breakdown: &mut PayloadBreakdown) {
+    add_item_size(message, breakdown);
+    add_message_content_breakdown(message, breakdown);
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        breakdown.function_call_items += tool_calls.len();
+        breakdown.tool_call_bytes += serde_json::to_vec(tool_calls).map_or(0, |bytes| bytes.len());
+    }
+}
+
+fn add_message_content_breakdown(item: &Value, breakdown: &mut PayloadBreakdown) {
+    match item.get("content") {
+        Some(Value::String(text)) => add_text_or_thinking_bytes(text, breakdown),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    add_text_or_thinking_bytes(text, breakdown);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn add_text_or_thinking_bytes(text: &str, breakdown: &mut PayloadBreakdown) {
+    if text.contains("[thinking]") {
+        breakdown.thinking_items += 1;
+        breakdown.thinking_bytes += text.len();
+    } else {
+        breakdown.text_items += 1;
+        breakdown.text_bytes += text.len();
+    }
+}
+
+pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &Value) {
+    if !enabled!(Level::DEBUG) {
+        return;
+    }
+
+    let stats = request_observability(body);
+    debug!(
+        provider,
+        endpoint,
+        model = %stats.model,
+        stream = stats.stream,
+        input_items = stats.input_items,
+        has_tools = stats.has_tools,
+        has_parallel_tool_calls = stats.has_parallel_tool_calls,
+        has_reasoning = stats.has_reasoning,
+        has_include = stats.has_include,
+        has_instructions = stats.has_instructions,
+        body_bytes = stats.body_bytes,
+        text_items = stats.text_items,
+        thinking_items = stats.thinking_items,
+        function_call_items = stats.function_call_items,
+        function_output_items = stats.function_output_items,
+        largest_item_bytes = stats.largest_item_bytes,
+        text_bytes = stats.text_bytes,
+        thinking_bytes = stats.thinking_bytes,
+        tool_call_bytes = stats.tool_call_bytes,
+        tool_output_bytes = stats.tool_output_bytes,
+        instructions_bytes = stats.instructions_bytes,
+        "Provider request payload stats"
+    );
+}
+
 impl OpenAiProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -234,15 +419,7 @@ impl OpenAiProvider {
         let body = request::convert_request(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
-        debug!(
-            "OpenAI request: model={} stream={} messages={}",
-            body.get("model").and_then(|v| v.as_str()).unwrap_or("?"),
-            request.stream,
-            body.get("messages")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0)
-        );
+        log_request_observability("openai", "/chat/completions", &body);
 
         let response = self
             .client
@@ -283,15 +460,7 @@ impl OpenAiProvider {
         let body = crate::copilot::responses::convert_to_responses(&request);
         let url = format!("{}/responses", self.base_url);
 
-        debug!(
-            "OpenAI responses request: model={} stream={} input_items={}",
-            body.get("model").and_then(|v| v.as_str()).unwrap_or("?"),
-            request.stream,
-            body.get("input")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0)
-        );
+        log_request_observability("openai", "/responses", &body);
 
         let response = self
             .client
@@ -1179,6 +1348,74 @@ mod tests {
             info.supported_endpoints,
             vec!["/chat/completions", "/responses"]
         );
+    }
+
+    #[test]
+    fn request_observability_summarizes_responses_payload() {
+        let body = json!({
+            "model": "gpt-5.4-mini",
+            "input": [
+                {"role": "user", "content": "secret prompt"},
+                {"role": "assistant", "content": "[thinking]\nprivate chain\n[/thinking]"},
+                {"type": "function_call", "name": "read", "arguments": "{\"path\":\"README.md\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"}
+            ],
+            "stream": true,
+            "tools": [{"type": "function", "name": "read", "parameters": {}}],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "none"},
+            "include": ["reasoning.encrypted_content"],
+            "instructions": "system text"
+        });
+
+        let stats = request_observability(&body);
+
+        assert_eq!(stats.model, "gpt-5.4-mini");
+        assert!(stats.stream);
+        assert_eq!(stats.input_items, 4);
+        assert!(stats.has_tools);
+        assert!(stats.has_parallel_tool_calls);
+        assert!(stats.has_reasoning);
+        assert!(stats.has_include);
+        assert!(stats.has_instructions);
+        assert!(stats.body_bytes > 0);
+        assert_eq!(stats.text_items, 1);
+        assert_eq!(stats.thinking_items, 1);
+        assert_eq!(stats.function_call_items, 1);
+        assert_eq!(stats.function_output_items, 1);
+        assert_eq!(stats.text_bytes, "secret prompt".len());
+        assert_eq!(stats.tool_output_bytes, "tool output".len());
+        assert_eq!(stats.instructions_bytes, "system text".len());
+        assert!(stats.thinking_bytes > 0);
+        assert!(stats.tool_call_bytes > 0);
+        assert!(stats.largest_item_bytes > 0);
+    }
+
+    #[test]
+    fn request_observability_summarizes_chat_completions_payload() {
+        let body = json!({
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "secret prompt"}],
+            "stream": false
+        });
+
+        let stats = request_observability(&body);
+
+        assert_eq!(stats.model, "gpt-4.1");
+        assert!(!stats.stream);
+        assert_eq!(stats.input_items, 1);
+        assert!(!stats.has_tools);
+        assert!(!stats.has_parallel_tool_calls);
+        assert!(!stats.has_reasoning);
+        assert!(!stats.has_include);
+        assert!(!stats.has_instructions);
+        assert!(stats.body_bytes > 0);
+        assert_eq!(stats.text_items, 1);
+        assert_eq!(stats.text_bytes, "secret prompt".len());
+        assert_eq!(stats.thinking_items, 0);
+        assert_eq!(stats.function_call_items, 0);
+        assert_eq!(stats.function_output_items, 0);
+        assert_eq!(stats.tool_output_bytes, 0);
     }
 
     #[test]

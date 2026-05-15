@@ -9,11 +9,28 @@ use tokio::sync::mpsc;
 use crate::http::fmt_reqwest_err;
 use crate::provider::ProviderError;
 
+const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
+const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
+
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     let mut input = Vec::new();
+    let current_message_index = req.messages.len().saturating_sub(1);
+    let historical_tool_outputs = req
+        .messages
+        .iter()
+        .take(current_message_index)
+        .map(count_tool_results)
+        .sum::<usize>();
+    let mut historical_tool_outputs_to_truncate =
+        historical_tool_outputs.saturating_sub(RECENT_TOOL_OUTPUTS_TO_KEEP);
 
-    for msg in &req.messages {
-        append_message_items(&mut input, msg);
+    for (index, msg) in req.messages.iter().enumerate() {
+        append_message_items(
+            &mut input,
+            msg,
+            index == current_message_index,
+            &mut historical_tool_outputs_to_truncate,
+        );
     }
 
     let mut body = json!({
@@ -103,7 +120,22 @@ fn should_include_encrypted_reasoning(req: &MessagesRequest) -> bool {
     })
 }
 
-fn append_message_items(input: &mut Vec<Value>, msg: &Message) {
+fn count_tool_results(message: &Message) -> usize {
+    match &message.content {
+        MessageContent::Text(_) => 0,
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter(|block| matches!(block, Content::ToolResult { .. }))
+            .count(),
+    }
+}
+
+fn append_message_items(
+    input: &mut Vec<Value>,
+    msg: &Message,
+    is_current_message: bool,
+    historical_tool_outputs_to_truncate: &mut usize,
+) {
     match &msg.content {
         MessageContent::Text(text) => {
             input.push(message_item(&msg.role, text.clone()));
@@ -146,7 +178,14 @@ fn append_message_items(input: &mut Vec<Value>, msg: &Message) {
                             input.push(message_item(&msg.role, text_parts.join("\n")));
                             text_parts.clear();
                         }
-                        let output = tool_result_text(content, *is_error);
+                        let output = tool_result_text(
+                            content,
+                            *is_error,
+                            should_truncate_tool_output(
+                                is_current_message,
+                                historical_tool_outputs_to_truncate,
+                            ),
+                        );
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
@@ -163,6 +202,17 @@ fn append_message_items(input: &mut Vec<Value>, msg: &Message) {
     }
 }
 
+fn should_truncate_tool_output(
+    is_current_message: bool,
+    historical_tool_outputs_to_truncate: &mut usize,
+) -> bool {
+    if is_current_message || *historical_tool_outputs_to_truncate == 0 {
+        return false;
+    }
+    *historical_tool_outputs_to_truncate -= 1;
+    true
+}
+
 fn message_item(role: &Role, text: String) -> Value {
     let role = match role {
         Role::User => "user",
@@ -174,11 +224,24 @@ fn message_item(role: &Role, text: String) -> Value {
     })
 }
 
-fn tool_result_text(content: &Option<Value>, is_error: Option<bool>) -> String {
+fn tool_result_text(
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    truncate_if_large: bool,
+) -> String {
     let text = match content {
         Some(Value::String(text)) => text.clone(),
         Some(value) => value.to_string(),
         None => String::new(),
+    };
+    let text = if truncate_if_large && text.len() > MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
+        format!(
+            "[tool output truncated: original_bytes={}, max_historical_tool_output_bytes={}]",
+            text.len(),
+            MAX_HISTORICAL_TOOL_OUTPUT_BYTES
+        )
+    } else {
+        text
     };
     if is_error == Some(true) {
         format!("ERROR: {text}")
@@ -1057,8 +1120,71 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_to_responses_truncates_old_large_tool_outputs() {
+        let large_output = "x".repeat(MAX_HISTORICAL_TOOL_OUTPUT_BYTES + 1);
+        let mut messages = Vec::new();
+        for index in 0..(RECENT_TOOL_OUTPUTS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: format!("call_{index}"),
+                    content: Some(Value::String(large_output.clone())),
+                    is_error: if index == 0 { Some(true) } else { None },
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![Content::ToolResult {
+                tool_use_id: "current_call".to_string(),
+                content: Some(Value::String(large_output.clone())),
+                is_error: None,
+            }]),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+        let input = body["input"].as_array().expect("input items");
+
+        assert_eq!(
+            input[0]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("ERROR: [tool output truncated:"),
+            true
+        );
+        assert!(
+            input[1]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("[tool output truncated:")
+        );
+        assert_eq!(input[2]["output"], large_output);
+        assert_eq!(input.last().unwrap()["output"], large_output);
+    }
+
+    #[test]
     fn test_tool_result_text_prefixes_errors() {
-        let text = tool_result_text(&Some(Value::String("failed".to_string())), Some(true));
+        let text = tool_result_text(
+            &Some(Value::String("failed".to_string())),
+            Some(true),
+            false,
+        );
 
         assert_eq!(text, "ERROR: failed");
     }

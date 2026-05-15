@@ -22,7 +22,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
-use crate::openai::{apply_openai_intent, openai_model_info};
+use crate::openai::{apply_openai_intent, log_request_observability, openai_model_info};
 use crate::provider::{Provider, ProviderError};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -402,6 +402,7 @@ impl Provider for ChatGptProvider {
         let mut body = crate::copilot::responses::convert_to_responses(&request);
         body.as_object_mut()
             .map(|object| object.remove("max_output_tokens"));
+        log_request_observability("chatgpt", "/responses", &body);
 
         let mut request_builder = self
             .http_client
