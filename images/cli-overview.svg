@@ -1,29 +1,27 @@
-<svg width="1180" height="520" viewBox="0 0 1180 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+<svg width="1280" height="604" viewBox="0 0 1280 604" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">claude-proxy CLI overview</title>
-  <desc id="desc">Terminal style screenshot showing the claude-proxy top-level CLI help output.</desc>
+  <desc id="desc">Top-level command surface for claude-proxy.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0%" stop-color="#0f172a"/>
-      <stop offset="100%" stop-color="#111827"/>
+    <linearGradient id="page" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#eff6ff"/>
+      <stop offset="55%" stop-color="#eef2ff"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="terminal" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#101827"/>
     </linearGradient>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020617" flood-opacity="0.45"/>
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#0f172a" flood-opacity="0.28"/>
     </filter>
   </defs>
-  <rect width="1180" height="520" fill="#e5e7eb"/>
-  <rect x="70" y="56" width="1040" height="408" rx="18" fill="url(#bg)" filter="url(#shadow)"/>
-  <rect x="70" y="56" width="1040" height="52" rx="18" fill="#1f2937"/>
-  <circle cx="102" cy="82" r="7" fill="#ef4444"/>
-  <circle cx="126" cy="82" r="7" fill="#f59e0b"/>
-  <circle cx="150" cy="82" r="7" fill="#22c55e"/>
-  <text x="590" y="88" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">claude-proxy --help</text>
-  <text x="106" y="148" fill="#22c55e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">$ claude-proxy --help</text>
-  <text x="106" y="190" fill="#e5e7eb" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Claude-compatible proxy for OpenAI and Anthropic providers</text>
-  <text x="106" y="238" fill="#93c5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Usage:</text>
-  <text x="204" y="238" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">claude-proxy &lt;COMMAND&gt;</text>
-  <text x="106" y="286" fill="#93c5fd" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Commands:</text>
-  <text x="132" y="324" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">provider</text><text x="302" y="324" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Provider management</text>
-  <text x="132" y="358" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">config</text><text x="302" y="358" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Configuration management</text>
-  <text x="132" y="392" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">server</text><text x="302" y="392" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Server management</text>
-  <text x="132" y="426" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">tui</text><text x="302" y="426" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Launch interactive TUI configuration interface</text>
+  <rect width="1280" height="604" rx="0" fill="url(#page)"/>
+  <rect x="58" y="48" width="1164" height="508" rx="24" fill="url(#terminal)" filter="url(#shadow)"/>
+  <rect x="58" y="48" width="1164" height="56" rx="24" fill="#1e293b"/>
+  <rect x="58" y="80" width="1164" height="28" fill="#1e293b"/>
+  <circle cx="92" cy="76" r="7" fill="#fb7185"/>
+  <circle cx="118" cy="76" r="7" fill="#fbbf24"/>
+  <circle cx="144" cy="76" r="7" fill="#34d399"/>
+  <text x="640" y="82" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="17">claude-proxy CLI overview</text>
+  <text x="96" y="118" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">$ claude-proxy --help</text><text x="96" y="148" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Claude-compatible proxy for OpenAI and Anthropic providers</text><text x="96" y="178" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400"></text><text x="96" y="208" fill="#60a5fa" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">Usage: claude-proxy &lt;COMMAND&gt;</text><text x="96" y="238" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400"></text><text x="96" y="268" fill="#c084fc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">Commands:</text><text x="96" y="298" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">  provider     Provider management</text><text x="96" y="328" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">  config       Configuration management</text><text x="96" y="358" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">  server       Server management</text><text x="96" y="388" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">  completions  Generate shell completions</text><text x="96" y="418" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">  tui          Launch interactive TUI configuration interface</text><text x="96" y="448" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400"></text><text x="96" y="478" fill="#fbbf24" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">One binary: provider setup, runtime control, completions and TUI.</text>
 </svg>

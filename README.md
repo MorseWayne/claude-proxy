@@ -18,27 +18,57 @@ Claude 兼容代理服务器：把 Claude Code、Claude SDK 或任何 Anthropic 
 
 ## 截图预览
 
-### CLI 总览
+### 1. 快速接入 Claude Code
+
+从添加 provider、启动服务到设置 `ANTHROPIC_BASE_URL`，核心路径只需要几条命令。
+
+![快速接入流程](images/quickstart-flow.svg)
+
+### 2. CLI 总览
+
+一个二进制覆盖 provider、配置、服务、补全和 TUI，不需要额外运行时或后台管理面板。
 
 ![CLI 总览](images/cli-overview.svg)
 
-### Provider 管理
+### 3. Provider 管理
+
+Provider 命令覆盖添加、测试、测速、切换和模型缓存刷新，适合在本地快速试错多个上游。
 
 ![Provider 命令](images/provider-commands.svg)
 
-### 配置与服务控制
+### 4. Provider 支持矩阵
+
+API key provider 和 OAuth provider 可以共存在同一份 TOML 配置中，再通过模型名精确路由。
+
+![Provider 支持矩阵](images/provider-matrix.svg)
+
+### 5. 配置与服务控制
+
+配置查看会自动脱敏；服务侧支持前台运行、Unix daemon、SIGUSR1 reload 和状态查询。
 
 ![配置与服务控制](images/config-server-commands.svg)
 
-### TUI 模型选择
+### 6. TUI 模型选择
+
+TUI 提供键盘导航的模型选择、Provider 管理和配置入口，适合不想手写 TOML 的场景。
 
 ![TUI 模型选择](images/tui-model-selection.png)
 
-### TUI 指标仪表盘
+### 7. TUI 指标仪表盘
+
+Dashboard 会展示请求数、错误数、延迟和按模型聚合的 token 用量，并合并 SQLite 历史累计数据。
 
 ![TUI 仪表盘](images/metrics-dashboard.png)
 
-### 在 Claude Code 中使用
+### 8. Metrics API
+
+管理接口可直接返回 JSON 指标，方便接入脚本、监控或自定义 dashboard。
+
+![Metrics API](images/metrics-api.svg)
+
+### 9. 在 Claude Code 中使用
+
+设置环境变量后，Claude Code 可以像访问 Anthropic API 一样访问本地代理。
 
 ![Claude Code 集成](images/claude-code-usage.png)
 

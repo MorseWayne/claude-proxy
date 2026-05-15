@@ -1,30 +1,27 @@
-<svg width="1180" height="620" viewBox="0 0 1180 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">claude-proxy runtime controls</title>
-  <desc id="desc">Terminal style screenshot showing configuration and server management commands.</desc>
+<svg width="1280" height="574" viewBox="0 0 1280 574" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Config and server controls</title>
+  <desc id="desc">Runtime configuration and server management commands.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0%" stop-color="#0f172a"/>
-      <stop offset="100%" stop-color="#111827"/>
+    <linearGradient id="page" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#eff6ff"/>
+      <stop offset="55%" stop-color="#eef2ff"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="terminal" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#101827"/>
     </linearGradient>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020617" flood-opacity="0.45"/>
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#0f172a" flood-opacity="0.28"/>
     </filter>
   </defs>
-  <rect width="1180" height="620" fill="#e5e7eb"/>
-  <rect x="70" y="56" width="1040" height="508" rx="18" fill="url(#bg)" filter="url(#shadow)"/>
-  <rect x="70" y="56" width="1040" height="52" rx="18" fill="#1f2937"/>
-  <circle cx="102" cy="82" r="7" fill="#ef4444"/>
-  <circle cx="126" cy="82" r="7" fill="#f59e0b"/>
-  <circle cx="150" cy="82" r="7" fill="#22c55e"/>
-  <text x="590" y="88" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">config and server controls</text>
-  <text x="106" y="148" fill="#22c55e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">$ claude-proxy config --help</text>
-  <text x="106" y="190" fill="#e5e7eb" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Configuration management</text>
-  <text x="132" y="230" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">show</text><text x="308" y="230" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Show current configuration (keys masked)</text>
-  <text x="132" y="264" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">validate</text><text x="308" y="264" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Validate the configuration</text>
-  <text x="132" y="298" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">export/import</text><text x="308" y="298" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Backup or restore TOML config</text>
-  <text x="106" y="358" fill="#22c55e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">$ claude-proxy server --help</text>
-  <text x="106" y="400" fill="#e5e7eb" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Server management</text>
-  <text x="132" y="440" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">start</text><text x="308" y="440" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Start the proxy server</text>
-  <text x="132" y="474" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">restart</text><text x="308" y="474" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Graceful restart via SIGUSR1</text>
-  <text x="132" y="508" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">status</text><text x="308" y="508" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Show server status</text>
+  <rect width="1280" height="574" rx="0" fill="url(#page)"/>
+  <rect x="58" y="48" width="1164" height="478" rx="24" fill="url(#terminal)" filter="url(#shadow)"/>
+  <rect x="58" y="48" width="1164" height="56" rx="24" fill="#1e293b"/>
+  <rect x="58" y="80" width="1164" height="28" fill="#1e293b"/>
+  <circle cx="92" cy="76" r="7" fill="#fb7185"/>
+  <circle cx="118" cy="76" r="7" fill="#fbbf24"/>
+  <circle cx="144" cy="76" r="7" fill="#34d399"/>
+  <text x="640" y="82" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="17">Config and server controls</text>
+  <text x="96" y="118" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">$ claude-proxy config show</text><text x="96" y="148" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">providers.openai.api_key = &quot;sk-***&quot;</text><text x="96" y="178" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">server.host = &quot;127.0.0.1&quot;</text><text x="96" y="208" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">server.port = 8082</text><text x="96" y="238" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">model.default = &quot;openai/gpt-4.1&quot;</text><text x="96" y="268" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400"></text><text x="96" y="298" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">$ claude-proxy config validate</text><text x="96" y="328" fill="#22d3ee" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">Configuration is valid</text><text x="96" y="358" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400"></text><text x="96" y="388" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">$ claude-proxy server start --daemon</text><text x="96" y="418" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Listening on http://127.0.0.1:8082</text><text x="96" y="448" fill="#fbbf24" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">Config watcher, SIGUSR1 reload and model cache warmup are enabled.</text>
 </svg>

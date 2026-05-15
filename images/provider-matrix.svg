@@ -1,0 +1,27 @@
+<svg width="1280" height="520" viewBox="0 0 1280 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Provider matrix</title>
+  <desc id="desc">Supported provider categories and authentication methods.</desc>
+  <defs>
+    <linearGradient id="page" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#eff6ff"/>
+      <stop offset="55%" stop-color="#eef2ff"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="terminal" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#101827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#0f172a" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="520" rx="0" fill="url(#page)"/>
+  <rect x="58" y="48" width="1164" height="424" rx="24" fill="url(#terminal)" filter="url(#shadow)"/>
+  <rect x="58" y="48" width="1164" height="56" rx="24" fill="#1e293b"/>
+  <rect x="58" y="80" width="1164" height="28" fill="#1e293b"/>
+  <circle cx="92" cy="76" r="7" fill="#fb7185"/>
+  <circle cx="118" cy="76" r="7" fill="#fbbf24"/>
+  <circle cx="144" cy="76" r="7" fill="#34d399"/>
+  <text x="640" y="82" text-anchor="middle" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="17">Provider matrix</text>
+  <text x="96" y="118" fill="#60a5fa" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="700">Provider             Auth       Adapter                         Best for</text><text x="96" y="148" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">────────────────────────────────────────────────────────────────────────────────────</text><text x="96" y="178" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">OpenAI               API key    OpenAI Chat Completions         GPT and compatible APIs</text><text x="96" y="208" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Anthropic            API key    Anthropic passthrough           Official Claude API</text><text x="96" y="238" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">GitHub Copilot       OAuth      Copilot + VS Code headers       Copilot account routing</text><text x="96" y="268" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">ChatGPT              OAuth      Codex backend device flow       ChatGPT Pro/Plus usage</text><text x="96" y="298" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">OpenRouter           API key    OpenAI-compatible adapter       Multi-model marketplace</text><text x="96" y="328" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Google               API key    OpenAI-compatible adapter       Gemini-compatible routing</text><text x="96" y="358" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Custom OpenAI        API key    OpenAI-compatible adapter       one-api / LiteLLM / vLLM</text><text x="96" y="388" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="20" font-weight="400">Custom Anthropic     API key    Anthropic adapter               Private Claude gateways</text>
+</svg>
