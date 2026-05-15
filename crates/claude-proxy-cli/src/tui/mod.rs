@@ -4,10 +4,12 @@ pub mod theme;
 pub mod ui;
 pub mod widgets;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -346,6 +348,11 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
 }
 
 fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
+    if matches!(app.overlay, Some(Overlay::OAuth(_))) {
+        handle_oauth_overlay_key(app, key);
+        return;
+    }
+
     match app.overlay.as_mut().unwrap() {
         Overlay::Confirm(overlay) => {
             match key.code {
@@ -501,8 +508,9 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 .nth(idx)
                                 .unwrap_or(ProviderType::Custom(String::new()));
 
-                            let default_id = provider_type.as_str().to_string();
-                            let id = generate_unique_provider_id(&app.settings.providers, &default_id);
+                            let default_id = default_provider_id(&provider_type).to_string();
+                            let id = default_id;
+                            let provider_type = provider_type_with_id(provider_type, &id);
 
                             let copilot = if provider_type == ProviderType::Copilot {
                                 Some(CopilotProviderConfig::default())
@@ -512,6 +520,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
 
                             let is_oauth = !provider_type.needs_api_key();
 
+                            let replaced = app.settings.providers.contains_key(&id);
                             app.settings.providers.insert(
                                 id.clone(),
                                 ProviderConfig {
@@ -523,11 +532,17 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 },
                             );
                             app.mark_dirty();
-                            app.content_idx = app.settings.providers.len().saturating_sub(1);
+                            app.content_idx = app
+                                .settings
+                                .providers
+                                .keys()
+                                .position(|provider_id| provider_id == &id)
+                                .unwrap_or_else(|| app.settings.providers.len().saturating_sub(1));
                             app.overlay = None;
                             app.focus = Focus::Content;
+                            let action = if replaced { "Updated" } else { "Added" };
                             app.show_toast(Toast::success(format!(
-                                "Added \"{id}\". Edit fields, Ctrl+S to save."
+                                "{action} \"{id}\". Edit fields, Ctrl+S to save."
                             )));
 
                             // Start OAuth flow for providers that need it
@@ -552,16 +567,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                 app.show_toast(Toast::info("Cancelled"));
             }
         }
-        Overlay::OAuth(_) => {
-            if key.code == KeyCode::Esc {
-                app.overlay = None;
-                app.focus = Focus::Content;
-                app.oauth_rx = None;
-                app.oauth_pending_id = None;
-                app.oauth_device_info = None;
-                app.show_toast(Toast::info("OAuth cancelled"));
-            }
-        }
+        Overlay::OAuth(_) => {}
         Overlay::Help => {
             if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
                 app.overlay = None;
@@ -569,6 +575,55 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
             }
         }
     }
+}
+
+fn handle_oauth_overlay_key(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = None;
+            app.focus = Focus::Content;
+            app.oauth_rx = None;
+            app.oauth_pending_id = None;
+            app.oauth_device_info = None;
+            app.show_toast(Toast::info("OAuth cancelled"));
+        }
+        KeyCode::Char('c') => copy_oauth_value(app, OAuthCopyTarget::Code),
+        KeyCode::Char('u') => copy_oauth_value(app, OAuthCopyTarget::Url),
+        _ => {}
+    }
+}
+
+enum OAuthCopyTarget {
+    Code,
+    Url,
+}
+
+fn copy_oauth_value(app: &mut App, target: OAuthCopyTarget) {
+    let Some(Overlay::OAuth(oauth)) = app.overlay.as_ref() else {
+        return;
+    };
+
+    let OAuthStep::ShowCode { url, code } = &oauth.step else {
+        app.show_toast(Toast::info("Device code not ready yet"));
+        return;
+    };
+
+    let (label, value) = match target {
+        OAuthCopyTarget::Code => ("Device code", code.as_str()),
+        OAuthCopyTarget::Url => ("Verification URL", url.as_str()),
+    };
+
+    match copy_to_clipboard(value) {
+        Ok(()) => app.show_toast(Toast::success(format!("{label} copied"))),
+        Err(err) => app.show_toast(Toast::error(format!("Copy failed: {err}"))),
+    }
+}
+
+fn copy_to_clipboard(value: &str) -> io::Result<()> {
+    let encoded = general_purpose::STANDARD.encode(value.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
 }
 
 // ── Actions ──
@@ -944,6 +999,7 @@ fn add_provider(app: &mut App) {
                 ProviderType::OpenRouter => " — API key, OpenAI-compatible",
                 ProviderType::Google => " — API key, OpenAI-compatible",
                 ProviderType::Custom(_) => " — OpenAI-compatible",
+                ProviderType::CustomAnthropic(_) => " — Anthropic-compatible",
             };
             format!("{}{}", t.display_name(), desc)
         })
@@ -958,17 +1014,20 @@ fn add_provider(app: &mut App) {
     app.focus = Focus::Overlay;
 }
 
-fn generate_unique_provider_id(providers: &std::collections::HashMap<String, ProviderConfig>, base: &str) -> String {
-    if !providers.contains_key(base) {
-        return base.to_string();
+fn default_provider_id(provider_type: &ProviderType) -> &str {
+    match provider_type {
+        ProviderType::Custom(_) => "custom-openai",
+        ProviderType::CustomAnthropic(_) => "custom-anthropic",
+        _ => provider_type.as_str(),
     }
-    for n in 2..100 {
-        let candidate = format!("{base}-{n}");
-        if !providers.contains_key(&candidate) {
-            return candidate;
-        }
+}
+
+fn provider_type_with_id(provider_type: ProviderType, id: &str) -> ProviderType {
+    match provider_type {
+        ProviderType::Custom(_) => ProviderType::Custom(id.to_string()),
+        ProviderType::CustomAnthropic(_) => ProviderType::CustomAnthropic(id.to_string()),
+        other => other,
     }
-    format!("{base}-{}", providers.len() + 1)
 }
 
 /// Fetch models using the provider trait (handles OAuth, API keys, etc. correctly).
@@ -1018,6 +1077,7 @@ fn fetch_models_via_provider(
 /// Start the GitHub OAuth device flow for a Copilot provider in the background.
 fn start_oauth_flow(app: &mut App, provider_id: &str) {
     let pid = provider_id.to_string();
+    let settings = app.settings.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     app.oauth_rx = Some(rx);
     app.oauth_pending_id = Some(pid.clone());
@@ -1030,11 +1090,17 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .expect("oauth runtime");
         rt.block_on(async {
-            let client = reqwest::Client::new();
+            let client = match build_tui_oauth_http_client(&settings) {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = tx.send(OAuthResult::Error(e));
+                    return;
+                }
+            };
             match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await
             {
                 Ok(auth) => match auth.start_device_code().await {
@@ -1068,11 +1134,30 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
     });
 }
 
+fn build_tui_oauth_http_client(settings: &Settings) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(settings.http.connect_timeout))
+        .read_timeout(Duration::from_secs(settings.http.read_timeout));
+
+    builder = claude_proxy_providers::apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)
+        .map_err(|e| e.to_string())?;
+
+    builder
+        .build()
+        .map_err(|e| claude_proxy_providers::fmt_reqwest_err(&e))
+}
+
 /// Poll OAuth background thread results and update overlay state.
 fn poll_oauth(app: &mut App) {
-    if let Some(ref rx) = app.oauth_rx
-        && let Ok(result) = rx.try_recv()
-    {
+    if let Some(ref rx) = app.oauth_rx {
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                OAuthResult::Error("OAuth worker exited before returning a device code".into())
+            }
+        };
+
         match result {
             OAuthResult::CodeInfo {
                 url,
@@ -1110,14 +1195,6 @@ fn poll_oauth(app: &mut App) {
                 // Keep overlay open so user can see the error; Esc to dismiss
             }
         }
-    }
-
-    // Advance Polling state if we've shown the code and are waiting
-    if let Some(Overlay::OAuth(ref mut oa)) = app.overlay
-        && matches!(oa.step, OAuthStep::ShowCode { .. })
-        && app.oauth_rx.is_some()
-    {
-        oa.step = OAuthStep::Polling;
     }
 }
 

@@ -192,7 +192,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
 
     // Actions hint at bottom
     let hints = if detail_focused {
-        vec![
+        let mut hints = vec![
             Span::styled(
                 " e ",
                 Style::default()
@@ -209,12 +209,28 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" Back to list", widgets::dim_style()),
-        ]
+        ];
+        if !pt.needs_api_key() {
+            hints.push(Span::styled(
+                "  o ",
+                Style::default()
+                    .fg(theme::BG_DARK)
+                    .bg(theme::ACCENT2)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            hints.push(Span::styled(" Re-auth", widgets::dim_style()));
+        }
+        hints
     } else {
-        vec![Span::styled(
+        let mut hints = vec![Span::styled(
             "  Press → or Enter to edit fields",
             widgets::dim_style(),
-        )]
+        )];
+        if !pt.needs_api_key() {
+            hints.push(Span::styled("  o ", widgets::dim_style()));
+            hints.push(Span::styled("Re-auth", widgets::dim_style()));
+        }
+        hints
     };
     f.render_widget(Paragraph::new(Line::from(hints)), rows[6]);
 }

@@ -53,9 +53,9 @@ enum ProviderAction {
     List,
     /// Show the current default model
     Current,
-    /// Add a new provider (interactive if ID omitted)
+    /// Add a new provider
     Add {
-        /// Provider ID (e.g., "openai", "anthropic")
+        /// Optional provider ID or known provider type (e.g., "copilot")
         id: Option<String>,
     },
     /// Edit a provider's configuration
@@ -261,26 +261,53 @@ async fn handle_provider(action: ProviderAction) {
             println!("{}", settings.model.default.cyan());
         }
         ProviderAction::Add { id } => {
-            let provider_id = id.unwrap_or_else(|| {
-                dialoguer::Input::new()
-                    .with_prompt("Provider ID")
-                    .interact_text()
-                    .unwrap()
-            });
+            let mut settings = match claude_proxy_config::Settings::config_file_path() {
+                Some(path) if path.exists() => claude_proxy_config::Settings::load(&path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} Failed to load config: {e}", "Error:".red().bold());
+                        process::exit(1);
+                    }),
+                _ => claude_proxy_config::Settings::default(),
+            };
 
-            // Select provider type
-            let known_types = ProviderType::known_types();
-            let type_names: Vec<String> = known_types
-                .iter()
-                .map(|t| t.display_name().to_string())
-                .collect();
-            let type_idx = dialoguer::Select::new()
-                .with_prompt("Provider type")
-                .items(&type_names)
-                .default(0)
-                .interact()
-                .unwrap();
-            let provider_type = known_types[type_idx].clone();
+            let (provider_id, provider_type) = match id {
+                Some(provider_id) => {
+                    let inferred_type = ProviderType::parse(&provider_id);
+                    let provider_type = if is_custom_provider_type(&inferred_type) {
+                        prompt_provider_type()
+                    } else {
+                        println!(
+                            "Provider type: {} (inferred from \"{}\")",
+                            inferred_type.display_name(),
+                            provider_id
+                        );
+                        inferred_type
+                    };
+                    (provider_id, provider_type)
+                }
+                None => {
+                    let provider_type = prompt_provider_type();
+                    let provider_id = if is_custom_provider_type(&provider_type) {
+                        dialoguer::Input::new()
+                            .with_prompt("Provider ID")
+                            .interact_text()
+                            .unwrap()
+                    } else {
+                        let id = provider_type.as_str().to_string();
+                        println!("Provider ID: {}", id.green());
+                        id
+                    };
+                    (provider_id, provider_type)
+                }
+            };
+
+            let provider_type = match provider_type {
+                ProviderType::Custom(_) => ProviderType::Custom(provider_id.clone()),
+                ProviderType::CustomAnthropic(_) => {
+                    ProviderType::CustomAnthropic(provider_id.clone())
+                }
+                other => other,
+            };
 
             let api_key: String = if provider_type.needs_api_key() {
                 dialoguer::Password::new()
@@ -309,14 +336,7 @@ async fn handle_provider(action: ProviderAction) {
                 None
             };
 
-            let mut settings = match claude_proxy_config::Settings::config_file_path() {
-                Some(path) if path.exists() => claude_proxy_config::Settings::load(&path)
-                    .unwrap_or_else(|e| {
-                        eprintln!("{} Failed to load config: {e}", "Error:".red().bold());
-                        process::exit(1);
-                    }),
-                _ => claude_proxy_config::Settings::default(),
-            };
+            let replaced = settings.providers.contains_key(&provider_id);
             settings.providers.insert(
                 provider_id.clone(),
                 ProviderConfig {
@@ -329,8 +349,9 @@ async fn handle_provider(action: ProviderAction) {
             );
 
             save_settings(&settings);
+            let action = if replaced { "updated" } else { "added" };
             println!(
-                "{} Provider \"{}\" (type: {}) added.",
+                "{} Provider \"{}\" (type: {}) {action}.",
                 "✓".green().bold(),
                 provider_id.green(),
                 provider_type.display_name()
@@ -892,4 +913,26 @@ fn is_process_running(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn is_process_running(_pid: u32) -> bool {
     false
+}
+
+fn prompt_provider_type() -> ProviderType {
+    let known_types = ProviderType::known_types();
+    let type_names: Vec<String> = known_types
+        .iter()
+        .map(|t| t.display_name().to_string())
+        .collect();
+    let type_idx = dialoguer::Select::new()
+        .with_prompt("Provider type")
+        .items(&type_names)
+        .default(0)
+        .interact()
+        .unwrap();
+    known_types[type_idx].clone()
+}
+
+fn is_custom_provider_type(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::Custom(_) | ProviderType::CustomAnthropic(_)
+    )
 }

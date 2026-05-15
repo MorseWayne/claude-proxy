@@ -91,7 +91,7 @@ fn get_footer_hints(app: &App) -> (Vec<HintPair>, Vec<HintPair>) {
             Overlay::Input(_) => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
             Overlay::Picker(_) => vec![("↑↓", "move"), ("Enter", "select"), ("Esc", "cancel")],
             Overlay::Loading(_) => vec![("Esc", "cancel")],
-            Overlay::OAuth(_) => vec![("Esc", "cancel")],
+            Overlay::OAuth(_) => vec![("c", "copy code"), ("u", "copy url"), ("Esc", "cancel")],
             Overlay::Help => vec![("Esc", "Close")],
         };
         return (vec![], acts);
@@ -113,11 +113,13 @@ fn get_footer_hints(app: &App) -> (Vec<HintPair>, Vec<HintPair>) {
                         ("→/Enter", "detail"),
                         ("a", "add"),
                         ("d", "delete"),
+                        ("o", "auth"),
                         ("Esc", "back"),
                         ("?", "help"),
                     ],
                     ProviderFocus::Detail => vec![
                         ("e/Enter", "edit"),
+                        ("o", "auth"),
                         ("←/Esc", "list"),
                         ("Ctrl+S", "save"),
                         ("?", "help"),

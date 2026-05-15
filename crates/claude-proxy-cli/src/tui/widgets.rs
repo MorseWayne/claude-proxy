@@ -588,6 +588,10 @@ pub fn render_help_overlay(f: &mut Frame, area: Rect) {
             Span::styled("  d           ", key_style),
             Span::raw("  Delete provider"),
         ]),
+        Line::from(vec![
+            Span::styled("  o           ", key_style),
+            Span::raw("  Authenticate / re-authenticate OAuth provider"),
+        ]),
         Line::from(""),
         Line::from(Span::styled(" General", section_style)),
         Line::from(""),
@@ -765,6 +769,10 @@ pub fn render_oauth_overlay(
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
+            Line::from(Span::styled(
+                "  Press c to copy code, u to copy URL",
+                dim_style(),
+            )),
             Line::from(Span::styled("  Waiting for authorization...", dim_style())),
         ],
         OAuthStep::Polling => vec![

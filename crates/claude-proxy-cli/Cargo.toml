@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 dialoguer = "0.11"

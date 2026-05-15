@@ -42,6 +42,15 @@ pub async fn create_provider(
             settings.http.read_timeout,
             &settings.http.extra_ca_certs,
         )?)),
+        ProviderType::CustomAnthropic(_) => Ok(Box::new(anthropic::AnthropicProvider::new(
+            provider_id,
+            &config.api_key,
+            &config.base_url,
+            &config.proxy,
+            settings.http.connect_timeout,
+            settings.http.read_timeout,
+            &settings.http.extra_ca_certs,
+        )?)),
         ProviderType::Copilot => Ok(Box::new(
             copilot::CopilotProvider::new(provider_id, config, settings).await?,
         )),

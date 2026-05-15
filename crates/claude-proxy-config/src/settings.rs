@@ -116,7 +116,10 @@ pub enum ProviderType {
     Copilot,
     OpenRouter,
     Google,
+    /// Custom OpenAI-compatible endpoint.
     Custom(String),
+    /// Custom Anthropic-compatible endpoint.
+    CustomAnthropic(String),
 }
 
 impl std::str::FromStr for ProviderType {
@@ -129,6 +132,7 @@ impl std::str::FromStr for ProviderType {
             "copilot" | "github-copilot" => ProviderType::Copilot,
             "openrouter" => ProviderType::OpenRouter,
             "google" => ProviderType::Google,
+            "custom-anthropic" => ProviderType::CustomAnthropic(String::new()),
             _ => ProviderType::Custom(s.to_string()),
         })
     }
@@ -149,6 +153,7 @@ impl ProviderType {
             ProviderType::OpenRouter => "openrouter",
             ProviderType::Google => "google",
             ProviderType::Custom(s) => s.as_str(),
+            ProviderType::CustomAnthropic(s) => s.as_str(),
         }
     }
 
@@ -161,6 +166,7 @@ impl ProviderType {
             ProviderType::OpenRouter => "OpenRouter",
             ProviderType::Google => "Google",
             ProviderType::Custom(_) => "Custom (OpenAI-compatible)",
+            ProviderType::CustomAnthropic(_) => "Custom (Anthropic-compatible)",
         }
     }
 
@@ -173,6 +179,7 @@ impl ProviderType {
             ProviderType::OpenRouter => "https://openrouter.ai/api/v1",
             ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta",
             ProviderType::Custom(_) => "",
+            ProviderType::CustomAnthropic(_) => "",
         }
     }
 
@@ -206,6 +213,7 @@ impl ProviderType {
             ProviderType::OpenRouter,
             ProviderType::Google,
             ProviderType::Custom(String::new()),
+            ProviderType::CustomAnthropic(String::new()),
         ]
     }
 }
@@ -214,6 +222,9 @@ impl Serialize for ProviderType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             ProviderType::Custom(s) => serializer.serialize_str(&format!("custom:{s}")),
+            ProviderType::CustomAnthropic(s) => {
+                serializer.serialize_str(&format!("custom-anthropic:{s}"))
+            }
             _ => serializer.serialize_str(self.as_str()),
         }
     }
@@ -222,7 +233,11 @@ impl Serialize for ProviderType {
 impl<'de> Deserialize<'de> for ProviderType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        if let Some(name) = s.strip_prefix("custom:") {
+        if let Some(name) = s.strip_prefix("custom-anthropic:") {
+            Ok(ProviderType::CustomAnthropic(name.to_string()))
+        } else if let Some(name) = s.strip_prefix("custom:anthropic:") {
+            Ok(ProviderType::CustomAnthropic(name.to_string()))
+        } else if let Some(name) = s.strip_prefix("custom:") {
             Ok(ProviderType::Custom(name.to_string()))
         } else {
             Ok(ProviderType::parse(&s))
@@ -603,6 +618,10 @@ auth_token = "test-token"
         assert_eq!(ProviderType::parse("openrouter"), ProviderType::OpenRouter);
         assert_eq!(ProviderType::parse("google"), ProviderType::Google);
         assert!(matches!(
+            ProviderType::parse("custom-anthropic"),
+            ProviderType::CustomAnthropic(s) if s.is_empty()
+        ));
+        assert!(matches!(
             ProviderType::parse("my-custom"),
             ProviderType::Custom(s) if s == "my-custom"
         ));
@@ -614,6 +633,7 @@ auth_token = "test-token"
         assert_eq!(ProviderType::Anthropic.as_str(), "anthropic");
         assert_eq!(ProviderType::Copilot.as_str(), "copilot");
         assert_eq!(ProviderType::Custom("foo".into()).as_str(), "foo");
+        assert_eq!(ProviderType::CustomAnthropic("bar".into()).as_str(), "bar");
     }
 
     #[test]
@@ -639,6 +659,10 @@ auth_token = "test-token"
                 .contains("openrouter.ai")
         );
         assert_eq!(ProviderType::Custom("x".into()).default_base_url(), "");
+        assert_eq!(
+            ProviderType::CustomAnthropic("x".into()).default_base_url(),
+            ""
+        );
     }
 
     #[test]
@@ -658,6 +682,7 @@ auth_token = "test-token"
             ProviderType::OpenRouter,
             ProviderType::Google,
             ProviderType::Custom("my-provider".into()),
+            ProviderType::CustomAnthropic("my-anthropic".into()),
         ];
         for pt in cases {
             let json = serde_json::to_string(&pt).unwrap();
@@ -695,8 +720,21 @@ base_url = "https://custom.example.com"
     }
 
     #[test]
+    fn test_custom_anthropic_provider_type_deserialize() {
+        let pt: ProviderType = serde_json::from_str("\"custom-anthropic:my-claude\"").unwrap();
+        assert!(matches!(
+            pt,
+            ProviderType::CustomAnthropic(ref s) if s == "my-claude"
+        ));
+        assert_eq!(
+            serde_json::to_string(&pt).unwrap(),
+            "\"custom-anthropic:my-claude\""
+        );
+    }
+
+    #[test]
     fn test_known_types_count() {
         let types = ProviderType::known_types();
-        assert_eq!(types.len(), 6);
+        assert_eq!(types.len(), 7);
     }
 }
