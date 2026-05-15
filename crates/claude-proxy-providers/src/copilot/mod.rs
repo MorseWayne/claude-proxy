@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use crate::http::{apply_extra_ca_certs, fmt_reqwest_err};
 use crate::provider::{Provider, ProviderError};
 
 use self::auth::CopilotAuth;
@@ -81,9 +82,14 @@ impl CopilotProvider {
             );
         }
 
-        builder
-            .build()
-            .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))
+        builder = apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)?;
+
+        builder.build().map_err(|e| {
+            ProviderError::Network(format!(
+                "failed to build HTTP client: {}",
+                fmt_reqwest_err(&e)
+            ))
+        })
     }
 
     fn build_headers(&self, token: &str, vision: bool) -> HeaderMap {
@@ -150,7 +156,7 @@ impl CopilotProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Network(e.to_string())
+                    ProviderError::Network(fmt_reqwest_err(&e))
                 }
             })?;
 
@@ -162,14 +168,14 @@ impl CopilotProvider {
             let stream = response.bytes_stream().map(|chunk| {
                 chunk
                     .map(|bytes| parse_anthropic_sse(&bytes))
-                    .map_err(|e| ProviderError::Network(e.to_string()))
+                    .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))
             });
             Ok(Box::pin(stream))
         } else {
             let body = response
                 .text()
                 .await
-                .map_err(|e| ProviderError::Network(e.to_string()))?;
+                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = SseEvent {
                 event: "message".to_string(),
@@ -203,7 +209,7 @@ impl CopilotProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Network(e.to_string())
+                    ProviderError::Network(fmt_reqwest_err(&e))
                 }
             })?;
 
@@ -240,7 +246,9 @@ impl CopilotProvider {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(ProviderError::Network(e.to_string()))).await;
+                            let _ = tx
+                                .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
+                                .await;
                             return;
                         }
                     }
@@ -259,7 +267,7 @@ impl CopilotProvider {
             let body = response
                 .text()
                 .await
-                .map_err(|e| ProviderError::Network(e.to_string()))?;
+                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let events = crate::openai::convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
@@ -363,7 +371,7 @@ impl Provider for CopilotProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Network(e.to_string())
+                    ProviderError::Network(fmt_reqwest_err(&e))
                 }
             })?;
 

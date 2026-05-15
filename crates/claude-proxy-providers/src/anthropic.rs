@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::debug;
 
+use crate::http::{apply_extra_ca_certs, fmt_reqwest_err};
 use crate::provider::{Provider, ProviderError};
 
 pub struct AnthropicProvider {
@@ -21,6 +22,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: &str,
         api_key: &str,
@@ -28,6 +30,7 @@ impl AnthropicProvider {
         proxy: &str,
         connect_timeout: u64,
         read_timeout: u64,
+        extra_ca_certs: &[String],
     ) -> Result<Self, ProviderError> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout))
@@ -51,9 +54,14 @@ impl AnthropicProvider {
             );
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))?;
+        builder = apply_extra_ca_certs(builder, extra_ca_certs)?;
+
+        let client = builder.build().map_err(|e| {
+            ProviderError::Network(format!(
+                "failed to build HTTP client: {}",
+                fmt_reqwest_err(&e)
+            ))
+        })?;
 
         Ok(Self {
             id: id.to_string(),
@@ -91,7 +99,7 @@ impl Provider for AnthropicProvider {
                 if e.is_timeout() {
                     ProviderError::Timeout
                 } else {
-                    ProviderError::Network(e.to_string())
+                    ProviderError::Network(fmt_reqwest_err(&e))
                 }
             })?;
 
@@ -118,14 +126,14 @@ impl Provider for AnthropicProvider {
             let stream = response.bytes_stream().map(|chunk| {
                 chunk
                     .map(|bytes| parse_anthropic_sse(&bytes))
-                    .map_err(|e| ProviderError::Network(e.to_string()))
+                    .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))
             });
             Ok(Box::pin(stream))
         } else {
             let body = response
                 .text()
                 .await
-                .map_err(|e| ProviderError::Network(e.to_string()))?;
+                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = SseEvent {
                 event: "message".to_string(),

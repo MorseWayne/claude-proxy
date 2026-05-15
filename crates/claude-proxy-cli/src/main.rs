@@ -340,13 +340,32 @@ async fn handle_provider(action: ProviderAction) {
             if provider_type == ProviderType::Copilot {
                 println!();
                 println!("{}", "Authenticating with GitHub Copilot...".bold());
-                let client = reqwest::Client::new();
+                let client = match build_oauth_http_client(&settings) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} Failed to build HTTP client: {e}", "✗".red().bold());
+                        if !settings.http.extra_ca_certs.is_empty() {
+                            eprintln!(
+                                "  hint: check that http.extra_ca_certs entries are readable PEM files"
+                            );
+                        }
+                        return;
+                    }
+                };
                 match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode")
                     .await
                 {
                     Ok(auth) => {
                         if let Err(e) = auth.run_device_flow().await {
                             eprintln!("{} Authentication failed: {e}", "✗".red().bold());
+                            if matches!(e, claude_proxy_providers::ProviderError::Network(_)) {
+                                let cfg_path = claude_proxy_config::Settings::config_file_path()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
+                                eprintln!(
+                                    "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
+                                );
+                            }
                             return;
                         }
                         let _ = auth.refresh_copilot_token().await;
@@ -476,7 +495,11 @@ async fn handle_provider(action: ProviderAction) {
                 .and_then(|cfg| {
                     let pt = cfg.resolve_type(&id);
                     let m = pt.default_model_name();
-                    if m.is_empty() { None } else { Some(m.to_string()) }
+                    if m.is_empty() {
+                        None
+                    } else {
+                        Some(m.to_string())
+                    }
                 })
                 .unwrap_or_else(|| "default".to_string());
             let model_ref = format!("{id}/{model_name}");
@@ -764,6 +787,29 @@ async fn handle_server(action: ServerAction) {
             }
         },
     }
+}
+
+/// Build the reqwest client used by the interactive Copilot OAuth device
+/// flow. Honours `http.connect_timeout`, `http.read_timeout`, and
+/// `http.extra_ca_certs` so the CLI behaves the same as the server-side
+/// providers — important when the user is behind a TLS-intercepting firewall
+/// (Fortinet, Zscaler, ...) where the corporate root CA must be added
+/// explicitly because rustls-tls does not consult the system trust store.
+fn build_oauth_http_client(
+    settings: &claude_proxy_config::Settings,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            settings.http.connect_timeout,
+        ))
+        .read_timeout(std::time::Duration::from_secs(settings.http.read_timeout));
+
+    builder = claude_proxy_providers::apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)
+        .map_err(|e| e.to_string())?;
+
+    builder
+        .build()
+        .map_err(|e| claude_proxy_providers::fmt_reqwest_err(&e))
 }
 
 fn load_settings_or_exit() -> claude_proxy_config::Settings {

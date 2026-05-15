@@ -2,9 +2,11 @@
 
 pub mod anthropic;
 pub mod copilot;
+pub mod http;
 pub mod openai;
 pub mod provider;
 
+pub use http::{apply_extra_ca_certs, fmt_err_chain, fmt_reqwest_err};
 pub use provider::{Provider, ProviderError};
 
 use claude_proxy_config::Settings;
@@ -29,6 +31,7 @@ pub async fn create_provider(
             &config.proxy,
             settings.http.connect_timeout,
             settings.http.read_timeout,
+            &settings.http.extra_ca_certs,
         )?)),
         ProviderType::Anthropic => Ok(Box::new(anthropic::AnthropicProvider::new(
             provider_id,
@@ -37,6 +40,7 @@ pub async fn create_provider(
             &config.proxy,
             settings.http.connect_timeout,
             settings.http.read_timeout,
+            &settings.http.extra_ca_certs,
         )?)),
         ProviderType::Copilot => Ok(Box::new(
             copilot::CopilotProvider::new(provider_id, config, settings).await?,
@@ -49,6 +53,7 @@ pub async fn create_provider(
                 &config.proxy,
                 settings.http.connect_timeout,
                 settings.http.read_timeout,
+                &settings.http.extra_ca_certs,
             )?))
         }
     }

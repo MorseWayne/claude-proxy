@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
+use crate::http::fmt_reqwest_err;
 use crate::provider::ProviderError;
 
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -152,7 +153,10 @@ impl CopilotAuth {
 
     /// Poll GitHub until the user authorizes the device code.
     /// Returns the GitHub access token on success.
-    pub async fn complete_device_code(&self, info: &DeviceCodeInfo) -> Result<String, ProviderError> {
+    pub async fn complete_device_code(
+        &self,
+        info: &DeviceCodeInfo,
+    ) -> Result<String, ProviderError> {
         let dc = DeviceCodeResponse {
             device_code: info.device_code.clone(),
             user_code: info.user_code.clone(),
@@ -196,7 +200,12 @@ impl CopilotAuth {
             }))
             .send()
             .await
-            .map_err(|e| ProviderError::Network(format!("device code request failed: {e}")))?;
+            .map_err(|e| {
+                ProviderError::Network(format!(
+                    "device code request failed: {}",
+                    fmt_reqwest_err(&e)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -205,9 +214,12 @@ impl CopilotAuth {
             )));
         }
 
-        resp.json::<DeviceCodeResponse>()
-            .await
-            .map_err(|e| ProviderError::Network(format!("invalid device code response: {e}")))
+        resp.json::<DeviceCodeResponse>().await.map_err(|e| {
+            ProviderError::Network(format!(
+                "invalid device code response: {}",
+                fmt_reqwest_err(&e)
+            ))
+        })
     }
 
     async fn poll_for_token(&self, dc: &DeviceCodeResponse) -> Result<String, ProviderError> {
@@ -228,7 +240,9 @@ impl CopilotAuth {
                 }))
                 .send()
                 .await
-                .map_err(|e| ProviderError::Network(format!("token poll failed: {e}")))?;
+                .map_err(|e| {
+                    ProviderError::Network(format!("token poll failed: {}", fmt_reqwest_err(&e)))
+                })?;
 
             let body_text = resp.text().await.unwrap_or_default();
             let parsed: AccessTokenResponse = serde_json::from_str(&body_text)
@@ -301,7 +315,12 @@ impl CopilotAuth {
             .header("editor-version", "vscode/1.118.0")
             .send()
             .await
-            .map_err(|e| ProviderError::Network(format!("copilot token request failed: {e}")))?;
+            .map_err(|e| {
+                ProviderError::Network(format!(
+                    "copilot token request failed: {}",
+                    fmt_reqwest_err(&e)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -320,10 +339,12 @@ impl CopilotAuth {
             return Err(ProviderError::UpstreamError { status, body });
         }
 
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Network(format!("invalid copilot token response: {e}")))?;
+        let data: Value = resp.json().await.map_err(|e| {
+            ProviderError::Network(format!(
+                "invalid copilot token response: {}",
+                fmt_reqwest_err(&e)
+            ))
+        })?;
 
         let token_str = data["token"]
             .as_str()

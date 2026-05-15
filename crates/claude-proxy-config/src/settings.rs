@@ -213,9 +213,7 @@ impl ProviderType {
 impl Serialize for ProviderType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            ProviderType::Custom(s) => {
-                serializer.serialize_str(&format!("custom:{s}"))
-            }
+            ProviderType::Custom(s) => serializer.serialize_str(&format!("custom:{s}")),
             _ => serializer.serialize_str(self.as_str()),
         }
     }
@@ -274,6 +272,18 @@ pub struct HttpConfig {
     pub write_timeout: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
+    /// Extra CA certificate files (PEM, single cert or bundle) to trust in
+    /// addition to the built-in webpki Mozilla roots. Required for corporate
+    /// networks that perform TLS MITM (Fortinet, Zscaler, Bluecoat, ...) —
+    /// without this, every outbound HTTPS call fails with `error sending
+    /// request` even though `curl` works, because the rustls feature this
+    /// crate uses (`rustls-tls`) does not consult the system trust store.
+    ///
+    /// Example: `extra_ca_certs = ["/etc/ssl/certs/ca-certificates.crt"]`
+    /// or point at the specific corporate root, e.g.
+    /// `["/etc/ssl/certs/FG201ETK19909125.pem"]`.
+    #[serde(default)]
+    pub extra_ca_certs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +378,7 @@ impl Default for HttpConfig {
             read_timeout: default_read_timeout(),
             write_timeout: default_write_timeout(),
             connect_timeout: default_connect_timeout(),
+            extra_ca_certs: Vec::new(),
         }
     }
 }
@@ -607,10 +618,26 @@ auth_token = "test-token"
 
     #[test]
     fn test_provider_type_default_base_url() {
-        assert!(ProviderType::OpenAI.default_base_url().contains("openai.com"));
-        assert!(ProviderType::Anthropic.default_base_url().contains("anthropic.com"));
-        assert!(ProviderType::Copilot.default_base_url().contains("githubcopilot.com"));
-        assert!(ProviderType::OpenRouter.default_base_url().contains("openrouter.ai"));
+        assert!(
+            ProviderType::OpenAI
+                .default_base_url()
+                .contains("openai.com")
+        );
+        assert!(
+            ProviderType::Anthropic
+                .default_base_url()
+                .contains("anthropic.com")
+        );
+        assert!(
+            ProviderType::Copilot
+                .default_base_url()
+                .contains("githubcopilot.com")
+        );
+        assert!(
+            ProviderType::OpenRouter
+                .default_base_url()
+                .contains("openrouter.ai")
+        );
         assert_eq!(ProviderType::Custom("x".into()).default_base_url(), "");
     }
 

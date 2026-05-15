@@ -5,9 +5,7 @@ use std::path::Path;
 use tracing::info;
 
 use crate::error::ConfigError;
-use crate::settings::{
-    ModelConfig, ProviderConfig, ProviderType, ServerConfig, Settings,
-};
+use crate::settings::{ModelConfig, ProviderConfig, ProviderType, ServerConfig, Settings};
 
 /// Migrate a legacy `.env` file to a `Settings` struct.
 ///
@@ -201,6 +199,15 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
             .get("HTTP_CONNECT_TIMEOUT")
             .and_then(|s| s.parse().ok())
             .unwrap_or(60),
+        extra_ca_certs: env
+            .get("HTTP_EXTRA_CA_CERTS")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     Settings {
