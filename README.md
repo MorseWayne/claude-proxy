@@ -8,8 +8,16 @@ Claude 兼容代理服务器，将请求路由到 OpenAI、Anthropic 或 **GitHu
 
 ## 安装
 
+Linux / macOS:
+
 ```bash
 curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
 ```
 
 或从 [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases) 下载。

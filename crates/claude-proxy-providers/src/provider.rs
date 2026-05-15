@@ -17,6 +17,18 @@ pub enum ProviderError {
     #[error("rate limited")]
     RateLimited { retry_after: Option<u64> },
 
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("request too large: {0}")]
+    RequestTooLarge(String),
+
+    #[error("upstream overloaded: {message}")]
+    Overloaded {
+        message: String,
+        retry_after: Option<u64>,
+    },
+
     #[error("upstream error (HTTP {status}): {body}")]
     UpstreamError { status: u16, body: String },
 

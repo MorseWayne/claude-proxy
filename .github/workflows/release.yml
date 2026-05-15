@@ -92,3 +92,4 @@ jobs:
             artifacts/**/*
             checksums.txt
             install.sh
+            install.ps1

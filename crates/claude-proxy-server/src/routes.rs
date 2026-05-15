@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
@@ -7,8 +8,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use claude_proxy_core::*;
-use claude_proxy_providers::provider::ProviderError;
+use claude_proxy_providers::provider::{Provider, ProviderError};
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::time::Duration;
@@ -62,10 +64,7 @@ pub async fn messages(
     {
         let settings = state.settings.read().await;
         if !check_auth(&headers, &settings.server.auth_token) {
-            state.metrics.record_error();
-            state
-                .metrics
-                .record_latency(start.elapsed().as_millis() as u64);
+            record_request_error(&state, start);
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 &ErrorResponse::authentication("invalid API key"),
@@ -83,10 +82,7 @@ pub async fn messages(
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => {
             error!("Semaphore closed unexpectedly");
-            state.metrics.record_error();
-            state
-                .metrics
-                .record_latency(start.elapsed().as_millis() as u64);
+            record_request_error(&state, start);
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("service unavailable"),
@@ -94,10 +90,7 @@ pub async fn messages(
         }
         Err(_) => {
             warn!("Concurrency limit reached, request timed out");
-            state.metrics.record_error();
-            state
-                .metrics
-                .record_latency(start.elapsed().as_millis() as u64);
+            record_request_error(&state, start);
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("too many concurrent requests"),
@@ -105,98 +98,21 @@ pub async fn messages(
         }
     };
 
-    let (_model_ref, provider_id, upstream_model) = {
-        let settings = state.settings.read().await;
-        let model_ref = settings.resolve_model(&request.model).to_string();
-        let provider_id = claude_proxy_config::Settings::parse_provider_id(&model_ref).to_string();
-        let upstream_model =
-            claude_proxy_config::Settings::parse_model_name(&model_ref).to_string();
-        (model_ref, provider_id, upstream_model)
-    };
+    let resolved = resolve_upstream_request(&state, &request).await;
 
     info!(
         "Request: model={} → {}/{}",
-        request.model, provider_id, upstream_model
+        request.model, resolved.provider_id, resolved.upstream_model
     );
-
-    // Build upstream request with resolved model name
-    let mut upstream_request = request.clone();
-    upstream_request.model = upstream_model;
 
     // --- Concurrent request deduplication ---
     // Compute a hash of the full request to identify identical inflight requests.
-    let request_hash = compute_request_hash(&upstream_request);
+    let request_hash = compute_request_hash(&resolved.request);
 
     // Check if an identical request is already in flight
+    if let Some(response) = join_inflight_request(&state, request_hash, request.stream, start).await
     {
-        let inflight = state.inflight.lock().await;
-        if let Some(sender) = inflight.get(&request_hash) {
-            let mut receiver = sender.subscribe();
-            drop(inflight);
-            debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
-
-            // Serve this request from the existing broadcast stream
-            if request.stream {
-                let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
-                tokio::spawn(async move {
-                    loop {
-                        match receiver.recv().await {
-                            Ok(InflightEvent::Event(event)) => {
-                                let sse_text = format_sse_event(&event);
-                                if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(InflightEvent::Done) | Err(_) => break,
-                            Ok(InflightEvent::Error(msg)) => {
-                                let error_event = SseEvent {
-                                    event: "error".to_string(),
-                                    data: json!({"error": {"type": "api_error", "message": msg}}),
-                                };
-                                let _ = tx
-                                    .send(Ok(format_sse_event(&error_event).into_bytes()))
-                                    .await;
-                                break;
-                            }
-                        }
-                    }
-                });
-                state
-                    .metrics
-                    .record_latency(start.elapsed().as_millis() as u64);
-                let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
-                return Response::builder()
-                    .status(200)
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("connection", "keep-alive")
-                    .body(Body::from_stream(stream_body))
-                    .unwrap();
-            } else {
-                // Non-streaming: collect from broadcast
-                let mut events = Vec::new();
-                loop {
-                    match receiver.recv().await {
-                        Ok(InflightEvent::Event(event)) => events.push(event),
-                        Ok(InflightEvent::Done) | Err(_) => break,
-                        Ok(InflightEvent::Error(msg)) => {
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &ErrorResponse::api_error(&msg),
-                            );
-                        }
-                    }
-                }
-                let response_data = events
-                    .last()
-                    .map(|e| e.data.clone())
-                    .unwrap_or(json!({"error": "no response from provider"}));
-                state
-                    .metrics
-                    .record_latency(start.elapsed().as_millis() as u64);
-                return Json(response_data).into_response();
-            }
-        }
+        return response;
     }
 
     // Register this request as inflight (we are the "leader")
@@ -207,147 +123,281 @@ pub async fn messages(
     }
 
     // Get or create provider — lock is released after obtaining the Arc
-    let provider = {
-        let mut registry = state.provider_registry.write().await;
-        let settings = state.settings.read().await;
-        match registry.get_or_create(&provider_id, &settings).await {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Provider error: {e}");
-                state.metrics.record_error();
-                state
-                    .metrics
-                    .record_latency(start.elapsed().as_millis() as u64);
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    &ErrorResponse::not_found(&format!("provider not available: {e}")),
-                );
-            }
+    let provider = match get_provider(&state, &resolved.provider_id).await {
+        Ok(provider) => provider,
+        Err(e) => {
+            error!("Provider error: {e}");
+            record_request_error(&state, start);
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &ErrorResponse::not_found(&format!("provider not available: {e}")),
+            );
         }
     };
 
     // Call provider (registry lock is no longer held)
-    match provider.chat(upstream_request).await {
-        Ok(mut stream) => {
+    match provider.chat(resolved.request).await {
+        Ok(stream) => {
             if request.stream {
-                // Streaming SSE response
-                let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
-
-                let metrics = state.metrics.clone();
-                let model_name = request.model.clone();
-                let inflight_map = state.inflight.clone();
-                tokio::spawn(async move {
-                    let task_start = std::time::Instant::now();
-                    let mut usage = TokenUsage::default();
-                    let mut had_error = false;
-                    while let Some(event_result) = stream.next().await {
-                        match event_result {
-                            Ok(event) => {
-                                // Extract token usage from streaming events
-                                extract_usage_from_event(&event.data, &mut usage);
-                                let sse_text = format_sse_event(&event);
-                                // Broadcast to dedup subscribers (ignore errors = no subscribers)
-                                let _ = broadcast_tx.send(InflightEvent::Event(event));
-                                if sender.send(Ok(sse_text.into_bytes())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                had_error = true;
-                                let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
-                                let error_event = SseEvent {
-                                    event: "error".to_string(),
-                                    data: json!({"error": {"type": "api_error", "message": e.to_string()}}),
-                                };
-                                let sse_text = format_sse_event(&error_event);
-                                let _ = sender.send(Ok(sse_text.into_bytes())).await;
-                                break;
-                            }
-                        }
-                    }
-                    // Signal completion to dedup subscribers
-                    let _ = broadcast_tx.send(InflightEvent::Done);
-                    // Remove from inflight map
-                    inflight_map.lock().await.remove(&request_hash);
-                    // Record token usage after stream completes (persisted)
-                    let latency_ms = task_start.elapsed().as_millis() as u64;
-                    metrics
-                        .record_completed_request(&model_name, &usage, had_error, latency_ms)
-                        .await;
-                });
-
-                state
-                    .metrics
-                    .record_latency(start.elapsed().as_millis() as u64);
-                let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
-                Response::builder()
-                    .status(200)
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("connection", "keep-alive")
-                    .body(Body::from_stream(stream_body))
-                    .unwrap()
+                stream_leader_response(&state, &request, request_hash, broadcast_tx, stream, start)
+                    .await
             } else {
-                // Non-streaming: collect all events and return final message
-                let mut events = Vec::new();
-                while let Some(event_result) = stream.next().await {
-                    match event_result {
-                        Ok(event) => {
-                            let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
-                            events.push(event);
-                        }
-                        Err(e) => {
-                            let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
-                            let _ = broadcast_tx.send(InflightEvent::Done);
-                            state.inflight.lock().await.remove(&request_hash);
-                            return error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &ErrorResponse::api_error(&e.to_string()),
-                            );
-                        }
-                    }
-                }
-                let _ = broadcast_tx.send(InflightEvent::Done);
-                state.inflight.lock().await.remove(&request_hash);
-
-                let response_data = events
-                    .last()
-                    .map(|e| e.data.clone())
-                    .unwrap_or(json!({"error": "no response from provider"}));
-
-                // Extract token usage from all events (message_start has input_tokens,
-                // message_delta has output_tokens; message_stop has none)
-                let mut usage = TokenUsage::default();
-                for event in &events {
-                    extract_usage_from_event(&event.data, &mut usage);
-                }
-                let latency_ms = start.elapsed().as_millis() as u64;
-                state
-                    .metrics
-                    .record_completed_request(&request.model, &usage, false, latency_ms)
-                    .await;
-
-                state.metrics.record_latency(latency_ms);
-                Json(response_data).into_response()
+                collect_leader_response(&state, &request, request_hash, broadcast_tx, stream, start)
+                    .await
             }
         }
         Err(e) => {
-            // Clean up inflight on error
-            let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
-            let _ = broadcast_tx.send(InflightEvent::Done);
-            state.inflight.lock().await.remove(&request_hash);
-
-            error!("Provider error: {e}");
-            state.metrics.record_error();
-            let latency_ms = start.elapsed().as_millis() as u64;
-            state.metrics.record_latency(latency_ms);
-            state
-                .metrics
-                .record_completed_request(&request.model, &TokenUsage::default(), true, latency_ms)
-                .await;
-            provider_error_to_response(&e)
+            handle_provider_error(&state, &request, request_hash, broadcast_tx, e, start).await
         }
     }
+}
+
+struct ResolvedUpstreamRequest {
+    provider_id: String,
+    upstream_model: String,
+    request: MessagesRequest,
+}
+
+async fn resolve_upstream_request(
+    state: &AppState,
+    request: &MessagesRequest,
+) -> ResolvedUpstreamRequest {
+    let settings = state.settings.read().await;
+    let model_ref = settings.resolve_model(&request.model).to_string();
+    let provider_id = claude_proxy_config::Settings::parse_provider_id(&model_ref).to_string();
+    let upstream_model = claude_proxy_config::Settings::parse_model_name(&model_ref).to_string();
+
+    let mut request = request.clone();
+    request.model = upstream_model.clone();
+
+    ResolvedUpstreamRequest {
+        provider_id,
+        upstream_model,
+        request,
+    }
+}
+
+async fn get_provider(state: &AppState, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+    let mut registry = state.provider_registry.write().await;
+    let settings = state.settings.read().await;
+    registry.get_or_create(provider_id, &settings).await
+}
+
+fn record_request_error(state: &AppState, start: std::time::Instant) {
+    state.metrics.record_error();
+    state
+        .metrics
+        .record_latency(start.elapsed().as_millis() as u64);
+}
+
+async fn join_inflight_request(
+    state: &AppState,
+    request_hash: u64,
+    stream: bool,
+    start: std::time::Instant,
+) -> Option<Response> {
+    let inflight = state.inflight.lock().await;
+    let sender = inflight.get(&request_hash)?;
+    let receiver = sender.subscribe();
+    drop(inflight);
+
+    debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
+
+    let response = if stream {
+        join_inflight_stream(receiver)
+    } else {
+        join_inflight_non_stream(receiver).await
+    };
+    state
+        .metrics
+        .record_latency(start.elapsed().as_millis() as u64);
+    Some(response)
+}
+
+fn join_inflight_stream(mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>) -> Response {
+    let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(InflightEvent::Event(event)) => {
+                    let sse_text = format_sse_event(&event);
+                    if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(InflightEvent::Done) | Err(_) => break,
+                Ok(InflightEvent::Error(msg)) => {
+                    let error_event = SseEvent {
+                        event: "error".to_string(),
+                        data: json!({"error": {"type": "api_error", "message": msg}}),
+                    };
+                    let _ = tx
+                        .send(Ok(format_sse_event(&error_event).into_bytes()))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    sse_body_response(body)
+}
+
+async fn join_inflight_non_stream(
+    mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
+) -> Response {
+    let mut events = Vec::new();
+    loop {
+        match receiver.recv().await {
+            Ok(InflightEvent::Event(event)) => events.push(event),
+            Ok(InflightEvent::Done) | Err(_) => break,
+            Ok(InflightEvent::Error(msg)) => {
+                return error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&msg));
+            }
+        }
+    }
+
+    let response_data = events
+        .last()
+        .map(|e| e.data.clone())
+        .unwrap_or(json!({"error": "no response from provider"}));
+    Json(response_data).into_response()
+}
+
+async fn stream_leader_response(
+    state: &AppState,
+    request: &MessagesRequest,
+    request_hash: u64,
+    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    start: std::time::Instant,
+) -> Response {
+    let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
+
+    let metrics = state.metrics.clone();
+    let model_name = request.model.clone();
+    let inflight_map = state.inflight.clone();
+    tokio::spawn(async move {
+        let task_start = std::time::Instant::now();
+        let mut usage = TokenUsage::default();
+        let mut had_error = false;
+        while let Some(event_result) = stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    extract_usage_from_event(&event.data, &mut usage);
+                    let sse_text = format_sse_event(&event);
+                    let _ = broadcast_tx.send(InflightEvent::Event(event));
+                    if sender.send(Ok(sse_text.into_bytes())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    had_error = true;
+                    let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+                    let error_event = SseEvent {
+                        event: "error".to_string(),
+                        data: json!({"error": {"type": "api_error", "message": e.to_string()}}),
+                    };
+                    let sse_text = format_sse_event(&error_event);
+                    let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                    break;
+                }
+            }
+        }
+        let _ = broadcast_tx.send(InflightEvent::Done);
+        inflight_map.lock().await.remove(&request_hash);
+        let latency_ms = task_start.elapsed().as_millis() as u64;
+        metrics
+            .record_completed_request(&model_name, &usage, had_error, latency_ms)
+            .await;
+    });
+
+    state
+        .metrics
+        .record_latency(start.elapsed().as_millis() as u64);
+    sse_body_response(body)
+}
+
+async fn collect_leader_response(
+    state: &AppState,
+    request: &MessagesRequest,
+    request_hash: u64,
+    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    start: std::time::Instant,
+) -> Response {
+    let mut events = Vec::new();
+    while let Some(event_result) = stream.next().await {
+        match event_result {
+            Ok(event) => {
+                let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
+                events.push(event);
+            }
+            Err(e) => {
+                let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+                let _ = broadcast_tx.send(InflightEvent::Done);
+                state.inflight.lock().await.remove(&request_hash);
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &ErrorResponse::api_error(&e.to_string()),
+                );
+            }
+        }
+    }
+    let _ = broadcast_tx.send(InflightEvent::Done);
+    state.inflight.lock().await.remove(&request_hash);
+
+    let response_data = events
+        .last()
+        .map(|e| e.data.clone())
+        .unwrap_or(json!({"error": "no response from provider"}));
+
+    let mut usage = TokenUsage::default();
+    for event in &events {
+        extract_usage_from_event(&event.data, &mut usage);
+    }
+    let latency_ms = start.elapsed().as_millis() as u64;
+    state
+        .metrics
+        .record_completed_request(&request.model, &usage, false, latency_ms)
+        .await;
+
+    state.metrics.record_latency(latency_ms);
+    Json(response_data).into_response()
+}
+
+async fn handle_provider_error(
+    state: &AppState,
+    request: &MessagesRequest,
+    request_hash: u64,
+    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    error: ProviderError,
+    start: std::time::Instant,
+) -> Response {
+    let _ = broadcast_tx.send(InflightEvent::Error(error.to_string()));
+    let _ = broadcast_tx.send(InflightEvent::Done);
+    state.inflight.lock().await.remove(&request_hash);
+
+    error!("Provider error: {error}");
+    state.metrics.record_error();
+    let latency_ms = start.elapsed().as_millis() as u64;
+    state.metrics.record_latency(latency_ms);
+    state
+        .metrics
+        .record_completed_request(&request.model, &TokenUsage::default(), true, latency_ms)
+        .await;
+    provider_error_to_response(&error)
+}
+
+fn sse_body_response(body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Infallible>>) -> Response {
+    let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream_body))
+        .unwrap()
 }
 
 /// GET /v1/models — list available models
@@ -527,6 +577,29 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
             }
             response
         }
+        ProviderError::InvalidRequest(msg) => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(msg),
+        ),
+        ProviderError::RequestTooLarge(msg) => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse::invalid_request(msg),
+        ),
+        ProviderError::Overloaded {
+            message,
+            retry_after,
+        } => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error(message),
+            );
+            if let Some(secs) = retry_after
+                && let Ok(header_value) = axum::http::HeaderValue::from_str(&secs.to_string())
+            {
+                response.headers_mut().insert("retry-after", header_value);
+            }
+            response
+        }
         ProviderError::ModelNotFound(msg) => {
             error_response(StatusCode::NOT_FOUND, &ErrorResponse::not_found(msg))
         }
@@ -536,10 +609,7 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
         ),
         ProviderError::UpstreamError { status, body } => {
             error!("Upstream error (HTTP {status}): {body}");
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                &ErrorResponse::api_error("upstream unavailable"),
-            )
+            upstream_error_to_response(*status, body)
         }
         ProviderError::ServiceUnavailable(msg) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -550,6 +620,49 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
             &ErrorResponse::api_error(&format!("network error: {msg}")),
         ),
     }
+}
+
+fn upstream_error_to_response(status: u16, body: &str) -> Response {
+    let message = extract_upstream_error_message(body);
+    match status {
+        400 => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(&message),
+        ),
+        413 => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse::invalid_request(&message),
+        ),
+        408 => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            &ErrorResponse::timeout(&message),
+        ),
+        503 | 529 => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorResponse::api_error(&message),
+        ),
+        _ => error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&message)),
+    }
+}
+
+fn extract_upstream_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                "upstream unavailable".to_string()
+            } else {
+                body.to_string()
+            }
+        })
 }
 
 fn error_response(status: StatusCode, error: &ErrorResponse) -> Response {
@@ -634,4 +747,26 @@ fn compute_request_hash(request: &MessagesRequest) -> u64 {
         json.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_anthropic_upstream_error_message() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad thinking block"}}"#;
+
+        assert_eq!(extract_upstream_error_message(body), "bad thinking block");
+    }
+
+    #[test]
+    fn upstream_400_maps_to_invalid_request_response() {
+        let response = upstream_error_to_response(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"bad request"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

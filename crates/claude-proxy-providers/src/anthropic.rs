@@ -12,7 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::http::{apply_extra_ca_certs, fmt_reqwest_err};
+use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
 use crate::provider::{Provider, ProviderError};
 
 pub struct AnthropicProvider {
@@ -84,6 +84,8 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
 
         // Serialize request and inject cache_control for prompt caching
+        let mut request = request;
+        sanitize_anthropic_history(&mut request);
         let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("failed to serialize request: {e}")))?;
         inject_cache_control(&mut body);
@@ -105,22 +107,7 @@ impl Provider for AnthropicProvider {
             })?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(match status {
-                401 => ProviderError::Authentication(body_text),
-                429 => ProviderError::RateLimited { retry_after },
-                404 => ProviderError::ModelNotFound(body_text),
-                _ => ProviderError::UpstreamError {
-                    status,
-                    body: body_text,
-                },
-            });
+            return Err(map_upstream_response(response).await);
         }
 
         if request.stream {
@@ -189,6 +176,54 @@ impl Provider for AnthropicProvider {
                 reasoning_effort_levels: Vec::new(),
             },
         ])
+    }
+}
+
+fn sanitize_anthropic_history(request: &mut MessagesRequest) {
+    let mut messages = Vec::with_capacity(request.messages.len());
+
+    for mut message in request.messages.drain(..) {
+        if sanitize_message(&mut message) {
+            messages.push(message);
+        }
+    }
+
+    request.messages = messages;
+}
+
+fn sanitize_message(message: &mut Message) -> bool {
+    match &mut message.content {
+        MessageContent::Text(text) => {
+            trim_text(text);
+            !text.is_empty()
+        }
+        MessageContent::Blocks(blocks) => {
+            blocks.retain_mut(keep_content_block);
+            !blocks.is_empty()
+        }
+    }
+}
+
+fn keep_content_block(block: &mut Content) -> bool {
+    match block {
+        Content::Text { text } => {
+            trim_text(text);
+            !text.is_empty()
+        }
+        Content::Thinking {
+            thinking,
+            signature,
+        } => !thinking.trim().is_empty() && signature.as_ref().is_some_and(|s| !s.is_empty()),
+        Content::ToolUse { .. }
+        | Content::ToolResult { .. }
+        | Content::ServerToolUse { .. }
+        | Content::Unknown => true,
+    }
+}
+
+fn trim_text(text: &mut String) {
+    if text.chars().last().is_some_and(char::is_whitespace) {
+        text.truncate(text.trim_end().len());
     }
 }
 
@@ -331,4 +366,89 @@ fn count_existing_cache_controls(body: &Value) -> u32 {
     }
 
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base_request(messages: Vec<Message>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            system: None,
+            messages,
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn sanitize_history_strips_unsigned_thinking_and_empty_messages() {
+        let mut request = base_request(vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    Content::Thinking {
+                        thinking: "completed".to_string(),
+                        signature: None,
+                    },
+                    Content::Text {
+                        text: "answer  \n".to_string(),
+                    },
+                ]),
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![Content::Thinking {
+                    thinking: String::new(),
+                    signature: Some("sig".to_string()),
+                }]),
+            },
+        ]);
+
+        sanitize_anthropic_history(&mut request);
+
+        assert_eq!(request.messages.len(), 1);
+        match &request.messages[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(&blocks[0], Content::Text { text } if text == "answer"));
+            }
+            MessageContent::Text(_) => panic!("expected content blocks"),
+        }
+    }
+
+    #[test]
+    fn sanitize_history_preserves_signed_thinking() {
+        let mut request = base_request(vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![Content::Thinking {
+                thinking: "completed".to_string(),
+                signature: Some("signature".to_string()),
+            }]),
+        }]);
+
+        sanitize_anthropic_history(&mut request);
+
+        match &request.messages[0].content {
+            MessageContent::Blocks(blocks) => assert!(matches!(
+                &blocks[0],
+                Content::Thinking {
+                    thinking,
+                    signature: Some(signature),
+                } if thinking == "completed" && signature == "signature"
+            )),
+            MessageContent::Text(_) => panic!("expected content blocks"),
+        }
+    }
 }

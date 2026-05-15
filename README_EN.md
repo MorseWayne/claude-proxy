@@ -6,8 +6,16 @@ Single native binary, zero runtime dependencies.
 
 ## Install
 
+Linux / macOS:
+
 ```bash
 curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
 ```
 
 Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases).

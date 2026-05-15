@@ -16,6 +16,7 @@
 use std::path::Path;
 
 use crate::provider::ProviderError;
+use serde_json::Value;
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
 /// callers see the real root cause (TLS handshake error, DNS failure, …)
@@ -39,6 +40,50 @@ pub fn fmt_err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// what most call sites already have on hand.
 pub fn fmt_reqwest_err(err: &reqwest::Error) -> String {
     fmt_err_chain(err)
+}
+
+pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let body = response.text().await.unwrap_or_default();
+    let message = extract_upstream_error_message(&body);
+
+    match status {
+        400 => ProviderError::InvalidRequest(message),
+        401 => ProviderError::Authentication(message),
+        404 => ProviderError::ModelNotFound(message),
+        413 => ProviderError::RequestTooLarge(message),
+        429 => ProviderError::RateLimited { retry_after },
+        503 | 529 => ProviderError::Overloaded {
+            message,
+            retry_after,
+        },
+        _ => ProviderError::UpstreamError { status, body },
+    }
+}
+
+pub fn extract_upstream_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                "upstream unavailable".to_string()
+            } else {
+                body.to_string()
+            }
+        })
 }
 
 /// Read every certificate from a PEM file (single cert or bundle) and append
