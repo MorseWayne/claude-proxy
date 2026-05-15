@@ -358,15 +358,12 @@ impl ResponsesStreamConverter {
                 if !delta.is_empty() {
                     let idx = self.ensure_function_block(output_index, event, &mut events);
                     self.function_argument_streamed.insert(output_index);
-                    events.push(SseEvent {
-                        event: "content_block_delta".to_string(),
-                        data: json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": {"type": "input_json_delta", "partial_json": delta}
-                        }),
-                    });
+                    Self::push_function_arguments_delta(idx, delta, &mut events);
                 }
+            }
+            "response.function_call_arguments.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.handle_function_call_arguments_done(event, &mut events);
             }
             "response.output_item.done" => {
                 self.handle_output_item_done(event, &mut events);
@@ -472,19 +469,48 @@ impl ResponsesStreamConverter {
                 && let Some(arguments) = item["arguments"].as_str()
                 && !arguments.is_empty()
             {
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "input_json_delta", "partial_json": arguments}
-                    }),
-                });
+                Self::push_function_arguments_delta(idx, arguments, events);
+                self.function_argument_streamed.insert(output_index);
             }
             events.push(block_stop(idx));
             self.function_blocks.remove(&output_index);
             self.function_argument_streamed.remove(&output_index);
         }
+    }
+
+    fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        if let Some(name) = event["name"].as_str() {
+            self.function_names.insert(output_index, name.to_string());
+        }
+        if let Some(call_id) = event["call_id"]
+            .as_str()
+            .or_else(|| event["item_id"].as_str())
+        {
+            self.function_call_ids
+                .insert(output_index, call_id.to_string());
+        }
+        if self.function_argument_streamed.contains(&output_index) {
+            return;
+        }
+
+        let arguments = event["arguments"].as_str().unwrap_or_default();
+        if !arguments.is_empty() {
+            let idx = self.ensure_function_block(output_index, event, events);
+            Self::push_function_arguments_delta(idx, arguments, events);
+            self.function_argument_streamed.insert(output_index);
+        }
+    }
+
+    fn push_function_arguments_delta(idx: u32, arguments: &str, events: &mut Vec<SseEvent>) {
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": arguments}
+            }),
+        });
     }
 
     fn ensure_text_block(
@@ -556,11 +582,14 @@ impl ResponsesStreamConverter {
         let call_id = item["call_id"]
             .as_str()
             .or_else(|| item["id"].as_str())
+            .or_else(|| event["call_id"].as_str())
+            .or_else(|| event["item_id"].as_str())
             .map(str::to_string)
             .or_else(|| self.function_call_ids.get(&output_index).cloned())
             .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
         let name = item["name"]
             .as_str()
+            .or_else(|| event["name"].as_str())
             .map(str::to_string)
             .or_else(|| self.function_names.get(&output_index).cloned())
             .unwrap_or_default();
@@ -951,6 +980,51 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta");
         assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_uses_done_function_arguments_without_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Edit"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Edit",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Edit"
+            }
+        })));
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+                && event.data["content_block"]["name"] == "Edit"
+                && event.data["content_block"]["id"] == "call_1"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"]
+                    == "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
+        }));
     }
 
     #[test]
