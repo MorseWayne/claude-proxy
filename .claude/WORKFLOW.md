@@ -4,7 +4,38 @@ A lightweight milestone ledger for Claude Code development work.
 
 ## Active
 
-None.
+### WF-2026-05-17-001 — ChatGPT tool parameter sanitization
+
+Status: In Progress
+Level: 2
+Current phase: Phase 1 — Implement and validate
+Started: 2026-05-17
+Updated: 2026-05-17
+Goal: Prevent ChatGPT provider tool calls from leaking invalid empty optional parameters such as `Read.pages: ""`, strengthen default instructions, and validate with provider tests.
+Decisions:
+- Use deterministic sanitizer for empty optional-like tool parameters before forwarding schemas/body where feasible.
+- Strengthen ChatGPT fallback instructions; keep existing user/system instructions authoritative.
+
+#### Phase 1 — Implement and validate
+Status: In Progress
+Depends on:
+- GitNexus LOW impact analysis for `build_chatgpt_responses_body` and `convert_tool`.
+Tasks:
+- [x] Run GitNexus impact analysis before editing.
+- [x] Add ChatGPT default tool-use instructions.
+- [x] Sanitize empty string optional tool parameters, prioritizing `pages`.
+- [x] Add regression tests.
+- [x] Run formatting, provider tests, and full validation as practical.
+
+Acceptance / Review:
+- Review: Strengthened ChatGPT fallback instructions and added streaming/non-streaming Responses tool argument sanitizer that recursively removes empty string fields before emitting Anthropic tool inputs.
+- Validation: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test -p claude-proxy-providers`, and `cargo test` passed.
+- GitNexus: Pre-edit impacts were LOW for `build_chatgpt_responses_body`, `convert_tool`, and `convert_function_call`; final `detect_changes` reported LOW risk with no affected execution flows.
+- Tests: Added regression coverage for stream and non-stream Responses tool calls with empty `pages`/nested empty fields.
+- Gaps: None.
+
+Resume next: Commit the validated changes and update the GitNexus index.
+
 
 ## Backlog / Future
 
@@ -27,45 +58,4 @@ Acceptance summary:
 - Validation: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test -p claude-proxy-providers`, and `cargo test` passed.
 - GitNexus: Initial `impact` on `ChatGptProvider.chat` returned LOW risk; final `detect_changes` reported HIGH due to touched `chatgpt.rs` and related test flows, reviewed as expected. `npx gitnexus analyze` updated the index to 1,584 nodes / 3,814 edges / 139 flows.
 - Tests: Added coverage for missing ChatGPT instructions, preserving existing system instructions, and fast-intent body generation.
-- Gaps: None.
-
-### WF-2026-05-17-001 — ChatGPT tool parameter sanitization
-
-Status: Done
-Level: 2
-Started: 2026-05-17
-Completed: 2026-05-17
-Goal: Prevent ChatGPT provider tool calls from leaking invalid empty optional parameters such as `Read.pages: ""`, strengthen default instructions, and validate with provider tests.
-Decisions:
-- Use deterministic sanitizer for empty optional-like tool parameters before forwarding schemas/body where feasible.
-- Strengthen ChatGPT fallback instructions; keep existing user/system instructions authoritative.
-
-#### Phase 1 — Implement and validate
-Status: Done
-Depends on:
-- GitNexus LOW impact analysis for `build_chatgpt_responses_body` and `convert_tool`.
-Tasks:
-- [x] Run GitNexus impact analysis before editing.
-- [x] Add ChatGPT default tool-use instructions.
-- [x] Sanitize empty string optional tool parameters, prioritizing `pages`.
-- [x] Add regression tests.
-- [x] Run formatting, provider tests, and full validation as practical.
-
-Acceptance / Review:
-- Review: Strengthened ChatGPT fallback instructions and added streaming/non-streaming Responses tool argument sanitizer that recursively removes empty string fields before emitting Anthropic tool inputs.
-- Validation: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test -p claude-proxy-providers`, and `cargo test` passed.
-- GitNexus: Pre-edit impacts were LOW for `build_chatgpt_responses_body`, `convert_tool`, and `convert_function_call`; final `detect_changes` reported LOW risk with no affected execution flows.
-- Tests: Added regression coverage for stream and non-stream Responses tool calls with empty `pages`/nested empty fields.
-- Gaps: None.
-
-Commits:
-
-- 12385bd Fix ChatGPT tool argument sanitization
-
-Acceptance summary:
-
-- Review: ChatGPT fallback instructions now tell models to omit empty optional tool parameters and retry corrected tool calls silently; Responses streaming/non-streaming function arguments now remove empty string fields recursively before Anthropic tool_use emission.
-- Validation: `cargo fmt --check`, `cargo test -p claude-proxy-providers`, `cargo clippy -- -D warnings`, and `cargo test` passed.
-- GitNexus: Pre-edit impact LOW for `build_chatgpt_responses_body`, `convert_tool`, and `convert_function_call`; final detect_changes LOW; `npx gitnexus analyze` updated index to 1,592 nodes / 3,838 edges / 140 flows.
-- Tests: Added stream and non-stream regression tests covering `pages: ""` and nested empty fields.
 - Gaps: None.
