@@ -5,59 +5,68 @@ A lightweight milestone ledger for Claude Code development work.
 ## Active
 
 <!-- workflow-ledger:task
-id: WF-YYYY-MM-DD-001
+id: WF-2026-05-16-001
 level: 2
 status: In Progress
-current_phase: Phase 1 — Name
-updated: YYYY-MM-DD
+current_phase: Phase 2 — Implement and validate
+updated: 2026-05-16
 -->
 
-### WF-YYYY-MM-DD-001 — Task title
+### WF-2026-05-16-001 — ChatGPT responses default instructions
 Status: In Progress
 Level: 2
-Started: YYYY-MM-DD
-Last updated: YYYY-MM-DD
-Current phase: Phase 1 — Name
+Started: 2026-05-16
+Last updated: 2026-05-16
+Current phase: Phase 2 — Implement and validate
 
 Goal:
-- Describe the user-visible goal.
+- Prevent Claude Desktop requests routed to `chatgpt/gpt-5.5` from failing upstream with `Instructions are required` when the Anthropic request has no system prompt.
 
 Decisions:
-- YYYY-MM-DD — Key decision and reason.
+- 2026-05-16 — Only patch the `ChatGptProvider` Responses path with a non-empty fallback instruction to avoid changing shared OpenAI/Copilot Responses conversion semantics.
+- 2026-05-16 — Use `Follow the user's instructions.` as the minimal fallback because it satisfies the upstream requirement without adding an assistant persona.
 
 Phases:
 
-#### Phase 1 — Name
-Status: In Progress
+#### Phase 1 — Design and impact analysis
+Status: Done
 Depends on:
 - None
 Tasks:
-- [ ] First current-phase task
-- [ ] Second current-phase task
+- [x] Confirm the failing request path and missing `instructions` condition.
+- [x] Choose a scoped provider-specific fix.
+- [x] Run GitNexus impact analysis for `ChatGptProvider.chat`.
 
 Acceptance / Review:
-- Review: N/A until this phase is complete.
-- Validation: N/A until this phase is complete.
-- GitNexus: N/A until this phase is complete.
-- Tests: N/A until this phase is complete.
-- Gaps: N/A until this phase is complete.
+- Review: Confirmed `ChatGptProvider.chat` builds a Responses body from `convert_to_responses` before sending upstream.
+- Validation: User approved provider-specific fallback design.
+- GitNexus: `impact` on `ChatGptProvider.chat` returned LOW risk with 0 direct upstream callers/processes affected.
+- Tests: N/A; design phase only.
+- Gaps: None.
 
-Resume next:
-- Continue from the first unchecked task in this phase.
-
-#### Phase 2 — Name
-Status: Pending
+#### Phase 2 — Implement and validate
+Status: In Progress
 Depends on:
 - Phase 1
 Tasks:
-- [ ] High-level future task; expand when entering this phase.
+- [x] Add ChatGPT-only fallback `instructions` handling.
+- [x] Add tests for missing and existing instructions.
+- [x] Run provider tests and required validation.
+- [ ] Commit and update GitNexus index.
 
-Discovered tasks:
-- [ ] Future: useful task that does not block the current goal.
+Acceptance / Review:
+- Review: Implemented `build_chatgpt_responses_body` so only ChatGPT Responses requests get fallback instructions and existing system instructions are preserved.
+- Validation: `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` passed.
+- GitNexus: `detect_changes` returned HIGH due to touched `chatgpt.rs` and related test processes; reviewed as expected for provider request-body construction and tests.
+- Tests: `cargo test -p claude-proxy-providers`; `cargo test`.
+- Gaps: Commit and GitNexus index update still pending.
+
+Resume next:
+- Commit the two modified files, run `npx gitnexus analyze`, then report commit hash.
 
 ## Backlog / Future
 
-- [ ] Future task discovered outside the active task scope.
+- [ ] Consider whether OpenAI/Copilot Responses paths need provider-specific handling if their upstreams start requiring `instructions`.
 
 ## Completed
 

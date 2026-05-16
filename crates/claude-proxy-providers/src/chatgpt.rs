@@ -35,6 +35,7 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_EXPIRES_IN: i64 = 3600;
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 const MAX_DEVICE_POLL_ATTEMPTS: u32 = 60;
+const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptToken {
@@ -399,9 +400,7 @@ impl Provider for ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
-        let mut body = crate::copilot::responses::convert_to_responses(&request);
-        body.as_object_mut()
-            .map(|object| object.remove("max_output_tokens"));
+        let body = build_chatgpt_responses_body(&request);
         log_request_observability("chatgpt", "/responses", &body);
 
         let mut request_builder = self
@@ -483,6 +482,24 @@ fn codex_responses_endpoint(base_url: &str) -> String {
     } else {
         format!("{base}/responses")
     }
+}
+
+fn build_chatgpt_responses_body(request: &MessagesRequest) -> Value {
+    let mut body = crate::copilot::responses::convert_to_responses(request);
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_output_tokens");
+        let missing_instructions = object
+            .get("instructions")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty);
+        if missing_instructions {
+            object.insert(
+                "instructions".to_string(),
+                json!(DEFAULT_CHATGPT_INSTRUCTIONS),
+            );
+        }
+    }
+    body
 }
 
 fn chatgpt_models() -> Vec<ModelInfo> {
@@ -634,6 +651,61 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_adds_default_instructions() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn chatgpt_responses_body_preserves_system_instructions() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: Some(SystemPrompt::Text("Use terse answers.".to_string())),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["instructions"], "Use terse answers.");
+    }
+
+    #[test]
     fn chatgpt_intent_fast_affects_responses_body() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
@@ -656,11 +728,10 @@ mod tests {
         };
 
         let req = apply_openai_intent(req);
-        let mut body = crate::copilot::responses::convert_to_responses(&req);
-        body.as_object_mut()
-            .map(|object| object.remove("max_output_tokens"));
+        let body = build_chatgpt_responses_body(&req);
 
         assert_eq!(body["model"], "gpt-5.4-mini");
+        assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
         assert_eq!(body["reasoning"]["effort"], "none");
         assert!(body["reasoning"].get("summary").is_none());
         assert!(body.get("max_output_tokens").is_none());
