@@ -588,6 +588,7 @@ struct ResponsesStreamConverter {
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
+    function_argument_buffers: HashMap<u64, String>,
     function_argument_streamed: HashSet<u64>,
     input_tokens: u32,
     output_tokens: u32,
@@ -653,9 +654,11 @@ impl ResponsesStreamConverter {
                 let output_index = event["output_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    let idx = self.ensure_function_block(output_index, event, &mut events);
-                    self.function_argument_streamed.insert(output_index);
-                    Self::push_function_arguments_delta(idx, delta, &mut events);
+                    self.ensure_function_block(output_index, event, &mut events);
+                    self.function_argument_buffers
+                        .entry(output_index)
+                        .or_default()
+                        .push_str(delta);
                 }
             }
             "response.function_call_arguments.done" => {
@@ -762,15 +765,20 @@ impl ResponsesStreamConverter {
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
             let idx = self.ensure_function_block(output_index, event, events);
-            if !self.function_argument_streamed.contains(&output_index)
-                && let Some(arguments) = item["arguments"].as_str()
-                && !arguments.is_empty()
-            {
-                Self::push_function_arguments_delta(idx, arguments, events);
-                self.function_argument_streamed.insert(output_index);
+            if !self.function_argument_streamed.contains(&output_index) {
+                if let Some(arguments) = item["arguments"].as_str()
+                    && !arguments.is_empty()
+                {
+                    self.function_argument_buffers
+                        .entry(output_index)
+                        .or_default()
+                        .push_str(arguments);
+                }
+                self.flush_function_arguments(output_index, idx, events);
             }
             events.push(block_stop(idx));
             self.function_blocks.remove(&output_index);
+            self.function_argument_buffers.remove(&output_index);
             self.function_argument_streamed.remove(&output_index);
         }
     }
@@ -793,10 +801,30 @@ impl ResponsesStreamConverter {
 
         let arguments = event["arguments"].as_str().unwrap_or_default();
         if !arguments.is_empty() {
-            let idx = self.ensure_function_block(output_index, event, events);
-            Self::push_function_arguments_delta(idx, arguments, events);
-            self.function_argument_streamed.insert(output_index);
+            self.function_argument_buffers
+                .entry(output_index)
+                .or_default()
+                .push_str(arguments);
         }
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.flush_function_arguments(output_index, idx, events);
+    }
+
+    fn flush_function_arguments(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let Some(arguments) = self.function_argument_buffers.remove(&output_index) else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let arguments = sanitize_tool_arguments_json(&arguments).unwrap_or(arguments);
+        Self::push_function_arguments_delta(idx, &arguments, events);
+        self.function_argument_streamed.insert(output_index);
     }
 
     fn push_function_arguments_delta(idx: u32, arguments: &str, events: &mut Vec<SseEvent>) {
@@ -927,9 +955,13 @@ impl ResponsesStreamConverter {
 
     fn close_function_blocks(&mut self, events: &mut Vec<SseEvent>) {
         let blocks = std::mem::take(&mut self.function_blocks);
-        for idx in blocks.values() {
-            events.push(block_stop(*idx));
+        for (output_index, idx) in blocks {
+            if !self.function_argument_streamed.contains(&output_index) {
+                self.flush_function_arguments(output_index, idx, events);
+            }
+            events.push(block_stop(idx));
         }
+        self.function_argument_buffers.clear();
         self.function_argument_streamed.clear();
     }
 
@@ -999,6 +1031,34 @@ fn block_stop(index: u32) -> SseEvent {
     SseEvent {
         event: "content_block_stop".to_string(),
         data: json!({"type": "content_block_stop", "index": index}),
+    }
+}
+
+fn parse_and_sanitize_tool_arguments(arguments: &str) -> Option<Value> {
+    let mut input = serde_json::from_str::<Value>(arguments).ok()?;
+    remove_empty_string_fields(&mut input);
+    Some(input)
+}
+
+fn sanitize_tool_arguments_json(arguments: &str) -> Option<String> {
+    let input = parse_and_sanitize_tool_arguments(arguments)?;
+    serde_json::to_string(&input).ok()
+}
+
+fn remove_empty_string_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|_, value| !matches!(value, Value::String(text) if text.is_empty()));
+            for value in object.values_mut() {
+                remove_empty_string_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remove_empty_string_fields(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1101,7 +1161,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
         self.next_block_index += 1;
         let input = item["arguments"]
             .as_str()
-            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .and_then(parse_and_sanitize_tool_arguments)
             .unwrap_or_else(|| json!({}));
         self.events.push(SseEvent {
             event: "content_block_start".to_string(),
@@ -1574,6 +1634,68 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_converter_sanitizes_empty_tool_argument_fields() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": "{\"file_path\":\"src/main.rs\",\"pages\":\"\",\"nested\":{\"empty\":\"\",\"keep\":\"value\"}}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+
+        let arguments = events
+            .iter()
+            .find(|event| event.event == "content_block_delta")
+            .expect("arguments delta");
+        assert_eq!(
+            arguments.data["delta"]["partial_json"],
+            r#"{"file_path":"src/main.rs","nested":{"keep":"value"}}"#
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_sanitizes_empty_tool_argument_fields() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let start = events
+            .iter()
+            .find(|event| event.event == "content_block_start")
+            .expect("content block start");
+
+        assert_eq!(
+            start.data["content_block"]["input"],
+            json!({"file_path": "src/main.rs"})
+        );
+    }
+
+    #[test]
     fn test_stream_converter_uses_done_function_arguments_without_delta() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
@@ -1610,12 +1732,18 @@ mod tests {
                 && event.data["content_block"]["name"] == "Edit"
                 && event.data["content_block"]["id"] == "call_1"
         }));
-        assert!(events.iter().any(|event| {
-            event.event == "content_block_delta"
-                && event.data["delta"]["type"] == "input_json_delta"
-                && event.data["delta"]["partial_json"]
-                    == "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
-        }));
+        let arguments = events
+            .iter()
+            .find(|event| event.event == "content_block_delta")
+            .expect("arguments delta");
+        let arguments = serde_json::from_str::<Value>(
+            arguments.data["delta"]["partial_json"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            arguments,
+            json!({"file_path":"src/main.rs","old_string":"old","new_string":"new"})
+        );
     }
 
     #[test]

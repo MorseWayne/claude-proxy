@@ -35,7 +35,7 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_EXPIRES_IN: i64 = 3600;
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 const MAX_DEVICE_POLL_ATTEMPTS: u32 = 60;
-const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
+const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions. When calling tools, omit unused optional parameters instead of setting them to empty strings. If a tool call fails, retry with corrected arguments when possible instead of explaining the failed call to the user.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptToken {
