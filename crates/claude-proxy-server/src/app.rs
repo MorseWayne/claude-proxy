@@ -37,10 +37,7 @@ pub struct ModelMetrics {
 
 impl ModelMetrics {
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
+        self.input_tokens + self.output_tokens
     }
 
     fn add_usage(&mut self, usage: &TokenUsage) {
@@ -101,6 +98,8 @@ impl Metrics {
     /// Record a completed request with usage, persisting to store if available.
     pub async fn record_completed_request(
         &self,
+        provider: &str,
+        initiator: &str,
         model: &str,
         usage: &TokenUsage,
         is_error: bool,
@@ -108,7 +107,7 @@ impl Metrics {
     ) {
         self.record_token_usage(model, usage).await;
         if let Some(ref store) = self.store {
-            store.record_usage(model, usage, is_error, latency_ms);
+            store.record_usage(provider, initiator, model, usage, is_error, latency_ms);
         }
     }
 
@@ -152,6 +151,24 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_tokens_excludes_cache_tokens() {
+        let metrics = ModelMetrics {
+            requests: 1,
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_creation_input_tokens: 40,
+            cache_read_input_tokens: 60,
+        };
+
+        assert_eq!(metrics.total_tokens(), 125);
     }
 }
 

@@ -9,6 +9,8 @@ use crate::app::TokenUsage;
 
 /// A single write event to be persisted.
 struct UsageEvent {
+    provider: String,
+    initiator: String,
     model: String,
     input_tokens: i64,
     output_tokens: i64,
@@ -16,6 +18,36 @@ struct UsageEvent {
     cache_read_input_tokens: i64,
     is_error: i64,
     latency_ms: i64,
+}
+
+fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let has_current_schema = conn
+        .prepare("SELECT provider, initiator FROM usage_events LIMIT 0")
+        .is_ok();
+
+    if !has_current_schema {
+        conn.execute_batch("DROP TABLE IF EXISTS usage_events;")?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            initiator TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+            is_error INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_events_provider ON usage_events(provider);
+        CREATE INDEX IF NOT EXISTS idx_usage_events_initiator ON usage_events(initiator);
+        CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
+        CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);",
+    )
 }
 
 /// Persisted metrics store backed by SQLite with a background writer task.
@@ -45,22 +77,8 @@ impl MetricsStore {
         )
         .map_err(|e| format!("failed to set WAL mode: {e}"))?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS usage_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-                is_error INTEGER NOT NULL DEFAULT 0,
-                latency_ms INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
-            CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);",
-        )
-        .map_err(|e| format!("failed to initialize metrics schema: {e}"))?;
+        rebuild_usage_events_schema(&conn)
+            .map_err(|e| format!("failed to initialize metrics schema: {e}"))?;
 
         info!("Metrics store opened at {}", db_path.display());
 
@@ -108,9 +126,11 @@ impl MetricsStore {
                 if let Ok(tx) = c.unchecked_transaction() {
                     for ev in &batch {
                         if let Err(e) = tx.execute(
-                            "INSERT INTO usage_events (model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            "INSERT INTO usage_events (provider, initiator, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             rusqlite::params![
+                                ev.provider,
+                                ev.initiator,
                                 ev.model,
                                 ev.input_tokens,
                                 ev.output_tokens,
@@ -147,8 +167,18 @@ impl MetricsStore {
     }
 
     /// Record a completed request with its token usage (non-blocking).
-    pub fn record_usage(&self, model: &str, usage: &TokenUsage, is_error: bool, latency_ms: u64) {
+    pub fn record_usage(
+        &self,
+        provider: &str,
+        initiator: &str,
+        model: &str,
+        usage: &TokenUsage,
+        is_error: bool,
+        latency_ms: u64,
+    ) {
         let event = UsageEvent {
+            provider: provider.to_string(),
+            initiator: initiator.to_string(),
             model: model.to_string(),
             input_tokens: usage.input_tokens as i64,
             output_tokens: usage.output_tokens as i64,
@@ -249,4 +279,94 @@ pub struct StoredModelMetrics {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("claude-proxy-{name}-{nanos}.db"))
+    }
+
+    #[test]
+    fn schema_rebuilds_legacy_usage_events_table() {
+        let path = temp_db_path("legacy-schema");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO usage_events (model, input_tokens) VALUES ('old-model', 10);",
+        )
+        .unwrap();
+
+        rebuild_usage_events_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        conn.prepare("SELECT provider, initiator FROM usage_events LIMIT 0")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn record_usage_persists_provider_and_initiator() {
+        let path = temp_db_path("usage-event");
+        let store = MetricsStore::open(path.clone()).unwrap();
+        store.record_usage(
+            "chatgpt",
+            "agent",
+            "gpt-5.5",
+            &TokenUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_input_tokens: 3,
+                cache_read_input_tokens: 2,
+            },
+            false,
+            123,
+        );
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let conn = Connection::open(&path).unwrap();
+        let row: (String, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT provider, initiator, model, input_tokens, output_tokens FROM usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            row,
+            ("chatgpt".into(), "agent".into(), "gpt-5.5".into(), 11, 7)
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }

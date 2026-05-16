@@ -146,13 +146,19 @@ pub async fn messages(
         }
     };
 
+    let metrics_context = RequestMetricsContext {
+        provider_id: resolved.provider_id.clone(),
+        model: resolved.request.model.clone(),
+        initiator: resolved.initiator,
+    };
+
     // Call provider (registry lock is no longer held)
     match provider.chat(resolved.request).await {
         Ok(stream) => {
             if request.stream {
                 stream_leader_response(
                     &state,
-                    &request,
+                    &metrics_context,
                     request_hash,
                     broadcast_tx,
                     stream,
@@ -166,7 +172,7 @@ pub async fn messages(
             } else {
                 collect_leader_response(
                     &state,
-                    &request,
+                    &metrics_context,
                     request_hash,
                     broadcast_tx,
                     stream,
@@ -180,7 +186,15 @@ pub async fn messages(
             }
         }
         Err(e) => {
-            handle_provider_error(&state, &request, request_hash, broadcast_tx, e, start).await
+            handle_provider_error(
+                &state,
+                &metrics_context,
+                request_hash,
+                broadcast_tx,
+                e,
+                start,
+            )
+            .await
         }
     }
 }
@@ -190,6 +204,13 @@ struct ResolvedUpstreamRequest {
     upstream_model: String,
     initiator: &'static str,
     request: MessagesRequest,
+}
+
+#[derive(Clone)]
+struct RequestMetricsContext {
+    provider_id: String,
+    model: String,
+    initiator: &'static str,
 }
 
 async fn resolve_upstream_request(
@@ -221,12 +242,13 @@ fn resolve_request_initiator(
     let agent_marking_enabled = settings
         .providers
         .get(provider_id)
-        .filter(|config| config.resolve_type(provider_id) == ProviderType::Copilot)
-        .map(|config| {
-            config
+        .map(|config| match config.resolve_type(provider_id) {
+            ProviderType::Copilot => config
                 .copilot
                 .as_ref()
-                .is_none_or(|copilot| copilot.enable_agent_marking)
+                .is_none_or(|copilot| copilot.enable_agent_marking),
+            ProviderType::ChatGPT => true,
+            _ => false,
         })
         .unwrap_or(false);
 
@@ -402,7 +424,7 @@ async fn join_inflight_non_stream(
 
 async fn stream_leader_response(
     state: &AppState,
-    request: &MessagesRequest,
+    request: &RequestMetricsContext,
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
@@ -412,6 +434,8 @@ async fn stream_leader_response(
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
     let metrics = state.metrics.clone();
+    let provider_id = request.provider_id.clone();
+    let initiator = request.initiator;
     let model_name = request.model.clone();
     let inflight_map = state.inflight.clone();
     tokio::spawn(async move {
@@ -446,7 +470,14 @@ async fn stream_leader_response(
         inflight_map.lock().await.remove(&request_hash);
         let latency_ms = task_start.elapsed().as_millis() as u64;
         metrics
-            .record_completed_request(&model_name, &usage, had_error, latency_ms)
+            .record_completed_request(
+                &provider_id,
+                initiator,
+                &model_name,
+                &usage,
+                had_error,
+                latency_ms,
+            )
             .await;
     });
 
@@ -458,7 +489,7 @@ async fn stream_leader_response(
 
 async fn collect_leader_response(
     state: &AppState,
-    request: &MessagesRequest,
+    request: &RequestMetricsContext,
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
@@ -495,7 +526,14 @@ async fn collect_leader_response(
     let latency_ms = start.elapsed().as_millis() as u64;
     state
         .metrics
-        .record_completed_request(&request.model, &usage, false, latency_ms)
+        .record_completed_request(
+            &request.provider_id,
+            request.initiator,
+            &request.model,
+            &usage,
+            false,
+            latency_ms,
+        )
         .await;
 
     state.metrics.record_latency(latency_ms);
@@ -504,7 +542,7 @@ async fn collect_leader_response(
 
 async fn handle_provider_error(
     state: &AppState,
-    request: &MessagesRequest,
+    request: &RequestMetricsContext,
     request_hash: u64,
     broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
     error: ProviderError,
@@ -520,7 +558,14 @@ async fn handle_provider_error(
     state.metrics.record_latency(latency_ms);
     state
         .metrics
-        .record_completed_request(&request.model, &TokenUsage::default(), true, latency_ms)
+        .record_completed_request(
+            &request.provider_id,
+            request.initiator,
+            &request.model,
+            &TokenUsage::default(),
+            true,
+            latency_ms,
+        )
         .await;
     provider_error_to_response(&error)
 }
@@ -900,7 +945,93 @@ impl<H: Hasher> io::Write for HashWriter<'_, H> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use claude_proxy_config::settings::{
+        AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelConfig, ProviderConfig,
+        ProviderType, ServerConfig,
+    };
+
     use super::*;
+
+    fn settings_with_provider(provider_type: ProviderType) -> claude_proxy_config::Settings {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: String::new(),
+                proxy: String::new(),
+                provider_type: Some(provider_type),
+                copilot: None,
+            },
+        );
+
+        claude_proxy_config::Settings {
+            providers,
+            model: ModelConfig {
+                default: "test/model".to_string(),
+                reasoning: None,
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                auth_token: String::new(),
+            },
+            admin: AdminConfig { auth_token: None },
+            limits: LimitsConfig::default(),
+            http: HttpConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+
+    fn request_with_system(system: Option<SystemPrompt>) -> MessagesRequest {
+        MessagesRequest {
+            model: "test/model".to_string(),
+            system,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn chatgpt_subagent_marker_resolves_agent_initiator() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let request = request_with_system(Some(SystemPrompt::Text(
+            "prefix __SUBAGENT_MARKER__ suffix".to_string(),
+        )));
+
+        assert_eq!(
+            resolve_request_initiator(&settings, "test", &request),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn openai_subagent_marker_stays_user_initiator() {
+        let settings = settings_with_provider(ProviderType::OpenAI);
+        let request = request_with_system(Some(SystemPrompt::Text(
+            "prefix __SUBAGENT_MARKER__ suffix".to_string(),
+        )));
+
+        assert_eq!(
+            resolve_request_initiator(&settings, "test", &request),
+            "user"
+        );
+    }
 
     #[test]
     fn extracts_anthropic_upstream_error_message() {
