@@ -697,6 +697,49 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_normalizes_tool_schema_for_codex() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("read the file".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "Read".to_string(),
+                description: Some("Read a file".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": "file_path"
+                }),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "Read");
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}}
+            })
+        );
+    }
+
+    #[test]
     fn chatgpt_intent_fast_affects_responses_body() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),

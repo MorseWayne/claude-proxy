@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use claude_proxy_core::*;
 use futures::StreamExt;
@@ -456,7 +456,7 @@ fn convert_tool(tool: &Tool) -> Value {
     let mut value = json!({
         "type": "function",
         "name": tool.name,
-        "parameters": tool.input_schema,
+        "parameters": normalize_tool_schema(&tool.input_schema),
     });
 
     if let Some(description) = &tool.description {
@@ -464,6 +464,39 @@ fn convert_tool(tool: &Tool) -> Value {
     }
 
     value
+}
+
+fn normalize_tool_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return json!({"type": "object", "properties": {}});
+    };
+
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|schema_type| schema_type != "object")
+    {
+        return json!({"type": "object", "properties": {}});
+    }
+
+    let mut normalized = object.clone();
+    normalized.insert("type".to_string(), json!("object"));
+    if !normalized
+        .get("properties")
+        .is_some_and(|properties| properties.is_object())
+    {
+        normalized.insert("properties".to_string(), json!({}));
+    }
+
+    if let Some(required) = normalized.get("required")
+        && !required
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    {
+        normalized.remove("required");
+    }
+
+    Value::Object(normalized)
 }
 
 fn normalize_tool_choice(tool_choice: &Value) -> Value {
@@ -588,7 +621,9 @@ struct ResponsesStreamConverter {
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
-    function_argument_streamed: HashSet<u64>,
+    function_argument_buffers: HashMap<u64, String>,
+    function_argument_emitted: HashMap<u64, String>,
+    saw_function_call: bool,
     input_tokens: u32,
     output_tokens: u32,
     stopped: bool,
@@ -653,14 +688,12 @@ impl ResponsesStreamConverter {
                 let output_index = event["output_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    let idx = self.ensure_function_block(output_index, event, &mut events);
-                    self.function_argument_streamed.insert(output_index);
-                    let arguments = self
-                        .function_names
-                        .get(&output_index)
-                        .and_then(|name| sanitize_read_empty_pages(name, delta))
-                        .unwrap_or_else(|| delta.to_string());
-                    Self::push_function_arguments_delta(idx, &arguments, &mut events);
+                    self.ensure_function_block(output_index, event, &mut events);
+                    self.function_argument_buffers
+                        .entry(output_index)
+                        .or_default()
+                        .push_str(delta);
+                    self.emit_parseable_function_arguments(output_index, event, &mut events);
                 }
             }
             "response.function_call_arguments.done" => {
@@ -726,6 +759,7 @@ impl ResponsesStreamConverter {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
+            self.saw_function_call = true;
             if let Some(name) = item["name"].as_str() {
                 self.function_names.insert(output_index, name.to_string());
             }
@@ -766,26 +800,20 @@ impl ResponsesStreamConverter {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
+            self.saw_function_call = true;
             let idx = self.ensure_function_block(output_index, event, events);
-            if !self.function_argument_streamed.contains(&output_index)
-                && let Some(arguments) = item["arguments"].as_str()
-                && !arguments.is_empty()
-            {
-                let arguments = item["name"]
-                    .as_str()
-                    .and_then(|name| sanitize_read_empty_pages(name, arguments))
-                    .unwrap_or_else(|| arguments.to_string());
-                Self::push_function_arguments_delta(idx, &arguments, events);
-                self.function_argument_streamed.insert(output_index);
-            }
+            let arguments = item["arguments"].as_str();
+            self.emit_function_arguments(output_index, idx, arguments, false, events);
             events.push(block_stop(idx));
             self.function_blocks.remove(&output_index);
-            self.function_argument_streamed.remove(&output_index);
+            self.function_argument_buffers.remove(&output_index);
+            self.function_argument_emitted.remove(&output_index);
         }
     }
 
     fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
+        self.saw_function_call = true;
         if let Some(name) = event["name"].as_str() {
             self.function_names.insert(output_index, name.to_string());
         }
@@ -796,20 +824,75 @@ impl ResponsesStreamConverter {
             self.function_call_ids
                 .insert(output_index, call_id.to_string());
         }
-        if self.function_argument_streamed.contains(&output_index) {
+
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.emit_function_arguments(
+            output_index,
+            idx,
+            event["arguments"].as_str(),
+            false,
+            events,
+        );
+    }
+
+    fn emit_parseable_function_arguments(
+        &mut self,
+        output_index: u64,
+        event: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let Some(arguments) = self.function_argument_buffers.get(&output_index) else {
+            return;
+        };
+        if serde_json::from_str::<Value>(arguments).is_err() {
+            return;
+        }
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.emit_function_arguments(output_index, idx, None, true, events);
+    }
+
+    fn emit_function_arguments(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        final_arguments: Option<&str>,
+        require_valid_json: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let arguments = final_arguments
+            .filter(|arguments| !arguments.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.function_argument_buffers.get(&output_index).cloned())
+            .unwrap_or_default();
+        if arguments.is_empty() {
             return;
         }
 
-        let arguments = event["arguments"].as_str().unwrap_or_default();
-        if !arguments.is_empty() {
-            let idx = self.ensure_function_block(output_index, event, events);
-            let arguments = self
-                .function_names
-                .get(&output_index)
-                .and_then(|name| sanitize_read_empty_pages(name, arguments))
-                .unwrap_or_else(|| arguments.to_string());
-            Self::push_function_arguments_delta(idx, &arguments, events);
-            self.function_argument_streamed.insert(output_index);
+        if require_valid_json && serde_json::from_str::<Value>(&arguments).is_err() {
+            return;
+        }
+
+        let sanitized = self
+            .function_names
+            .get(&output_index)
+            .and_then(|name| sanitize_read_empty_pages(name, &arguments))
+            .unwrap_or(arguments);
+        let previous = self
+            .function_argument_emitted
+            .get(&output_index)
+            .map(String::as_str)
+            .unwrap_or("");
+        if sanitized == previous {
+            return;
+        }
+        if let Some(delta) = sanitized.strip_prefix(previous) {
+            Self::push_function_arguments_delta(idx, delta, events);
+            self.function_argument_emitted
+                .insert(output_index, sanitized);
+        } else if previous.is_empty() {
+            Self::push_function_arguments_delta(idx, &sanitized, events);
+            self.function_argument_emitted
+                .insert(output_index, sanitized);
         }
     }
 
@@ -935,16 +1018,18 @@ impl ResponsesStreamConverter {
         }
         self.close_open_block(events);
         self.close_function_blocks(events);
-        let reason = response_stop_reason(response);
+        let reason = response_stop_reason(response, self.saw_function_call);
         self.stop_with_reason(reason, events);
     }
 
     fn close_function_blocks(&mut self, events: &mut Vec<SseEvent>) {
         let blocks = std::mem::take(&mut self.function_blocks);
-        for idx in blocks.values() {
-            events.push(block_stop(*idx));
+        for (output_index, idx) in blocks {
+            self.emit_function_arguments(output_index, idx, None, false, events);
+            events.push(block_stop(idx));
         }
-        self.function_argument_streamed.clear();
+        self.function_argument_buffers.clear();
+        self.function_argument_emitted.clear();
     }
 
     fn stop_with_reason(&mut self, reason: &str, events: &mut Vec<SseEvent>) {
@@ -974,7 +1059,7 @@ impl ResponsesStreamConverter {
     }
 }
 
-fn response_stop_reason(response: &Value) -> &'static str {
+fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static str {
     if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
         return match reason {
             "max_output_tokens" => "max_tokens",
@@ -987,11 +1072,13 @@ fn response_stop_reason(response: &Value) -> &'static str {
         return "error";
     }
 
-    if response["output"].as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item["type"].as_str() == Some("function_call"))
-    }) {
+    if saw_function_call
+        || response["output"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"].as_str() == Some("function_call"))
+        })
+    {
         "tool_use"
     } else {
         "end_turn"
@@ -1089,7 +1176,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             event: "message_delta".to_string(),
             data: json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": response_stop_reason(self.data), "stop_sequence": null},
+                "delta": {"stop_reason": response_stop_reason(self.data, false), "stop_sequence": null},
                 "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
             }),
         });
@@ -1265,6 +1352,64 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "detailed");
         assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_normalizes_tool_schemas() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![
+                Tool {
+                    name: "empty".to_string(),
+                    description: None,
+                    input_schema: json!({}),
+                },
+                Tool {
+                    name: "bad_required".to_string(),
+                    description: None,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": "path"
+                    }),
+                },
+                Tool {
+                    name: "non_object".to_string(),
+                    description: None,
+                    input_schema: json!({"type": "string"}),
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            body["tools"][1]["parameters"],
+            json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        );
+        assert_eq!(
+            body["tools"][2]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
     }
 
     #[test]
@@ -1651,6 +1796,232 @@ mod tests {
                 && event.data["delta"]["partial_json"]
                     == "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
         }));
+    }
+
+    #[test]
+    fn test_stream_converter_marks_tool_use_when_completed_output_is_empty() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"src/main.rs\"}"
+            }
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })));
+
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_split_read_arguments_on_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\","
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "\"pages\":\"\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "name": "Read",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+        })));
+
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let arguments: Value = serde_json::from_str(&arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_stream_converter_incrementally_sanitizes_when_json_completes() {
+        let mut converter = ResponsesStreamConverter::new();
+
+        let mut events = converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        }));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\","
+        })));
+
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+        }));
+
+        let events = converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "\"pages\":\"\"}"
+        }));
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let arguments: Value = serde_json::from_str(&arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_stream_converter_chatgpt_codex_tool_fixture() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_chatgpt_1", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_chatgpt_1",
+                    "call_id": "call_chatgpt_1",
+                    "name": "Bash",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "delta": "{\"command\":\"git"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "delta": " status --short\",\"description\":\"\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "name": "Bash",
+                "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_chatgpt_1",
+                    "call_id": "call_chatgpt_1",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_chatgpt_1",
+                    "model": "gpt-5.3-codex",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"command": "git status --short", "description": ""})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
