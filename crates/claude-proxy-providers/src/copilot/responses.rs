@@ -655,7 +655,12 @@ impl ResponsesStreamConverter {
                 if !delta.is_empty() {
                     let idx = self.ensure_function_block(output_index, event, &mut events);
                     self.function_argument_streamed.insert(output_index);
-                    Self::push_function_arguments_delta(idx, delta, &mut events);
+                    let arguments = self
+                        .function_names
+                        .get(&output_index)
+                        .and_then(|name| sanitize_read_empty_pages(name, delta))
+                        .unwrap_or_else(|| delta.to_string());
+                    Self::push_function_arguments_delta(idx, &arguments, &mut events);
                 }
             }
             "response.function_call_arguments.done" => {
@@ -766,7 +771,11 @@ impl ResponsesStreamConverter {
                 && let Some(arguments) = item["arguments"].as_str()
                 && !arguments.is_empty()
             {
-                Self::push_function_arguments_delta(idx, arguments, events);
+                let arguments = item["name"]
+                    .as_str()
+                    .and_then(|name| sanitize_read_empty_pages(name, arguments))
+                    .unwrap_or_else(|| arguments.to_string());
+                Self::push_function_arguments_delta(idx, &arguments, events);
                 self.function_argument_streamed.insert(output_index);
             }
             events.push(block_stop(idx));
@@ -794,7 +803,12 @@ impl ResponsesStreamConverter {
         let arguments = event["arguments"].as_str().unwrap_or_default();
         if !arguments.is_empty() {
             let idx = self.ensure_function_block(output_index, event, events);
-            Self::push_function_arguments_delta(idx, arguments, events);
+            let arguments = self
+                .function_names
+                .get(&output_index)
+                .and_then(|name| sanitize_read_empty_pages(name, arguments))
+                .unwrap_or_else(|| arguments.to_string());
+            Self::push_function_arguments_delta(idx, &arguments, events);
             self.function_argument_streamed.insert(output_index);
         }
     }
@@ -1002,6 +1016,21 @@ fn block_stop(index: u32) -> SseEvent {
     }
 }
 
+fn sanitize_read_empty_pages(tool_name: &str, arguments: &str) -> Option<String> {
+    if tool_name != "Read" {
+        return None;
+    }
+
+    let mut input = serde_json::from_str::<Value>(arguments).ok()?;
+    let object = input.as_object_mut()?;
+    if matches!(object.get("pages"), Some(Value::String(pages)) if pages.is_empty()) {
+        object.remove("pages");
+        return serde_json::to_string(&input).ok();
+    }
+
+    None
+}
+
 pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
     let mut converter = NonStreamingResponsesConverter::new(data);
     converter.convert()
@@ -1101,7 +1130,13 @@ impl<'a> NonStreamingResponsesConverter<'a> {
         self.next_block_index += 1;
         let input = item["arguments"]
             .as_str()
-            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .and_then(|args| {
+                let arguments = item["name"]
+                    .as_str()
+                    .and_then(|name| sanitize_read_empty_pages(name, args))
+                    .unwrap_or_else(|| args.to_string());
+                serde_json::from_str::<Value>(&arguments).ok()
+            })
             .unwrap_or_else(|| json!({}));
         self.events.push(SseEvent {
             event: "content_block_start".to_string(),
@@ -1656,6 +1691,126 @@ mod tests {
                 .unwrap()
                 .data["delta"]["stop_reason"],
             "tool_use"
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_read_empty_pages_from_done_arguments() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        let arguments: Value = serde_json::from_str(arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_bash_command_and_empty_strings() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Bash",
+            "arguments": "{\"command\":\"git status --short\",\"description\":\"\",\"run_in_background\":false}"
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        assert_eq!(
+            arguments,
+            "{\"command\":\"git status --short\",\"description\":\"\",\"run_in_background\":false}"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_sanitizes_read_empty_pages_only() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let inputs = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use")
+                    .then_some(&event.data["content_block"]["input"])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(inputs[0], &json!({"file_path": "src/main.rs"}));
+        assert_eq!(
+            inputs[1],
+            &json!({"command": "git status --short", "description": ""})
+        );
+    }
+
+    #[test]
+    fn test_non_read_tool_pages_empty_string_is_preserved() {
+        assert_eq!(
+            sanitize_read_empty_pages("Other", "{\"pages\":\"\",\"value\":\"\"}"),
+            None
         );
     }
 }
