@@ -4,114 +4,52 @@
 
 ## Active（进行中）
 
-### WF-2026-05-17-003 — ChatGPT/Codex Responses 优化
-
-Status: In Progress（进行中）
-Level: 3
-Started: 2026-05-17
-Updated: 2026-05-17
-Current phase: Phase 3 — 提升 usage 与 metrics 准确性（已完成）
-Goal: 通过稳定 Codex/ChatGPT 共享 Responses 转换路径中的 tool schema、流式 function arguments、stop reason 和后续 metrics 准确性，深度优化 ChatGPT provider 行为。
-
-Decisions（决策）:
-- 归类为 Level 3，因为该工作会触及 ChatGPT 与 Copilot 共用的 Responses converter 中的 streaming/tool-call 行为。
-- 先稳定行为修复，再考虑模块抽取；避免把功能修复和结构重构混在同一阶段。
-- 当前 GitNexus 核实结果显示：`detect_changes` 风险为 medium，`ResponsesStreamConverter.process_event` 上游影响为 MEDIUM，直接消费者主要限于 `stream_responses_response` 和 converter 测试。
-- Claude Code 历史源码支持“先缓冲 streamed tool input，再 normalize”的策略；本地日志也确认反复出现 `Read.pages: ""` 失败和 split tool arguments 场景。
-
-#### Phase 1 — 稳定当前 converter 修复
-Status: Done（已完成）
-Depends on（依赖）:
-- None（无）
-Tasks（任务）:
-- [x] 审查当前 provider 改动，重点确认 schema normalization、argument buffering、sanitize 行为和 stop reason 处理。
-- [x] 运行聚焦 provider 验证：`cargo test -p claude-proxy-providers`。
-- [x] 如果聚焦测试通过，运行完整 workspace 验证。
-- [x] 验证后重新运行 GitNexus `detect_changes`，确认影响范围仍符合预期。
-- [x] 确认已提交的行为修复并记录提交信息。
-
-Acceptance / Review（验收 / 复核）:
-- Review: 已确认 `cb66177 Prepare v0.3.4 release fixes` 包含 `Cargo.toml`、`chatgpt.rs`、`copilot/responses.rs`，覆盖 tool schema normalization、split function arguments buffering/sanitization、empty completed output 的 `tool_use` stop reason，以及 ChatGPT/Codex fixture 测试。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 推进前 `detect_changes` 为 medium，变更集中在 Responses converter；最终复核时 provider 代码已在 HEAD，剩余工作树仅有 workflow/AGENTS/CLAUDE 文档变更，`detect_changes` 为 low 且无 affected processes。
-- Tests: provider crate 62/62 通过；完整 workspace 测试全部通过。
-- Gaps: 代码修复已提交但 GitNexus 元数据文档和 workflow ledger 仍有未提交更新；Phase 2/3 仍待决策和实施。
-
-#### Phase 2 — 分离共享 Responses 模块边界
-Status: Done（暂缓抽取）
-Depends on（依赖）:
-- Phase 1
-Tasks（任务）:
-- [x] 在行为修复提交后，决定是否将共享 Responses 代码从 `copilot::responses` 抽出。
-- [x] 如果需要抽取，在不改变行为的前提下迁移 request、stream、non-stream、sanitize 职责。
-- [x] 抽取后验证 ChatGPT 与 Copilot 路径。
-
-Acceptance / Review（验收 / 复核）:
-- Review: 暂不抽取共享 Responses 模块。`copilot::responses` 的命名确实不理想，但当前行为修复已经稳定；立即移动模块会把低收益结构调整和高风险请求体转换混在一起。
-- Validation: 只读评估当前边界：ChatGPT 直接复用 `convert_to_responses` 和 `stream_responses_response`；Copilot `/responses` 同时复用 request、stream 和 non-stream 转换。
-- GitNexus: `convert_to_responses` 上游影响为 CRITICAL，直接触达 `build_chatgpt_responses_body` 与多组 Copilot tests；`stream_responses_response` 上游 impact 为 LOW；`convert_non_streaming_response` 上游 impact 为 LOW。结论是请求体转换抽取风险高，stream/non-stream 单独抽取收益有限。
-- Tests: 本阶段未改代码，未重新运行测试；沿用 Phase 1 已通过的 `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings`。
-- Gaps: 命名/模块边界问题保留为后续重构，不阻塞当前 ChatGPT/Codex 行为优化。
-
-#### Phase 3 — 提升 usage 与 metrics 准确性
-Status: Done（已完成）
-Depends on（依赖）:
-- Phase 1
-Tasks（任务）:
-- [x] 审计最终 Responses usage 是否正确传播到 `message_delta.usage`。
-- [x] 确认 server metrics 优先采用 completed/delta 事件中的最终 usage。
-- [x] 如果仍有缺口，为 streaming input/output token 捕获添加回归测试。
-
-Acceptance / Review（验收 / 复核）:
-- Review: 确认 Responses converter 会在 `response.completed` / `response.incomplete` / `response.failed` 中读取最终 `response.usage` 并通过 `message_delta.usage` 发出；OpenAI Chat Completions streaming 也会在 final chunk usage 后通过 `message_delta.usage` 暴露累计 input/output tokens。server 侧原先累加 usage 字段，可能在重复 final snapshot 或 fallback `finish()` 场景中把 input/output/cache tokens 翻倍；已改为对每个 usage 字段保留最终累计快照最大值。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server usage_extraction`、`cargo test -p claude-proxy-server`、`cargo test -p claude-proxy-providers`、`cargo test` 均通过。
-- GitNexus: `extract_usage_from_event` 上游 impact 为 LOW，直接调用者为 `stream_leader_response` 与 `collect_leader_response`，间接影响 `messages`；`StreamConverter.process_chunk` impact 为 LOW；`StreamConverter.finish` impact 为 LOW；变更后 `detect_changes` 为 low，affected processes 为空。
-- Tests: 新增 `usage_extraction_keeps_final_token_snapshot` 覆盖重复 `message_delta.usage` 不翻倍；新增 `usage_extraction_keeps_cache_token_snapshot` 覆盖 cache token snapshot 不重复累计。server crate 10/10 与 integration 7/7 通过；provider crate 62/62 通过；完整 workspace 全部通过。
-- Gaps: Phase 3 usage/metrics 修复完成；provider-neutral Responses 模块抽取仍作为后续重构保留。
-
-Discovered tasks（发现的后续任务）:
-- 当前 ChatGPT/Codex 兼容性修复稳定后，考虑抽取 provider-neutral 的 Responses 转换模块。
-- 将 OpenAI/Responses streaming token accounting 审计作为独立于 tool-call 兼容性工作的后续任务。
-
-Resume next（下次继续）: ChatGPT/Codex Responses 优化三个阶段已完成；后续可进入 v0.3.4 发布任务，或单独规划 provider-neutral Responses 模块抽取。
-
-### WF-2026-05-17-002 — v0.3.4 发布
-
-Status: In Progress（进行中）
-Level: 2
-Started: 2026-05-17
-Updated: 2026-05-17
-Current phase: Phase 2 — 发布与推送
-Goal: 准备并发布 v0.3.4，包含待处理的 provider 修复和版本号更新。
-
-Decisions（决策）:
-- 发布版本为 v0.3.4，因为最新已有 tag 是 v0.3.3。
-- 验证通过后，将现有 provider 改动纳入本次发布。
-
-#### Phase 1 — 发布准备
-Status: Done（已完成）
-Depends on（依赖）:
-- None（无）
-Tasks（任务）:
-- [x] 确认当前 git 状态和最新 tag。
-- [x] 审查待处理的 provider 改动。
-- [x] 将 workspace package version 提升到 0.3.4。
-- [x] 运行发布验证。
-
-Acceptance / Review（验收 / 复核）:
-- Review: 确认 v0.3.4 包含 Responses tool schema normalization、split function arguments buffering/sanitization、empty completed output tool_use stop reason 和版本号更新。
-- Validation: `./target/release/claude-proxy --version` 输出 `claude-proxy 0.3.4`；`v0.3.4` tag 尚不存在。
-- GitNexus: 文件级 impact 对 `chatgpt.rs` 和 `copilot/responses.rs` 为 LOW；最终 `detect_changes` 为 medium，主要变更集中在 `ResponsesStreamConverter`、`normalize_tool_schema` 和相关测试。
-- Tests: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings`、`cargo build --release` 均通过。
-- Gaps: 尚需提交、打 tag、更新 GitNexus 索引并推送。
-
-Resume next（下次继续）: 提交 GitNexus/ledger 元数据，打 v0.3.4 tag，推送 commits 与 tag。
+None（无）。
 
 ## Backlog / Future（待办 / 未来）
 
 - [ ] 如果 OpenAI/Copilot Responses 上游开始强制要求 `instructions`，再评估是否需要 provider-specific 处理。
+- [ ] 在后续独立重构中考虑抽取 provider-neutral 的 Responses 转换模块；不阻塞 v0.3.4。
 
 ## Completed（已完成）
+
+### WF-2026-05-17-003 — ChatGPT/Codex Responses 优化
+
+Status: Done（已完成）
+Completed: 2026-05-17
+Level: 3
+Commits（提交）:
+
+- cb66177 Prepare v0.3.4 release fixes
+- 5e1a146 Fix streaming usage snapshot accounting
+- ef6163a Refresh GitNexus index metadata
+
+Acceptance summary（验收摘要）:
+
+- Review: 完成 ChatGPT/Codex Responses 路径优化：稳定 tool schema normalization、split function arguments buffering/sanitization、empty completed output 的 `tool_use` stop reason，并修正 server streaming usage 统计为最终累计快照语义，避免重复 `message_delta.usage` 导致 token 翻倍。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test -p claude-proxy-server usage_extraction`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: Phase 1 推进前 `detect_changes` 为 medium，集中在 Responses converter；Phase 2 评估显示 `convert_to_responses` 上游影响为 CRITICAL，因此暂缓抽取；Phase 3 中 `extract_usage_from_event` 上游 impact 为 LOW，变更后 `detect_changes` 为 low 且无 affected processes。最终 `npx gitnexus analyze` 已刷新索引至 1,608 nodes / 3,892 edges / 141 flows。
+- Tests: provider crate 62/62 通过；server crate 10/10 与 integration 7/7 通过；完整 workspace 测试全部通过。新增 usage snapshot 回归覆盖重复 `message_delta.usage` 与 cache token snapshot。
+- Gaps: provider-neutral Responses 模块抽取保留为后续独立重构；当前 ChatGPT/Codex 行为优化已完成。
+
+### WF-2026-05-17-002 — v0.3.4 发布
+
+Status: Done（已完成）
+Completed: 2026-05-17
+Level: 2
+Commits / Tag（提交 / 标签）:
+
+- cb66177 Prepare v0.3.4 release fixes
+- c5d145a Refresh v0.3.4 release metadata
+- v0.3.4 tag: 4524ceb（本地 tag 存在，指向 `c5d145a`）
+
+Acceptance summary（验收摘要）:
+
+- Review: 确认 v0.3.4 包含 Responses tool schema normalization、split function arguments buffering/sanitization、empty completed output `tool_use` stop reason、版本号更新和发布元数据刷新。
+- Validation: 发布准备阶段已验证 `./target/release/claude-proxy --version` 输出 `claude-proxy 0.3.4`；`cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings`、`cargo build --release` 均通过。
+- GitNexus: 文件级 impact 对 `chatgpt.rs` 和 `copilot/responses.rs` 为 LOW；最终发布准备 `detect_changes` 为 medium，主要变更集中在 `ResponsesStreamConverter`、`normalize_tool_schema` 和相关测试。发布后 GitNexus 元数据已刷新。
+- Tests: provider crate 与完整 workspace 验证通过。
+- Gaps: 用户确认发布任务已由其他 agent 完成；本 ledger 已据本地 tag 状态补记完成。
 
 ### WF-2026-05-17-001 — ChatGPT Read pages 参数清理
 
