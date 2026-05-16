@@ -10,7 +10,7 @@ Status: In Progress（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 2 — 分离共享 Responses 模块边界
+Current phase: Phase 3 — 提升 usage 与 metrics 准确性（已完成）
 Goal: 通过稳定 Codex/ChatGPT 共享 Responses 转换路径中的 tool schema、流式 function arguments、stop reason 和后续 metrics 准确性，深度优化 ChatGPT provider 行为。
 
 Decisions（决策）:
@@ -38,28 +38,42 @@ Acceptance / Review（验收 / 复核）:
 - Gaps: 代码修复已提交但 GitNexus 元数据文档和 workflow ledger 仍有未提交更新；Phase 2/3 仍待决策和实施。
 
 #### Phase 2 — 分离共享 Responses 模块边界
-Status: Pending（待处理）
+Status: Done（暂缓抽取）
 Depends on（依赖）:
 - Phase 1
 Tasks（任务）:
-- [ ] 在行为修复提交后，决定是否将共享 Responses 代码从 `copilot::responses` 抽出。
-- [ ] 如果需要抽取，在不改变行为的前提下迁移 request、stream、non-stream、sanitize 职责。
-- [ ] 抽取后验证 ChatGPT 与 Copilot 路径。
+- [x] 在行为修复提交后，决定是否将共享 Responses 代码从 `copilot::responses` 抽出。
+- [x] 如果需要抽取，在不改变行为的前提下迁移 request、stream、non-stream、sanitize 职责。
+- [x] 抽取后验证 ChatGPT 与 Copilot 路径。
+
+Acceptance / Review（验收 / 复核）:
+- Review: 暂不抽取共享 Responses 模块。`copilot::responses` 的命名确实不理想，但当前行为修复已经稳定；立即移动模块会把低收益结构调整和高风险请求体转换混在一起。
+- Validation: 只读评估当前边界：ChatGPT 直接复用 `convert_to_responses` 和 `stream_responses_response`；Copilot `/responses` 同时复用 request、stream 和 non-stream 转换。
+- GitNexus: `convert_to_responses` 上游影响为 CRITICAL，直接触达 `build_chatgpt_responses_body` 与多组 Copilot tests；`stream_responses_response` 上游 impact 为 LOW；`convert_non_streaming_response` 上游 impact 为 LOW。结论是请求体转换抽取风险高，stream/non-stream 单独抽取收益有限。
+- Tests: 本阶段未改代码，未重新运行测试；沿用 Phase 1 已通过的 `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings`。
+- Gaps: 命名/模块边界问题保留为后续重构，不阻塞当前 ChatGPT/Codex 行为优化。
 
 #### Phase 3 — 提升 usage 与 metrics 准确性
-Status: Pending（待处理）
+Status: Done（已完成）
 Depends on（依赖）:
 - Phase 1
 Tasks（任务）:
-- [ ] 审计最终 Responses usage 是否正确传播到 `message_delta.usage`。
-- [ ] 确认 server metrics 优先采用 completed/delta 事件中的最终 usage。
-- [ ] 如果仍有缺口，为 streaming input/output token 捕获添加回归测试。
+- [x] 审计最终 Responses usage 是否正确传播到 `message_delta.usage`。
+- [x] 确认 server metrics 优先采用 completed/delta 事件中的最终 usage。
+- [x] 如果仍有缺口，为 streaming input/output token 捕获添加回归测试。
+
+Acceptance / Review（验收 / 复核）:
+- Review: 确认 Responses converter 会在 `response.completed` / `response.incomplete` / `response.failed` 中读取最终 `response.usage` 并通过 `message_delta.usage` 发出；OpenAI Chat Completions streaming 也会在 final chunk usage 后通过 `message_delta.usage` 暴露累计 input/output tokens。server 侧原先累加 usage 字段，可能在重复 final snapshot 或 fallback `finish()` 场景中把 input/output/cache tokens 翻倍；已改为对每个 usage 字段保留最终累计快照最大值。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server usage_extraction`、`cargo test -p claude-proxy-server`、`cargo test -p claude-proxy-providers`、`cargo test` 均通过。
+- GitNexus: `extract_usage_from_event` 上游 impact 为 LOW，直接调用者为 `stream_leader_response` 与 `collect_leader_response`，间接影响 `messages`；`StreamConverter.process_chunk` impact 为 LOW；`StreamConverter.finish` impact 为 LOW；变更后 `detect_changes` 为 low，affected processes 为空。
+- Tests: 新增 `usage_extraction_keeps_final_token_snapshot` 覆盖重复 `message_delta.usage` 不翻倍；新增 `usage_extraction_keeps_cache_token_snapshot` 覆盖 cache token snapshot 不重复累计。server crate 10/10 与 integration 7/7 通过；provider crate 62/62 通过；完整 workspace 全部通过。
+- Gaps: Phase 3 usage/metrics 修复完成；provider-neutral Responses 模块抽取仍作为后续重构保留。
 
 Discovered tasks（发现的后续任务）:
 - 当前 ChatGPT/Codex 兼容性修复稳定后，考虑抽取 provider-neutral 的 Responses 转换模块。
 - 将 OpenAI/Responses streaming token accounting 审计作为独立于 tool-call 兼容性工作的后续任务。
 
-Resume next（下次继续）: 审查现有未提交 provider 改动，运行聚焦 provider 测试，然后重新运行 GitNexus change detection，再决定提交或调整实现。
+Resume next（下次继续）: ChatGPT/Codex Responses 优化三个阶段已完成；后续可进入 v0.3.4 发布任务，或单独规划 provider-neutral Responses 模块抽取。
 
 ### WF-2026-05-17-002 — v0.3.4 发布
 

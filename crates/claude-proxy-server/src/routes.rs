@@ -876,47 +876,33 @@ fn mask_toml_keys(toml_str: &str) -> String {
 }
 
 /// Extract token usage from a streaming SSE event.
-/// In streaming, usage comes in:
-/// - `message_start` event: `message.usage.input_tokens`
-/// - `message_delta` event: `usage.output_tokens`
 fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
-    // message_start: { "message": { "usage": { "input_tokens": N, ... } } }
     if let Some(message) = data.get("message")
         && let Some(u) = message.get("usage")
     {
-        if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-            usage.input_tokens += v;
-        }
-        if let Some(v) = u
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            usage.cache_creation_input_tokens += v;
-        }
-        if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-            usage.cache_read_input_tokens += v;
-        }
+        update_usage_snapshot(u, usage);
     }
 
-    // message_delta: { "usage": { "output_tokens": N } }
     if let Some(u) = data.get("usage") {
-        if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-            usage.output_tokens += v;
-        }
-        // Also check for input tokens in delta (some providers include them)
-        if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-            usage.input_tokens += v;
-        }
-        // Cache tokens at top level (Anthropic non-streaming response format)
-        if let Some(v) = u
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            usage.cache_creation_input_tokens += v;
-        }
-        if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-            usage.cache_read_input_tokens += v;
-        }
+        update_usage_snapshot(u, usage);
+    }
+}
+
+fn update_usage_snapshot(u: &Value, usage: &mut TokenUsage) {
+    if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+        usage.input_tokens = usage.input_tokens.max(v);
+    }
+    if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+        usage.output_tokens = usage.output_tokens.max(v);
+    }
+    if let Some(v) = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.cache_creation_input_tokens = usage.cache_creation_input_tokens.max(v);
+    }
+    if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(v);
     }
 }
 
@@ -1048,5 +1034,80 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn usage_extraction_keeps_final_token_snapshot() {
+        let mut usage = TokenUsage::default();
+        extract_usage_from_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7
+                }
+            }),
+            &mut usage,
+        );
+
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn usage_extraction_keeps_cache_token_snapshot() {
+        let mut usage = TokenUsage::default();
+        extract_usage_from_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 30,
+                        "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 10
+                    }
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 30,
+                    "output_tokens": 4,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 10
+                }
+            }),
+            &mut usage,
+        );
+
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.cache_creation_input_tokens, 5);
+        assert_eq!(usage.cache_read_input_tokens, 10);
     }
 }
