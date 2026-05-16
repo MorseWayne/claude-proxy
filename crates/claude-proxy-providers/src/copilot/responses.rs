@@ -5,6 +5,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::http::fmt_reqwest_err;
 use crate::provider::ProviderError;
@@ -547,17 +548,45 @@ pub fn stream_responses_response(
         let mut converter = ResponsesStreamConverter::new();
         let mut buffer = String::new();
         let mut byte_stream = response.bytes_stream();
+        let mut chunk_index = 0_u64;
+        let mut event_index = 0_u64;
 
         while let Some(chunk_result) = byte_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    chunk_index += 1;
+                    let chunk_text = String::from_utf8_lossy(&chunk);
+                    debug!(
+                        chunk_index,
+                        chunk_bytes = chunk.len(),
+                        raw_chunk = %chunk_text,
+                        "Received Responses streaming bytes"
+                    );
+                    buffer.push_str(&chunk_text);
                     while let Some(pos) = buffer.find("\n\n") {
+                        event_index += 1;
                         let event = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
+                        debug!(
+                            event_index,
+                            event_bytes = event.len(),
+                            raw_event = %event,
+                            remaining_buffer_bytes = buffer.len(),
+                            "Split Responses SSE event"
+                        );
 
                         if let Some(value) = parse_sse_json(&event) {
+                            debug!(
+                                responses_event_type = value["type"].as_str().unwrap_or_default(),
+                                responses_event = %value,
+                                "Parsed Responses SSE JSON event"
+                            );
                             for event in converter.process_event(&value) {
+                                debug!(
+                                    anthropic_event = %event.event,
+                                    anthropic_data = %event.data,
+                                    "Emitting Anthropic SSE event converted from Responses event"
+                                );
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
                                 }
@@ -687,12 +716,38 @@ impl ResponsesStreamConverter {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
                 let output_index = event["output_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
+                debug!(
+                    output_index,
+                    item_id = event["item_id"].as_str().unwrap_or_default(),
+                    delta = %delta,
+                    delta_bytes = delta.len(),
+                    buffered_before = self
+                        .function_argument_buffers
+                        .get(&output_index)
+                        .map(String::len)
+                        .unwrap_or_default(),
+                    "Processing Responses function_call_arguments delta"
+                );
                 if !delta.is_empty() {
                     self.ensure_function_block(output_index, event, &mut events);
                     self.function_argument_buffers
                         .entry(output_index)
                         .or_default()
                         .push_str(delta);
+                    debug!(
+                        output_index,
+                        buffered_arguments = %self
+                            .function_argument_buffers
+                            .get(&output_index)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        buffered_after = self
+                            .function_argument_buffers
+                            .get(&output_index)
+                            .map(String::len)
+                            .unwrap_or_default(),
+                        "Buffered Responses function call arguments delta"
+                    );
                     self.emit_parseable_function_arguments(output_index, event, &mut events);
                 }
             }
@@ -813,6 +868,20 @@ impl ResponsesStreamConverter {
 
     fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
+        debug!(
+            output_index,
+            item_id = event["item_id"].as_str().unwrap_or_default(),
+            call_id = event["call_id"].as_str().unwrap_or_default(),
+            name = event["name"].as_str().unwrap_or_default(),
+            done_arguments = event["arguments"].as_str().unwrap_or_default(),
+            done_arguments_bytes = event["arguments"].as_str().map(str::len).unwrap_or_default(),
+            buffered_arguments = %self
+                .function_argument_buffers
+                .get(&output_index)
+                .map(String::as_str)
+                .unwrap_or_default(),
+            "Processing Responses function_call_arguments done"
+        );
         self.saw_function_call = true;
         if let Some(name) = event["name"].as_str() {
             self.function_names.insert(output_index, name.to_string());
@@ -882,6 +951,15 @@ impl ResponsesStreamConverter {
             .get(&output_index)
             .map(String::as_str)
             .unwrap_or("");
+        debug!(
+            output_index,
+            anthropic_block_index = idx,
+            final_arguments_present = final_arguments.is_some(),
+            require_valid_json,
+            sanitized_arguments = %sanitized,
+            previous_emitted = %previous,
+            "Preparing Responses function arguments for Anthropic input_json_delta"
+        );
         if sanitized == previous {
             return;
         }
@@ -897,6 +975,12 @@ impl ResponsesStreamConverter {
     }
 
     fn push_function_arguments_delta(idx: u32, arguments: &str, events: &mut Vec<SseEvent>) {
+        debug!(
+            anthropic_block_index = idx,
+            partial_json = %arguments,
+            partial_json_bytes = arguments.len(),
+            "Emitting Responses Anthropic input_json_delta"
+        );
         events.push(SseEvent {
             event: "content_block_delta".to_string(),
             data: json!({
