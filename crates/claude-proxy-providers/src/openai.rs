@@ -692,42 +692,19 @@ pub fn stream_openai_response(
         let mut converter = StreamConverter::new();
         let mut buffer = String::new();
         let mut byte_stream = response.bytes_stream();
-        let mut chunk_index = 0_u64;
-        let mut event_index = 0_u64;
 
         while let Some(chunk_result) = byte_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    chunk_index += 1;
-                    let chunk_text = String::from_utf8_lossy(&chunk);
-                    debug!(
-                        chunk_index,
-                        chunk_bytes = chunk.len(),
-                        raw_chunk = %chunk_text,
-                        "Received OpenAI streaming bytes"
-                    );
-                    buffer.push_str(&chunk_text);
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                     while let Some(pos) = buffer.find("\n\n") {
-                        event_index += 1;
                         let event_str = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
-                        debug!(
-                            event_index,
-                            event_bytes = event_str.len(),
-                            raw_event = %event_str,
-                            remaining_buffer_bytes = buffer.len(),
-                            "Split OpenAI SSE event"
-                        );
 
                         if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
                             let events = converter.process_chunk(&openai_chunk);
                             for event in events {
-                                debug!(
-                                    anthropic_event = %event.event,
-                                    anthropic_data = %event.data,
-                                    "Emitting Anthropic SSE event converted from OpenAI chunk"
-                                );
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
                                 }
@@ -901,21 +878,7 @@ impl StreamConverter {
 
             // Handle tool calls
             if let Some(ref tool_calls) = choice.delta.tool_calls {
-                debug!(
-                    choice_index = choice.index,
-                    tool_call_count = tool_calls.len(),
-                    "Processing OpenAI tool call deltas"
-                );
                 for tc in tool_calls {
-                    debug!(
-                        choice_index = choice.index,
-                        openai_tool_index = tc.index,
-                        openai_tool_id = tc.id.as_deref().unwrap_or(""),
-                        openai_tool_name = tc.function.name.as_deref().unwrap_or(""),
-                        arguments_delta = %tc.function.arguments,
-                        arguments_delta_bytes = tc.function.arguments.len(),
-                        "Processing OpenAI tool call delta"
-                    );
                     // Close text/thinking blocks if open
                     if self.current_text_index.is_some() {
                         let idx = self.current_text_index.take().unwrap();
@@ -948,13 +911,6 @@ impl StreamConverter {
                             .clone()
                             .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
                         let tool_name = tc.function.name.clone().unwrap_or_default();
-                        debug!(
-                            openai_tool_index = tc.index,
-                            anthropic_block_index = idx,
-                            anthropic_tool_id = %tool_id,
-                            anthropic_tool_name = %tool_name,
-                            "Starting Anthropic tool_use content block"
-                        );
                         events.push(SseEvent {
                             event: "content_block_start".to_string(),
                             data: json!({
@@ -973,13 +929,6 @@ impl StreamConverter {
 
                     // Emit argument deltas
                     if !tc.function.arguments.is_empty() {
-                        debug!(
-                            openai_tool_index = tc.index,
-                            anthropic_block_index = block_idx,
-                            partial_json = %tc.function.arguments,
-                            partial_json_bytes = tc.function.arguments.len(),
-                            "Emitting Anthropic input_json_delta"
-                        );
                         events.push(SseEvent {
                             event: "content_block_delta".to_string(),
                             data: json!({
@@ -1090,7 +1039,6 @@ impl StreamConverter {
 
 /// Parse raw SSE text into an OpenAI chunk.
 pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
-    debug!(raw_event = %text, raw_event_bytes = text.len(), "Parsing OpenAI SSE event");
     let mut data_str = None;
 
     for line in text.lines() {
@@ -1122,12 +1070,6 @@ pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
             let reasoning_content = delta["reasoning_content"].as_str().map(|s| s.to_string());
 
             let tool_calls = delta["tool_calls"].as_array().map(|arr| {
-                debug!(
-                    choice_index = index,
-                    tool_call_count = arr.len(),
-                    raw_tool_calls = %(serde_json::Value::Array(arr.clone())),
-                    "Parsed OpenAI tool_calls array"
-                );
                 arr.iter()
                     .map(|tc| {
                         let idx = tc["index"].as_u64().unwrap_or(0) as u32;
@@ -1137,16 +1079,6 @@ pub fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
                             .as_str()
                             .unwrap_or("")
                             .to_string();
-                        debug!(
-                            choice_index = index,
-                            openai_tool_index = idx,
-                            openai_tool_id = id.as_deref().unwrap_or(""),
-                            openai_tool_name = name.as_deref().unwrap_or(""),
-                            arguments_delta = %arguments,
-                            arguments_delta_bytes = arguments.len(),
-                            raw_tool_call = %tc,
-                            "Parsed OpenAI tool call delta"
-                        );
 
                         OpenAiToolCall {
                             index: idx,
