@@ -7,6 +7,10 @@ use tracing::{error, info, warn};
 
 use crate::app::TokenUsage;
 
+const METRICS_RETENTION_DAYS: i64 = 90;
+const METRICS_MAINTENANCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
 /// A single write event to be persisted.
 struct UsageEvent {
     provider: String,
@@ -50,6 +54,44 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn run_metrics_maintenance(conn: &Connection) -> rusqlite::Result<()> {
+    prune_old_usage_events(conn, METRICS_RETENTION_DAYS)?;
+    checkpoint_metrics_wal(conn)?;
+    Ok(())
+}
+
+fn prune_old_usage_events(conn: &Connection, retention_days: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM usage_events WHERE created_at < datetime('now', ?1)",
+        [format!("-{retention_days} days")],
+    )
+}
+
+fn checkpoint_metrics_wal(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+}
+
+fn spawn_metrics_maintenance(conn: Arc<std::sync::Mutex<Connection>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(METRICS_MAINTENANCE_INTERVAL);
+        loop {
+            interval.tick().await;
+            let conn = conn.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = conn.lock().unwrap();
+                run_metrics_maintenance(&conn)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => info!("Metrics maintenance completed"),
+                Ok(Err(e)) => warn!("Metrics maintenance failed: {e}"),
+                Err(e) => warn!("Metrics maintenance task failed: {e}"),
+            }
+        }
+    });
+}
+
 /// Persisted metrics store backed by SQLite with a background writer task.
 pub struct MetricsStore {
     /// Channel to send writes to the background task.
@@ -79,6 +121,9 @@ impl MetricsStore {
 
         rebuild_usage_events_schema(&conn)
             .map_err(|e| format!("failed to initialize metrics schema: {e}"))?;
+        if let Err(e) = run_metrics_maintenance(&conn) {
+            warn!("Metrics maintenance skipped: {e}");
+        }
 
         info!("Metrics store opened at {}", db_path.display());
 
@@ -95,6 +140,7 @@ impl MetricsStore {
 
         // Spawn the background writer task
         tokio::spawn(Self::writer_loop(write_conn, write_rx));
+        spawn_metrics_maintenance(read_conn.clone());
 
         Ok(Self {
             write_tx,
@@ -323,6 +369,29 @@ mod tests {
         assert_eq!(count, 0);
         conn.prepare("SELECT provider, initiator FROM usage_events LIMIT 0")
             .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prunes_usage_events_older_than_retention_window() {
+        let path = temp_db_path("retention");
+        let conn = Connection::open(&path).unwrap();
+        rebuild_usage_events_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO usage_events (provider, initiator, model, created_at)
+             VALUES ('chatgpt', 'user', 'gpt-5.5', datetime('now', '-91 days'));
+             INSERT INTO usage_events (provider, initiator, model, created_at)
+             VALUES ('chatgpt', 'user', 'gpt-5.5', datetime('now', '-89 days'));",
+        )
+        .unwrap();
+
+        let deleted = prune_old_usage_events(&conn, 90).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(count, 1);
         let _ = std::fs::remove_file(path);
     }
 
