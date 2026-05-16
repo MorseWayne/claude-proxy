@@ -427,20 +427,9 @@ impl Provider for ChatGptProvider {
             return Err(map_upstream_response(response).await);
         }
 
-        if request.stream {
-            Ok(crate::copilot::responses::stream_responses_response(
-                response,
-            ))
-        } else {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
-            let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::copilot::responses::convert_non_streaming_response(&data);
-            let stream = futures::stream::iter(events.into_iter().map(Ok));
-            Ok(Box::pin(stream))
-        }
+        Ok(crate::copilot::responses::stream_responses_response(
+            response,
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -488,6 +477,7 @@ fn build_chatgpt_responses_body(request: &MessagesRequest) -> Value {
     let mut body = crate::copilot::responses::convert_to_responses(request);
     if let Some(object) = body.as_object_mut() {
         object.remove("max_output_tokens");
+        object.insert("stream".to_string(), json!(true));
         let missing_instructions = object
             .get("instructions")
             .and_then(Value::as_str)
@@ -664,7 +654,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop_sequences: None,
-            stream: true,
+            stream: false,
             tools: None,
             tool_choice: None,
             thinking: None,
@@ -675,6 +665,7 @@ mod tests {
         let body = build_chatgpt_responses_body(&req);
 
         assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
+        assert_eq!(body["stream"], true);
         assert!(body.get("max_output_tokens").is_none());
     }
 
