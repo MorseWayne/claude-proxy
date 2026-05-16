@@ -30,17 +30,17 @@ Claude 兼容代理服务器：把 Claude Code、Claude SDK 或任何 Anthropic 
 
 ![CLI 总览](images/cli-overview.svg)
 
-### 3. Provider 管理
+### 3. 多 Provider 管理
 
-Provider 命令覆盖添加、测试、测速、切换和模型缓存刷新，适合在本地快速试错多个上游。
+TUI 可以集中查看 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和自定义 Provider，并快速切换默认模型。
 
-![Provider 命令](images/provider-commands.svg)
+![多 Provider 管理](images/multi-providers.png)
 
-### 4. Provider 支持矩阵
+### 4. 模型路由配置
 
-API key provider 和 OAuth provider 可以共存在同一份 TOML 配置中，再通过模型名精确路由。
+Model 页面展示默认模型和 Claude alias 的路由关系，方便确认 `opus`、`sonnet`、`haiku` 等别名最终会落到哪个上游模型。
 
-![Provider 支持矩阵](images/provider-matrix.svg)
+![模型路由配置](images/model-route.png)
 
 ### 5. 配置与服务控制
 
