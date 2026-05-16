@@ -67,7 +67,7 @@ Rust workspace (edition 2024) — 5 crates:
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **claude-proxy** (1522 symbols, 3660 relationships, 133 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **claude-proxy** (1576 symbols, 3794 relationships, 138 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -107,3 +107,23 @@ This project is indexed by GitNexus as **claude-proxy** (1522 symbols, 3660 rela
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+
+## Workflow Ledger
+
+Use `workflow-ledger` for recoverable development work.
+
+- Classify tasks before executing: Level 0 Q&A, Level 1 lightweight edit, Level 2 standard code work, Level 3 complex work.
+- Maintain `.claude/WORKFLOW.md` for Level 2/3 tasks and for any task the user wants tracked across sessions.
+- Organize tracked work by phases and subtasks, not a flat checklist.
+- Before marking a phase Done, record `Acceptance / Review` with `Review`, `Validation`, `GitNexus`, `Tests`, and `Gaps`; failed validation means the phase stays In Progress or Blocked.
+- Record dependencies and discovered future tasks; complete prerequisites before blocked work, and defer non-blocking discoveries to Backlog/Future.
+- Use TodoWrite for current-session execution; use `.claude/WORKFLOW.md` for milestone history and resume points.
+- Do not create attachments or extra spec files unless Level 3 work genuinely needs them or the user asks.
+
+Do not rationalize skipping the ledger:
+
+- “This is small” still requires Level classification; Level 2/3 work is tracked.
+- “I will update it later” is unsafe; update at phase completion, blockers, key decisions, and handoff points.
+- TodoWrite is session-local; `.claude/WORKFLOW.md` is the durable recovery state.
+- Keep core fields stable so `.claude/bin/workflow-ledger doctor` can check the ledger.
