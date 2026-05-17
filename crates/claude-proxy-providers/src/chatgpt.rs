@@ -17,13 +17,16 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+    UpstreamRequestPolicy, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
+    send_upstream_request_with_policy,
 };
 use crate::openai_compat::{apply_openai_intent, log_request_observability, openai_model_info};
 use crate::provider::{Provider, ProviderError};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
+const CHATGPT_SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
 
 pub use auth::{ChatGptAuth, ChatGptToken, DeviceCodeInfo};
 
@@ -80,7 +83,11 @@ impl Provider for ChatGptProvider {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
 
-        let response = send_upstream_request(request_builder.json(&body)).await?;
+        let response = send_upstream_request_with_policy(
+            request_builder.json(&body),
+            chatgpt_upstream_request_policy(),
+        )
+        .await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -114,6 +121,13 @@ fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, Provide
             fmt_reqwest_err(&e)
         ))
     })
+}
+
+fn chatgpt_upstream_request_policy() -> UpstreamRequestPolicy {
+    UpstreamRequestPolicy {
+        max_attempts: CHATGPT_SEND_MAX_ATTEMPTS,
+        attempt_timeout: Some(CHATGPT_SEND_ATTEMPT_TIMEOUT),
+    }
 }
 
 fn codex_responses_endpoint(base_url: &str) -> String {
@@ -188,6 +202,14 @@ mod tests {
             gpt55.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
         );
+    }
+
+    #[test]
+    fn chatgpt_request_policy_caps_first_response_wait() {
+        let policy = chatgpt_upstream_request_policy();
+
+        assert_eq!(policy.max_attempts, 2);
+        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(60)));
     }
 
     #[test]

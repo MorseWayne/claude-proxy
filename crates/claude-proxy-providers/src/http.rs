@@ -22,12 +22,34 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
+use tracing::warn;
 
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SEND_ATTEMPTS: usize = 3;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamRequestPolicy {
+    pub max_attempts: usize,
+    pub attempt_timeout: Option<Duration>,
+}
+
+impl Default for UpstreamRequestPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: MAX_SEND_ATTEMPTS,
+            attempt_timeout: None,
+        }
+    }
+}
+
+impl UpstreamRequestPolicy {
+    fn max_attempts(self) -> usize {
+        self.max_attempts.max(1)
+    }
+}
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
 /// callers see the real root cause (TLS handshake error, DNS failure, …)
@@ -75,30 +97,85 @@ where
 pub async fn send_upstream_request(
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, ProviderError> {
+    send_upstream_request_with_policy(request, UpstreamRequestPolicy::default()).await
+}
+
+pub async fn send_upstream_request_with_policy(
+    request: reqwest::RequestBuilder,
+    policy: UpstreamRequestPolicy,
+) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 0;
+    let max_attempts = policy.max_attempts();
     loop {
         attempt += 1;
         let Some(next_request) = request.try_clone() else {
-            return send_once(request).await;
+            return send_once(request, policy.attempt_timeout).await;
         };
 
-        let response = send_once(next_request).await;
-        if attempt >= MAX_SEND_ATTEMPTS || !should_retry_result(&response) {
+        let response = send_once(next_request, policy.attempt_timeout).await;
+        if attempt >= max_attempts || !should_retry_result(&response) {
             return response;
         }
 
+        warn_retrying_upstream_request(attempt, max_attempts, &response);
         sleep(retry_delay(attempt, response.as_ref().ok())).await;
     }
 }
 
-async fn send_once(request: reqwest::RequestBuilder) -> Result<reqwest::Response, ProviderError> {
-    request.send().await.map_err(|e| {
-        if e.is_timeout() {
-            ProviderError::Timeout
-        } else {
-            ProviderError::Network(fmt_reqwest_err(&e))
-        }
-    })
+async fn send_once(
+    request: reqwest::RequestBuilder,
+    attempt_timeout: Option<Duration>,
+) -> Result<reqwest::Response, ProviderError> {
+    with_request_timeout(
+        async {
+            request.send().await.map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Network(fmt_reqwest_err(&e))
+                }
+            })
+        },
+        attempt_timeout,
+    )
+    .await
+}
+
+async fn with_request_timeout<F, T>(
+    request: F,
+    attempt_timeout: Option<Duration>,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = Result<T, ProviderError>>,
+{
+    if let Some(attempt_timeout) = attempt_timeout {
+        timeout(attempt_timeout, request)
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+    } else {
+        request.await
+    }
+}
+
+fn warn_retrying_upstream_request(
+    attempt: usize,
+    max_attempts: usize,
+    response: &Result<reqwest::Response, ProviderError>,
+) {
+    match response {
+        Ok(response) => warn!(
+            attempt,
+            max_attempts,
+            status = response.status().as_u16(),
+            "Retrying upstream request after retryable HTTP status"
+        ),
+        Err(error) => warn!(
+            attempt,
+            max_attempts,
+            error = %error,
+            "Retrying upstream request after transient error"
+        ),
+    }
 }
 
 fn should_retry_result(response: &Result<reqwest::Response, ProviderError>) -> bool {
@@ -286,5 +363,26 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ProviderError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn request_attempt_times_out_when_policy_budget_expires() {
+        let result = with_request_timeout(
+            std::future::pending::<Result<(), ProviderError>>(),
+            Some(Duration::ZERO),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProviderError::Timeout)));
+    }
+
+    #[test]
+    fn request_policy_uses_one_attempt_when_configured_zero() {
+        let policy = UpstreamRequestPolicy {
+            max_attempts: 0,
+            attempt_timeout: None,
+        };
+
+        assert_eq!(policy.max_attempts(), 1);
     }
 }
