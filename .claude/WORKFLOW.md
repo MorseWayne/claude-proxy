@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 5A — Metrics shape enrichment 已完成
+Current phase: Phase 5B — Model capability metadata 已完成
 
 Goal（目标）:
 
@@ -25,6 +25,7 @@ Decisions（决策）:
 - Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
 - Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata；不保留旧 metrics JSON 兼容，server 与 TUI 同步更新新契约。
 - Phase 5A 已实施 server-only metrics shape enrichment：session 与 stored metrics 均新增 provider / initiator 维度聚合；SQLite schema 无需变更。
+- Phase 5B 已实施 model capability metadata：`/admin/metrics` 顶层新增 `model_capabilities`，从 provider registry cached models 暴露现有可信字段；当前 `ModelInfo` 不包含 context window，因此不猜测或新增 context 字段。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
 Status: Done
@@ -102,7 +103,7 @@ Tasks:
 
 Planned implementation order:
 1. **Phase 5A — Metrics shape enrichment（server-only）**：扩展 `Metrics` / `StoredTotals` 的聚合输出，保留现有 token snapshot 语义，新增 provider+initiator 维度聚合；直接定义新的 `/admin/metrics` JSON shape，不为旧 shape 添加兼容 shim。
-2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 context window、max output tokens、supported endpoints/reasoning metadata 暴露到新的 metrics/admin 响应契约，供 TUI 展示；避免混入 request path 的实时计费逻辑。
+2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 max output tokens、supported endpoints、vision/thinking/reasoning metadata 暴露到新的 metrics/admin 响应契约，供 TUI 展示；当前 `ModelInfo` 不包含 context window，避免混入猜测字段或 request path 的实时计费逻辑。
 3. **Phase 5C — TUI metrics display**：按新 metrics JSON 契约更新 Dashboard 解析与展示 provider/initiator 维度、模型能力列；不支持旧 server 的旧 metrics shape，发现字段缺失时按新契约默认空值处理即可。
 4. **Phase 5D — Cost estimate（optional）**：仅在有明确 pricing table 来源和更新策略后实现估算；否则只展示 billable token 分解，避免误导性成本数字。
 
@@ -130,6 +131,23 @@ Acceptance / Review:
 - Tests: 新增 `completed_request_records_provider_and_initiator_metrics` 覆盖 session `models` / `providers` / `initiators` JSON；新增 `load_totals_groups_usage_by_model_provider_and_initiator` 覆盖 stored model/provider/initiator 聚合与 error totals。
 - Gaps: TUI 仍只解析旧 Dashboard model usage 展示；按规划留到 Phase 5C 与新 metrics contract 同步更新。模型能力 metadata 未实现，留到 Phase 5B。
 
+#### Phase 5B — Model capability metadata（provider/server boundary）
+Status: Done
+Depends on:
+- Phase 5A
+Tasks:
+- [x] 用 GitNexus 确认 model cache、`ProviderRegistry` 与 `admin_metrics` 的影响边界。
+- [x] 从 provider registry cached models 暴露 `model_capabilities`。
+- [x] 只使用 `ModelInfo` 现有可信字段，不新增 context window 或 pricing 字段。
+- [x] 补充 registry 与 `/admin/metrics` 路由级回归测试。
+
+Acceptance / Review:
+- Review: 已在 [app.rs](crates/claude-proxy-server/src/app.rs) 新增 `ProviderRegistry::model_capabilities()`，按 `provider/model` key 输出 provider、model、vendor、max output tokens、supported endpoints、vision/thinking/adaptive thinking、thinking budget 与 reasoning effort levels；已在 [routes.rs](crates/claude-proxy-server/src/routes.rs) 将 cached model capabilities 注入 `/admin/metrics` 顶层 `model_capabilities`。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: `ProviderRegistry.all_cached_models#0` upstream impact 为 LOW（direct=1，仅 `/v1/models`）；`Metrics.to_json#0` upstream impact 为 LOW（direct=2，`admin_metrics` 与测试）。实施后 `detect_changes(scope=all)` 为 LOW，changed_count=15，affected_count=0，affected_processes=[]。
+- Tests: 新增 `provider_registry_exports_model_capabilities` 覆盖 capability JSON shape；新增 `admin_metrics_includes_model_capabilities` 覆盖 `/admin/metrics` 注入 cached model metadata。
+- Gaps: TUI 尚未消费 `model_capabilities`，留到 Phase 5C；当前不暴露 context window，因为 `ModelInfo` 尚无可信字段。
+
 Discovered tasks（发现的后续任务）:
 
 - 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
@@ -137,7 +155,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 5A 已完成 server-only metrics shape enrichment；下一步建议推进 Phase 5B model capability metadata，或先做 Phase 5C TUI metrics display 以消费新增 provider/initiator 维度。
+- Phase 5B 已完成 model capability metadata server 输出；下一步建议推进 Phase 5C TUI metrics display，按新契约消费 provider/initiator 维度与 `model_capabilities`。
 
 ## Backlog / Future（待办 / 未来）
 

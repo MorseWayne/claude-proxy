@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use claude_proxy_config::Settings;
 use claude_proxy_providers::provider::Provider;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::persistence::{MetricsStore, StoredTotals};
@@ -240,6 +240,44 @@ mod tests {
         );
         assert_eq!(data["stored"]["providers"].as_object().unwrap().len(), 0);
     }
+
+    #[test]
+    fn provider_registry_exports_model_capabilities() {
+        let mut registry = ProviderRegistry::new();
+        registry.cache_models(
+            "chatgpt",
+            vec![claude_proxy_core::ModelInfo {
+                model_id: "gpt-5.5".to_string(),
+                supports_thinking: Some(true),
+                vendor: Some("openai".to_string()),
+                max_output_tokens: Some(128_000),
+                supported_endpoints: vec!["/responses".to_string()],
+                is_chat_default: None,
+                supports_vision: Some(true),
+                supports_adaptive_thinking: Some(false),
+                min_thinking_budget: Some(1024),
+                max_thinking_budget: Some(32_000),
+                reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+            }],
+        );
+
+        let capabilities = registry.model_capabilities();
+
+        assert_eq!(capabilities["chatgpt/gpt-5.5"]["provider"], "chatgpt");
+        assert_eq!(capabilities["chatgpt/gpt-5.5"]["model"], "gpt-5.5");
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["max_output_tokens"],
+            128_000
+        );
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["supported_endpoints"][0],
+            "/responses"
+        );
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["reasoning_effort_levels"][1],
+            "high"
+        );
+    }
 }
 
 /// Shared application state.
@@ -323,6 +361,35 @@ impl ProviderRegistry {
     /// Get all cached models across all providers.
     pub fn all_cached_models(&self) -> Vec<claude_proxy_core::ModelInfo> {
         self.model_cache.values().flatten().cloned().collect()
+    }
+
+    pub fn model_capabilities(&self) -> Value {
+        let capabilities = self
+            .model_cache
+            .iter()
+            .flat_map(|(provider_id, models)| {
+                models.iter().map(move |model| {
+                    (
+                        format!("{provider_id}/{}", model.model_id),
+                        json!({
+                            "provider": provider_id,
+                            "model": model.model_id,
+                            "vendor": model.vendor,
+                            "max_output_tokens": model.max_output_tokens,
+                            "supported_endpoints": model.supported_endpoints,
+                            "supports_thinking": model.supports_thinking,
+                            "supports_vision": model.supports_vision,
+                            "supports_adaptive_thinking": model.supports_adaptive_thinking,
+                            "min_thinking_budget": model.min_thinking_budget,
+                            "max_thinking_budget": model.max_thinking_budget,
+                            "reasoning_effort_levels": model.reasoning_effort_levels,
+                            "is_chat_default": model.is_chat_default,
+                        }),
+                    )
+                })
+            })
+            .collect::<serde_json::Map<_, _>>();
+        Value::Object(capabilities)
     }
 
     /// Clear all providers (on config reload).

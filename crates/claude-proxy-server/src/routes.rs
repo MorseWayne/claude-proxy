@@ -730,7 +730,14 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
             &ErrorResponse::authentication("invalid admin token"),
         );
     }
-    Json(state.metrics.to_json().await).into_response()
+    drop(settings);
+
+    let model_capabilities = state.provider_registry.read().await.model_capabilities();
+    let mut metrics = state.metrics.to_json().await;
+    if let Some(object) = metrics.as_object_mut() {
+        object.insert("model_capabilities".to_string(), model_capabilities);
+    }
+    Json(metrics).into_response()
 }
 
 fn format_sse_event(event: &SseEvent) -> String {
@@ -1109,5 +1116,42 @@ mod tests {
         assert_eq!(usage.output_tokens, 4);
         assert_eq!(usage.cache_creation_input_tokens, 5);
         assert_eq!(usage.cache_read_input_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn admin_metrics_includes_model_capabilities() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let state = AppState::new(settings, None);
+        state.provider_registry.write().await.cache_models(
+            "chatgpt",
+            vec![ModelInfo {
+                model_id: "gpt-5.5".to_string(),
+                supports_thinking: Some(true),
+                vendor: Some("openai".to_string()),
+                max_output_tokens: Some(128_000),
+                supported_endpoints: vec!["/responses".to_string()],
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+            }],
+        );
+
+        let response = admin_metrics(State(state), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            body["model_capabilities"]["chatgpt/gpt-5.5"]["max_output_tokens"],
+            128_000
+        );
+        assert_eq!(
+            body["model_capabilities"]["chatgpt/gpt-5.5"]["supported_endpoints"][0],
+            "/responses"
+        );
     }
 }
