@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 4 — PII-safe tool diagnostics 实施完成
+Current phase: Phase 5 — Usage/cost metrics 规划完成，待实施
 
 Goal（目标）:
 
@@ -23,6 +23,7 @@ Decisions（决策）:
 - Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
 - Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
 - Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
+- Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata。
 - 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
@@ -90,6 +91,28 @@ Acceptance / Review:
 - Tests: provider crate 81/81、workspace 全量测试通过；新增 `read_sanitizer_reports_pii_safe_diagnostics` 与 `read_sanitizer_reports_removed_unverifiable_offset` 覆盖诊断字段、sanitization 类型与长度，不断言敏感参数内容。
 - Gaps: usage/cost metrics 未在本阶段实现；因会影响 server metrics schema、admin API 与 TUI 展示，保留为独立后续任务。
 
+#### Phase 5 — Usage/cost metrics 规划
+Status: Done
+Depends on:
+- Phase 4
+Tasks:
+- [x] 用 GitNexus 复核 server metrics、persistence、admin API 与 TUI dashboard 的执行边界。
+- [x] 明确第一步不直接做价格估算，先补齐 per-provider/per-initiator/per-model 的可观测性与模型能力 metadata。
+- [x] 拆分实施顺序，降低 schema/API/TUI 同时变更风险。
+
+Planned implementation order:
+1. **Phase 5A — Metrics shape enrichment（server-only）**：扩展 `Metrics` / `StoredTotals` 的聚合输出，保留现有 token snapshot 语义，新增 provider+initiator 维度聚合；如需变更 SQLite schema，先做兼容 migration 和 persistence 单元测试。
+2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 context window、max output tokens、supported endpoints/reasoning metadata 暴露到 `/admin/metrics` 或相邻 admin endpoint，供 TUI 展示；避免混入 request path 的实时计费逻辑。
+3. **Phase 5C — TUI metrics display**：在 Dashboard 合并 session + stored totals 时展示 provider/initiator 维度和模型能力列；保持旧 metrics JSON 字段可选解析，避免旧 server 下 TUI 崩溃。
+4. **Phase 5D — Cost estimate（optional）**：仅在有明确 pricing table 来源和更新策略后实现估算；否则只展示 billable token 分解，避免误导性成本数字。
+
+Acceptance / Review:
+- Review: 已确认当前 [app.rs](crates/claude-proxy-server/src/app.rs) 的 `TokenUsage` / `ModelMetrics` 只按 model 聚合 token，`MetricsStore` 只持久化 provider、initiator、model、token、error、latency，`/admin/metrics` 输出 session/stored totals，TUI Dashboard 只解析并合并 model token totals。
+- Validation: 规划阶段未修改业务代码；读取并复核 [routes.rs](crates/claude-proxy-server/src/routes.rs)、[persistence.rs](crates/claude-proxy-server/src/persistence.rs)、[dashboard.rs](crates/claude-proxy-cli/src/tui/pages/dashboard.rs) 与 [app.rs](crates/claude-proxy-cli/src/tui/app.rs)。
+- GitNexus: `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`admin_metrics`、`fetch_live_metrics`、`render_model_usage` 是主要边界；server 与 TUI 变更会跨 crate，应分阶段实施。
+- Tests: N/A（规划阶段）。
+- Gaps: 尚未选择 pricing source；未运行具体符号 impact，实施前仍需对拟修改符号逐一运行 GitNexus upstream impact。
+
 Discovered tasks（发现的后续任务）:
 
 - 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
@@ -97,7 +120,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 4 已完成 provider 侧 PII-safe sanitizer diagnostics 并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步如继续优化，应单独规划 usage/cost metrics 或清理 provider-neutral Responses 抽取历史待办。
+- Phase 5 usage/cost metrics 已完成规划；下一步建议从 Phase 5A server-only metrics shape enrichment 开始，先对 `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`Metrics.to_json` 运行 GitNexus upstream impact。
 
 ## Backlog / Future（待办 / 未来）
 
