@@ -16,6 +16,7 @@ pub struct OpenAiRequestLogInfo {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub reasoning_source: &'static str,
+    pub thinking_type: Option<String>,
     pub thinking_budget_tokens: Option<u32>,
 }
 
@@ -40,6 +41,10 @@ pub fn openai_request_log_info(request: &MessagesRequest) -> OpenAiRequestLogInf
         model: request.model,
         reasoning_effort,
         reasoning_source,
+        thinking_type: request
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.r#type.clone()),
         thinking_budget_tokens: request
             .thinking
             .as_ref()

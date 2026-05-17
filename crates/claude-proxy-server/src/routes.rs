@@ -216,16 +216,19 @@ fn log_resolved_request(original_request: &MessagesRequest, resolved: &ResolvedU
     if openai_compatible_reasoning_log(&resolved.provider_type) {
         let info = openai_request_log_info(&resolved.request);
         if let Some(reasoning_effort) = info.reasoning_effort {
-            if let Some(thinking_budget_tokens) = info.thinking_budget_tokens {
+            if info.thinking_type.is_some() || info.thinking_budget_tokens.is_some() {
                 info!(
-                    "Request: initiator={} model={} → {}/{} reasoning_effort={} reasoning_source={} thinking_budget_tokens={}",
+                    "Request: initiator={} model={} → {}/{} reasoning_effort={} reasoning_source={} thinking_type={} thinking_budget_tokens={}",
                     resolved.initiator,
                     original_request.model,
                     resolved.provider_id,
                     info.model,
                     reasoning_effort,
                     info.reasoning_source,
-                    thinking_budget_tokens
+                    info.thinking_type.as_deref().unwrap_or("unset"),
+                    info.thinking_budget_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_else(|| "unset".to_string())
                 );
                 return;
             }
