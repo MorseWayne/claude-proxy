@@ -178,6 +178,7 @@ mod tests {
             .expect("gpt-5.5 model");
 
         assert_eq!(gpt55.max_output_tokens, Some(128_000));
+        assert_eq!(gpt55.context_window, Some(400_000));
         assert!(
             gpt55
                 .supported_endpoints

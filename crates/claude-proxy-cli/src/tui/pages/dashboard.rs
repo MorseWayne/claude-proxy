@@ -308,6 +308,10 @@ fn push_capability_rows(
     )));
     let row_budget = available.saturating_sub(1);
     for (name, capability) in capabilities.iter().take(row_budget) {
+        let context_window = capability
+            .context_window
+            .map(format_tokens)
+            .unwrap_or_else(|| "-".to_string());
         let max_output = capability
             .max_output_tokens
             .map(format_tokens)
@@ -323,7 +327,11 @@ fn push_capability_rows(
                 Style::default().fg(theme::FG_DIM),
             ),
             Span::styled(
-                format!(" max {}", max_output),
+                format!(" ctx {:>7}", context_window),
+                Style::default().fg(theme::ACCENT2),
+            ),
+            Span::styled(
+                format!(" out {:>7}", max_output),
                 Style::default().fg(theme::ACCENT2),
             ),
             Span::styled(format!(" {flags}"), Style::default().fg(theme::FG_DIM)),

@@ -251,6 +251,7 @@ mod tests {
                 supports_thinking: Some(true),
                 vendor: Some("openai".to_string()),
                 max_output_tokens: Some(128_000),
+                context_window: Some(400_000),
                 supported_endpoints: vec!["/responses".to_string()],
                 is_chat_default: None,
                 supports_vision: Some(true),
@@ -269,6 +270,7 @@ mod tests {
             capabilities["chatgpt/gpt-5.5"]["max_output_tokens"],
             128_000
         );
+        assert_eq!(capabilities["chatgpt/gpt-5.5"]["context_window"], 400_000);
         assert_eq!(
             capabilities["chatgpt/gpt-5.5"]["supported_endpoints"][0],
             "/responses"
@@ -376,6 +378,7 @@ impl ProviderRegistry {
                             "model": model.model_id,
                             "vendor": model.vendor,
                             "max_output_tokens": model.max_output_tokens,
+                            "context_window": model.context_window,
                             "supported_endpoints": model.supported_endpoints,
                             "supports_thinking": model.supports_thinking,
                             "supports_vision": model.supports_vision,

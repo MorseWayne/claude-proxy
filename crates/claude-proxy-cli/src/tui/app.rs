@@ -358,6 +358,7 @@ pub struct ModelCapability {
     pub provider: String,
     pub vendor: Option<String>,
     pub max_output_tokens: Option<u64>,
+    pub context_window: Option<u64>,
     pub supported_endpoints: Vec<String>,
     pub supports_thinking: Option<bool>,
     pub supports_vision: Option<bool>,

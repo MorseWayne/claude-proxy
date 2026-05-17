@@ -126,6 +126,11 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
         } else {
             None
         },
+        context_window: if model_id.starts_with("gpt-5") {
+            Some(400_000)
+        } else {
+            None
+        },
         supported_endpoints,
         is_chat_default: None,
         supports_vision: None,
@@ -402,6 +407,7 @@ mod tests {
 
         assert!(prefers_responses("gpt-5.5"));
         assert_eq!(info.max_output_tokens, Some(128_000));
+        assert_eq!(info.context_window, Some(400_000));
         assert_eq!(
             info.supported_endpoints,
             vec!["/chat/completions", "/responses"]

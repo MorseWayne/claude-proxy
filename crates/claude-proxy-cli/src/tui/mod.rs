@@ -1739,6 +1739,7 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
                         .to_string(),
                     vendor: v.get("vendor").and_then(|x| x.as_str()).map(str::to_string),
                     max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
+                    context_window: v.get("context_window").and_then(|x| x.as_u64()),
                     supported_endpoints: v
                         .get("supported_endpoints")
                         .and_then(|x| x.as_array())
@@ -1980,6 +1981,7 @@ mod tests {
                 "provider": "chatgpt",
                 "vendor": "openai",
                 "max_output_tokens": 128000,
+                "context_window": 400000,
                 "supported_endpoints": ["/responses"],
                 "supports_thinking": true,
                 "supports_vision": true,
@@ -1992,6 +1994,7 @@ mod tests {
         assert_eq!(capabilities[0].1.provider, "chatgpt");
         assert_eq!(capabilities[0].1.vendor.as_deref(), Some("openai"));
         assert_eq!(capabilities[0].1.max_output_tokens, Some(128000));
+        assert_eq!(capabilities[0].1.context_window, Some(400000));
         assert_eq!(capabilities[0].1.supported_endpoints[0], "/responses");
         assert_eq!(capabilities[0].1.supports_thinking, Some(true));
         assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");

@@ -39,6 +39,9 @@ fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
     if upstream.max_output_tokens.is_none() {
         upstream.max_output_tokens = known.max_output_tokens;
     }
+    if upstream.context_window.is_none() {
+        upstream.context_window = known.context_window;
+    }
     if upstream.supported_endpoints.is_empty() || supports_responses(&upstream.model_id) {
         upstream.supported_endpoints = known.supported_endpoints;
     }
@@ -198,6 +201,7 @@ impl Provider for OpenAiProvider {
                         supports_thinking: None,
                         vendor: Some("openai".to_string()),
                         max_output_tokens: None,
+                        context_window: None,
                         supported_endpoints: vec!["/chat/completions".to_string()],
                         is_chat_default: None,
                         supports_vision: None,
@@ -225,6 +229,7 @@ mod tests {
             supports_thinking: None,
             vendor: Some("openai".to_string()),
             max_output_tokens: None,
+            context_window: None,
             supported_endpoints: vec!["/chat/completions".to_string()],
             is_chat_default: None,
             supports_vision: None,
@@ -234,6 +239,7 @@ mod tests {
             reasoning_effort_levels: Vec::new(),
         });
 
+        assert_eq!(info.context_window, Some(400_000));
         assert_eq!(
             info.supported_endpoints,
             vec!["/chat/completions", "/responses"]

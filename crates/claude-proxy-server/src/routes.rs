@@ -595,6 +595,7 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
                 "supports_thinking": m.supports_thinking,
                 "vendor": m.vendor,
                 "max_output_tokens": m.max_output_tokens,
+                "context_window": m.context_window,
                 "supported_endpoints": m.supported_endpoints,
                 "is_chat_default": m.is_chat_default,
                 "supports_vision": m.supports_vision,
@@ -1129,6 +1130,7 @@ mod tests {
                 supports_thinking: Some(true),
                 vendor: Some("openai".to_string()),
                 max_output_tokens: Some(128_000),
+                context_window: Some(400_000),
                 supported_endpoints: vec!["/responses".to_string()],
                 is_chat_default: None,
                 supports_vision: None,
@@ -1148,6 +1150,10 @@ mod tests {
         assert_eq!(
             body["model_capabilities"]["chatgpt/gpt-5.5"]["max_output_tokens"],
             128_000
+        );
+        assert_eq!(
+            body["model_capabilities"]["chatgpt/gpt-5.5"]["context_window"],
+            400_000
         );
         assert_eq!(
             body["model_capabilities"]["chatgpt/gpt-5.5"]["supported_endpoints"][0],

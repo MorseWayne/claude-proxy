@@ -33,6 +33,11 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
         max_output_tokens: limits["max_output_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok()),
+        context_window: limits["max_context_window_tokens"]
+            .as_u64()
+            .or_else(|| limits["context_window"].as_u64())
+            .or_else(|| capabilities["context_window"].as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
         supported_endpoints: parse_supported_endpoints(&model["supported_endpoints"]),
         is_chat_default: model["is_chat_default"].as_bool(),
         supports_vision: supports["vision"]
@@ -116,7 +121,7 @@ mod tests {
             "max_thinking_budget": 8192,
             "supported_endpoints": ["/v1/messages", {"path": "/chat/completions"}],
             "capabilities": {
-                "limits": {"max_output_tokens": 16384},
+                "limits": {"max_output_tokens": 16384, "max_context_window_tokens": 200000},
                 "supports": {
                     "vision": true,
                     "adaptive_thinking": true,
@@ -131,6 +136,7 @@ mod tests {
         assert_eq!(model.model_id, "claude-sonnet-4");
         assert_eq!(model.vendor.as_deref(), Some("anthropic"));
         assert_eq!(model.max_output_tokens, Some(16384));
+        assert_eq!(model.context_window, Some(200000));
         assert_eq!(
             model.supported_endpoints,
             vec!["/v1/messages", "/chat/completions"]
