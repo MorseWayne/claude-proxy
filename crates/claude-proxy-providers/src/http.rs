@@ -13,6 +13,7 @@
 //! `http.extra_ca_certs` setting; we install each cert as an additional root
 //! on every reqwest client we build.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -20,12 +21,13 @@ use crate::provider::ProviderError;
 use futures::StreamExt;
 use reqwest::StatusCode;
 use serde_json::Value;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SEND_ATTEMPTS: usize = 3;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
+const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
 /// callers see the real root cause (TLS handshake error, DNS failure, …)
@@ -49,6 +51,25 @@ pub fn fmt_err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// what most call sites already have on hand.
 pub fn fmt_reqwest_err(err: &reqwest::Error) -> String {
     fmt_err_chain(err)
+}
+
+pub async fn next_upstream_stream_item<F, T>(next: F) -> Result<Option<T>, ProviderError>
+where
+    F: Future<Output = Option<T>>,
+{
+    next_upstream_stream_item_with_timeout(next, UPSTREAM_STREAM_IDLE_TIMEOUT).await
+}
+
+async fn next_upstream_stream_item_with_timeout<F, T>(
+    next: F,
+    idle_timeout: Duration,
+) -> Result<Option<T>, ProviderError>
+where
+    F: Future<Output = Option<T>>,
+{
+    timeout(idle_timeout, next)
+        .await
+        .map_err(|_| ProviderError::Timeout)
 }
 
 pub async fn send_upstream_request(
@@ -254,5 +275,16 @@ mod tests {
         assert!(!should_retry_result(&Err(ProviderError::InvalidRequest(
             "bad request".to_string()
         ))));
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_item_times_out_when_idle() {
+        let result = next_upstream_stream_item_with_timeout(
+            std::future::pending::<Option<Result<(), reqwest::Error>>>(),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ProviderError::Timeout)));
     }
 }

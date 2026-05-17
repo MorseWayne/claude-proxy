@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 1 — Retry / error classification 实施完成
+Current phase: Phase 2 — Streaming idle / half-open detection 实施完成
 
 Goal（目标）:
 
@@ -20,8 +20,8 @@ Decisions（决策）:
 
 - 先推进 provider-level retry / error classification；这是收益最高且边界最清晰的稳定性优化。
 - 当前 Phase 1 已实施：共享 HTTP retry helper 已接入 OpenAI、ChatGPT、Copilot 的 chat 与 model listing 请求路径；OAuth/device-flow 轮询请求暂不纳入本阶段。
-- Phase 2 继续处理 SSE idle / half-open stream detection，避免 streaming 请求长期挂死。
-- Chat Completions finalization 先以测试复核为主，确认是否存在重复 stop / usage 事件后再决定是否改状态机。
+- Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
+- Chat Completions finalization 作为 Phase 3，先以测试复核为主，确认是否存在重复 stop / usage 事件后再决定是否改状态机。
 - PII-safe diagnostics 与 usage/cost metrics 作为后续增强，不与 retry/SSE 修复混合。
 - 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
 
@@ -43,13 +43,20 @@ Acceptance / Review:
 - Gaps: 未覆盖 Anthropic provider 与 ChatGPT/Copilot OAuth/device-code 请求；这些认证/轮询路径有不同节奏与语义，后续如需处理应单独评估。
 
 #### Phase 2 — Streaming idle / half-open detection
-Status: Pending
+Status: Done
 Depends on:
 - Phase 1
 Tasks:
-- [ ] 评估 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming loop 是否需要统一 idle timeout。
-- [ ] 设计 provider stream idle timeout 行为，超时返回明确 `ProviderError::Timeout`。
-- [ ] 添加 stream 卡住/无 chunk 的回归测试或可执行验证。
+- [x] 评估 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming loop 是否需要统一 idle timeout。
+- [x] 设计 provider stream idle timeout 行为，超时返回明确 `ProviderError::Timeout`。
+- [x] 添加 stream 卡住/无 chunk 的回归测试或可执行验证。
+
+Acceptance / Review:
+- Review: 已在 [http.rs](crates/claude-proxy-providers/src/http.rs) 增加共享 `next_upstream_stream_item` helper，使用 120 秒 idle timeout 包装上游 `bytes_stream().next()`；[chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming loop 均已接入，超时会向下游发送 `ProviderError::Timeout` 并结束任务。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers http::tests`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `stream_openai_response` 与 `stream_responses_response` upstream impact 均为 LOW；实施后 `detect_changes(scope=all)` 为 LOW，changed_count=5，affected_count=0，affected_processes=[]。
+- Tests: 新增 `upstream_stream_item_times_out_when_idle`，覆盖 pending upstream item 在零时长 timeout 下返回 `ProviderError::Timeout`；provider crate 78/78、workspace 全量测试通过。
+- Gaps: 当前 idle timeout 固定为 120 秒，未暴露配置项；如后续用户需要可配置化，应作为独立配置变更处理。
 
 #### Phase 3 — Chat Completions finalization parity
 Status: Pending
@@ -75,7 +82,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 1 已完成并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步进入 Phase 2：评估 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming idle / half-open detection。
+- Phase 2 已完成并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步进入 Phase 3：复核 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 中 `finish_reason` 与 stream EOF 后 `finish()` 的交互，先补重复 stop/usage 相关回归测试。
 
 ## Backlog / Future（待办 / 未来）
 

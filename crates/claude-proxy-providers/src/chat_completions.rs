@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::http::fmt_reqwest_err;
+use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::provider::ProviderError;
 use crate::tool_args::sanitize_tool_arguments;
 
@@ -74,7 +74,16 @@ pub(crate) fn stream_openai_response(
         let mut buffer = String::new();
         let mut byte_stream = response.bytes_stream();
 
-        while let Some(chunk_result) = byte_stream.next().await {
+        loop {
+            let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
+                Ok(Some(chunk_result)) => chunk_result,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+
             match chunk_result {
                 Ok(chunk) => {
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
