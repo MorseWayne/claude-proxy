@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 5 — Usage/cost metrics 规划完成，待实施
+Current phase: Phase 5A — Metrics shape enrichment 已完成
 
 Goal（目标）:
 
@@ -24,7 +24,7 @@ Decisions（决策）:
 - Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
 - Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
 - Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata；不保留旧 metrics JSON 兼容，server 与 TUI 同步更新新契约。
-- 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
+- Phase 5A 已实施 server-only metrics shape enrichment：session 与 stored metrics 均新增 provider / initiator 维度聚合；SQLite schema 无需变更。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
 Status: Done
@@ -113,6 +113,23 @@ Acceptance / Review:
 - Tests: N/A（规划阶段）。
 - Gaps: 尚未选择 pricing source；未运行具体符号 impact，实施前仍需对拟修改符号逐一运行 GitNexus upstream impact；无需为旧 metrics JSON shape 设计兼容层。
 
+#### Phase 5A — Metrics shape enrichment（server-only）
+Status: Done
+Depends on:
+- Phase 5
+Tasks:
+- [x] 对 `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`Metrics.to_json` 运行 GitNexus upstream impact。
+- [x] 扩展 session metrics 输出，新增 provider / initiator 维度聚合。
+- [x] 扩展 stored totals 聚合，按 model / provider / initiator 输出统一 token usage metrics。
+- [x] 补充 server metrics shape 与 persistence aggregation 回归测试。
+
+Acceptance / Review:
+- Review: 已在 [app.rs](crates/claude-proxy-server/src/app.rs) 将 `ModelMetrics` 泛化为 `UsageMetrics`，保留 `ModelMetrics` alias，并为 session metrics 新增 `providers` 与 `initiators` 输出；已在 [persistence.rs](crates/claude-proxy-server/src/persistence.rs) 复用现有 `usage_events.provider` / `initiator` 字段聚合 stored totals，无需 SQLite schema migration。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `Metrics.record_completed_request#6`、`MetricsStore.record_usage#6`、`MetricsStore.load_totals#0`、`Metrics.to_json#0` upstream impact 均为 LOW；实施后 `detect_changes(scope=all)` 为 MEDIUM，changed_count=31，affected_count=1，affected_processes=[`Handle_server → Load_stored_totals`]，符合启动加载 stored totals 的预期影响。
+- Tests: 新增 `completed_request_records_provider_and_initiator_metrics` 覆盖 session `models` / `providers` / `initiators` JSON；新增 `load_totals_groups_usage_by_model_provider_and_initiator` 覆盖 stored model/provider/initiator 聚合与 error totals。
+- Gaps: TUI 仍只解析旧 Dashboard model usage 展示；按规划留到 Phase 5C 与新 metrics contract 同步更新。模型能力 metadata 未实现，留到 Phase 5B。
+
 Discovered tasks（发现的后续任务）:
 
 - 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
@@ -120,7 +137,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 5 usage/cost metrics 已完成规划；下一步建议从 Phase 5A server-only metrics shape enrichment 开始，先对 `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`Metrics.to_json` 运行 GitNexus upstream impact。
+- Phase 5A 已完成 server-only metrics shape enrichment；下一步建议推进 Phase 5B model capability metadata，或先做 Phase 5C TUI metrics display 以消费新增 provider/initiator 维度。
 
 ## Backlog / Future（待办 / 未来）
 

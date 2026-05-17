@@ -25,9 +25,9 @@ impl TokenUsage {
     }
 }
 
-/// Accumulated metrics for a specific model.
+/// Accumulated usage metrics for a grouping key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelMetrics {
+pub struct UsageMetrics {
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -35,7 +35,7 @@ pub struct ModelMetrics {
     pub cache_read_input_tokens: u64,
 }
 
-impl ModelMetrics {
+impl UsageMetrics {
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
@@ -49,6 +49,8 @@ impl ModelMetrics {
     }
 }
 
+pub type ModelMetrics = UsageMetrics;
+
 /// Request metrics counters.
 pub struct Metrics {
     pub requests_total: AtomicU64,
@@ -56,7 +58,11 @@ pub struct Metrics {
     pub latency_sum_ms: AtomicU64,
     pub latency_count: AtomicU64,
     /// Per-model token usage metrics (current session).
-    pub model_metrics: Mutex<HashMap<String, ModelMetrics>>,
+    pub model_metrics: Mutex<HashMap<String, UsageMetrics>>,
+    /// Per-provider token usage metrics (current session).
+    pub provider_metrics: Mutex<HashMap<String, UsageMetrics>>,
+    /// Per-initiator token usage metrics (current session).
+    pub initiator_metrics: Mutex<HashMap<String, UsageMetrics>>,
     /// Persistent store for all-time metrics.
     store: Option<Arc<MetricsStore>>,
     /// All-time totals loaded from store at startup.
@@ -71,6 +77,8 @@ impl Metrics {
             latency_sum_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             model_metrics: Mutex::new(HashMap::new()),
+            provider_metrics: Mutex::new(HashMap::new()),
+            initiator_metrics: Mutex::new(HashMap::new()),
             store,
             stored_totals: Mutex::new(StoredTotals::default()),
         }
@@ -95,6 +103,28 @@ impl Metrics {
         map.entry(model.to_string()).or_default().add_usage(usage);
     }
 
+    async fn record_usage_dimensions(
+        &self,
+        provider: &str,
+        initiator: &str,
+        model: &str,
+        usage: &TokenUsage,
+    ) {
+        self.record_token_usage(model, usage).await;
+        self.provider_metrics
+            .lock()
+            .await
+            .entry(provider.to_string())
+            .or_default()
+            .add_usage(usage);
+        self.initiator_metrics
+            .lock()
+            .await
+            .entry(initiator.to_string())
+            .or_default()
+            .add_usage(usage);
+    }
+
     /// Record a completed request with usage, persisting to store if available.
     pub async fn record_completed_request(
         &self,
@@ -105,7 +135,8 @@ impl Metrics {
         is_error: bool,
         latency_ms: u64,
     ) {
-        self.record_token_usage(model, usage).await;
+        self.record_usage_dimensions(provider, initiator, model, usage)
+            .await;
         if let Some(ref store) = self.store {
             store.record_usage(provider, initiator, model, usage, is_error, latency_ms);
         }
@@ -128,21 +159,35 @@ impl Metrics {
 
         let model_metrics = self.model_metrics.lock().await;
         let models: serde_json::Value = serde_json::to_value(&*model_metrics).unwrap_or_default();
+        let provider_metrics = self.provider_metrics.lock().await;
+        let providers: serde_json::Value =
+            serde_json::to_value(&*provider_metrics).unwrap_or_default();
+        let initiator_metrics = self.initiator_metrics.lock().await;
+        let initiators: serde_json::Value =
+            serde_json::to_value(&*initiator_metrics).unwrap_or_default();
 
         let stored = self.stored_totals.lock().await;
         let stored_models: serde_json::Value =
             serde_json::to_value(&stored.model_metrics).unwrap_or_default();
+        let stored_providers: serde_json::Value =
+            serde_json::to_value(&stored.provider_metrics).unwrap_or_default();
+        let stored_initiators: serde_json::Value =
+            serde_json::to_value(&stored.initiator_metrics).unwrap_or_default();
 
         json!({
             "requests_total": requests,
             "errors_total": errors,
             "avg_latency_ms": avg_latency,
             "models": models,
+            "providers": providers,
+            "initiators": initiators,
             "stored": {
                 "requests_total": stored.requests_total,
                 "errors_total": stored.errors_total,
                 "avg_latency_ms": stored.latency_sum_ms.checked_div(stored.latency_count).unwrap_or(0),
                 "models": stored_models,
+                "providers": stored_providers,
+                "initiators": stored_initiators,
             },
         })
     }
@@ -169,6 +214,31 @@ mod tests {
         };
 
         assert_eq!(metrics.total_tokens(), 125);
+    }
+
+    #[tokio::test]
+    async fn completed_request_records_provider_and_initiator_metrics() {
+        let metrics = Metrics::default();
+        let usage = TokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 2,
+        };
+
+        metrics
+            .record_completed_request("chatgpt", "agent", "gpt-5.5", &usage, false, 123)
+            .await;
+        let data = metrics.to_json().await;
+
+        assert_eq!(data["models"]["gpt-5.5"]["requests"], 1);
+        assert_eq!(data["models"]["gpt-5.5"]["input_tokens"], 11);
+        assert_eq!(data["providers"]["chatgpt"]["output_tokens"], 7);
+        assert_eq!(
+            data["initiators"]["agent"]["cache_creation_input_tokens"],
+            3
+        );
+        assert_eq!(data["stored"]["providers"].as_object().unwrap().len(), 0);
     }
 }
 

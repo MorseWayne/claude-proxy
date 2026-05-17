@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::app::TokenUsage;
+use crate::app::{TokenUsage, UsageMetrics};
 
 const METRICS_RETENTION_DAYS: i64 = 90;
 const METRICS_MAINTENANCE_INTERVAL: std::time::Duration =
@@ -268,44 +268,56 @@ impl MetricsStore {
                 totals.latency_count = row.3 as u64;
             }
 
-            // Per-model totals
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT model,
-                        COUNT(*) as requests,
-                        COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cache_creation_input_tokens), 0),
-                        COALESCE(SUM(cache_read_input_tokens), 0)
-                 FROM usage_events
-                 GROUP BY model",
-            ) && let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            }) {
-                for row in rows.flatten() {
-                    totals.model_metrics.insert(
-                        row.0,
-                        StoredModelMetrics {
-                            requests: row.1 as u64,
-                            input_tokens: row.2 as u64,
-                            output_tokens: row.3 as u64,
-                            cache_creation_input_tokens: row.4 as u64,
-                            cache_read_input_tokens: row.5 as u64,
-                        },
-                    );
-                }
-            }
+            load_usage_metrics(&conn, "model", &mut totals.model_metrics);
+            load_usage_metrics(&conn, "provider", &mut totals.provider_metrics);
+            load_usage_metrics(&conn, "initiator", &mut totals.initiator_metrics);
 
             totals
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+fn load_usage_metrics(
+    conn: &Connection,
+    group_field: &str,
+    target: &mut std::collections::HashMap<String, UsageMetrics>,
+) {
+    let query = format!(
+        "SELECT {group_field},
+                COUNT(*) as requests,
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_creation_input_tokens), 0),
+                COALESCE(SUM(cache_read_input_tokens), 0)
+         FROM usage_events
+         GROUP BY {group_field}"
+    );
+    if let Ok(mut stmt) = conn.prepare(&query)
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+    {
+        for row in rows.flatten() {
+            target.insert(
+                row.0,
+                UsageMetrics {
+                    requests: row.1 as u64,
+                    input_tokens: row.2 as u64,
+                    output_tokens: row.3 as u64,
+                    cache_creation_input_tokens: row.4 as u64,
+                    cache_read_input_tokens: row.5 as u64,
+                },
+            );
+        }
     }
 }
 
@@ -315,16 +327,9 @@ pub struct StoredTotals {
     pub errors_total: u64,
     pub latency_sum_ms: u64,
     pub latency_count: u64,
-    pub model_metrics: std::collections::HashMap<String, StoredModelMetrics>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct StoredModelMetrics {
-    pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
+    pub model_metrics: std::collections::HashMap<String, UsageMetrics>,
+    pub provider_metrics: std::collections::HashMap<String, UsageMetrics>,
+    pub initiator_metrics: std::collections::HashMap<String, UsageMetrics>,
 }
 
 #[cfg(test)]
@@ -396,8 +401,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_usage_persists_provider_and_initiator() {
-        let path = temp_db_path("usage-event");
+    async fn load_totals_groups_usage_by_model_provider_and_initiator() {
+        let path = temp_db_path("usage-totals");
         let store = MetricsStore::open(path.clone()).unwrap();
         store.record_usage(
             "chatgpt",
@@ -412,30 +417,35 @@ mod tests {
             false,
             123,
         );
-        drop(store);
+        store.record_usage(
+            "openai",
+            "user",
+            "gpt-4.1",
+            &TokenUsage {
+                input_tokens: 5,
+                output_tokens: 13,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1,
+            },
+            true,
+            77,
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let conn = Connection::open(&path).unwrap();
-        let row: (String, String, String, i64, i64) = conn
-            .query_row(
-                "SELECT provider, initiator, model, input_tokens, output_tokens FROM usage_events",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
+        let totals = store.load_totals().await;
 
+        assert_eq!(totals.requests_total, 2);
+        assert_eq!(totals.errors_total, 1);
+        assert_eq!(totals.model_metrics["gpt-5.5"].input_tokens, 11);
+        assert_eq!(totals.model_metrics["gpt-4.1"].output_tokens, 13);
         assert_eq!(
-            row,
-            ("chatgpt".into(), "agent".into(), "gpt-5.5".into(), 11, 7)
+            totals.provider_metrics["chatgpt"].cache_creation_input_tokens,
+            3
         );
+        assert_eq!(totals.provider_metrics["openai"].cache_read_input_tokens, 1);
+        assert_eq!(totals.initiator_metrics["agent"].requests, 1);
+        assert_eq!(totals.initiator_metrics["user"].output_tokens, 13);
+        drop(store);
         let _ = std::fs::remove_file(path);
     }
 }
