@@ -7,6 +7,7 @@ pub mod routes;
 
 pub use app::AppState;
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
 use axum::Router;
@@ -19,6 +20,8 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
+
+const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(state: AppState, settings: &Settings) -> Router {
@@ -74,9 +77,29 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => {
+            result?;
+        }
+        _ = shutdown_signal() => {
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => warn!(
+                    "Graceful shutdown timed out after {}s; forcing shutdown",
+                    GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
+                ),
+            }
+        }
+    }
 
     info!("Server shut down");
     Ok(())
