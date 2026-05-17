@@ -134,6 +134,7 @@ struct StreamConverter {
     tool_argument_buffers: HashMap<u32, String>,
     tool_argument_emitted: HashMap<u32, String>,
     started: bool,
+    stopped: bool,
     input_tokens: u32,
     output_tokens: u32,
 }
@@ -165,6 +166,7 @@ impl StreamConverter {
             tool_argument_buffers: HashMap::new(),
             tool_argument_emitted: HashMap::new(),
             started: false,
+            stopped: false,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -377,6 +379,7 @@ impl StreamConverter {
                 self.tool_call_names.clear();
                 self.tool_argument_buffers.clear();
                 self.tool_argument_emitted.clear();
+                self.stopped = true;
 
                 let stop_reason = match reason.as_str() {
                     "stop" => "end_turn",
@@ -464,6 +467,9 @@ impl StreamConverter {
 
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if self.stopped {
+            return events;
+        }
 
         // Close any remaining open blocks
         if self.current_text_index.is_some() {
@@ -501,6 +507,7 @@ impl StreamConverter {
 
         // If we never got a finish_reason, send message_stop
         if self.started {
+            self.stopped = true;
             events.push(SseEvent {
                 event: "message_delta".to_string(),
                 data: json!({
@@ -920,6 +927,38 @@ mod tests {
         assert_eq!(input["offset"], 520);
         assert_eq!(input["limit"], 5);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_stream_converter_does_not_finish_twice_after_finish_reason() {
+        let mut converter = StreamConverter::new();
+        let events = converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4.1".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("Done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 11,
+                completion_tokens: 3,
+            }),
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_stop")
+                .count(),
+            1
+        );
+        assert!(converter.finish().is_empty());
     }
 
     #[test]

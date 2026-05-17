@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 2 — Streaming idle / half-open detection 实施完成
+Current phase: Phase 3 — Chat Completions finalization parity 实施完成
 
 Goal（目标）:
 
@@ -21,7 +21,7 @@ Decisions（决策）:
 - 先推进 provider-level retry / error classification；这是收益最高且边界最清晰的稳定性优化。
 - 当前 Phase 1 已实施：共享 HTTP retry helper 已接入 OpenAI、ChatGPT、Copilot 的 chat 与 model listing 请求路径；OAuth/device-flow 轮询请求暂不纳入本阶段。
 - Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
-- Chat Completions finalization 作为 Phase 3，先以测试复核为主，确认是否存在重复 stop / usage 事件后再决定是否改状态机。
+- Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
 - PII-safe diagnostics 与 usage/cost metrics 作为后续增强，不与 retry/SSE 修复混合。
 - 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
 
@@ -59,13 +59,20 @@ Acceptance / Review:
 - Gaps: 当前 idle timeout 固定为 120 秒，未暴露配置项；如后续用户需要可配置化，应作为独立配置变更处理。
 
 #### Phase 3 — Chat Completions finalization parity
-Status: Pending
+Status: Done
 Depends on:
 - Phase 2
 Tasks:
-- [ ] 复核 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 中 `finish_reason` 与 stream EOF 后 `finish()` 的交互。
-- [ ] 补充重复 `message_stop` / `message_delta.usage` / tool argument flush 的回归测试。
-- [ ] 仅在测试证明存在问题时调整状态机。
+- [x] 复核 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 中 `finish_reason` 与 stream EOF 后 `finish()` 的交互。
+- [x] 补充重复 `message_stop` / `message_delta.usage` / tool argument flush 的回归测试。
+- [x] 仅在测试证明存在问题时调整状态机。
+
+Acceptance / Review:
+- Review: 回归测试先确认 `finish_reason` 后再调用 EOF `finish()` 会重复 finalization；随后在 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 的 `StreamConverter` 增加 `stopped` 状态，`process_chunk` 处理 `finish_reason` 后标记停止，`finish()` 对已停止状态直接返回空事件。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers test_stream_converter_does_not_finish_twice_after_finish_reason`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: `stream_openai_response` upstream impact 为 LOW；`process_chunk` upstream impact 为 LOW（4 direct，包括入口和测试）；`finish` upstream impact 为 LOW（1 direct）。实施后 `detect_changes(scope=all)` 为 LOW，changed_count=9，affected_count=0，affected_processes=[]。
+- Tests: 新增 `test_stream_converter_does_not_finish_twice_after_finish_reason`，覆盖 `finish_reason` chunk 已产生一次 `message_stop` 后 EOF `finish()` 不再产生事件；provider crate 79/79、workspace 全量测试通过。
+- Gaps: 当前只修正 Chat Completions converter；Responses converter 已有 stopped 状态，本阶段无需改动。
 
 #### Phase 4 — Diagnostics 与 metrics 增强
 Status: Pending
@@ -82,7 +89,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 2 已完成并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步进入 Phase 3：复核 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 中 `finish_reason` 与 stream EOF 后 `finish()` 的交互，先补重复 stop/usage 相关回归测试。
+- Phase 3 已完成并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步进入 Phase 4：评估 PII-safe tool diagnostics 与 usage/cost metrics 增强是否应拆分为独立较小任务。
 
 ## Backlog / Future（待办 / 未来）
 
