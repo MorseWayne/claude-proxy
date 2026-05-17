@@ -1,13 +1,13 @@
-use std::collections::HashMap;
-
 use claude_proxy_core::*;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::http::fmt_reqwest_err;
 use crate::provider::ProviderError;
+use crate::tool_args::sanitize_tool_arguments;
 
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
@@ -211,7 +211,7 @@ fn block_compression_stats(blocks: &[Content]) -> HistoryCompressionStats {
                 stats.tool_outputs += 1;
                 stats.tool_output_bytes += raw_tool_result_text_len(content);
             }
-            Content::Unknown => {}
+            Content::Unknown(_) => {}
         }
     }
 
@@ -323,7 +323,7 @@ fn append_message_items(
                             "output": output,
                         }));
                     }
-                    Content::Unknown => {}
+                    Content::Unknown(_) => {}
                 }
             }
             if !text_parts.is_empty() {
@@ -875,7 +875,7 @@ impl ResponsesStreamConverter {
         let sanitized = self
             .function_names
             .get(&output_index)
-            .and_then(|name| sanitize_read_empty_pages(name, &arguments))
+            .and_then(|name| sanitize_tool_arguments(name, &arguments))
             .unwrap_or(arguments);
         let previous = self
             .function_argument_emitted
@@ -1103,21 +1103,6 @@ fn block_stop(index: u32) -> SseEvent {
     }
 }
 
-fn sanitize_read_empty_pages(tool_name: &str, arguments: &str) -> Option<String> {
-    if tool_name != "Read" {
-        return None;
-    }
-
-    let mut input = serde_json::from_str::<Value>(arguments).ok()?;
-    let object = input.as_object_mut()?;
-    if matches!(object.get("pages"), Some(Value::String(pages)) if pages.is_empty()) {
-        object.remove("pages");
-        return serde_json::to_string(&input).ok();
-    }
-
-    None
-}
-
 pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
     let mut converter = NonStreamingResponsesConverter::new(data);
     converter.convert()
@@ -1220,7 +1205,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             .and_then(|args| {
                 let arguments = item["name"]
                     .as_str()
-                    .and_then(|name| sanitize_read_empty_pages(name, args))
+                    .and_then(|name| sanitize_tool_arguments(name, args))
                     .unwrap_or_else(|| args.to_string());
                 serde_json::from_str::<Value>(&arguments).ok()
             })
@@ -1290,6 +1275,8 @@ impl<'a> NonStreamingResponsesConverter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -2101,6 +2088,88 @@ mod tests {
     }
 
     #[test]
+    fn test_read_sanitizer_recovers_concatenated_large_offset() {
+        let path = temp_read_fixture(1_113);
+        let sanitized = sanitize_tool_arguments(
+            "Read",
+            &json!({
+                "file_path": path.to_string_lossy(),
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert_eq!(input["offset"], 520);
+        assert_eq!(input["limit"], 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_read_sanitizer_removes_absurd_offset_when_file_is_unavailable() {
+        let sanitized = sanitize_tool_arguments(
+            "Read",
+            &json!({
+                "file_path": "missing-routes.rs",
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert!(input.get("offset").is_none());
+        assert_eq!(input["limit"], 5);
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_read_large_offset_before_tool_use() {
+        let path = temp_read_fixture(1_113);
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+        let arguments = json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 5_206_854_u64,
+            "limit": 5
+        })
+        .to_string();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": arguments
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        let input: Value = serde_json::from_str(arguments).expect("valid arguments");
+        assert_eq!(input["offset"], 520);
+        assert_eq!(input["limit"], 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn test_stream_converter_preserves_bash_command_and_empty_strings() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
@@ -2180,8 +2249,21 @@ mod tests {
     #[test]
     fn test_non_read_tool_pages_empty_string_is_preserved() {
         assert_eq!(
-            sanitize_read_empty_pages("Other", "{\"pages\":\"\",\"value\":\"\"}"),
+            sanitize_tool_arguments("Other", "{\"pages\":\"\",\"value\":\"\"}"),
             None
         );
+    }
+
+    fn temp_read_fixture(lines: usize) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "claude-proxy-read-fixture-{}-{}.txt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let body = (1..=lines)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).expect("write read fixture");
+        path
     }
 }

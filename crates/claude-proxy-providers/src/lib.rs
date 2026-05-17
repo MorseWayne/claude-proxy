@@ -1,11 +1,14 @@
 //! Provider trait and implementations for upstream API adapters.
 
 pub mod anthropic;
+mod chat_completions;
 pub mod chatgpt;
 pub mod copilot;
 pub mod http;
 pub mod openai;
 pub mod provider;
+pub(crate) mod responses;
+mod tool_args;
 
 pub use http::{apply_extra_ca_certs, fmt_err_chain, fmt_reqwest_err};
 pub use provider::{Provider, ProviderError};

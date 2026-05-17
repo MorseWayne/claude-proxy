@@ -74,7 +74,7 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
                                 "content": content_str
                             }));
                         }
-                        Content::Unknown => {}
+                        Content::Unknown(_) => {}
                     }
                 }
 

@@ -94,7 +94,7 @@ fn keep_content_block(block: &mut Content, stats: &mut SanitizeStats) -> bool {
         Content::ToolUse { .. }
         | Content::ToolResult { .. }
         | Content::ServerToolUse { .. }
-        | Content::Unknown => true,
+        | Content::Unknown(_) => true,
     }
 }
 

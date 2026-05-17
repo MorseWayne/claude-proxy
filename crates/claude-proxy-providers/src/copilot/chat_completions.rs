@@ -79,7 +79,7 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
                             }));
                             continue;
                         }
-                        Content::Unknown => {}
+                        Content::Unknown(_) => {}
                     }
                 }
                 if !parts.is_empty() {

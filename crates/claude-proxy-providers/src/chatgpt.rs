@@ -3,6 +3,8 @@
 //! Uses the same OpenAI Auth device flow and Codex Responses endpoint that
 //! opencode uses for ChatGPT Pro/Plus authentication.
 
+mod responses;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -427,9 +429,7 @@ impl Provider for ChatGptProvider {
             return Err(map_upstream_response(response).await);
         }
 
-        Ok(crate::copilot::responses::stream_responses_response(
-            response,
-        ))
+        Ok(responses::stream_response(response))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -474,22 +474,7 @@ fn codex_responses_endpoint(base_url: &str) -> String {
 }
 
 fn build_chatgpt_responses_body(request: &MessagesRequest) -> Value {
-    let mut body = crate::copilot::responses::convert_to_responses(request);
-    if let Some(object) = body.as_object_mut() {
-        object.remove("max_output_tokens");
-        object.insert("stream".to_string(), json!(true));
-        let missing_instructions = object
-            .get("instructions")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty);
-        if missing_instructions {
-            object.insert(
-                "instructions".to_string(),
-                json!(DEFAULT_CHATGPT_INSTRUCTIONS),
-            );
-        }
-    }
-    body
+    responses::build_body(request, DEFAULT_CHATGPT_INSTRUCTIONS)
 }
 
 fn chatgpt_models() -> Vec<ModelInfo> {
@@ -737,6 +722,53 @@ mod tests {
                 "properties": {"file_path": {"type": "string"}}
             })
         );
+    }
+
+    #[test]
+    fn chatgpt_responses_body_preserves_tool_history_shape() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Blocks(vec![Content::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "Read".to_string(),
+                        input: json!({"file_path": "README.md"}),
+                    }]),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(vec![Content::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: Some(Value::String("done".to_string())),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["stream"], true);
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["call_id"], "call_1");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        assert_eq!(body["input"][1]["output"], "done");
     }
 
     #[test]

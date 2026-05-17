@@ -4,7 +4,6 @@ pub mod headers;
 mod messages;
 mod model;
 mod preprocess;
-pub(crate) mod responses;
 mod sse;
 mod thinking;
 
@@ -17,7 +16,6 @@ use claude_proxy_config::settings::{
     CopilotProviderConfig, ProviderConfig as ConfigProviderConfig, Settings,
 };
 use claude_proxy_core::*;
-use futures::StreamExt;
 use futures::stream::BoxStream;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
@@ -153,7 +151,9 @@ impl CopilotProvider {
 
     fn has_vision_content(messages: &[Message]) -> bool {
         messages.iter().any(|m| match &m.content {
-            MessageContent::Blocks(blocks) => blocks.iter().any(|b| matches!(b, Content::Unknown)),
+            MessageContent::Blocks(blocks) => {
+                blocks.iter().any(|b| matches!(b, Content::Unknown(_)))
+            }
             _ => false,
         })
     }
@@ -220,12 +220,7 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            let stream = response.bytes_stream().map(|chunk| {
-                chunk
-                    .map(|bytes| sse::parse_anthropic_sse(&bytes))
-                    .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))
-            });
-            Ok(Box::pin(stream))
+            Ok(sse::stream_anthropic_sse_response(response))
         } else {
             let body = response
                 .text()
@@ -274,14 +269,14 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(crate::openai::stream_openai_response(response))
+            Ok(crate::chat_completions::stream_openai_response(response))
         } else {
             let body = response
                 .text()
                 .await
                 .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::openai::convert_non_streaming_response(&data);
+            let events = crate::chat_completions::convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
         }
@@ -296,7 +291,7 @@ impl CopilotProvider {
         let url = format!("{}/responses", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
         let headers = self.build_headers(token, vision, initiator);
-        let body = responses::convert_to_responses(&request);
+        let body = crate::responses::convert_to_responses(&request);
 
         debug!("Copilot responses API request to {url}");
 
@@ -320,14 +315,14 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(responses::stream_responses_response(response))
+            Ok(crate::responses::stream_responses_response(response))
         } else {
             let body = response
                 .text()
                 .await
                 .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = responses::convert_non_streaming_response(&data);
+            let events = crate::responses::convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
         }
