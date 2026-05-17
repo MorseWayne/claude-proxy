@@ -336,6 +336,9 @@ pub struct LiveMetrics {
     pub errors_total: u64,
     pub avg_latency_ms: u64,
     pub models: Vec<(String, LiveModelMetrics)>,
+    pub providers: Vec<(String, LiveModelMetrics)>,
+    pub initiators: Vec<(String, LiveModelMetrics)>,
+    pub model_capabilities: Vec<(String, ModelCapability)>,
     /// All-time stored totals (persisted across restarts).
     pub stored: Option<StoredMetrics>,
 }
@@ -346,6 +349,20 @@ pub struct StoredMetrics {
     pub errors_total: u64,
     pub avg_latency_ms: u64,
     pub models: Vec<(String, LiveModelMetrics)>,
+    pub providers: Vec<(String, LiveModelMetrics)>,
+    pub initiators: Vec<(String, LiveModelMetrics)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModelCapability {
+    pub provider: String,
+    pub vendor: Option<String>,
+    pub max_output_tokens: Option<u64>,
+    pub supported_endpoints: Vec<String>,
+    pub supports_thinking: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_adaptive_thinking: Option<bool>,
+    pub reasoning_effort_levels: Vec<String>,
 }
 
 /// Per-model metrics for display.

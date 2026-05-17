@@ -23,9 +23,10 @@ use serde_json::{Map, Value};
 
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
-    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, NavItem,
-    OAuthOverlay, OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
-    ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus, StoredMetrics, Toast,
+    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, ModelCapability,
+    NavItem, OAuthOverlay, OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay,
+    ProviderCheckOk, ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus,
+    StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{CopilotProviderConfig, ProviderConfig, ProviderType};
@@ -1691,6 +1692,85 @@ fn fetch_live_metrics(app: &mut App) {
     });
 }
 
+fn parse_usage_metrics(value: Option<&Value>) -> Vec<(String, LiveModelMetrics)> {
+    let Some(metrics) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<(String, LiveModelMetrics)> = metrics
+        .iter()
+        .map(|(name, v)| {
+            let m = LiveModelMetrics {
+                requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
+                input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                cache_creation_input_tokens: v
+                    .get("cache_creation_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                cache_read_input_tokens: v
+                    .get("cache_read_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+            };
+            (name.clone(), m)
+        })
+        .collect();
+    items.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
+    items
+}
+
+fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapability)> {
+    let Some(capabilities) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<(String, ModelCapability)> = capabilities
+        .iter()
+        .map(|(name, v)| {
+            (
+                name.clone(),
+                ModelCapability {
+                    provider: v
+                        .get("provider")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    vendor: v.get("vendor").and_then(|x| x.as_str()).map(str::to_string),
+                    max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
+                    supported_endpoints: v
+                        .get("supported_endpoints")
+                        .and_then(|x| x.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    supports_thinking: v.get("supports_thinking").and_then(|x| x.as_bool()),
+                    supports_vision: v.get("supports_vision").and_then(|x| x.as_bool()),
+                    supports_adaptive_thinking: v
+                        .get("supports_adaptive_thinking")
+                        .and_then(|x| x.as_bool()),
+                    reasoning_effort_levels: v
+                        .get("reasoning_effort_levels")
+                        .and_then(|x| x.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
 /// Poll for completed metrics fetch results (called every tick).
 fn poll_metrics(app: &mut App) {
     let data = if let Some(ref rx) = app.metrics_rx {
@@ -1722,37 +1802,16 @@ fn poll_metrics(app: &mut App) {
             .get("avg_latency_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        models: Vec::new(),
+        models: parse_usage_metrics(data.get("models")),
+        providers: parse_usage_metrics(data.get("providers")),
+        initiators: parse_usage_metrics(data.get("initiators")),
+        model_capabilities: parse_model_capabilities(data.get("model_capabilities")),
         stored: None,
     };
 
-    if let Some(models) = data.get("models").and_then(|v| v.as_object()) {
-        let mut model_list: Vec<(String, LiveModelMetrics)> = models
-            .iter()
-            .map(|(name, v)| {
-                let m = LiveModelMetrics {
-                    requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                    input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                    output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                    cache_creation_input_tokens: v
-                        .get("cache_creation_input_tokens")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
-                    cache_read_input_tokens: v
-                        .get("cache_read_input_tokens")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
-                };
-                (name.clone(), m)
-            })
-            .collect();
-        model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
-        live.models = model_list;
-    }
-
     // Parse stored (all-time) metrics
     if let Some(stored) = data.get("stored") {
-        let mut stored_metrics = StoredMetrics {
+        let stored_metrics = StoredMetrics {
             requests_total: stored
                 .get("requests_total")
                 .and_then(|v| v.as_u64())
@@ -1765,31 +1824,10 @@ fn poll_metrics(app: &mut App) {
                 .get("avg_latency_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            models: Vec::new(),
+            models: parse_usage_metrics(stored.get("models")),
+            providers: parse_usage_metrics(stored.get("providers")),
+            initiators: parse_usage_metrics(stored.get("initiators")),
         };
-        if let Some(models) = stored.get("models").and_then(|v| v.as_object()) {
-            let mut model_list: Vec<(String, LiveModelMetrics)> = models
-                .iter()
-                .map(|(name, v)| {
-                    let m = LiveModelMetrics {
-                        requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
-                        input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                        output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                        cache_creation_input_tokens: v
-                            .get("cache_creation_input_tokens")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                        cache_read_input_tokens: v
-                            .get("cache_read_input_tokens")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0),
-                    };
-                    (name.clone(), m)
-                })
-                .collect();
-            model_list.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
-            stored_metrics.models = model_list;
-        }
         live.stored = Some(stored_metrics);
     }
 
@@ -1903,6 +1941,54 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    }
+
+    #[test]
+    fn parse_metrics_contract_reads_new_usage_dimensions() {
+        let metrics = parse_usage_metrics(Some(&json!({
+            "chatgpt": {
+                "requests": 2,
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 20
+            },
+            "openai": {
+                "requests": 1,
+                "input_tokens": 3,
+                "output_tokens": 4
+            }
+        })));
+
+        assert_eq!(metrics[0].0, "chatgpt");
+        assert_eq!(metrics[0].1.requests, 2);
+        assert_eq!(metrics[0].1.cache_read_input_tokens, 20);
+        assert_eq!(metrics[1].0, "openai");
+        assert_eq!(metrics[1].1.total_tokens(), 7);
+    }
+
+    #[test]
+    fn parse_model_capabilities_reads_metadata_fields() {
+        let capabilities = parse_model_capabilities(Some(&json!({
+            "chatgpt/gpt-5.5": {
+                "provider": "chatgpt",
+                "vendor": "openai",
+                "max_output_tokens": 128000,
+                "supported_endpoints": ["/responses"],
+                "supports_thinking": true,
+                "supports_vision": true,
+                "supports_adaptive_thinking": false,
+                "reasoning_effort_levels": ["low", "high"]
+            }
+        })));
+
+        assert_eq!(capabilities[0].0, "chatgpt/gpt-5.5");
+        assert_eq!(capabilities[0].1.provider, "chatgpt");
+        assert_eq!(capabilities[0].1.vendor.as_deref(), Some("openai"));
+        assert_eq!(capabilities[0].1.max_output_tokens, Some(128000));
+        assert_eq!(capabilities[0].1.supported_endpoints[0], "/responses");
+        assert_eq!(capabilities[0].1.supports_thinking, Some(true));
+        assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");
     }
 
     #[test]

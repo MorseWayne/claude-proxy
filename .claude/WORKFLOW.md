@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 5B — Model capability metadata 已完成
+Current phase: Phase 5C — TUI metrics display 已完成
 
 Goal（目标）:
 
@@ -26,6 +26,7 @@ Decisions（决策）:
 - Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata；不保留旧 metrics JSON 兼容，server 与 TUI 同步更新新契约。
 - Phase 5A 已实施 server-only metrics shape enrichment：session 与 stored metrics 均新增 provider / initiator 维度聚合；SQLite schema 无需变更。
 - Phase 5B 已实施 model capability metadata：`/admin/metrics` 顶层新增 `model_capabilities`，从 provider registry cached models 暴露现有可信字段；当前 `ModelInfo` 不包含 context window，因此不猜测或新增 context 字段。
+- Phase 5C 已实施 TUI metrics display：Dashboard 按新 metrics 契约解析并展示 models / providers / initiators 与 model capabilities；不保留旧 metrics shape 兼容。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
 Status: Done
@@ -148,6 +149,23 @@ Acceptance / Review:
 - Tests: 新增 `provider_registry_exports_model_capabilities` 覆盖 capability JSON shape；新增 `admin_metrics_includes_model_capabilities` 覆盖 `/admin/metrics` 注入 cached model metadata。
 - Gaps: TUI 尚未消费 `model_capabilities`，留到 Phase 5C；当前不暴露 context window，因为 `ModelInfo` 尚无可信字段。
 
+#### Phase 5C — TUI metrics display
+Status: Done
+Depends on:
+- Phase 5B
+Tasks:
+- [x] 对 TUI metrics polling 与 Dashboard usage rendering 运行 GitNexus upstream impact。
+- [x] 按新 `/admin/metrics` 契约解析 session/stored models、providers、initiators。
+- [x] 解析并展示 `model_capabilities` 中现有可信模型能力字段。
+- [x] 补充 TUI metrics parser 回归测试。
+
+Acceptance / Review:
+- Review: 已在 [app.rs](crates/claude-proxy-cli/src/tui/app.rs) 扩展 `LiveMetrics` / `StoredMetrics` 并新增 `ModelCapability`；已在 [mod.rs](crates/claude-proxy-cli/src/tui/mod.rs) 将 metrics parser 抽成统一 usage/capability 解析；已在 [dashboard.rs](crates/claude-proxy-cli/src/tui/pages/dashboard.rs) 将 Dashboard usage 区更新为 Models / Providers / Initiators / Model Capabilities 展示。Capability metadata 可在无请求记录时展示；不支持旧 metrics JSON shape。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-cli`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `poll_metrics` 与 `render_model_usage` upstream impact 为 HIGH，影响集中在 TUI run/render 主路径，已按预期限制为解析与展示变更。实施后 `detect_changes(scope=all)` 为 HIGH，changed_count=19，affected_count=7，affected_processes 包含 TUI render/run 相关流程，符合 Dashboard metrics 展示变更预期。
+- Tests: 新增 `parse_metrics_contract_reads_new_usage_dimensions` 覆盖新 usage dimensions 解析；新增 `parse_model_capabilities_reads_metadata_fields` 覆盖 capability metadata 字段解析。
+- Gaps: 未做交互式 TUI 截图/浏览器级视觉验证；Phase 5D cost estimate 仍仅在明确 pricing source 与更新策略后再评估；当前仍不展示 context window，因为 `ModelInfo` 尚无可信字段。
+
 Discovered tasks（发现的后续任务）:
 
 - 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
@@ -155,7 +173,7 @@ Discovered tasks（发现的后续任务）:
 
 Resume next（下次继续）:
 
-- Phase 5B 已完成 model capability metadata server 输出；下一步建议推进 Phase 5C TUI metrics display，按新契约消费 provider/initiator 维度与 `model_capabilities`。
+- Phase 5C 已完成 TUI metrics display；下一步不要启动 Phase 5D，除非先明确 pricing source 与更新策略。可先提交本阶段并刷新 GitNexus 索引。
 
 ## Backlog / Future（待办 / 未来）
 
