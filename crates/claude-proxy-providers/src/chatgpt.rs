@@ -24,7 +24,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
-use crate::openai::{apply_openai_intent, log_request_observability, openai_model_info};
+use crate::openai_compat::{apply_openai_intent, log_request_observability, openai_model_info};
 use crate::provider::{Provider, ProviderError};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";

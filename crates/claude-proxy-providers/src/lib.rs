@@ -6,6 +6,7 @@ pub mod chatgpt;
 pub mod copilot;
 pub mod http;
 pub mod openai;
+mod openai_compat;
 pub mod provider;
 pub(crate) mod responses;
 mod tool_args;
