@@ -16,6 +16,7 @@ pub struct OpenAiRequestLogInfo {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub reasoning_source: &'static str,
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 pub fn openai_request_log_info(request: &MessagesRequest) -> OpenAiRequestLogInfo {
@@ -39,6 +40,10 @@ pub fn openai_request_log_info(request: &MessagesRequest) -> OpenAiRequestLogInf
         model: request.model,
         reasoning_effort,
         reasoning_source,
+        thinking_budget_tokens: request
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens),
     }
 }
 
