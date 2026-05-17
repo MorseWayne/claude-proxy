@@ -397,6 +397,14 @@ cargo build --release
 # 二进制文件位于 target/release/claude-proxy
 ```
 
+构建 Linux musl 静态链接版本：
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# 二进制文件位于 target/x86_64-unknown-linux-musl/release/claude-proxy
+```
+
 常用开发命令：
 
 ```bash

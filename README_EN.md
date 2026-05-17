@@ -250,6 +250,14 @@ cargo build --release
 # binary at target/release/claude-proxy
 ```
 
+Build the Linux musl statically linked version:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# binary at target/x86_64-unknown-linux-musl/release/claude-proxy
+```
+
 ## License
 
 MIT
