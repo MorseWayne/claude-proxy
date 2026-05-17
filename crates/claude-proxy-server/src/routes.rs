@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use claude_proxy_config::settings::ProviderType;
 use claude_proxy_core::*;
+use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{Provider, ProviderError};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -83,10 +84,7 @@ pub async fn messages(
 
     let resolved = resolve_upstream_request(&state, &request).await;
 
-    info!(
-        "Request: initiator={} model={} → {}/{}",
-        resolved.initiator, request.model, resolved.provider_id, resolved.upstream_model
-    );
+    log_resolved_request(&request, &resolved);
 
     // --- Concurrent request deduplication ---
     // Compute a hash of the full request to identify identical inflight requests.
@@ -201,6 +199,7 @@ pub async fn messages(
 
 struct ResolvedUpstreamRequest {
     provider_id: String,
+    provider_type: ProviderType,
     upstream_model: String,
     initiator: &'static str,
     request: MessagesRequest,
@@ -213,6 +212,40 @@ struct RequestMetricsContext {
     initiator: &'static str,
 }
 
+fn log_resolved_request(original_request: &MessagesRequest, resolved: &ResolvedUpstreamRequest) {
+    if openai_compatible_reasoning_log(&resolved.provider_type) {
+        let info = openai_request_log_info(&resolved.request);
+        if let Some(reasoning_effort) = info.reasoning_effort {
+            info!(
+                "Request: initiator={} model={} → {}/{} reasoning_effort={} reasoning_source={}",
+                resolved.initiator,
+                original_request.model,
+                resolved.provider_id,
+                info.model,
+                reasoning_effort,
+                info.reasoning_source
+            );
+            return;
+        }
+    }
+
+    info!(
+        "Request: initiator={} model={} → {}/{}",
+        resolved.initiator, original_request.model, resolved.provider_id, resolved.upstream_model
+    );
+}
+
+fn openai_compatible_reasoning_log(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::OpenAI
+            | ProviderType::ChatGPT
+            | ProviderType::OpenRouter
+            | ProviderType::Google
+            | ProviderType::Custom(_)
+    )
+}
+
 async fn resolve_upstream_request(
     state: &AppState,
     request: &MessagesRequest,
@@ -221,6 +254,11 @@ async fn resolve_upstream_request(
     let model_ref = settings.resolve_model(&request.model).to_string();
     let provider_id = claude_proxy_config::Settings::parse_provider_id(&model_ref).to_string();
     let upstream_model = claude_proxy_config::Settings::parse_model_name(&model_ref).to_string();
+    let provider_type = settings
+        .providers
+        .get(&provider_id)
+        .map(|config| config.resolve_type(&provider_id))
+        .unwrap_or_else(|| ProviderType::parse(&provider_id));
     let initiator = resolve_request_initiator(&settings, &provider_id, request);
 
     let mut request = request.clone();
@@ -228,6 +266,7 @@ async fn resolve_upstream_request(
 
     ResolvedUpstreamRequest {
         provider_id,
+        provider_type,
         upstream_model,
         initiator,
         request,

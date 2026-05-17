@@ -13,6 +13,7 @@ mod tool_args;
 mod tool_choice;
 
 pub use http::{apply_extra_ca_certs, fmt_err_chain, fmt_reqwest_err};
+pub use openai_compat::{OpenAiRequestLogInfo, openai_request_log_info};
 pub use provider::{Provider, ProviderError};
 
 use std::sync::Arc;

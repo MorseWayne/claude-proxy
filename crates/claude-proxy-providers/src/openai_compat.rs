@@ -11,6 +11,102 @@ fn intent(req: &MessagesRequest) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct OpenAiRequestLogInfo {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_source: &'static str,
+}
+
+pub fn openai_request_log_info(request: &MessagesRequest) -> OpenAiRequestLogInfo {
+    let original_intent = intent(request).map(str::to_string);
+    let original_reasoning_source = explicit_reasoning_source(request);
+    let request = apply_openai_intent(request.clone());
+    let reasoning_effort = request_reasoning_effort(&request);
+    let reasoning_source = original_reasoning_source
+        .or_else(|| thinking_reasoning_source(&request))
+        .or_else(|| {
+            original_intent.as_deref().and_then(|intent| {
+                reasoning_effort
+                    .is_some()
+                    .then_some(intent_reasoning_source(intent))
+                    .flatten()
+            })
+        })
+        .unwrap_or("unspecified");
+
+    OpenAiRequestLogInfo {
+        model: request.model,
+        reasoning_effort,
+        reasoning_source,
+    }
+}
+
+fn explicit_reasoning_source(request: &MessagesRequest) -> Option<&'static str> {
+    if request.extra.contains_key("reasoning") {
+        Some("explicit:reasoning")
+    } else if request.extra.contains_key("reasoning_effort") {
+        Some("explicit:reasoning_effort")
+    } else {
+        None
+    }
+}
+
+fn thinking_reasoning_source(request: &MessagesRequest) -> Option<&'static str> {
+    request.thinking.as_ref().and_then(|thinking| {
+        if thinking.r#type.as_deref() == Some("disabled")
+            || matches!(thinking.r#type.as_deref(), Some("enabled" | "adaptive"))
+            || thinking.budget_tokens.is_some()
+        {
+            Some("thinking")
+        } else {
+            None
+        }
+    })
+}
+
+fn intent_reasoning_source(intent: &str) -> Option<&'static str> {
+    match intent {
+        "fast" => Some("intent:fast"),
+        "quick_reply" => Some("intent:quick_reply"),
+        "summarization" => Some("intent:summarization"),
+        "deep_think" => Some("intent:deep_think"),
+        "reasoning" => Some("intent:reasoning"),
+        "tool_use" => Some("intent:tool_use"),
+        "agent" => Some("intent:agent"),
+        _ => None,
+    }
+}
+
+fn request_reasoning_effort(request: &MessagesRequest) -> Option<String> {
+    if let Some(reasoning) = request.extra.get("reasoning") {
+        return Some(
+            reasoning
+                .get("effort")
+                .and_then(Value::as_str)
+                .unwrap_or("custom")
+                .to_string(),
+        );
+    }
+    if let Some(effort) = request
+        .extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+    {
+        return Some(effort.to_string());
+    }
+    let thinking = request.thinking.as_ref()?;
+    if thinking.r#type.as_deref() == Some("disabled") {
+        return Some("none".to_string());
+    }
+    if matches!(thinking.r#type.as_deref(), Some("enabled" | "adaptive"))
+        || thinking.budget_tokens.is_some()
+    {
+        return Some("medium".to_string());
+    }
+    None
+}
+
 pub(crate) fn apply_openai_intent(mut request: MessagesRequest) -> MessagesRequest {
     let intent = intent(&request).map(str::to_string);
     if let Some(fast_model) = intent
@@ -566,6 +662,98 @@ mod tests {
             req.extra.get("reasoning_effort").and_then(Value::as_str),
             Some("none")
         );
+    }
+
+    #[test]
+    fn request_log_info_reports_intent_reasoning_and_model_rewrite() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "fast"})),
+            extra: Default::default(),
+        };
+
+        let info = openai_request_log_info(&req);
+
+        assert_eq!(info.model, "gpt-5.4-mini");
+        assert_eq!(info.reasoning_effort.as_deref(), Some("none"));
+        assert_eq!(info.reasoning_source, "intent:fast");
+    }
+
+    #[test]
+    fn request_log_info_reports_explicit_reasoning_effort() {
+        let mut req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("think".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "fast"})),
+            extra: Default::default(),
+        };
+        req.extra
+            .insert("reasoning_effort".to_string(), json!("high"));
+
+        let info = openai_request_log_info(&req);
+
+        assert_eq!(info.model, "gpt-5.4-mini");
+        assert_eq!(info.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(info.reasoning_source, "explicit:reasoning_effort");
+    }
+
+    #[test]
+    fn request_log_info_reports_thinking_reasoning_effort() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("think".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: Some(4096),
+            }),
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let info = openai_request_log_info(&req);
+
+        assert_eq!(info.model, "gpt-5.5");
+        assert_eq!(info.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(info.reasoning_source, "thinking");
     }
 
     #[test]
