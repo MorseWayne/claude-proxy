@@ -23,7 +23,7 @@ Decisions（决策）:
 - Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
 - Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
 - Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
-- Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata。
+- Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata；不保留旧 metrics JSON 兼容，server 与 TUI 同步更新新契约。
 - 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
@@ -101,17 +101,17 @@ Tasks:
 - [x] 拆分实施顺序，降低 schema/API/TUI 同时变更风险。
 
 Planned implementation order:
-1. **Phase 5A — Metrics shape enrichment（server-only）**：扩展 `Metrics` / `StoredTotals` 的聚合输出，保留现有 token snapshot 语义，新增 provider+initiator 维度聚合；如需变更 SQLite schema，先做兼容 migration 和 persistence 单元测试。
-2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 context window、max output tokens、supported endpoints/reasoning metadata 暴露到 `/admin/metrics` 或相邻 admin endpoint，供 TUI 展示；避免混入 request path 的实时计费逻辑。
-3. **Phase 5C — TUI metrics display**：在 Dashboard 合并 session + stored totals 时展示 provider/initiator 维度和模型能力列；保持旧 metrics JSON 字段可选解析，避免旧 server 下 TUI 崩溃。
+1. **Phase 5A — Metrics shape enrichment（server-only）**：扩展 `Metrics` / `StoredTotals` 的聚合输出，保留现有 token snapshot 语义，新增 provider+initiator 维度聚合；直接定义新的 `/admin/metrics` JSON shape，不为旧 shape 添加兼容 shim。
+2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 context window、max output tokens、supported endpoints/reasoning metadata 暴露到新的 metrics/admin 响应契约，供 TUI 展示；避免混入 request path 的实时计费逻辑。
+3. **Phase 5C — TUI metrics display**：按新 metrics JSON 契约更新 Dashboard 解析与展示 provider/initiator 维度、模型能力列；不支持旧 server 的旧 metrics shape，发现字段缺失时按新契约默认空值处理即可。
 4. **Phase 5D — Cost estimate（optional）**：仅在有明确 pricing table 来源和更新策略后实现估算；否则只展示 billable token 分解，避免误导性成本数字。
 
 Acceptance / Review:
-- Review: 已确认当前 [app.rs](crates/claude-proxy-server/src/app.rs) 的 `TokenUsage` / `ModelMetrics` 只按 model 聚合 token，`MetricsStore` 只持久化 provider、initiator、model、token、error、latency，`/admin/metrics` 输出 session/stored totals，TUI Dashboard 只解析并合并 model token totals。
+- Review: 已确认当前 [app.rs](crates/claude-proxy-server/src/app.rs) 的 `TokenUsage` / `ModelMetrics` 只按 model 聚合 token，`MetricsStore` 只持久化 provider、initiator、model、token、error、latency，`/admin/metrics` 输出 session/stored totals，TUI Dashboard 只解析并合并 model token totals；用户明确要求不考虑兼容，因此后续实施可同步替换 server/TUI 的 metrics 契约。
 - Validation: 规划阶段未修改业务代码；读取并复核 [routes.rs](crates/claude-proxy-server/src/routes.rs)、[persistence.rs](crates/claude-proxy-server/src/persistence.rs)、[dashboard.rs](crates/claude-proxy-cli/src/tui/pages/dashboard.rs) 与 [app.rs](crates/claude-proxy-cli/src/tui/app.rs)。
 - GitNexus: `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`admin_metrics`、`fetch_live_metrics`、`render_model_usage` 是主要边界；server 与 TUI 变更会跨 crate，应分阶段实施。
 - Tests: N/A（规划阶段）。
-- Gaps: 尚未选择 pricing source；未运行具体符号 impact，实施前仍需对拟修改符号逐一运行 GitNexus upstream impact。
+- Gaps: 尚未选择 pricing source；未运行具体符号 impact，实施前仍需对拟修改符号逐一运行 GitNexus upstream impact；无需为旧 metrics JSON shape 设计兼容层。
 
 Discovered tasks（发现的后续任务）:
 
