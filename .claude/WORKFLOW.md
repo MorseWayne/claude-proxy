@@ -4,47 +4,6 @@
 
 ## Active（进行中）
 
-### WF-2026-05-17-006 — Model context window metadata
-
-Status: Active（进行中）
-Level: 3
-Started: 2026-05-17
-Updated: 2026-05-17
-Current phase: Phase 1 — ModelInfo context window metadata 已完成
-
-Goal（目标）:
-
-- 扩展模型能力 metadata，新增 `context_window`，并让 TUI Dashboard 分开展示 context window 与 max output tokens，避免把输出上限误读为上下文窗口。
-
-Decisions（决策）:
-
-- 不保留旧 metrics shape 兼容；server 与 TUI 同步扩展新字段。
-- 继续复用 provider cached `ModelInfo` 作为 `/admin/metrics` 与 `/v1/models` 的模型能力来源。
-- OpenAI/ChatGPT known GPT-5 系列模型暂按 400k context window 暴露；gpt-5.5 继续保留 128k max output tokens。
-
-#### Phase 1 — ModelInfo context window metadata
-Status: Done
-Depends on:
-- None
-Tasks:
-- [x] 对 `ModelInfo`、OpenAI known metadata、server capability export、TUI capability rows 运行 GitNexus upstream impact。
-- [x] 在 `ModelInfo` 新增 `context_window` 字段并补齐 provider 构造点。
-- [x] 将 `context_window` 输出到 `/v1/models` 与 `/admin/metrics` model capabilities。
-- [x] 扩展 TUI parser 与 Dashboard capability rows，分开展示 context 和 output。
-- [x] 补充/更新回归测试并运行验证。
-- [x] 运行 GitNexus detect_changes、提交并刷新索引。
-
-Acceptance / Review:
-- Review: 已在 core `ModelInfo`、OpenAI/ChatGPT known model metadata、Copilot model parser、server `/v1/models` 与 `/admin/metrics` capability export、TUI capability parser/Dashboard rows 接入 `context_window`。Dashboard 现在分开展示 `ctx` 与 `out`，避免将 max output 误读为上下文窗口。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test -p claude-proxy-server`、`cargo test -p claude-proxy-cli`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `ModelInfo` upstream impact 为 HIGH（5 direct，3 modules），`openai_model_info`、`model_capabilities`、`push_capability_rows` 为 LOW；实施后 `detect_changes(scope=all)` 为 MEDIUM，影响集中在 TUI capability 解析/运行流程，符合预期。
-- Tests: 更新 provider/server/TUI 回归测试覆盖 gpt-5.5 `context_window`、Copilot context parser、server capability JSON、TUI capability parser。
-- Gaps: 未做交互式 TUI 视觉验证；AGENTS.md/CLAUDE.md/Cargo.toml 存在本任务外的未提交变更，提交时需排除。
-
-Resume next（下次继续）:
-
-- 提交本次 context window metadata 变更，并运行 `npx gitnexus analyze` 刷新索引。
-
 ### WF-2026-05-17-005 — WebSearch tool_choice 兼容修复
 
 Status: Active（进行中）
@@ -261,6 +220,24 @@ Resume next（下次继续）:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-17-006 — Model context window metadata
+
+Status: Done（已完成）
+Completed: 2026-05-17
+Level: 3
+Commits（提交）:
+
+- 2bf7124 Add model context window metadata
+- 5d62164 Refresh GitNexus index metadata
+
+Acceptance summary（验收摘要）:
+
+- Review: 已在 core `ModelInfo`、OpenAI/ChatGPT known model metadata、Copilot model parser、server `/v1/models` 与 `/admin/metrics` capability export、TUI capability parser/Dashboard rows 接入 `context_window`。Dashboard 现在分开展示 `ctx` 与 `out`，避免将 max output 误读为上下文窗口。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test -p claude-proxy-server`、`cargo test -p claude-proxy-cli`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `ModelInfo` upstream impact 为 HIGH（5 direct，3 modules），`openai_model_info`、`model_capabilities`、`push_capability_rows` 为 LOW；实施后 `detect_changes(scope=all)` 为 MEDIUM，影响集中在 TUI capability 解析/运行流程，符合预期。`npx gitnexus analyze` 已刷新索引至 1,763 nodes / 4,293 edges / 155 flows。
+- Tests: 更新 provider/server/TUI 回归测试覆盖 gpt-5.5 `context_window`、Copilot context parser、server capability JSON、TUI capability parser。
+- Gaps: 未做交互式 TUI 视觉验证；Cargo.toml 存在本任务外的未提交版本号变更。
 
 ### WF-2026-05-17-003 — ChatGPT/Codex Responses 优化
 
