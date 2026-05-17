@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::provider::ProviderError;
 use crate::tool_args::sanitize_tool_arguments;
+use crate::tool_choice::normalize_for_responses;
 
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
@@ -102,7 +103,7 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
         body["tools"] = json!(tools.iter().map(convert_tool).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body["tool_choice"] = normalize_tool_choice(tool_choice);
+        body["tool_choice"] = normalize_for_responses(tool_choice);
     }
     if let Some(reasoning) = convert_reasoning(req) {
         body["reasoning"] = reasoning;
@@ -497,23 +498,6 @@ fn normalize_tool_schema(schema: &Value) -> Value {
     }
 
     Value::Object(normalized)
-}
-
-fn normalize_tool_choice(tool_choice: &Value) -> Value {
-    if let Some(choice_type) = tool_choice.get("type").and_then(Value::as_str) {
-        match choice_type {
-            "auto" => return json!("auto"),
-            "none" => return json!("none"),
-            "any" => return json!("required"),
-            "tool" => {
-                if let Some(name) = tool_choice.get("name").and_then(Value::as_str) {
-                    return json!({"type": "function", "name": name});
-                }
-            }
-            _ => {}
-        }
-    }
-    tool_choice.clone()
 }
 
 fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
@@ -1405,6 +1389,36 @@ mod tests {
         assert_eq!(
             body["tools"][2]["parameters"],
             json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_normalizes_named_tool_choice() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Search docs".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: Some(json!({"type": "tool", "name": "WebSearch"})),
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "WebSearch"})
         );
     }
 

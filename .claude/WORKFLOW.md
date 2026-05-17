@@ -4,6 +4,45 @@
 
 ## Active（进行中）
 
+### WF-2026-05-17-005 — WebSearch tool_choice 兼容修复
+
+Status: Active（进行中）
+Level: 2
+Started: 2026-05-17
+Updated: 2026-05-17
+Current phase: Phase 1 — 影响评估与最小修复已完成
+
+Goal（目标）:
+
+- 修复 WebSearch 触发 DeepSeek/OpenAI-compatible 请求时 `tool_choice.type` 被发送为 `tool` 导致上游 400 的问题。
+
+Decisions（决策）:
+
+- 用户批准采用“抽共享 helper”方案：复用 Responses 路径已有的 tool_choice 归一化语义，并接入 Chat Completions 请求转换。
+- Copilot Chat Completions 也存在同类 `tool_choice` 原样透传点，impact 为 LOW，已一并接入共享 helper。
+
+#### Phase 1 — 影响评估与最小修复
+Status: Done
+Depends on:
+- None
+Tasks:
+- [x] 对拟修改转换函数运行 GitNexus upstream impact。
+- [x] 抽取共享 `tool_choice` 归一化 helper。
+- [x] 接入 Chat Completions 与 Responses 请求转换路径。
+- [x] 补充 WebSearch/指定工具选择回归测试。
+- [x] 运行格式化、测试、GitNexus detect_changes、提交并刷新索引。
+
+Acceptance / Review:
+- Review: 已新增共享 `tool_choice` helper；OpenAI Chat Completions 与 Copilot Chat Completions 将 Anthropic `{"type":"tool","name":"WebSearch"}` 转换为 OpenAI Chat Completions `{"type":"function","function":{"name":"WebSearch"}}`，Responses 路径继续输出 `{"type":"function","name":"WebSearch"}`，保持原有 endpoint shape。
+- Validation: `cargo fmt --check`、目标 provider 测试、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `convert_request` impact LOW，`normalize_tool_choice` impact CRITICAL（Responses/ChatGPT 主路径），`convert_to_openai_chat` impact LOW；实施后 `detect_changes(scope=all)` 为 CRITICAL，影响集中在 `convert_to_responses` 与相关 Responses/ChatGPT 测试流程，符合移动并复用原 Responses 归一化语义的预期。
+- Tests: 新增 OpenAI Chat Completions、Copilot Chat Completions、Responses 三个 named tool_choice 回归测试；provider crate 84/84、workspace 全量测试通过。
+- Gaps: 未做真实 DeepSeek WebSearch 端到端请求验证；本地验证覆盖请求体 shape。
+
+Resume next（下次继续）:
+
+- 提交本次变更并运行 `npx gitnexus analyze` 刷新索引。
+
 ### WF-2026-05-17-004 — Provider 稳定性优化规划
 
 Status: Active（进行中）

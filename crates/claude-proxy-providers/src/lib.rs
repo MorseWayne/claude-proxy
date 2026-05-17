@@ -10,6 +10,7 @@ mod openai_compat;
 pub mod provider;
 pub(crate) mod responses;
 mod tool_args;
+mod tool_choice;
 
 pub use http::{apply_extra_ca_certs, fmt_err_chain, fmt_reqwest_err};
 pub use provider::{Provider, ProviderError};

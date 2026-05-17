@@ -1,6 +1,8 @@
 use claude_proxy_core::*;
 use serde_json::Value;
 
+use crate::tool_choice::normalize_for_chat_completions;
+
 pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
@@ -124,7 +126,7 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
         body["tools"] = serde_json::json!(openai_tools);
     }
     if let Some(tc) = &req.tool_choice {
-        body["tool_choice"] = tc.clone();
+        body["tool_choice"] = normalize_for_chat_completions(tc);
     }
     if let Some(thinking) = &req.thinking {
         let mut tv = serde_json::Map::new();
@@ -138,4 +140,41 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
     }
 
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn convert_to_openai_chat_normalizes_named_tool_choice() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Search docs".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: Some(json!({"type": "tool", "name": "WebSearch"})),
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_openai_chat(&req);
+
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "function": {"name": "WebSearch"}})
+        );
+    }
 }

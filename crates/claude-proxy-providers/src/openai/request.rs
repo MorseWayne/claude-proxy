@@ -1,6 +1,8 @@
 use claude_proxy_core::*;
 use serde_json::{Value, json};
 
+use crate::tool_choice::normalize_for_chat_completions;
+
 /// Convert an Anthropic MessagesRequest to an OpenAI ChatCompletion request body.
 pub(super) fn convert_request(req: &MessagesRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
@@ -132,7 +134,7 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
     }
 
     if let Some(tc) = &req.tool_choice {
-        body["tool_choice"] = tc.clone();
+        body["tool_choice"] = normalize_for_chat_completions(tc);
     }
 
     if let Some(thinking) = &req.thinking {
@@ -207,5 +209,21 @@ mod tests {
         assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn convert_request_normalizes_named_tool_choice() {
+        let mut req = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("Search docs".to_string()),
+        }]);
+        req.tool_choice = Some(json!({"type": "tool", "name": "WebSearch"}));
+
+        let body = convert_request(&req);
+
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "function": {"name": "WebSearch"}})
+        );
     }
 }
