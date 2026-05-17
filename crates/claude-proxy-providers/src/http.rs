@@ -14,12 +14,18 @@
 //! on every reqwest client we build.
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::provider::ProviderError;
 use futures::StreamExt;
+use reqwest::StatusCode;
 use serde_json::Value;
+use tokio::time::sleep;
 
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SEND_ATTEMPTS: usize = 3;
+const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
+const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
 /// callers see the real root cause (TLS handshake error, DNS failure, …)
@@ -43,6 +49,72 @@ pub fn fmt_err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// what most call sites already have on hand.
 pub fn fmt_reqwest_err(err: &reqwest::Error) -> String {
     fmt_err_chain(err)
+}
+
+pub async fn send_upstream_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, ProviderError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let Some(next_request) = request.try_clone() else {
+            return send_once(request).await;
+        };
+
+        let response = send_once(next_request).await;
+        if attempt >= MAX_SEND_ATTEMPTS || !should_retry_result(&response) {
+            return response;
+        }
+
+        sleep(retry_delay(attempt, response.as_ref().ok())).await;
+    }
+}
+
+async fn send_once(request: reqwest::RequestBuilder) -> Result<reqwest::Response, ProviderError> {
+    request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            ProviderError::Timeout
+        } else {
+            ProviderError::Network(fmt_reqwest_err(&e))
+        }
+    })
+}
+
+fn should_retry_result(response: &Result<reqwest::Response, ProviderError>) -> bool {
+    match response {
+        Ok(response) => is_retryable_status(response.status()),
+        Err(ProviderError::Timeout) | Err(ProviderError::Network(_)) => true,
+        Err(_) => false,
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::CONFLICT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retry_delay(attempt: usize, response: Option<&reqwest::Response>) -> Duration {
+    response
+        .and_then(retry_after_delay)
+        .unwrap_or_else(|| BASE_RETRY_DELAY * attempt as u32)
+}
+
+fn retry_after_delay_secs(value: &str) -> Option<Duration> {
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .map(|delay| delay.min(MAX_RETRY_AFTER_DELAY))
+}
+
+fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(retry_after_delay_secs)
 }
 
 pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError {
@@ -142,4 +214,45 @@ pub fn apply_extra_ca_certs(
         }
     }
     Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_statuses_include_transient_failures() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::CONFLICT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn retryable_statuses_exclude_client_failures() {
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn retry_after_delay_clamps_large_values() {
+        assert_eq!(retry_after_delay_secs("1"), Some(Duration::from_secs(1)));
+        assert_eq!(retry_after_delay_secs("60"), Some(MAX_RETRY_AFTER_DELAY));
+        assert_eq!(retry_after_delay_secs("not-a-number"), None);
+    }
+
+    #[test]
+    fn timeout_and_network_errors_are_retryable() {
+        assert!(should_retry_result(&Err(ProviderError::Timeout)));
+        assert!(should_retry_result(&Err(ProviderError::Network(
+            "connection closed".to_string()
+        ))));
+        assert!(!should_retry_result(&Err(ProviderError::InvalidRequest(
+            "bad request".to_string()
+        ))));
+    }
 }

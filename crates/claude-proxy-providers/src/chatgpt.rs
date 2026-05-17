@@ -16,7 +16,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
+use crate::http::{
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+};
 use crate::openai_compat::{apply_openai_intent, log_request_observability, openai_model_info};
 use crate::provider::{Provider, ProviderError};
 
@@ -78,13 +80,7 @@ impl Provider for ChatGptProvider {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
 
-        let response = request_builder.json(&body).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(fmt_reqwest_err(&e))
-            }
-        })?;
+        let response = send_upstream_request(request_builder.json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);

@@ -13,7 +13,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
+use crate::http::{
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+};
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
     supports_responses,
@@ -103,19 +105,7 @@ impl OpenAiProvider {
 
         log_request_observability("openai", "/chat/completions", &body);
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -144,19 +134,7 @@ impl OpenAiProvider {
 
         log_request_observability("openai", "/responses", &body);
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -197,13 +175,7 @@ impl Provider for OpenAiProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let url = format!("{}/models", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(fmt_reqwest_err(&e))
-            }
-        })?;
+        let response = send_upstream_request(self.client.get(&url)).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);

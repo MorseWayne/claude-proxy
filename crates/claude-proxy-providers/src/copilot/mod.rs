@@ -22,7 +22,9 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
+use crate::http::{
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+};
 use crate::provider::{Provider, ProviderError};
 
 use self::auth::CopilotAuth;
@@ -200,20 +202,8 @@ impl CopilotProvider {
 
         debug!("Copilot messages API request to {url}");
 
-        let response = self
-            .http_client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response =
+            send_upstream_request(self.http_client.post(&url).headers(headers).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(self.map_upstream_error(response).await);
@@ -249,20 +239,8 @@ impl CopilotProvider {
 
         debug!("Copilot chat completions API request to {url}");
 
-        let response = self
-            .http_client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response =
+            send_upstream_request(self.http_client.post(&url).headers(headers).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(self.map_upstream_error(response).await);
@@ -295,20 +273,8 @@ impl CopilotProvider {
 
         debug!("Copilot responses API request to {url}");
 
-        let response = self
-            .http_client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response =
+            send_upstream_request(self.http_client.post(&url).headers(headers).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(self.map_upstream_error(response).await);
@@ -410,19 +376,7 @@ impl Provider for CopilotProvider {
         drop(hb);
 
         let url = format!("{}/models", self.base_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response = send_upstream_request(self.http_client.get(&url).headers(headers)).await?;
 
         if !response.status().is_success() {
             return Err(self.map_upstream_error(response).await);
