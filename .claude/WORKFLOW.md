@@ -10,7 +10,7 @@ Status: Active（进行中）
 Level: 3
 Started: 2026-05-17
 Updated: 2026-05-17
-Current phase: Phase 3 — Chat Completions finalization parity 实施完成
+Current phase: Phase 4 — PII-safe tool diagnostics 实施完成
 
 Goal（目标）:
 
@@ -22,7 +22,7 @@ Decisions（决策）:
 - 当前 Phase 1 已实施：共享 HTTP retry helper 已接入 OpenAI、ChatGPT、Copilot 的 chat 与 model listing 请求路径；OAuth/device-flow 轮询请求暂不纳入本阶段。
 - Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
 - Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
-- PII-safe diagnostics 与 usage/cost metrics 作为后续增强，不与 retry/SSE 修复混合。
+- Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
 - 当前只做规划入账；实施前仍需按项目规则对拟修改符号运行 GitNexus impact。
 
 #### Phase 1 — Retry / error classification 设计与影响评估
@@ -74,22 +74,30 @@ Acceptance / Review:
 - Tests: 新增 `test_stream_converter_does_not_finish_twice_after_finish_reason`，覆盖 `finish_reason` chunk 已产生一次 `message_stop` 后 EOF `finish()` 不再产生事件；provider crate 79/79、workspace 全量测试通过。
 - Gaps: 当前只修正 Chat Completions converter；Responses converter 已有 stopped 状态，本阶段无需改动。
 
-#### Phase 4 — Diagnostics 与 metrics 增强
-Status: Pending
+#### Phase 4 — PII-safe tool diagnostics
+Status: Done
 Depends on:
 - Phase 3
 Tasks:
-- [ ] 在 [tool_args.rs](crates/claude-proxy-providers/src/tool_args.rs) 或调用边界加入 PII-safe 诊断，只记录 tool name、字段名、长度、sanitization 类型。
-- [ ] 评估 per-model cost / context window / max output tokens 指标是否应加入 server metrics。
-- [ ] 将已完成的 provider-neutral Responses 抽取待办从 Backlog 清理或改写为测试/文档跟进。
+- [x] 在 [tool_args.rs](crates/claude-proxy-providers/src/tool_args.rs) 加入 PII-safe 诊断，只记录 tool name、字段名、长度、sanitization 类型。
+- [x] 评估 per-model cost / context window / max output tokens 指标是否应加入 server metrics。
+- [x] 将 usage/cost metrics 拆出为后续独立任务，避免与 provider sanitizer 诊断混合。
+
+Acceptance / Review:
+- Review: 已在 [tool_args.rs](crates/claude-proxy-providers/src/tool_args.rs) 为 `Read` argument sanitizer 增加结构化诊断路径；公开 sanitizer 行为保持 `Option<String>` 不变，Chat Completions 与 Responses 调用点无需改动。诊断使用 DEBUG 日志，只记录 `tool_name`、字段名、sanitization 类型、原始/修正后长度，不记录 `file_path` 或 argument 内容。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers tool_args`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: Phase 4 探索显示 provider sanitizer 与 server metrics 是两条独立边界；`sanitize_tool_arguments` 与 `sanitize_read_line_window` upstream impact 为 HIGH（共享 Chat Completions/Responses sanitizer 与测试流程），已向用户确认后继续。实施后 `detect_changes(scope=all)` 为 HIGH，changed_count=9，affected_count=8，affected_processes 均集中在 `tool_args.rs` sanitizer 测试/辅助流程，符合预期。
+- Tests: provider crate 81/81、workspace 全量测试通过；新增 `read_sanitizer_reports_pii_safe_diagnostics` 与 `read_sanitizer_reports_removed_unverifiable_offset` 覆盖诊断字段、sanitization 类型与长度，不断言敏感参数内容。
+- Gaps: usage/cost metrics 未在本阶段实现；因会影响 server metrics schema、admin API 与 TUI 展示，保留为独立后续任务。
 
 Discovered tasks（发现的后续任务）:
 
 - 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
+- usage/cost metrics 增强需单独规划：可能涉及 server metrics schema、admin API 响应、SQLite migration/aggregation 与 TUI 展示。
 
 Resume next（下次继续）:
 
-- Phase 3 已完成并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步进入 Phase 4：评估 PII-safe tool diagnostics 与 usage/cost metrics 增强是否应拆分为独立较小任务。
+- Phase 4 已完成 provider 侧 PII-safe sanitizer diagnostics 并验证；提交后运行 `npx gitnexus analyze` 刷新索引。下一步如继续优化，应单独规划 usage/cost metrics 或清理 provider-neutral Responses 抽取历史待办。
 
 ## Backlog / Future（待办 / 未来）
 

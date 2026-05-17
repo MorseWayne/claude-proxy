@@ -3,10 +3,40 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use tracing::debug;
 
 const MAX_READ_OFFSET_WITHOUT_LINE_COUNT: u64 = 1_000_000;
 
+#[derive(Debug, PartialEq, Eq)]
+struct ToolArgumentDiagnostic {
+    field: &'static str,
+    sanitization: &'static str,
+    original_len: usize,
+    sanitized_len: usize,
+}
+
 pub(crate) fn sanitize_tool_arguments(tool_name: &str, arguments: &str) -> Option<String> {
+    let mut diagnostics = Vec::new();
+    let sanitized =
+        sanitize_tool_arguments_with_diagnostics(tool_name, arguments, &mut diagnostics);
+    for diagnostic in diagnostics {
+        debug!(
+            tool_name,
+            field = diagnostic.field,
+            sanitization = diagnostic.sanitization,
+            original_len = diagnostic.original_len,
+            sanitized_len = diagnostic.sanitized_len,
+            "Sanitized tool arguments"
+        );
+    }
+    sanitized
+}
+
+fn sanitize_tool_arguments_with_diagnostics(
+    tool_name: &str,
+    arguments: &str,
+    diagnostics: &mut Vec<ToolArgumentDiagnostic>,
+) -> Option<String> {
     if tool_name != "Read" {
         return None;
     }
@@ -15,24 +45,39 @@ pub(crate) fn sanitize_tool_arguments(tool_name: &str, arguments: &str) -> Optio
     let object = input.as_object_mut()?;
     let mut changed = false;
     if matches!(object.get("pages"), Some(Value::String(pages)) if pages.is_empty()) {
+        diagnostics.push(ToolArgumentDiagnostic {
+            field: "pages",
+            sanitization: "remove_empty_string",
+            original_len: 0,
+            sanitized_len: 0,
+        });
         object.remove("pages");
         changed = true;
     }
 
-    changed |= sanitize_read_line_window(object);
+    changed |= sanitize_read_line_window(object, diagnostics);
 
     changed
         .then(|| serde_json::to_string(&input).ok())
         .flatten()
 }
 
-fn sanitize_read_line_window(object: &mut serde_json::Map<String, Value>) -> bool {
+fn sanitize_read_line_window(
+    object: &mut serde_json::Map<String, Value>,
+    diagnostics: &mut Vec<ToolArgumentDiagnostic>,
+) -> bool {
     let Some(offset) = numeric_object_field(object, "offset") else {
         return false;
     };
 
     let mut changed = false;
     if offset == 0 {
+        diagnostics.push(ToolArgumentDiagnostic {
+            field: "offset",
+            sanitization: "raise_zero_to_one",
+            original_len: offset.to_string().len(),
+            sanitized_len: 1,
+        });
         object.insert("offset".to_string(), json!(1));
         changed = true;
     }
@@ -44,6 +89,12 @@ fn sanitize_read_line_window(object: &mut serde_json::Map<String, Value>) -> boo
     };
     let Some(line_count) = read_line_count(file_path) else {
         if offset > MAX_READ_OFFSET_WITHOUT_LINE_COUNT {
+            diagnostics.push(ToolArgumentDiagnostic {
+                field: "offset",
+                sanitization: "remove_unverifiable_large_offset",
+                original_len: offset.to_string().len(),
+                sanitized_len: 0,
+            });
             object.remove("offset");
             changed = true;
         }
@@ -54,9 +105,20 @@ fn sanitize_read_line_window(object: &mut serde_json::Map<String, Value>) -> boo
         return changed;
     }
 
-    let corrected_offset = recover_concatenated_offset(offset, line_count).unwrap_or_else(|| {
+    let recovered_offset = recover_concatenated_offset(offset, line_count);
+    let corrected_offset = recovered_offset.unwrap_or_else(|| {
         let limit = limit.unwrap_or(1);
         line_count.saturating_sub(limit.saturating_sub(1)).max(1)
+    });
+    diagnostics.push(ToolArgumentDiagnostic {
+        field: "offset",
+        sanitization: if recovered_offset.is_some() {
+            "recover_concatenated_offset"
+        } else {
+            "clamp_to_file_window"
+        },
+        original_len: offset.to_string().len(),
+        sanitized_len: corrected_offset.to_string().len(),
     });
     object.insert("offset".to_string(), json!(corrected_offset));
     changed = true;
@@ -66,6 +128,12 @@ fn sanitize_read_line_window(object: &mut serde_json::Map<String, Value>) -> boo
             .saturating_sub(corrected_offset)
             .saturating_add(1);
         if limit > max_limit {
+            diagnostics.push(ToolArgumentDiagnostic {
+                field: "limit",
+                sanitization: "clamp_to_file_window",
+                original_len: limit.to_string().len(),
+                sanitized_len: max_limit.max(1).to_string().len(),
+            });
             object.insert("limit".to_string(), json!(max_limit.max(1)));
         }
     }
@@ -151,6 +219,74 @@ mod tests {
         assert_eq!(
             sanitize_tool_arguments("Other", "{\"pages\":\"\",\"value\":\"\"}"),
             None
+        );
+    }
+
+    #[test]
+    fn read_sanitizer_reports_pii_safe_diagnostics() {
+        let path = temp_read_fixture(1_113);
+        let mut diagnostics = Vec::new();
+        let sanitized = sanitize_tool_arguments_with_diagnostics(
+            "Read",
+            &json!({
+                "file_path": path.to_string_lossy(),
+                "pages": "",
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+            &mut diagnostics,
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert!(input.get("pages").is_none());
+        assert_eq!(input["offset"], 520);
+        assert_eq!(
+            diagnostics,
+            vec![
+                ToolArgumentDiagnostic {
+                    field: "pages",
+                    sanitization: "remove_empty_string",
+                    original_len: 0,
+                    sanitized_len: 0,
+                },
+                ToolArgumentDiagnostic {
+                    field: "offset",
+                    sanitization: "recover_concatenated_offset",
+                    original_len: 7,
+                    sanitized_len: 3,
+                },
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_sanitizer_reports_removed_unverifiable_offset() {
+        let mut diagnostics = Vec::new();
+        let sanitized = sanitize_tool_arguments_with_diagnostics(
+            "Read",
+            &json!({
+                "file_path": "missing-routes.rs",
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+            &mut diagnostics,
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert!(input.get("offset").is_none());
+        assert_eq!(
+            diagnostics,
+            vec![ToolArgumentDiagnostic {
+                field: "offset",
+                sanitization: "remove_unverifiable_large_offset",
+                original_len: 7,
+                sanitized_len: 0,
+            }]
         );
     }
 
