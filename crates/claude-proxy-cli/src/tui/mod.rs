@@ -1594,6 +1594,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
 
     set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
+    set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
     env.remove("ANTHROPIC_AUTH_TOKEN");
     set_env(env, "ANTHROPIC_MODEL", &settings.model.default);
     set_optional_env(
@@ -1878,6 +1879,11 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_API_KEY").and_then(|v| v.as_str()),
             Some("proxy-token")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_ATTRIBUTION_HEADER")
+                .and_then(|v| v.as_str()),
+            Some("0")
         );
         assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
