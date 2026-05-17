@@ -109,12 +109,32 @@ fn request_reasoning_effort(request: &MessagesRequest) -> Option<String> {
     if thinking.r#type.as_deref() == Some("disabled") {
         return Some("none".to_string());
     }
-    if matches!(thinking.r#type.as_deref(), Some("enabled" | "adaptive"))
-        || thinking.budget_tokens.is_some()
-    {
+    if let Some(budget_tokens) = thinking.budget_tokens {
+        return Some(thinking_budget_to_reasoning_effort(budget_tokens).to_string());
+    }
+    if thinking.r#type.as_deref() == Some("adaptive") {
+        return Some(default_adaptive_reasoning_effort(&request.model).to_string());
+    }
+    if thinking.r#type.as_deref() == Some("enabled") {
         return Some("medium".to_string());
     }
     None
+}
+
+pub(crate) fn thinking_budget_to_reasoning_effort(budget_tokens: u32) -> &'static str {
+    match budget_tokens {
+        0..=2048 => "low",
+        2049..=8192 => "medium",
+        _ => "high",
+    }
+}
+
+pub(crate) fn default_adaptive_reasoning_effort(model: &str) -> &'static str {
+    if supports_reasoning_effort(model, "high") {
+        "high"
+    } else {
+        "medium"
+    }
 }
 
 pub(crate) fn apply_openai_intent(mut request: MessagesRequest) -> MessagesRequest {
@@ -164,7 +184,7 @@ fn apply_reasoning_effort(request: &mut MessagesRequest, intent: Option<&str>) {
     }
 }
 
-fn highest_reasoning_effort(model: &str) -> Option<&'static str> {
+pub(crate) fn highest_reasoning_effort(model: &str) -> Option<&'static str> {
     if supports_reasoning_effort(model, "xhigh") {
         Some("xhigh")
     } else if supports_reasoning_effort(model, "high") {
@@ -763,6 +783,71 @@ mod tests {
 
         assert_eq!(info.model, "gpt-5.5");
         assert_eq!(info.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(info.reasoning_source, "thinking");
+    }
+
+    #[test]
+    fn request_log_info_maps_thinking_budget_to_reasoning_effort() {
+        for (budget_tokens, expected_effort) in [(2048, "low"), (8192, "medium"), (12_000, "high")]
+        {
+            let req = MessagesRequest {
+                model: "gpt-5.5".to_string(),
+                system: None,
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text("think".to_string()),
+                }],
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: true,
+                tools: None,
+                tool_choice: None,
+                thinking: Some(ThinkingConfig {
+                    r#type: Some("enabled".to_string()),
+                    budget_tokens: Some(budget_tokens),
+                }),
+                metadata: None,
+                extra: Default::default(),
+            };
+
+            let info = openai_request_log_info(&req);
+
+            assert_eq!(info.reasoning_effort.as_deref(), Some(expected_effort));
+            assert_eq!(info.reasoning_source, "thinking");
+        }
+    }
+
+    #[test]
+    fn request_log_info_maps_adaptive_thinking_without_budget_to_high_reasoning_effort() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("think".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("adaptive".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let info = openai_request_log_info(&req);
+
+        assert_eq!(info.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(info.reasoning_source, "thinking");
     }
 

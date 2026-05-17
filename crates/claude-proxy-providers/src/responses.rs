@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
+use crate::openai_compat::{
+    default_adaptive_reasoning_effort, thinking_budget_to_reasoning_effort,
+};
 use crate::provider::ProviderError;
 use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
@@ -514,9 +517,15 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
     if thinking.r#type.as_deref() == Some("disabled") {
         return Some(json!({"effort": "none"}));
     }
-    if matches!(thinking.r#type.as_deref(), Some("enabled" | "adaptive"))
-        || thinking.budget_tokens.is_some()
-    {
+    if let Some(budget_tokens) = thinking.budget_tokens {
+        let effort = thinking_budget_to_reasoning_effort(budget_tokens);
+        return Some(json!({"effort": effort, "summary": "detailed"}));
+    }
+    if thinking.r#type.as_deref() == Some("adaptive") {
+        let effort = default_adaptive_reasoning_effort(&req.model);
+        return Some(json!({"effort": effort, "summary": "detailed"}));
+    }
+    if thinking.r#type.as_deref() == Some("enabled") {
         return Some(json!({"effort": "medium", "summary": "detailed"}));
     }
     None
@@ -1479,6 +1488,71 @@ mod tests {
 
         assert!(body.get("include").is_none());
         assert_eq!(body["reasoning"], json!({"effort": "none"}));
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_thinking_budget_to_reasoning_effort() {
+        for (budget_tokens, expected_effort) in [(2048, "low"), (8192, "medium"), (12_000, "high")]
+        {
+            let req = MessagesRequest {
+                model: "gpt-5".to_string(),
+                system: None,
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text("Hi".to_string()),
+                }],
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: true,
+                tools: None,
+                tool_choice: None,
+                thinking: Some(ThinkingConfig {
+                    r#type: Some("enabled".to_string()),
+                    budget_tokens: Some(budget_tokens),
+                }),
+                metadata: None,
+                extra: HashMap::new(),
+            };
+
+            let body = convert_to_responses(&req);
+
+            assert_eq!(body["reasoning"]["effort"], expected_effort);
+            assert_eq!(body["reasoning"]["summary"], "detailed");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_adaptive_thinking_without_budget_to_high_reasoning_effort() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("adaptive".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]
