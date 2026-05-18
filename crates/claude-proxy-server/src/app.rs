@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
+use claude_proxy_core::ModelInfo;
 use claude_proxy_providers::provider::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -345,6 +346,11 @@ mod tests {
             .lock()
             .await
             .insert("openai".to_string(), Arc::new(Semaphore::new(1)));
+        state
+            .model_refresh_locks
+            .lock()
+            .await
+            .insert("openai".to_string(), Arc::new(Mutex::new(())));
 
         state
             .apply_settings(settings_with_limits(3, 2, 2, 60))
@@ -362,6 +368,7 @@ mod tests {
                 .is_empty()
         );
         assert!(state.provider_creation_locks.lock().await.is_empty());
+        assert!(state.model_refresh_locks.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -373,6 +380,33 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
     }
+
+    #[tokio::test]
+    async fn get_or_refresh_models_reuses_cached_models() {
+        let state = AppState::new(settings_with_limits(1, 1, 10, 60), None);
+        state.provider_registry.write().await.cache_models(
+            "openai",
+            vec![ModelInfo {
+                model_id: "gpt-4.1".to_string(),
+                supports_thinking: None,
+                vendor: None,
+                max_output_tokens: None,
+                context_window: None,
+                supported_endpoints: Vec::new(),
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
+            }],
+        );
+
+        let models = state.get_or_refresh_models("openai").await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "gpt-4.1");
+    }
 }
 
 /// Shared application state.
@@ -381,6 +415,7 @@ pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     provider_creation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    model_refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub concurrency_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub rate_limit_runtime: Arc<RateLimitRuntime>,
@@ -495,6 +530,7 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
             provider_creation_locks: Arc::new(Mutex::new(HashMap::new())),
+            model_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             concurrency_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
                 limits.max_concurrency as usize,
             )))),
@@ -513,6 +549,7 @@ impl AppState {
         *self.settings.write().await = settings;
         self.provider_registry.write().await.clear();
         self.provider_creation_locks.lock().await.clear();
+        self.model_refresh_locks.lock().await.clear();
         self.apply_limits(&limits).await;
     }
 
@@ -551,8 +588,54 @@ impl AppState {
             .insert_if_absent(provider_id, provider))
     }
 
+    pub async fn get_or_refresh_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>, String> {
+        if let Some(models) = self
+            .provider_registry
+            .read()
+            .await
+            .cached_models(provider_id)
+            .cloned()
+        {
+            return Ok(models);
+        }
+
+        let refresh_lock = self.model_refresh_lock(provider_id).await;
+        let _refresh_guard = refresh_lock.lock().await;
+
+        if let Some(models) = self
+            .provider_registry
+            .read()
+            .await
+            .cached_models(provider_id)
+            .cloned()
+        {
+            return Ok(models);
+        }
+
+        let provider = self.get_or_create_provider(provider_id).await?;
+        let models = provider.list_models().await.map_err(|e| {
+            format!("failed to refresh model list for provider '{provider_id}': {e}")
+        })?;
+
+        self.provider_registry
+            .write()
+            .await
+            .cache_models(provider_id, models.clone());
+
+        Ok(models)
+    }
+
     async fn provider_creation_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
         self.provider_creation_locks
+            .lock()
+            .await
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn model_refresh_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
+        self.model_refresh_locks
             .lock()
             .await
             .entry(provider_id.to_string())

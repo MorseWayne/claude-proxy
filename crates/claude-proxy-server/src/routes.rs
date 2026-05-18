@@ -671,35 +671,8 @@ async fn refresh_missing_model_caches(state: &AppState) {
     };
 
     for provider_id in provider_ids {
-        if state
-            .provider_registry
-            .read()
-            .await
-            .cached_models(&provider_id)
-            .is_some()
-        {
-            continue;
-        }
-
-        let provider = match state.get_or_create_provider(&provider_id).await {
-            Ok(provider) => provider,
-            Err(error) => {
-                warn!("Failed to create provider '{provider_id}' for model list refresh: {error}");
-                continue;
-            }
-        };
-
-        match provider.list_models().await {
-            Ok(models) => {
-                state
-                    .provider_registry
-                    .write()
-                    .await
-                    .cache_models(&provider_id, models);
-            }
-            Err(error) => {
-                warn!("Failed to refresh model list for provider '{provider_id}': {error}");
-            }
+        if let Err(error) = state.get_or_refresh_models(&provider_id).await {
+            warn!("{error}");
         }
     }
 }
