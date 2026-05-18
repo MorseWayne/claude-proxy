@@ -501,6 +501,7 @@ async fn stream_leader_response(
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
     let metrics = state.metrics.clone();
+    let health_state = state.clone();
     let provider_id = request.provider_id.clone();
     let initiator = request.initiator;
     let model_name = request.model.clone();
@@ -510,6 +511,7 @@ async fn stream_leader_response(
         let task_start = std::time::Instant::now();
         let mut usage = TokenUsage::default();
         let mut had_error = false;
+        let mut last_error = None;
         let mut leader_tx_open = true;
         while let Some(event_result) = stream.next().await {
             match event_result {
@@ -529,6 +531,7 @@ async fn stream_leader_response(
                 Err(e) => {
                     had_error = true;
                     let error_message = e.to_string();
+                    last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     let error_event = stream_api_error_event(error_message);
                     if leader_tx_open {
@@ -542,6 +545,13 @@ async fn stream_leader_response(
         let _ = broadcast_tx.send(InflightEvent::Done);
         inflight_map.lock().await.remove(&request_hash);
         let latency_ms = task_start.elapsed().as_millis() as u64;
+        if let Some(error) = last_error {
+            health_state
+                .record_provider_error(&provider_id, &error)
+                .await;
+        } else {
+            health_state.record_provider_success(&provider_id).await;
+        }
         metrics
             .record_completed_request(
                 &provider_id,
@@ -579,12 +589,16 @@ async fn collect_leader_response(
                 events.push(event);
             }
             Err(e) => {
-                let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+                let error_message = e.to_string();
+                let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                 let _ = broadcast_tx.send(InflightEvent::Done);
                 state.inflight.lock().await.remove(&request_hash);
+                state
+                    .record_provider_error(&request.provider_id, &error_message)
+                    .await;
                 return error_response(
                     StatusCode::BAD_GATEWAY,
-                    &ErrorResponse::api_error(&e.to_string()),
+                    &ErrorResponse::api_error(&error_message),
                 );
             }
         }
@@ -609,6 +623,7 @@ async fn collect_leader_response(
         )
         .await;
 
+    state.record_provider_success(&request.provider_id).await;
     state.metrics.record_latency(latency_ms);
     Json(response_data).into_response()
 }
@@ -626,6 +641,9 @@ async fn handle_provider_error(
     state.inflight.lock().await.remove(&request_hash);
 
     error!("Provider error: {error}");
+    state
+        .record_provider_error(&request.provider_id, &error.to_string())
+        .await;
     state.metrics.record_error();
     let latency_ms = start.elapsed().as_millis() as u64;
     state.metrics.record_latency(latency_ms);
@@ -818,12 +836,18 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
             &ErrorResponse::authentication("invalid admin token"),
         );
     }
+    let provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
     drop(settings);
 
     let model_capabilities = state.provider_registry.read().await.model_capabilities();
+    let provider_health = state.provider_health_snapshot(provider_ids).await;
     let mut metrics = state.metrics.to_json().await;
     if let Some(object) = metrics.as_object_mut() {
         object.insert("model_capabilities".to_string(), model_capabilities);
+        object.insert(
+            "provider_health".to_string(),
+            serde_json::to_value(provider_health).unwrap_or_default(),
+        );
     }
     Json(metrics).into_response()
 }
@@ -1484,6 +1508,9 @@ mod tests {
                 reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
             }],
         );
+        state
+            .record_provider_error("chatgpt", "token refresh failed")
+            .await;
 
         let response = admin_metrics(State(state), HeaderMap::new()).await;
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1502,6 +1529,11 @@ mod tests {
         assert_eq!(
             body["model_capabilities"]["chatgpt/gpt-5.5"]["supported_endpoints"][0],
             "/responses"
+        );
+        assert_eq!(body["provider_health"]["chatgpt"]["status"], "unhealthy");
+        assert_eq!(
+            body["provider_health"]["chatgpt"]["last_error"],
+            "token refresh failed"
         );
     }
 }

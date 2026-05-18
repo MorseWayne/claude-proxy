@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
@@ -15,6 +15,7 @@ use crate::middleware::{RateLimitConfig, RateLimitRuntime};
 use crate::persistence::{MetricsStore, StoredTotals};
 
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_PROVIDER_HEALTH_ERROR_LEN: usize = 2048;
 
 /// Token usage breakdown for a single request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,6 +206,36 @@ impl Default for Metrics {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthStatus {
+    #[default]
+    Unknown,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealth {
+    pub status: ProviderHealthStatus,
+    pub last_ok_unix_secs: Option<u64>,
+    pub last_error_unix_secs: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+impl ProviderHealth {
+    fn mark_success(&mut self, timestamp: u64) {
+        self.status = ProviderHealthStatus::Healthy;
+        self.last_ok_unix_secs = Some(timestamp);
+    }
+
+    fn mark_error(&mut self, timestamp: u64, error: &str) {
+        self.status = ProviderHealthStatus::Unhealthy;
+        self.last_error_unix_secs = Some(timestamp);
+        self.last_error = Some(truncate_provider_error(error));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +324,39 @@ mod tests {
             3
         );
         assert_eq!(data["stored"]["providers"].as_object().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_health_tracks_recent_error_and_recovery() {
+        let state = AppState::new(settings_with_limits(1, 1, 10, 60), None);
+
+        let snapshot = state
+            .provider_health_snapshot(vec!["openai".to_string()])
+            .await;
+        assert_eq!(snapshot["openai"].status, ProviderHealthStatus::Unknown);
+
+        state
+            .record_provider_error("openai", "upstream timeout")
+            .await;
+        let snapshot = state
+            .provider_health_snapshot(vec!["openai".to_string()])
+            .await;
+        assert_eq!(snapshot["openai"].status, ProviderHealthStatus::Unhealthy);
+        assert_eq!(
+            snapshot["openai"].last_error.as_deref(),
+            Some("upstream timeout")
+        );
+
+        state.record_provider_success("openai").await;
+        let snapshot = state
+            .provider_health_snapshot(vec!["openai".to_string()])
+            .await;
+        assert_eq!(snapshot["openai"].status, ProviderHealthStatus::Healthy);
+        assert_eq!(
+            snapshot["openai"].last_error.as_deref(),
+            Some("upstream timeout")
+        );
+        assert!(snapshot["openai"].last_ok_unix_secs.is_some());
     }
 
     #[test]
@@ -531,6 +595,7 @@ pub struct AppState {
     pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub rate_limit_runtime: Arc<RateLimitRuntime>,
     pub metrics: Arc<Metrics>,
+    pub provider_health: Arc<Mutex<HashMap<String, ProviderHealth>>>,
     /// Inflight request deduplication: maps request hash → broadcast sender.
     /// Multiple identical concurrent requests share one upstream call.
     pub inflight: Arc<Mutex<HashMap<u64, tokio::sync::broadcast::Sender<InflightEvent>>>>,
@@ -715,6 +780,7 @@ impl AppState {
                 per_seconds: limits.rate_window,
             })),
             metrics: Arc::new(Metrics::new(store)),
+            provider_health: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -725,6 +791,7 @@ impl AppState {
         self.provider_registry.write().await.clear();
         self.provider_creation_locks.lock().await.clear();
         self.model_refresh_locks.lock().await.clear();
+        self.provider_health.lock().await.clear();
         self.apply_limits(&limits).await;
     }
 
@@ -758,7 +825,13 @@ impl AppState {
         }
 
         let settings = self.settings.read().await.clone();
-        let provider = create_provider_from_settings(provider_id, &settings).await?;
+        let provider = match create_provider_from_settings(provider_id, &settings).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.record_provider_error(provider_id, &error).await;
+                return Err(error);
+            }
+        };
 
         Ok(self
             .provider_registry
@@ -792,9 +865,18 @@ impl AppState {
         }
 
         let provider = self.get_or_create_provider(provider_id).await?;
-        let models = provider.list_models().await.map_err(|e| {
-            format!("failed to refresh model list for provider '{provider_id}': {e}")
-        })?;
+        let models = match provider.list_models().await {
+            Ok(models) => {
+                self.record_provider_success(provider_id).await;
+                models
+            }
+            Err(error) => {
+                let message =
+                    format!("failed to refresh model list for provider '{provider_id}': {error}");
+                self.record_provider_error(provider_id, &message).await;
+                return Err(message);
+            }
+        };
 
         self.provider_registry
             .write()
@@ -821,6 +903,37 @@ impl AppState {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
+
+    pub async fn record_provider_success(&self, provider_id: &str) {
+        let now = unix_timestamp_secs();
+        self.provider_health
+            .lock()
+            .await
+            .entry(provider_id.to_string())
+            .or_default()
+            .mark_success(now);
+    }
+
+    pub async fn record_provider_error(&self, provider_id: &str, error: &str) {
+        let now = unix_timestamp_secs();
+        self.provider_health
+            .lock()
+            .await
+            .entry(provider_id.to_string())
+            .or_default()
+            .mark_error(now, error);
+    }
+
+    pub async fn provider_health_snapshot(
+        &self,
+        provider_ids: impl IntoIterator<Item = String>,
+    ) -> HashMap<String, ProviderHealth> {
+        let mut snapshot = self.provider_health.lock().await.clone();
+        for provider_id in provider_ids {
+            snapshot.entry(provider_id).or_default();
+        }
+        snapshot
+    }
 }
 
 fn model_cache_ttl_from_limits(limits: &LimitsConfig) -> Duration {
@@ -829,6 +942,26 @@ fn model_cache_ttl_from_limits(limits: &LimitsConfig) -> Duration {
 
 fn sanitize_model_cache_ttl(ttl: Duration) -> Duration {
     ttl.max(Duration::from_secs(1))
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn truncate_provider_error(error: &str) -> String {
+    if error.len() <= MAX_PROVIDER_HEALTH_ERROR_LEN {
+        return error.to_string();
+    }
+
+    let mut truncated = error
+        .chars()
+        .take(MAX_PROVIDER_HEALTH_ERROR_LEN)
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn create_provider_from_settings(
