@@ -840,6 +840,10 @@ fn overloaded_response(message: &str, retry_after: Option<u64>) -> Response {
     response
 }
 
+fn is_retryable_upstream_error_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 500..=599)
+}
+
 fn provider_error_to_response(error: &ProviderError) -> Response {
     match error {
         ProviderError::Authentication(msg) => error_response(
@@ -903,15 +907,7 @@ fn upstream_error_to_response(status: u16, body: &str) -> Response {
             StatusCode::PAYLOAD_TOO_LARGE,
             &ErrorResponse::invalid_request(&message),
         ),
-        408 => error_response(
-            StatusCode::GATEWAY_TIMEOUT,
-            &ErrorResponse::timeout(&message),
-        ),
-        503 => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &ErrorResponse::api_error(&message),
-        ),
-        529 => overloaded_response(&message, None),
+        status if is_retryable_upstream_error_status(status) => overloaded_response(&message, None),
         _ => error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&message)),
     }
 }
@@ -1165,6 +1161,27 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "overloaded_error");
         assert_eq!(body["error"]["message"], "too busy");
+    }
+
+    #[tokio::test]
+    async fn retryable_upstream_errors_map_to_overloaded_response() {
+        for status in [408, 409, 500, 502, 503, 504] {
+            let response = upstream_error_to_response(
+                status,
+                r#"{"error":{"type":"upstream_error","message":"temporary upstream failure"}}"#,
+            );
+
+            assert_eq!(response.status().as_u16(), 529);
+            assert_eq!(
+                response.headers().get("x-should-retry").unwrap(),
+                HeaderValue::from_static("true")
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "overloaded_error");
+            assert_eq!(body["error"]["message"], "temporary upstream failure");
+        }
     }
 
     #[test]

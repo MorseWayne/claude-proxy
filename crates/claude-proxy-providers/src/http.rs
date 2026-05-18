@@ -194,6 +194,14 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
+fn is_retryable_overload_status(status: u16) -> bool {
+    StatusCode::from_u16(status).is_ok_and(|status| {
+        status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::CONFLICT
+            || status.is_server_error()
+    })
+}
+
 fn retry_delay(attempt: usize, response: Option<&reqwest::Response>) -> Duration {
     response
         .and_then(retry_after_delay)
@@ -242,7 +250,7 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         404 => ProviderError::ModelNotFound(message),
         413 => ProviderError::RequestTooLarge(message),
         429 => ProviderError::RateLimited { retry_after },
-        503 | 529 => ProviderError::Overloaded {
+        status if is_retryable_overload_status(status) => ProviderError::Overloaded {
             message,
             retry_after,
         },
@@ -337,6 +345,17 @@ mod tests {
         assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
         assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn retryable_overload_statuses_match_transient_upstream_failures() {
+        for status in [408, 409, 500, 502, 503, 504, 529] {
+            assert!(is_retryable_overload_status(status));
+        }
+
+        for status in [400, 401, 404, 413, 429] {
+            assert!(!is_retryable_overload_status(status));
+        }
     }
 
     #[test]
