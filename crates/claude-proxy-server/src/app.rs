@@ -240,7 +240,8 @@ impl ProviderHealth {
 mod tests {
     use super::*;
     use claude_proxy_config::settings::{
-        AdminConfig, HttpConfig, LogConfig, ModelConfig, ProviderConfig, ProviderType, ServerConfig,
+        AdminConfig, HttpConfig, LogConfig, ModelAliasConfig, ModelConfig, ProviderConfig,
+        ProviderType, ServerConfig,
     };
 
     fn settings_with_limits(
@@ -264,7 +265,7 @@ mod tests {
         Settings {
             providers,
             model: ModelConfig {
-                default: "openai/gpt-4".to_string(),
+                default: ModelAliasConfig::new("openai/gpt-4"),
                 reasoning: None,
                 opus: None,
                 sonnet: None,

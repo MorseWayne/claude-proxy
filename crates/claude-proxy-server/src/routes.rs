@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use claude_proxy_config::settings::ProviderType;
+use claude_proxy_config::settings::{ModelReasoningEffort, ProviderType};
 use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{Provider, ProviderError};
@@ -262,9 +262,10 @@ async fn resolve_upstream_request(
     request: &MessagesRequest,
 ) -> ResolvedUpstreamRequest {
     let settings = state.settings.read().await;
-    let model_ref = settings.resolve_model(&request.model).to_string();
-    let provider_id = claude_proxy_config::Settings::parse_provider_id(&model_ref).to_string();
-    let upstream_model = claude_proxy_config::Settings::parse_model_name(&model_ref).to_string();
+    let intent = request_intent(request);
+    let resolved_model = settings.resolve_model_with_intent(&request.model, intent);
+    let provider_id = resolved_model.provider_id.clone();
+    let upstream_model = resolved_model.upstream_model.clone();
     let provider_type = settings
         .providers
         .get(&provider_id)
@@ -274,6 +275,7 @@ async fn resolve_upstream_request(
 
     let mut request = request.clone();
     request.model = upstream_model.clone();
+    apply_alias_reasoning_effort(&mut request, resolved_model.reasoning_effort);
 
     ResolvedUpstreamRequest {
         provider_id,
@@ -281,6 +283,32 @@ async fn resolve_upstream_request(
         upstream_model,
         initiator,
         request,
+    }
+}
+
+fn request_intent(request: &MessagesRequest) -> Option<&str> {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("intent"))
+        .and_then(Value::as_str)
+}
+
+fn apply_alias_reasoning_effort(
+    request: &mut MessagesRequest,
+    effort: Option<ModelReasoningEffort>,
+) {
+    if request.extra.contains_key("reasoning")
+        || request.extra.contains_key("reasoning_effort")
+        || request.thinking.is_some()
+    {
+        return;
+    }
+
+    if let Some(value) = effort.and_then(ModelReasoningEffort::request_value) {
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!(value));
     }
 }
 
@@ -1110,8 +1138,8 @@ mod tests {
 
     use axum::body::to_bytes;
     use claude_proxy_config::settings::{
-        AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelConfig, ProviderConfig,
-        ProviderType, ServerConfig,
+        AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelAliasConfig, ModelConfig,
+        ProviderConfig, ProviderType, ServerConfig,
     };
 
     use super::*;
@@ -1132,7 +1160,7 @@ mod tests {
         claude_proxy_config::Settings {
             providers,
             model: ModelConfig {
-                default: "test/model".to_string(),
+                default: ModelAliasConfig::new("test/model"),
                 reasoning: None,
                 opus: None,
                 sonnet: None,
@@ -1180,6 +1208,56 @@ mod tests {
             metadata: None,
             extra: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn alias_reasoning_effort_injects_fixed_request_value() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::High));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn alias_reasoning_effort_default_preserves_intent_behavior() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::Auto));
+
+        assert!(!request.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn explicit_reasoning_fields_override_alias_reasoning_effort() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("low"));
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::High));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn request_intent_reads_metadata_intent() {
+        let mut request = request_with_system(None);
+        request.metadata = Some(json!({"intent": "deep_think"}));
+
+        assert_eq!(request_intent(&request), Some("deep_think"));
     }
 
     #[test]

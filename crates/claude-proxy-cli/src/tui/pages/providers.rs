@@ -77,7 +77,12 @@ fn render_provider_list(f: &mut Frame, app: &App, area: Rect) {
         .providers
         .iter()
         .map(|(id, cfg)| {
-            let is_default = app.settings.model.default.starts_with(&format!("{id}/"));
+            let is_default = app
+                .settings
+                .model
+                .default
+                .name
+                .starts_with(&format!("{id}/"));
             let marker = if is_default { " ★" } else { "" };
             let (status, status_style) = provider_status_label(app, id, cfg);
             let line = Line::from(vec![
@@ -179,9 +184,14 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_field(f, rows[3], "Check", &check_status, false, false);
 
     // Status (read-only)
-    let is_default = app.settings.model.default.starts_with(&format!("{id}/"));
+    let is_default = app
+        .settings
+        .model
+        .default
+        .name
+        .starts_with(&format!("{id}/"));
     let status = if is_default {
-        format!("Default ({})", app.settings.model.default)
+        format!("Default ({})", app.settings.model.default.name)
     } else {
         "Not default".into()
     };

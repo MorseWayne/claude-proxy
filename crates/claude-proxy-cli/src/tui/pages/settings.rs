@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::Rect,
-    style::Style,
+    layout::{Constraint, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 use super::super::app::{App, Focus, NavItem};
@@ -189,52 +189,118 @@ fn render_log_page(f: &mut Frame, app: &App, area: Rect) {
 fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     let inner = widgets::render_content_frame(f, area, app, "Model Aliases");
     let is_focused = matches!(app.focus, Focus::Content);
-    let rows = widgets::field_rows(inner, 6);
+    let rows_area = widgets::field_rows(inner, 6);
 
-    widgets::render_field(
-        f,
-        rows[0],
-        "Default",
-        &app.settings.model.default,
-        is_focused && app.content_idx == 0,
-        false,
-    );
-    widgets::render_field(
-        f,
-        rows[1],
-        "Reasoning",
-        &app.settings.model.reasoning.clone().unwrap_or_default(),
-        is_focused && app.content_idx == 1,
-        false,
-    );
-    widgets::render_field(
-        f,
-        rows[2],
-        "Opus Alias",
-        &app.settings.model.opus.clone().unwrap_or_default(),
-        is_focused && app.content_idx == 2,
-        false,
-    );
-    widgets::render_field(
-        f,
-        rows[3],
-        "Sonnet Alias",
-        &app.settings.model.sonnet.clone().unwrap_or_default(),
-        is_focused && app.content_idx == 3,
-        false,
-    );
-    widgets::render_field(
-        f,
-        rows[4],
-        "Haiku Alias",
-        &app.settings.model.haiku.clone().unwrap_or_default(),
-        is_focused && app.content_idx == 4,
-        false,
-    );
+    let aliases = [
+        (
+            "Default",
+            app.settings.model.default.name.as_str(),
+            app.settings
+                .model
+                .default
+                .reasoning_effort
+                .map(|effort| effort.as_config_value())
+                .unwrap_or("(unset)"),
+        ),
+        (
+            "Reasoning",
+            app.settings.model.reasoning_name().unwrap_or("(none)"),
+            app.settings
+                .model
+                .reasoning
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort)
+                .map(|effort| effort.as_config_value())
+                .unwrap_or("(unset)"),
+        ),
+        (
+            "Opus",
+            app.settings.model.opus_name().unwrap_or("(none)"),
+            app.settings
+                .model
+                .opus
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort)
+                .map(|effort| effort.as_config_value())
+                .unwrap_or("(unset)"),
+        ),
+        (
+            "Sonnet",
+            app.settings.model.sonnet_name().unwrap_or("(none)"),
+            app.settings
+                .model
+                .sonnet
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort)
+                .map(|effort| effort.as_config_value())
+                .unwrap_or("(unset)"),
+        ),
+        (
+            "Haiku",
+            app.settings.model.haiku_name().unwrap_or("(none)"),
+            app.settings
+                .model
+                .haiku
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort)
+                .map(|effort| effort.as_config_value())
+                .unwrap_or("(unset)"),
+        ),
+    ];
+
+    let table_rows = aliases
+        .iter()
+        .enumerate()
+        .map(|(idx, (label, model, effort))| {
+            let row_selected = is_focused && app.content_idx == idx;
+            let label_style = if row_selected {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::FG_DIM)
+            };
+            let model_style = cell_style(row_selected && app.detail_idx == 0);
+            let effort_style = cell_style(row_selected && app.detail_idx == 1);
+            Row::new(vec![
+                Cell::from(format!(" {}", label)).style(label_style),
+                Cell::from((*model).to_string()).style(model_style),
+                Cell::from((*effort).to_string()).style(effort_style),
+            ])
+        });
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(14),
+            Constraint::Percentage(56),
+            Constraint::Percentage(24),
+        ],
+    )
+    .header(
+        Row::new(vec![" Alias", "Model", "Reasoning Effort"]).style(
+            Style::default()
+                .fg(theme::FG_DIM)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .column_spacing(2);
+    f.render_widget(table, rows_area[0].union(rows_area[4]));
 
     render_hint(
         f,
-        rows[5],
-        "Format: provider_id/model_name. Empty = uses default",
+        rows_area[5],
+        "Model: provider_id/model_name. Reasoning: unset | default | none | low | medium | high | xhigh",
     );
+}
+
+fn cell_style(is_selected: bool) -> Style {
+    if is_selected {
+        Style::default()
+            .fg(theme::BG_DARK)
+            .bg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::FG)
+    }
 }

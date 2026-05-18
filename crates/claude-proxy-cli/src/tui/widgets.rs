@@ -82,7 +82,7 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &super::app::App) {
 
     // Right: status badges
     let status_text = format!("  {} providers  ", provider_count,);
-    let model_text = format!("  {}  ", app.settings.model.default);
+    let model_text = format!("  {}  ", app.settings.model.default.name);
 
     let right_spans = vec![
         Span::styled(

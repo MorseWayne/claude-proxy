@@ -174,6 +174,9 @@ pub enum PickerAction {
         provider_id: String,
         section: EditableSection,
     },
+    SetModelReasoningEffort {
+        section: EditableSection,
+    },
     /// Pick a log level value
     SetLogLevel,
     /// Add a new provider of the selected type
@@ -299,10 +302,15 @@ pub enum EditableSection {
     HttpConnectTimeout,
     LogLevel,
     ModelDefault,
+    ModelDefaultReasoningEffort,
     ModelReasoning,
+    ModelReasoningReasoningEffort,
     ModelOpus,
+    ModelOpusReasoningEffort,
     ModelSonnet,
+    ModelSonnetReasoningEffort,
     ModelHaiku,
+    ModelHaikuReasoningEffort,
 }
 
 // ── App State ──
@@ -495,7 +503,10 @@ impl App {
         if count > 0 && self.content_idx >= count {
             self.content_idx = count.saturating_sub(1);
         }
-        let detail_max = self.provider_detail_field_count();
+        let detail_max = match self.nav {
+            NavItem::Model => 2,
+            _ => self.provider_detail_field_count(),
+        };
         if self.detail_idx >= detail_max {
             self.detail_idx = detail_max.saturating_sub(1);
         }

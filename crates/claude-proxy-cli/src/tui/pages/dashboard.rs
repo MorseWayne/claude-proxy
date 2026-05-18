@@ -46,7 +46,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         &[
             ("Providers", &format!("{provider_count} configured")),
             ("Names", &provider_names.join(", ")),
-            ("Default", &app.settings.model.default),
+            ("Default", &app.settings.model.default.name),
         ],
     );
 

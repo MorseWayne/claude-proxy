@@ -29,7 +29,10 @@ use app::{
     StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
-use claude_proxy_config::settings::{CopilotProviderConfig, ProviderConfig, ProviderType};
+use claude_proxy_config::settings::{
+    CopilotProviderConfig, ModelAliasConfig, ModelConfig, ModelReasoningEffort, ProviderConfig,
+    ProviderType,
+};
 use tracing::{error, info};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
@@ -257,7 +260,14 @@ fn handle_content_key(app: &mut App, code: KeyCode, _key: event::KeyEvent) {
             }
         }
         KeyCode::Left => {
-            app.focus = Focus::Nav;
+            if app.nav == NavItem::Model && app.detail_idx > 0 {
+                app.detail_idx -= 1;
+            } else {
+                app.focus = Focus::Nav;
+            }
+        }
+        KeyCode::Right if app.nav == NavItem::Model && app.detail_idx < 1 => {
+            app.detail_idx += 1;
         }
         KeyCode::Enter | KeyCode::Char('e')
             if app.item_count() > 0 && app.content_idx < app.item_count() =>
@@ -471,7 +481,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                         PickerAction::SetModelDefault { provider_id } => {
                             app.overlay = None;
                             app.focus = Focus::Content;
-                            app.settings.model.default = format!("{provider_id}/{selected}");
+                            app.settings.model.default.name = format!("{provider_id}/{selected}");
                             app.mark_dirty();
                             app.show_toast(Toast::success(format!(
                                 "Default model: {provider_id}/{selected}"
@@ -514,6 +524,17 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 "{} = {}",
                                 get_section_label(&section),
                                 value
+                            )));
+                        }
+                        PickerAction::SetModelReasoningEffort { section } => {
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            set_model_reasoning_effort(app, &section, &selected);
+                            app.mark_dirty();
+                            app.show_toast(Toast::success(format!(
+                                "{} = {}",
+                                get_section_label(&section),
+                                display_reasoning_effort_value(&selected)
                             )));
                         }
                         PickerAction::SetLogLevel => {
@@ -708,17 +729,31 @@ fn start_editing(app: &mut App) {
         return;
     }
 
-    // For model page: show provider picker first, then model picker
     if app.nav == NavItem::Model {
-        let section = match app.content_idx {
-            0 => EditableSection::ModelDefault,
-            1 => EditableSection::ModelReasoning,
-            2 => EditableSection::ModelOpus,
-            3 => EditableSection::ModelSonnet,
-            4 => EditableSection::ModelHaiku,
-            _ => return,
+        let Some(section) = model_section_for_cell(app.content_idx, app.detail_idx) else {
+            return;
         };
-        // Build provider list for picker
+        if app.detail_idx == 1 {
+            let items = vec![
+                String::new(),
+                "default".to_string(),
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ];
+            let current = model_reasoning_effort_value(&app.settings.model, &section);
+            let selected = items.iter().position(|item| item == &current).unwrap_or(0);
+            app.overlay = Some(Overlay::Picker(PickerOverlay {
+                title: "Select Reasoning Effort".into(),
+                items,
+                selected,
+                action: PickerAction::SetModelReasoningEffort { section },
+            }));
+            app.focus = Focus::Overlay;
+            return;
+        }
         let providers: Vec<String> = app.settings.providers.keys().cloned().collect();
         if providers.is_empty() {
             app.show_toast(Toast::warning(
@@ -836,30 +871,88 @@ fn get_editable_section(app: &App) -> (Option<EditableSection>, String) {
             ),
             _ => (None, String::new()),
         },
-        NavItem::Model => match app.content_idx {
-            0 => (
-                Some(EditableSection::ModelDefault),
-                app.settings.model.default.clone(),
-            ),
-            1 => (
-                Some(EditableSection::ModelReasoning),
-                app.settings.model.reasoning.clone().unwrap_or_default(),
-            ),
-            2 => (
-                Some(EditableSection::ModelOpus),
-                app.settings.model.opus.clone().unwrap_or_default(),
-            ),
-            3 => (
-                Some(EditableSection::ModelSonnet),
-                app.settings.model.sonnet.clone().unwrap_or_default(),
-            ),
-            4 => (
-                Some(EditableSection::ModelHaiku),
-                app.settings.model.haiku.clone().unwrap_or_default(),
-            ),
-            _ => (None, String::new()),
-        },
+        NavItem::Model => {
+            let Some(section) = model_section_for_cell(app.content_idx, app.detail_idx) else {
+                return (None, String::new());
+            };
+            let value = if app.detail_idx == 0 {
+                model_name_value(&app.settings.model, &section)
+            } else {
+                model_reasoning_effort_value(&app.settings.model, &section)
+            };
+            (Some(section), value)
+        }
         _ => (None, String::new()),
+    }
+}
+
+fn model_section_for_cell(row: usize, column: usize) -> Option<EditableSection> {
+    match (row, column) {
+        (0, 0) => Some(EditableSection::ModelDefault),
+        (0, 1) => Some(EditableSection::ModelDefaultReasoningEffort),
+        (1, 0) => Some(EditableSection::ModelReasoning),
+        (1, 1) => Some(EditableSection::ModelReasoningReasoningEffort),
+        (2, 0) => Some(EditableSection::ModelOpus),
+        (2, 1) => Some(EditableSection::ModelOpusReasoningEffort),
+        (3, 0) => Some(EditableSection::ModelSonnet),
+        (3, 1) => Some(EditableSection::ModelSonnetReasoningEffort),
+        (4, 0) => Some(EditableSection::ModelHaiku),
+        (4, 1) => Some(EditableSection::ModelHaikuReasoningEffort),
+        _ => None,
+    }
+}
+
+fn model_name_value(model: &ModelConfig, section: &EditableSection) -> String {
+    match section {
+        EditableSection::ModelDefault => model.default.name.clone(),
+        EditableSection::ModelReasoning => model.reasoning_name().unwrap_or_default().to_string(),
+        EditableSection::ModelOpus => model.opus_name().unwrap_or_default().to_string(),
+        EditableSection::ModelSonnet => model.sonnet_name().unwrap_or_default().to_string(),
+        EditableSection::ModelHaiku => model.haiku_name().unwrap_or_default().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn model_reasoning_effort_value(model: &ModelConfig, section: &EditableSection) -> String {
+    let effort = match section {
+        EditableSection::ModelDefaultReasoningEffort => model.default.reasoning_effort,
+        EditableSection::ModelReasoningReasoningEffort => model
+            .reasoning
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        EditableSection::ModelOpusReasoningEffort => {
+            model.opus.as_ref().and_then(|alias| alias.reasoning_effort)
+        }
+        EditableSection::ModelSonnetReasoningEffort => model
+            .sonnet
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        EditableSection::ModelHaikuReasoningEffort => model
+            .haiku
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        _ => None,
+    };
+    effort
+        .map(ModelReasoningEffort::as_config_value)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn display_reasoning_effort_value(value: &str) -> &str {
+    if value.is_empty() { "unset" } else { value }
+}
+
+fn parse_model_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
+    match value.trim() {
+        "" => None,
+        "default" => Some(ModelReasoningEffort::Auto),
+        "none" => Some(ModelReasoningEffort::Disabled),
+        "low" => Some(ModelReasoningEffort::Low),
+        "medium" => Some(ModelReasoningEffort::Medium),
+        "high" => Some(ModelReasoningEffort::High),
+        "xhigh" => Some(ModelReasoningEffort::XHigh),
+        _ => None,
     }
 }
 
@@ -878,10 +971,15 @@ fn get_section_label(section: &EditableSection) -> &'static str {
         EditableSection::HttpConnectTimeout => "Connect Timeout (seconds)",
         EditableSection::LogLevel => "Log Level",
         EditableSection::ModelDefault => "Default Model",
+        EditableSection::ModelDefaultReasoningEffort => "Default Reasoning Effort",
         EditableSection::ModelReasoning => "Reasoning Model",
+        EditableSection::ModelReasoningReasoningEffort => "Reasoning Effort",
         EditableSection::ModelOpus => "Opus Alias",
+        EditableSection::ModelOpusReasoningEffort => "Opus Reasoning Effort",
         EditableSection::ModelSonnet => "Sonnet Alias",
+        EditableSection::ModelSonnetReasoningEffort => "Sonnet Reasoning Effort",
         EditableSection::ModelHaiku => "Haiku Alias",
+        EditableSection::ModelHaikuReasoningEffort => "Haiku Reasoning Effort",
     }
 }
 
@@ -960,18 +1058,17 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
                     }
                 }
                 EditableSection::LogLevel => app.settings.log.level = v,
-                EditableSection::ModelDefault => app.settings.model.default = v,
-                EditableSection::ModelReasoning => {
-                    app.settings.model.reasoning = if v.is_empty() { None } else { Some(v) };
-                }
-                EditableSection::ModelOpus => {
-                    app.settings.model.opus = if v.is_empty() { None } else { Some(v) };
-                }
-                EditableSection::ModelSonnet => {
-                    app.settings.model.sonnet = if v.is_empty() { None } else { Some(v) };
-                }
-                EditableSection::ModelHaiku => {
-                    app.settings.model.haiku = if v.is_empty() { None } else { Some(v) };
+                EditableSection::ModelDefault => app.settings.model.default.name = v,
+                EditableSection::ModelReasoning => set_model_field(app, section, &v),
+                EditableSection::ModelOpus => set_model_field(app, section, &v),
+                EditableSection::ModelSonnet => set_model_field(app, section, &v),
+                EditableSection::ModelHaiku => set_model_field(app, section, &v),
+                EditableSection::ModelDefaultReasoningEffort
+                | EditableSection::ModelReasoningReasoningEffort
+                | EditableSection::ModelOpusReasoningEffort
+                | EditableSection::ModelSonnetReasoningEffort
+                | EditableSection::ModelHaikuReasoningEffort => {
+                    set_model_reasoning_effort(app, section, &v)
                 }
             }
             app.mark_dirty();
@@ -979,7 +1076,7 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
             true
         }
         InputAction::SetModelDefault { provider_id } => {
-            app.settings.model.default = format!("{provider_id}/{value}");
+            app.settings.model.default.name = format!("{provider_id}/{value}");
             app.mark_dirty();
             app.show_toast(Toast::success(format!(
                 "Default model: {provider_id}/{value}"
@@ -1752,26 +1849,26 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
     env.remove("ANTHROPIC_AUTH_TOKEN");
-    set_env(env, "ANTHROPIC_MODEL", &settings.model.default);
+    set_env(env, "ANTHROPIC_MODEL", &settings.model.default.name);
     set_optional_env(
         env,
         "ANTHROPIC_REASONING_MODEL",
-        settings.model.reasoning.as_deref(),
+        settings.model.reasoning_name(),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        settings.model.haiku.as_deref(),
+        settings.model.haiku_name(),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        settings.model.sonnet.as_deref(),
+        settings.model.sonnet_name(),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        settings.model.opus.as_deref(),
+        settings.model.opus_name(),
     );
     env.remove("ANTHROPIC_SMALL_FAST_MODEL");
 }
@@ -1801,20 +1898,54 @@ fn set_env(env: &mut Map<String, Value>, key: &str, value: &str) {
 }
 
 fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
-    let v = value.to_string();
+    let v = value.trim().to_string();
     match section {
-        EditableSection::ModelDefault => app.settings.model.default = v,
+        EditableSection::ModelDefault => app.settings.model.default.name = v,
         EditableSection::ModelReasoning => {
-            app.settings.model.reasoning = if v.is_empty() { None } else { Some(v) }
+            set_optional_model_alias(&mut app.settings.model.reasoning, v)
         }
-        EditableSection::ModelOpus => {
-            app.settings.model.opus = if v.is_empty() { None } else { Some(v) }
+        EditableSection::ModelOpus => set_optional_model_alias(&mut app.settings.model.opus, v),
+        EditableSection::ModelSonnet => set_optional_model_alias(&mut app.settings.model.sonnet, v),
+        EditableSection::ModelHaiku => set_optional_model_alias(&mut app.settings.model.haiku, v),
+        _ => {}
+    }
+}
+
+fn set_optional_model_alias(alias: &mut Option<ModelAliasConfig>, name: String) {
+    if name.is_empty() {
+        *alias = None;
+    } else if let Some(existing) = alias {
+        existing.name = name;
+    } else {
+        *alias = Some(ModelAliasConfig::new(name));
+    }
+}
+
+fn set_model_reasoning_effort(app: &mut App, section: &EditableSection, value: &str) {
+    let effort = parse_model_reasoning_effort(value);
+    match section {
+        EditableSection::ModelDefaultReasoningEffort => {
+            app.settings.model.default.reasoning_effort = effort;
         }
-        EditableSection::ModelSonnet => {
-            app.settings.model.sonnet = if v.is_empty() { None } else { Some(v) }
+        EditableSection::ModelReasoningReasoningEffort => {
+            if let Some(alias) = app.settings.model.reasoning.as_mut() {
+                alias.reasoning_effort = effort;
+            }
         }
-        EditableSection::ModelHaiku => {
-            app.settings.model.haiku = if v.is_empty() { None } else { Some(v) }
+        EditableSection::ModelOpusReasoningEffort => {
+            if let Some(alias) = app.settings.model.opus.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        EditableSection::ModelSonnetReasoningEffort => {
+            if let Some(alias) = app.settings.model.sonnet.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        EditableSection::ModelHaikuReasoningEffort => {
+            if let Some(alias) = app.settings.model.haiku.as_mut() {
+                alias.reasoning_effort = effort;
+            }
         }
         _ => {}
     }
@@ -2031,7 +2162,7 @@ fn poll_metrics(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claude_proxy_config::settings::{ModelConfig, ServerConfig};
+    use claude_proxy_config::settings::{ModelAliasConfig, ModelConfig, ServerConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2050,11 +2181,11 @@ mod tests {
     fn claude_code_env_sync_sets_proxy_and_model_keys() {
         let mut settings = Settings {
             model: ModelConfig {
-                default: "copilot/claude-sonnet-4".to_string(),
-                reasoning: Some("copilot/deepseek-v4-flash".to_string()),
-                opus: Some("copilot/claude-opus-4".to_string()),
-                sonnet: Some("openai/gpt-5".to_string()),
-                haiku: Some("openai/gpt-5-mini".to_string()),
+                default: ModelAliasConfig::new("copilot/claude-sonnet-4"),
+                reasoning: Some(ModelAliasConfig::new("copilot/deepseek-v4-flash")),
+                opus: Some(ModelAliasConfig::new("copilot/claude-opus-4")),
+                sonnet: Some(ModelAliasConfig::new("openai/gpt-5")),
+                haiku: Some(ModelAliasConfig::new("openai/gpt-5-mini")),
             },
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
@@ -2139,10 +2270,10 @@ mod tests {
     fn claude_code_env_sync_removes_empty_optional_model_keys() {
         let settings = Settings {
             model: ModelConfig {
-                default: "openai/gpt-5".to_string(),
-                reasoning: Some("   ".to_string()),
+                default: ModelAliasConfig::new("openai/gpt-5"),
+                reasoning: Some(ModelAliasConfig::new("   ")),
                 opus: None,
-                sonnet: Some("   ".to_string()),
+                sonnet: Some(ModelAliasConfig::new("   ")),
                 haiku: None,
             },
             ..Settings::default()
@@ -2312,7 +2443,7 @@ mod tests {
 
         let mut changed_app = App::new(existing);
         changed_app.nav = NavItem::Providers;
-        changed_app.settings.model.default = "openai/gpt-5".to_string();
+        changed_app.settings.model.default.name = "openai/gpt-5".to_string();
         assert!(should_mark_claude_onboarding_complete_on_save(
             &changed_app,
             &config_path
@@ -2424,7 +2555,7 @@ mod tests {
 
         assert!(apply_pending_input(&mut app));
 
-        assert_eq!(app.settings.model.default, "openai/gpt-5");
+        assert_eq!(app.settings.model.default.name, "openai/gpt-5");
         assert!(app.overlay.is_none());
         assert_eq!(app.focus, Focus::Content);
         assert!(app.dirty);

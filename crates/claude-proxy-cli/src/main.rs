@@ -253,12 +253,12 @@ async fn handle_provider(action: ProviderAction) {
             println!(
                 "  {} {}",
                 "Default model:".bold(),
-                settings.model.default.cyan()
+                settings.model.default.name.cyan()
             );
         }
         ProviderAction::Current => {
             let settings = load_settings_or_exit();
-            println!("{}", settings.model.default.cyan());
+            println!("{}", settings.model.default.name.cyan());
         }
         ProviderAction::Add { id } => {
             let mut settings = match claude_proxy_config::Settings::config_file_path() {
@@ -453,7 +453,7 @@ async fn handle_provider(action: ProviderAction) {
                             .unwrap();
                         let model_name = &model_names[selection];
                         let model_ref = format!("{provider_id}/{model_name}");
-                        settings.model.default = model_ref.clone();
+                        settings.model.default.name = model_ref.clone();
                         save_settings(&settings);
                         println!("  → Default model: {}", model_ref.cyan());
                         return;
@@ -478,7 +478,7 @@ async fn handle_provider(action: ProviderAction) {
             } else {
                 format!("{provider_id}/{model_name}")
             };
-            settings.model.default = model_ref.clone();
+            settings.model.default.name = model_ref.clone();
             save_settings(&settings);
             println!("  → Default model: {}", model_ref.cyan());
         }
@@ -559,7 +559,7 @@ async fn handle_provider(action: ProviderAction) {
                 })
                 .unwrap_or_else(|| "default".to_string());
             let model_ref = format!("{id}/{model_name}");
-            settings.model.default = model_ref.clone();
+            settings.model.default.name = model_ref.clone();
             save_settings(&settings);
             println!(
                 "{} Default model set to \"{}\"",

@@ -5,7 +5,9 @@ use std::path::Path;
 use tracing::info;
 
 use crate::error::ConfigError;
-use crate::settings::{ModelConfig, ProviderConfig, ProviderType, ServerConfig, Settings};
+use crate::settings::{
+    ModelAliasConfig, ModelConfig, ProviderConfig, ProviderType, ServerConfig, Settings,
+};
 
 /// Migrate a legacy `.env` file to a `Settings` struct.
 ///
@@ -150,17 +152,31 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
     }
 
     let model = ModelConfig {
-        default: env
-            .get("MODEL")
-            .cloned()
-            .unwrap_or_else(|| "openai/gpt-4.1".to_string()),
+        default: ModelAliasConfig::new(
+            env.get("MODEL")
+                .cloned()
+                .unwrap_or_else(|| "openai/gpt-4.1".to_string()),
+        ),
         reasoning: env
             .get("MODEL_REASONING")
             .cloned()
-            .filter(|s| !s.is_empty()),
-        opus: env.get("MODEL_OPUS").cloned().filter(|s| !s.is_empty()),
-        sonnet: env.get("MODEL_SONNET").cloned().filter(|s| !s.is_empty()),
-        haiku: env.get("MODEL_HAIKU").cloned().filter(|s| !s.is_empty()),
+            .filter(|s| !s.is_empty())
+            .map(ModelAliasConfig::new),
+        opus: env
+            .get("MODEL_OPUS")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(ModelAliasConfig::new),
+        sonnet: env
+            .get("MODEL_SONNET")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(ModelAliasConfig::new),
+        haiku: env
+            .get("MODEL_HAIKU")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(ModelAliasConfig::new),
     };
 
     let server = ServerConfig {
@@ -260,7 +276,7 @@ PORT=9090
 
         let settings = build_settings_from_env(&env);
         assert_eq!(settings.server.auth_token, "my-token");
-        assert_eq!(settings.model.default, "openai/gpt-4.1");
+        assert_eq!(settings.model.default.name, "openai/gpt-4.1");
         assert!(settings.providers.contains_key("openai"));
     }
 }

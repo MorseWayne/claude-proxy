@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::ConfigError;
 
@@ -255,14 +255,162 @@ impl<'de> Deserialize<'de> for ProviderType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAliasConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+}
+
+impl ModelAliasConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            reasoning_effort: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelReasoningEffort {
+    #[serde(rename = "default")]
+    Auto,
+    #[serde(rename = "none")]
+    Disabled,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
+impl ModelReasoningEffort {
+    pub fn request_value(self) -> Option<&'static str> {
+        match self {
+            ModelReasoningEffort::Auto => None,
+            ModelReasoningEffort::Disabled => Some("none"),
+            ModelReasoningEffort::Low => Some("low"),
+            ModelReasoningEffort::Medium => Some("medium"),
+            ModelReasoningEffort::High => Some("high"),
+            ModelReasoningEffort::XHigh => Some("xhigh"),
+        }
+    }
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            ModelReasoningEffort::Auto => "default",
+            ModelReasoningEffort::Disabled => "none",
+            ModelReasoningEffort::Low => "low",
+            ModelReasoningEffort::Medium => "medium",
+            ModelReasoningEffort::High => "high",
+            ModelReasoningEffort::XHigh => "xhigh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAliasKind {
+    DefaultAlias,
+    Reasoning,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResolutionSource {
+    DirectProviderModel,
+    Alias(ModelAliasKind),
+    DefaultProviderFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub requested_model: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+    pub source: ModelResolutionSource,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+}
+
+impl ResolvedModel {
+    pub fn model_ref(&self) -> String {
+        format!("{}/{}", self.provider_id, self.upstream_model)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ModelAliasConfigRepr {
+    Name(String),
+    Config(ModelAliasConfig),
+}
+
+impl From<ModelAliasConfigRepr> for ModelAliasConfig {
+    fn from(value: ModelAliasConfigRepr) -> Self {
+        match value {
+            ModelAliasConfigRepr::Name(name) => ModelAliasConfig::new(name),
+            ModelAliasConfigRepr::Config(config) => config,
+        }
+    }
+}
+
+fn deserialize_model_alias<'de, D>(deserializer: D) -> Result<ModelAliasConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ModelAliasConfigRepr::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_optional_model_alias<'de, D>(
+    deserializer: D,
+) -> Result<Option<ModelAliasConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ModelAliasConfigRepr>::deserialize(deserializer).map(|value| value.map(Into::into))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    #[serde(default = "default_model")]
-    pub default: String,
-    pub reasoning: Option<String>,
-    pub opus: Option<String>,
-    pub sonnet: Option<String>,
-    pub haiku: Option<String>,
+    #[serde(
+        default = "default_model_alias",
+        deserialize_with = "deserialize_model_alias"
+    )]
+    pub default: ModelAliasConfig,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub reasoning: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub opus: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub sonnet: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub haiku: Option<ModelAliasConfig>,
+}
+
+impl ModelConfig {
+    pub fn default_name(&self) -> &str {
+        &self.default.name
+    }
+
+    pub fn reasoning_name(&self) -> Option<&str> {
+        self.reasoning.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn opus_name(&self) -> Option<&str> {
+        self.opus.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn sonnet_name(&self) -> Option<&str> {
+        self.sonnet.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn haiku_name(&self) -> Option<&str> {
+        self.haiku.as_ref().map(|alias| alias.name.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +488,9 @@ fn default_empty() -> String {
 fn default_model() -> String {
     "openai/gpt-4.1".to_string()
 }
+fn default_model_alias() -> ModelAliasConfig {
+    ModelAliasConfig::new(default_model())
+}
 fn default_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -380,7 +531,7 @@ fn default_log_level() -> String {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            default: default_model(),
+            default: default_model_alias(),
             reasoning: None,
             opus: None,
             sonnet: None,
@@ -434,6 +585,22 @@ impl Default for LogConfig {
     }
 }
 
+fn resolved_model(
+    requested_model: &str,
+    provider_id: &str,
+    upstream_model: &str,
+    source: ModelResolutionSource,
+    reasoning_effort: Option<ModelReasoningEffort>,
+) -> ResolvedModel {
+    ResolvedModel {
+        requested_model: requested_model.to_string(),
+        provider_id: provider_id.to_string(),
+        upstream_model: upstream_model.to_string(),
+        source,
+        reasoning_effort,
+    }
+}
+
 impl Settings {
     /// Load settings from a TOML file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -470,26 +637,76 @@ impl Settings {
 
     /// Resolve a Claude model name to a `provider_id/upstream_model` string.
     pub fn resolve_model(&self, claude_model: &str) -> String {
+        self.resolve_model_with_intent(claude_model, None)
+            .model_ref()
+    }
+
+    pub fn resolve_model_with_intent(
+        &self,
+        claude_model: &str,
+        intent: Option<&str>,
+    ) -> ResolvedModel {
         if claude_model.contains('/') {
-            return claude_model.to_string();
+            return resolved_model(
+                claude_model,
+                Self::parse_provider_id(claude_model),
+                Self::parse_model_name(claude_model),
+                ModelResolutionSource::DirectProviderModel,
+                None,
+            );
         }
 
         let lower = claude_model.to_lowercase();
         if lower.contains("opus")
-            && let Some(ref m) = self.model.opus
+            && let Some(ref alias) = self.model.opus
         {
-            return m.clone();
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Opus);
         } else if lower.contains("haiku")
-            && let Some(ref m) = self.model.haiku
+            && let Some(ref alias) = self.model.haiku
         {
-            return m.clone();
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Haiku);
         } else if lower.contains("sonnet")
-            && let Some(ref m) = self.model.sonnet
+            && let Some(ref alias) = self.model.sonnet
         {
-            return m.clone();
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Sonnet);
+        } else if self.should_use_reasoning_alias(&lower, intent)
+            && let Some(ref alias) = self.model.reasoning
+        {
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Reasoning);
+        } else if lower == "default" {
+            return self.resolve_alias(
+                claude_model,
+                &self.model.default,
+                ModelAliasKind::DefaultAlias,
+            );
         }
-        let provider = Self::parse_provider_id(&self.model.default);
-        format!("{}/{}", provider, claude_model)
+
+        resolved_model(
+            claude_model,
+            Self::parse_provider_id(&self.model.default.name),
+            claude_model,
+            ModelResolutionSource::DefaultProviderFallback,
+            None,
+        )
+    }
+
+    fn should_use_reasoning_alias(&self, lower_model: &str, intent: Option<&str>) -> bool {
+        lower_model.contains("reasoning") || matches!(intent, Some("deep_think" | "reasoning"))
+    }
+
+    fn resolve_alias(
+        &self,
+        requested_model: &str,
+        alias: &ModelAliasConfig,
+        kind: ModelAliasKind,
+    ) -> ResolvedModel {
+        resolved_model(
+            requested_model,
+            Self::parse_provider_id(&alias.name),
+            Self::parse_model_name(&alias.name),
+            ModelResolutionSource::Alias(kind),
+            alias.reasoning_effort,
+        )
     }
 
     /// Extract the provider ID from a `provider_id/model` string (first `/` only).
@@ -555,17 +772,19 @@ impl Settings {
         }
         // Validate model format: must contain provider_id/model_name
         let models = [
-            ("model.default", Some(self.model.default.as_str())),
-            ("model.opus", self.model.opus.as_deref()),
-            ("model.sonnet", self.model.sonnet.as_deref()),
-            ("model.haiku", self.model.haiku.as_deref()),
+            ("model.default", Some(&self.model.default)),
+            ("model.reasoning", self.model.reasoning.as_ref()),
+            ("model.opus", self.model.opus.as_ref()),
+            ("model.sonnet", self.model.sonnet.as_ref()),
+            ("model.haiku", self.model.haiku.as_ref()),
         ];
         for (field, value) in models {
-            if let Some(v) = value
-                && !v.contains('/')
+            if let Some(alias) = value
+                && !alias.name.contains('/')
             {
                 return Err(ConfigError::Validation(format!(
-                    "{field} must be in 'provider_id/model_name' format, got: {v}"
+                    "{field}.name must be in 'provider_id/model_name' format, got: {}",
+                    alias.name
                 )));
             }
         }
@@ -599,11 +818,11 @@ mod tests {
     fn test_resolve_model() {
         let settings = Settings {
             model: ModelConfig {
-                default: "openai/gpt-4.1".to_string(),
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
                 reasoning: None,
-                opus: Some("anthropic/claude-opus-4-20250514".to_string()),
+                opus: Some(ModelAliasConfig::new("anthropic/claude-opus-4-20250514")),
                 sonnet: None,
-                haiku: Some("openai/gpt-4.1-mini".to_string()),
+                haiku: Some(ModelAliasConfig::new("openai/gpt-4.1-mini")),
             },
             ..Default::default()
         };
@@ -633,11 +852,11 @@ mod tests {
     fn explicit_provider_model_takes_precedence_over_role_aliases() {
         let settings = Settings {
             model: ModelConfig {
-                default: "openai/gpt-4.1".to_string(),
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
                 reasoning: None,
-                opus: Some("anthropic/claude-opus-4-20250514".to_string()),
-                sonnet: Some("openai/gpt-4.1".to_string()),
-                haiku: Some("openai/gpt-4.1-mini".to_string()),
+                opus: Some(ModelAliasConfig::new("anthropic/claude-opus-4-20250514")),
+                sonnet: Some(ModelAliasConfig::new("openai/gpt-4.1")),
+                haiku: Some(ModelAliasConfig::new("openai/gpt-4.1-mini")),
             },
             ..Default::default()
         };
@@ -650,6 +869,109 @@ mod tests {
             settings.resolve_model("custom/claude-3-5-haiku-latest"),
             "custom/claude-3-5-haiku-latest"
         );
+    }
+
+    #[test]
+    fn resolve_model_reports_alias_source_and_reasoning_effort() {
+        let mut reasoning = ModelAliasConfig::new("openai/gpt-5");
+        reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        let settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
+                reasoning: Some(reasoning),
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let resolved = settings.resolve_model_with_intent("claude-sonnet", Some("deep_think"));
+
+        assert_eq!(resolved.provider_id, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-5");
+        assert_eq!(
+            resolved.source,
+            ModelResolutionSource::Alias(ModelAliasKind::Reasoning)
+        );
+        assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
+    }
+
+    #[test]
+    fn direct_and_fallback_models_do_not_inherit_default_reasoning_effort() {
+        let mut default = ModelAliasConfig::new("openai/gpt-4.1");
+        default.reasoning_effort = Some(ModelReasoningEffort::Disabled);
+        let settings = Settings {
+            model: ModelConfig {
+                default,
+                reasoning: None,
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let direct = settings.resolve_model_with_intent("copilot/gpt-5", None);
+        assert_eq!(direct.source, ModelResolutionSource::DirectProviderModel);
+        assert_eq!(direct.reasoning_effort, None);
+
+        let fallback = settings.resolve_model_with_intent("gpt-5", None);
+        assert_eq!(
+            fallback.source,
+            ModelResolutionSource::DefaultProviderFallback
+        );
+        assert_eq!(fallback.reasoning_effort, None);
+    }
+
+    #[test]
+    fn structured_and_legacy_model_alias_toml_are_both_supported() {
+        let toml = r#"
+[model]
+default = "openai/gpt-4.1"
+reasoning = { name = "openai/gpt-5", reasoning_effort = "high" }
+
+[model.opus]
+name = "anthropic/claude-opus-4-20250514"
+reasoning_effort = "default"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.model.default.name, "openai/gpt-4.1");
+        assert_eq!(settings.model.default.reasoning_effort, None);
+        assert_eq!(settings.model.reasoning_name(), Some("openai/gpt-5"));
+        assert_eq!(
+            settings
+                .model
+                .reasoning
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort),
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(
+            settings.model.opus_name(),
+            Some("anthropic/claude-opus-4-20250514")
+        );
+        assert_eq!(
+            settings
+                .model
+                .opus
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort),
+            Some(ModelReasoningEffort::Auto)
+        );
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_is_rejected() {
+        let toml = r#"
+[model.default]
+name = "openai/gpt-4.1"
+reasoning_effort = "extreme"
+"#;
+        let err = Settings::from_toml(toml, Path::new("test.toml")).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]
