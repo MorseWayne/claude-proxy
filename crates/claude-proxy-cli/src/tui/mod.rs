@@ -33,8 +33,7 @@ use claude_proxy_config::settings::{CopilotProviderConfig, ProviderConfig, Provi
 use tracing::{error, info};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
-/// Fetch metrics every 5 seconds (25 ticks * 200ms).
-const METRICS_FETCH_INTERVAL: u64 = 25;
+const METRICS_FETCH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -131,12 +130,8 @@ fn on_tick(app: &mut App) {
     if let Some(Overlay::OAuth(ref mut oauth)) = app.overlay {
         oauth.spinner_tick = app.tick;
     }
-    // Periodically fetch metrics from the running server
-    app.metrics_fetch_tick += 1;
-    if app.metrics_fetch_tick >= METRICS_FETCH_INTERVAL {
-        app.metrics_fetch_tick = 0;
-        fetch_live_metrics(app);
-    }
+    // Periodically fetch metrics from the running server.
+    fetch_live_metrics(app, Instant::now());
     // Poll OAuth results
     poll_oauth(app);
     // Poll provider connectivity/auth checks
@@ -813,6 +808,10 @@ fn get_editable_section(app: &App) -> (Option<EditableSection>, String) {
                 Some(EditableSection::MaxConcurrency),
                 app.settings.limits.max_concurrency.to_string(),
             ),
+            3 => (
+                Some(EditableSection::ModelCacheTtlSeconds),
+                app.settings.limits.model_cache_ttl_seconds.to_string(),
+            ),
             _ => (None, String::new()),
         },
         NavItem::Http => match app.content_idx {
@@ -873,6 +872,7 @@ fn get_section_label(section: &EditableSection) -> &'static str {
         EditableSection::RateLimit => "Rate Limit (requests)",
         EditableSection::RateWindow => "Window (seconds)",
         EditableSection::MaxConcurrency => "Max Concurrency",
+        EditableSection::ModelCacheTtlSeconds => "Model Cache TTL (seconds)",
         EditableSection::HttpReadTimeout => "Read Timeout (seconds)",
         EditableSection::HttpWriteTimeout => "Write Timeout (seconds)",
         EditableSection::HttpConnectTimeout => "Connect Timeout (seconds)",
@@ -922,6 +922,14 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
                 EditableSection::MaxConcurrency => {
                     if let Ok(n) = v.parse() {
                         app.settings.limits.max_concurrency = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::ModelCacheTtlSeconds => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.model_cache_ttl_seconds = n;
                     } else {
                         app.show_toast(Toast::error("Invalid number"));
                         return false;
@@ -1812,12 +1820,22 @@ fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
     }
 }
 
-/// Kick off a background thread to fetch live metrics (non-blocking).
-fn fetch_live_metrics(app: &mut App) {
+fn live_metrics_fetch_due(last_fetch_at: Option<Instant>, now: Instant) -> bool {
+    last_fetch_at
+        .map(|last| now.saturating_duration_since(last) >= METRICS_FETCH_INTERVAL)
+        .unwrap_or(true)
+}
+
+/// Kick off a throttled background thread to fetch live metrics (non-blocking).
+fn fetch_live_metrics(app: &mut App, now: Instant) {
     // Don't spawn a new fetch if one is already in-flight
     if app.metrics_rx.is_some() {
         return;
     }
+    if !live_metrics_fetch_due(app.last_metrics_fetch_at, now) {
+        return;
+    }
+    app.last_metrics_fetch_at = Some(now);
 
     let host = app.settings.server.host.clone();
     let port = app.settings.server.port;
@@ -2074,6 +2092,21 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(value["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn live_metrics_fetch_due_respects_interval() {
+        let now = Instant::now();
+
+        assert!(live_metrics_fetch_due(None, now));
+        assert!(!live_metrics_fetch_due(
+            Some(now - METRICS_FETCH_INTERVAL + Duration::from_millis(1)),
+            now
+        ));
+        assert!(live_metrics_fetch_due(
+            Some(now - METRICS_FETCH_INTERVAL),
+            now
+        ));
     }
 
     #[test]

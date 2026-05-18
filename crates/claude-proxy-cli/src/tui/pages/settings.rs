@@ -72,7 +72,7 @@ fn render_server_page(f: &mut Frame, app: &App, area: Rect) {
 fn render_limits_page(f: &mut Frame, app: &App, area: Rect) {
     let inner = widgets::render_content_frame(f, area, app, "Rate Limits");
     let is_focused = matches!(app.focus, Focus::Content);
-    let rows = widgets::field_rows(inner, 4);
+    let rows = widgets::field_rows(inner, 5);
 
     widgets::render_field(
         f,
@@ -98,10 +98,18 @@ fn render_limits_page(f: &mut Frame, app: &App, area: Rect) {
         is_focused && app.content_idx == 2,
         false,
     );
+    widgets::render_field(
+        f,
+        rows[3],
+        "Model Cache TTL (s)",
+        &app.settings.limits.model_cache_ttl_seconds.to_string(),
+        is_focused && app.content_idx == 3,
+        false,
+    );
 
     render_hint(
         f,
-        rows[3],
+        rows[4],
         "Rate limit: max requests allowed per time window",
     );
 }

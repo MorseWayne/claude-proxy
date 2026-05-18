@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
+use std::time::Instant;
 
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::ProviderType;
@@ -291,6 +292,7 @@ pub enum EditableSection {
     RateLimit,
     RateWindow,
     MaxConcurrency,
+    ModelCacheTtlSeconds,
     HttpReadTimeout,
     HttpWriteTimeout,
     HttpConnectTimeout,
@@ -414,8 +416,8 @@ pub struct App {
     pub live_metrics: Option<LiveMetrics>,
     /// Channel for receiving metrics fetch results from background thread.
     pub metrics_rx: Option<std::sync::mpsc::Receiver<Option<serde_json::Value>>>,
-    /// Tick counter for metrics refresh (every N ticks).
-    pub metrics_fetch_tick: u64,
+    /// Last time a metrics request was started; live_metrics remains displayed between fetches.
+    pub last_metrics_fetch_at: Option<Instant>,
     /// Pending provider types for the AddProvider picker.
     pub pending_provider_types: Option<Vec<ProviderType>>,
     /// Channel for OAuth background thread results.
@@ -450,7 +452,7 @@ impl App {
             tokio_handle: tokio::runtime::Handle::try_current().ok(),
             live_metrics: None,
             metrics_rx: None,
-            metrics_fetch_tick: 0,
+            last_metrics_fetch_at: None,
             pending_provider_types: None,
             oauth_rx: None,
             oauth_pending_id: None,
@@ -473,7 +475,7 @@ impl App {
             NavItem::Dashboard => 0,
             NavItem::Providers => self.settings.providers.len(),
             NavItem::Server => 4,
-            NavItem::Limits => 3,
+            NavItem::Limits => 4,
             NavItem::Http => 3,
             NavItem::Log => 3,
             NavItem::Model => 5,
