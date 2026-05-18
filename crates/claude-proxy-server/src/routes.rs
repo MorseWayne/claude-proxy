@@ -632,6 +632,8 @@ fn sse_body_response(body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Infallibl
 
 /// GET /v1/models — list available models
 pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+    refresh_missing_model_caches(&state).await;
+
     let registry = state.provider_registry.read().await;
     let models = registry.all_cached_models();
 
@@ -660,6 +662,46 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
         "data": data,
         "object": "list"
     }))
+}
+
+async fn refresh_missing_model_caches(state: &AppState) {
+    let provider_ids: Vec<String> = {
+        let settings = state.settings.read().await;
+        settings.providers.keys().cloned().collect()
+    };
+
+    for provider_id in provider_ids {
+        if state
+            .provider_registry
+            .read()
+            .await
+            .cached_models(&provider_id)
+            .is_some()
+        {
+            continue;
+        }
+
+        let provider = match state.get_or_create_provider(&provider_id).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                warn!("Failed to create provider '{provider_id}' for model list refresh: {error}");
+                continue;
+            }
+        };
+
+        match provider.list_models().await {
+            Ok(models) => {
+                state
+                    .provider_registry
+                    .write()
+                    .await
+                    .cache_models(&provider_id, models);
+            }
+            Err(error) => {
+                warn!("Failed to refresh model list for provider '{provider_id}': {error}");
+            }
+        }
+    }
 }
 
 /// GET /admin/config — get current config (keys masked)

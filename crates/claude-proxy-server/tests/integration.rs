@@ -281,22 +281,6 @@ async fn test_list_models() {
 
     let client = reqwest::Client::new();
 
-    // First, make a request to trigger provider creation and model fetch
-    // (models are cached lazily)
-    let _ = client
-        .post(format!("{}/v1/messages", proxy_url))
-        .header("x-api-key", "test-token")
-        .header("content-type", "application/json")
-        .json(&json!({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 10,
-            "stream": false,
-            "messages": [{"role": "user", "content": "Hi"}]
-        }))
-        .send()
-        .await;
-
-    // Now check models endpoint
     let resp = client
         .get(format!("{}/v1/models", proxy_url))
         .header("x-api-key", "test-token")
@@ -307,7 +291,9 @@ async fn test_list_models() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "list");
-    // Models come from cache, which may be empty until list_models is called
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"][0]["id"], "gpt-4");
+    assert_eq!(body["data"][1]["id"], "gpt-4-mini");
 }
 
 #[tokio::test]
