@@ -6,7 +6,7 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
@@ -69,6 +69,7 @@ enum AccessTokenResponse {
 pub struct CopilotAuth {
     github_token: RwLock<Option<String>>,
     copilot_token: RwLock<Option<CopilotToken>>,
+    token_refresh_lock: Mutex<()>,
     token_dir: PathBuf,
     http_client: Client,
     oauth_app: String,
@@ -86,6 +87,7 @@ impl CopilotAuth {
         let auth = Arc::new(Self {
             github_token: RwLock::new(github_token),
             copilot_token: RwLock::new(None),
+            token_refresh_lock: Mutex::new(()),
             token_dir,
             http_client,
             oauth_app: oauth_app.to_string(),
@@ -319,6 +321,11 @@ impl CopilotAuth {
 
     /// Exchange the GitHub token for a Copilot token.
     pub async fn refresh_copilot_token(&self) -> Result<(), ProviderError> {
+        let _refresh_guard = self.token_refresh_lock.lock().await;
+        self.refresh_copilot_token_inner().await
+    }
+
+    async fn refresh_copilot_token_inner(&self) -> Result<(), ProviderError> {
         let github_token = self
             .github_token
             .read()
@@ -408,42 +415,52 @@ impl CopilotAuth {
             self.reload_github_token_from_disk().await;
         }
 
-        // If no GitHub token, run device flow
-        if !self.has_github_token().await {
-            let _token = self.run_device_flow().await?;
-            self.refresh_copilot_token().await?;
-            // Return the copilot token
-            return self
-                .copilot_token
-                .read()
-                .await
-                .as_ref()
-                .map(|t| t.token.clone())
-                .ok_or_else(|| ProviderError::Authentication("no copilot token".to_string()));
+        if self.has_github_token().await && !self.copilot_token_needs_refresh().await {
+            return self.current_copilot_token().await;
         }
 
-        // If no copilot token or expired, refresh
-        let needs_refresh = {
-            let ct = self.copilot_token.read().await;
-            ct.as_ref().is_none_or(|t| {
-                let now = chrono::Utc::now().timestamp();
-                now + t.refresh_in >= t.expires_at
-            })
-        };
+        let _refresh_guard = self.token_refresh_lock.lock().await;
 
-        if needs_refresh && let Err(e) = self.refresh_copilot_token().await {
+        if !self.has_github_token().await {
+            self.reload_github_token_from_disk().await;
+        }
+
+        if !self.has_github_token().await {
+            let _token = self.run_device_flow().await?;
+            self.refresh_copilot_token_inner().await?;
+            return self.current_copilot_token().await;
+        }
+
+        if self.copilot_token_needs_refresh().await
+            && let Err(e) = self.refresh_copilot_token_inner().await
+        {
             warn!("Failed to refresh Copilot token: {e}");
-            // Return existing token if still valid
-            let ct = self.copilot_token.read().await;
-            if let Some(t) = ct.as_ref() {
-                let now = chrono::Utc::now().timestamp();
-                if now < t.expires_at {
-                    return Ok(t.token.clone());
-                }
+            if let Some(token) = self.current_unexpired_copilot_token().await {
+                return Ok(token);
             }
             return Err(e);
         }
 
+        self.current_copilot_token().await
+    }
+
+    async fn copilot_token_needs_refresh(&self) -> bool {
+        let ct = self.copilot_token.read().await;
+        ct.as_ref().is_none_or(|t| {
+            let now = chrono::Utc::now().timestamp();
+            now + t.refresh_in >= t.expires_at
+        })
+    }
+
+    async fn current_unexpired_copilot_token(&self) -> Option<String> {
+        let ct = self.copilot_token.read().await;
+        ct.as_ref().and_then(|t| {
+            let now = chrono::Utc::now().timestamp();
+            (now < t.expires_at).then(|| t.token.clone())
+        })
+    }
+
+    async fn current_copilot_token(&self) -> Result<String, ProviderError> {
         self.copilot_token
             .read()
             .await
@@ -472,5 +489,62 @@ impl CopilotAuth {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_with_token(token: Option<CopilotToken>) -> CopilotAuth {
+        CopilotAuth {
+            github_token: RwLock::new(Some("github-token".to_string())),
+            copilot_token: RwLock::new(token),
+            token_refresh_lock: Mutex::new(()),
+            token_dir: PathBuf::new(),
+            http_client: Client::new(),
+            oauth_app: "vscode".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_token_refresh_state_uses_refresh_window() {
+        let now = chrono::Utc::now().timestamp();
+        let fresh = auth_with_token(Some(CopilotToken {
+            token: "fresh".to_string(),
+            expires_at: now + 3600,
+            refresh_in: 1500,
+        }));
+        let stale = auth_with_token(Some(CopilotToken {
+            token: "stale".to_string(),
+            expires_at: now + 1200,
+            refresh_in: 1500,
+        }));
+        let missing = auth_with_token(None);
+
+        assert!(!fresh.copilot_token_needs_refresh().await);
+        assert!(stale.copilot_token_needs_refresh().await);
+        assert!(missing.copilot_token_needs_refresh().await);
+    }
+
+    #[tokio::test]
+    async fn current_unexpired_copilot_token_rejects_expired_token() {
+        let now = chrono::Utc::now().timestamp();
+        let valid = auth_with_token(Some(CopilotToken {
+            token: "valid".to_string(),
+            expires_at: now + 60,
+            refresh_in: 1500,
+        }));
+        let expired = auth_with_token(Some(CopilotToken {
+            token: "expired".to_string(),
+            expires_at: now - 1,
+            refresh_in: 1500,
+        }));
+
+        assert_eq!(
+            valid.current_unexpired_copilot_token().await.as_deref(),
+            Some("valid")
+        );
+        assert_eq!(expired.current_unexpired_copilot_token().await, None);
     }
 }

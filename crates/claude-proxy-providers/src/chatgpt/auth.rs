@@ -8,7 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -68,6 +68,7 @@ struct TokenResponse {
 
 pub struct ChatGptAuth {
     token: RwLock<Option<ChatGptToken>>,
+    token_refresh_lock: Mutex<()>,
     token_dir: PathBuf,
     http_client: Client,
 }
@@ -80,6 +81,7 @@ impl ChatGptAuth {
 
         let auth = Arc::new(Self {
             token: RwLock::new(Self::load_token(&token_dir)),
+            token_refresh_lock: Mutex::new(()),
             token_dir,
             http_client,
         });
@@ -236,20 +238,14 @@ impl ChatGptAuth {
     }
 
     pub async fn get_token(&self) -> Result<ChatGptToken, ProviderError> {
-        let needs_refresh = {
-            let token = self.token.read().await;
-            token.as_ref().is_none_or(|token| {
-                chrono::Utc::now().timestamp() + TOKEN_REFRESH_MARGIN_SECS >= token.expires_at
-            })
-        };
+        if !self.token_needs_refresh().await {
+            return self.current_token().await;
+        }
 
-        if !needs_refresh {
-            return self
-                .token
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| ProviderError::Authentication("no ChatGPT token".to_string()));
+        let _refresh_guard = self.token_refresh_lock.lock().await;
+
+        if !self.token_needs_refresh().await {
+            return self.current_token().await;
         }
 
         if self.token.read().await.is_none() {
@@ -258,6 +254,17 @@ impl ChatGptAuth {
             self.refresh_access_token().await?;
         }
 
+        self.current_token().await
+    }
+
+    async fn token_needs_refresh(&self) -> bool {
+        let token = self.token.read().await;
+        token.as_ref().is_none_or(|token| {
+            chrono::Utc::now().timestamp() + TOKEN_REFRESH_MARGIN_SECS >= token.expires_at
+        })
+    }
+
+    async fn current_token(&self) -> Result<ChatGptToken, ProviderError> {
         self.token
             .read()
             .await
@@ -416,10 +423,41 @@ fn extract_account_id_from_claims(claims: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn auth_with_token(token: Option<ChatGptToken>) -> ChatGptAuth {
+        ChatGptAuth {
+            token: RwLock::new(token),
+            token_refresh_lock: Mutex::new(()),
+            token_dir: PathBuf::new(),
+            http_client: Client::new(),
+        }
+    }
+
     fn jwt(payload: Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
         let body = URL_SAFE_NO_PAD.encode(payload.to_string());
         format!("{header}.{body}.sig")
+    }
+
+    #[tokio::test]
+    async fn token_refresh_state_uses_margin() {
+        let now = chrono::Utc::now().timestamp();
+        let fresh = auth_with_token(Some(ChatGptToken {
+            access_token: "fresh".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: now + TOKEN_REFRESH_MARGIN_SECS + 30,
+            account_id: None,
+        }));
+        let stale = auth_with_token(Some(ChatGptToken {
+            access_token: "stale".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: now + TOKEN_REFRESH_MARGIN_SECS - 1,
+            account_id: None,
+        }));
+        let missing = auth_with_token(None);
+
+        assert!(!fresh.token_needs_refresh().await);
+        assert!(stale.token_needs_refresh().await);
+        assert!(missing.token_needs_refresh().await);
     }
 
     #[test]
