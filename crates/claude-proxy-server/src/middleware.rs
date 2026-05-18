@@ -5,13 +5,12 @@ use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
-use governor::clock::DefaultClock;
+use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use tower::{Layer, Service};
@@ -52,36 +51,40 @@ pub struct RateLimitConfig {
 /// Runtime rate limit state that can be refreshed after config reload.
 pub struct RateLimitRuntime {
     governor: RwLock<Arc<Governor>>,
-    retry_after_secs: AtomicU64,
 }
 
 impl RateLimitRuntime {
     pub fn new(config: RateLimitConfig) -> Self {
-        let (governor, retry_after_secs) = build_governor(config);
+        let governor = build_governor(config);
         Self {
             governor: RwLock::new(Arc::new(governor)),
-            retry_after_secs: AtomicU64::new(retry_after_secs),
         }
     }
 
     pub fn update(&self, config: RateLimitConfig) {
-        let (governor, retry_after_secs) = build_governor(config);
+        let governor = build_governor(config);
         *self.governor.write().unwrap() = Arc::new(governor);
-        self.retry_after_secs
-            .store(retry_after_secs, Ordering::Relaxed);
     }
 
-    fn check_key(&self, key: &GovernorKey) -> bool {
+    fn check_key(&self, key: &GovernorKey) -> Result<(), u64> {
         let governor = Arc::clone(&self.governor.read().unwrap());
-        governor.check_key(key).is_ok()
-    }
-
-    fn retry_after_secs(&self) -> u64 {
-        self.retry_after_secs.load(Ordering::Relaxed)
+        governor.check_key(key).map_err(|not_until| {
+            retry_after_seconds(not_until.wait_time_from(governor.clock().now()))
+        })
     }
 }
 
-fn build_governor(config: RateLimitConfig) -> (Governor, u64) {
+fn retry_after_seconds(wait: Duration) -> u64 {
+    let secs = wait.as_secs();
+    if wait.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
+    .max(1)
+}
+
+fn build_governor(config: RateLimitConfig) -> Governor {
     let max_requests = config.max_requests.max(1);
     let max = NonZeroU32::new(max_requests).unwrap();
     let quota = if config.per_seconds <= 1 {
@@ -93,8 +96,7 @@ fn build_governor(config: RateLimitConfig) -> (Governor, u64) {
         .unwrap()
         .allow_burst(max)
     };
-    let retry_after_secs = (config.per_seconds as f64 / max_requests as f64).ceil() as u64;
-    (RateLimiter::keyed(quota), retry_after_secs)
+    RateLimiter::keyed(quota)
 }
 
 #[cfg(test)]
@@ -137,18 +139,24 @@ mod tests {
         });
         let key = GovernorKey("client".to_string());
 
-        assert!(runtime.check_key(&key));
-        assert!(!runtime.check_key(&key));
+        assert!(runtime.check_key(&key).is_ok());
+        assert_eq!(runtime.check_key(&key).unwrap_err(), 60);
 
         runtime.update(RateLimitConfig {
             max_requests: 2,
             per_seconds: 60,
         });
 
-        assert!(runtime.check_key(&key));
-        assert!(runtime.check_key(&key));
-        assert!(!runtime.check_key(&key));
-        assert_eq!(runtime.retry_after_secs(), 30);
+        assert!(runtime.check_key(&key).is_ok());
+        assert!(runtime.check_key(&key).is_ok());
+        assert_eq!(runtime.check_key(&key).unwrap_err(), 30);
+    }
+
+    #[test]
+    fn retry_after_seconds_rounds_up_and_never_returns_zero() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1_001)), 2);
     }
 }
 
@@ -199,29 +207,32 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let key = GovernorKey::from_request(&req);
 
-        if self.runtime.check_key(&key) {
-            // Allowed — forward to inner service
-            Box::pin(self.inner.call(req))
-        } else {
-            // Rate limited
-            let retry_after = self.runtime.retry_after_secs().max(1).to_string();
-            let body = serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "rate_limit_error",
-                    "message": "rate limit exceeded"
-                }
-            });
-            let response = Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("content-type", "application/json")
-                .header(
-                    "retry-after",
-                    HeaderValue::from_str(&retry_after).unwrap_or(HeaderValue::from_static("1")),
-                )
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-            Box::pin(async move { Ok(response) })
+        match self.runtime.check_key(&key) {
+            Ok(()) => {
+                // Allowed — forward to inner service
+                Box::pin(self.inner.call(req))
+            }
+            Err(retry_after_secs) => {
+                let retry_after = retry_after_secs.to_string();
+                let body = serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "rate limit exceeded"
+                    }
+                });
+                let response = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header(
+                        "retry-after",
+                        HeaderValue::from_str(&retry_after)
+                            .unwrap_or(HeaderValue::from_static("1")),
+                    )
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap();
+                Box::pin(async move { Ok(response) })
+            }
         }
     }
 }
