@@ -36,6 +36,12 @@ struct HistoryCompressionState {
     excess_bytes: usize,
 }
 
+#[derive(Debug)]
+enum ResponsesMessagePart {
+    Text(String),
+    ImageUrl(String),
+}
+
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
@@ -265,12 +271,14 @@ fn append_message_items(
             ));
         }
         MessageContent::Blocks(blocks) => {
-            let mut text_parts = Vec::new();
+            let mut parts = Vec::new();
             for block in blocks {
                 match block {
-                    Content::Text { text } => text_parts.push(text.clone()),
+                    Content::Text { text } => parts.push(ResponsesMessagePart::Text(text.clone())),
                     Content::Thinking { thinking, .. } => {
-                        text_parts.push(format!("[thinking]\n{thinking}\n[/thinking]"));
+                        parts.push(ResponsesMessagePart::Text(format!(
+                            "[thinking]\n{thinking}\n[/thinking]"
+                        )));
                     }
                     Content::ToolUse {
                         id,
@@ -282,17 +290,13 @@ fn append_message_items(
                         name,
                         input: args,
                     } => {
-                        if !text_parts.is_empty() {
-                            input.push(message_item(
-                                &msg.role,
-                                compressed_text_item(
-                                    &text_parts.join("\n"),
-                                    is_current_message,
-                                    compression,
-                                ),
-                            ));
-                            text_parts.clear();
-                        }
+                        flush_message_parts(
+                            input,
+                            &msg.role,
+                            &mut parts,
+                            is_current_message,
+                            compression,
+                        );
                         input.push(json!({
                             "type": "function_call",
                             "call_id": id,
@@ -305,17 +309,13 @@ fn append_message_items(
                         content,
                         is_error,
                     } => {
-                        if !text_parts.is_empty() {
-                            input.push(message_item(
-                                &msg.role,
-                                compressed_text_item(
-                                    &text_parts.join("\n"),
-                                    is_current_message,
-                                    compression,
-                                ),
-                            ));
-                            text_parts.clear();
-                        }
+                        flush_message_parts(
+                            input,
+                            &msg.role,
+                            &mut parts,
+                            is_current_message,
+                            compression,
+                        );
                         let output = tool_result_text(
                             content,
                             *is_error,
@@ -327,17 +327,75 @@ fn append_message_items(
                             "output": output,
                         }));
                     }
-                    Content::Unknown(_) => {}
+                    Content::Unknown(value) => {
+                        if let Some(image_url) = unknown_image_url(value) {
+                            parts.push(ResponsesMessagePart::ImageUrl(image_url));
+                        }
+                    }
                 }
             }
-            if !text_parts.is_empty() {
-                input.push(message_item(
-                    &msg.role,
-                    compressed_text_item(&text_parts.join("\n"), is_current_message, compression),
-                ));
-            }
+            flush_message_parts(
+                input,
+                &msg.role,
+                &mut parts,
+                is_current_message,
+                compression,
+            );
         }
     }
+}
+
+fn flush_message_parts(
+    input: &mut Vec<Value>,
+    role: &Role,
+    parts: &mut Vec<ResponsesMessagePart>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    if parts.is_empty() {
+        return;
+    }
+
+    let has_image = parts
+        .iter()
+        .any(|part| matches!(part, ResponsesMessagePart::ImageUrl(_)));
+
+    if !has_image {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                ResponsesMessagePart::Text(text) => Some(text.as_str()),
+                ResponsesMessagePart::ImageUrl(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.push(message_item(
+            role,
+            compressed_text_item(&text, is_current_message, compression),
+        ));
+        parts.clear();
+        return;
+    }
+
+    let content = parts
+        .iter()
+        .filter_map(|part| match part {
+            ResponsesMessagePart::Text(text) if text.is_empty() => None,
+            ResponsesMessagePart::Text(text) => Some(json!({
+                "type": "input_text",
+                "text": compressed_text_item(text, is_current_message, compression),
+            })),
+            ResponsesMessagePart::ImageUrl(image_url) => Some(json!({
+                "type": "input_image",
+                "image_url": image_url,
+            })),
+        })
+        .collect::<Vec<_>>();
+
+    if !content.is_empty() {
+        input.push(message_content_item(role, content));
+    }
+    parts.clear();
 }
 
 fn compressed_text_item(
@@ -428,6 +486,52 @@ fn message_item(role: &Role, text: String) -> Value {
         "role": role,
         "content": text,
     })
+}
+
+fn message_content_item(role: &Role, content: Vec<Value>) -> Value {
+    let role = match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    json!({
+        "role": role,
+        "content": content,
+    })
+}
+
+fn unknown_image_url(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("image") => image_source_url(value.get("source")?),
+        Some("input_image") => value
+            .get("image_url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("image_url") => match value.get("image_url") {
+            Some(Value::String(url)) => Some(url.clone()),
+            Some(Value::Object(image_url)) => image_url
+                .get("url")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn image_source_url(source: &Value) -> Option<String> {
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            (!media_type.is_empty() && !data.is_empty())
+                .then(|| format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 fn tool_result_text(
@@ -1341,6 +1445,55 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "detailed");
         assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_anthropic_image_blocks() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    Content::Text {
+                        text: "What is in this image?".to_string(),
+                    },
+                    Content::Unknown(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo="
+                        }
+                    })),
+                ]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "What is in this image?"
+        );
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
     }
 
     #[test]

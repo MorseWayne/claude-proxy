@@ -158,7 +158,11 @@ fn chatgpt_models() -> Vec<ModelInfo> {
         "gpt-5.2",
     ]
     .into_iter()
-    .map(openai_model_info)
+    .map(|model_id| {
+        let mut info = openai_model_info(model_id);
+        info.supports_vision = Some(true);
+        info
+    })
     .collect()
 }
 
@@ -198,6 +202,7 @@ mod tests {
                 .supported_endpoints
                 .contains(&"/responses".to_string())
         );
+        assert_eq!(gpt55.supports_vision, Some(true));
         assert_eq!(
             gpt55.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]

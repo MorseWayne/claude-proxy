@@ -285,10 +285,9 @@ fn spawn_sigusr1_handler(
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-
     #[cfg(unix)]
     {
+        let ctrl_c = tokio::signal::ctrl_c();
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler");
 
@@ -298,8 +297,28 @@ async fn shutdown_signal() {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        let mut ctrl_c =
+            tokio::signal::windows::ctrl_c().expect("failed to install CTRL+C handler");
+        let mut ctrl_break =
+            tokio::signal::windows::ctrl_break().expect("failed to install CTRL+BREAK handler");
+        let mut ctrl_close =
+            tokio::signal::windows::ctrl_close().expect("failed to install CTRL+CLOSE handler");
+        let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown()
+            .expect("failed to install CTRL+SHUTDOWN handler");
+
+        tokio::select! {
+            _ = ctrl_c.recv() => info!("Received CTRL+C"),
+            _ = ctrl_break.recv() => info!("Received CTRL+BREAK"),
+            _ = ctrl_close.recv() => info!("Received CTRL+CLOSE"),
+            _ = ctrl_shutdown.recv() => info!("Received CTRL+SHUTDOWN"),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
         let _ = ctrl_c.await;
         info!("Received SIGINT");
     }

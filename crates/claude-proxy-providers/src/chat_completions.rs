@@ -859,6 +859,7 @@ mod tests {
     #[test]
     fn test_stream_converter_sanitizes_split_read_arguments() {
         let path = temp_read_fixture(1_113);
+        let file_path_json = serde_json::to_string(path.to_string_lossy().as_ref()).unwrap();
         let mut converter = StreamConverter::new();
         let first = OpenAiChunk {
             id: "test".to_string(),
@@ -874,10 +875,7 @@ mod tests {
                         id: Some("call_1".to_string()),
                         function: OpenAiFunction {
                             name: Some("Read".to_string()),
-                            arguments: format!(
-                                "{{\"file_path\":\"{}\",\"offset\":",
-                                path.to_string_lossy()
-                            ),
+                            arguments: format!("{{\"file_path\":{file_path_json},\"offset\":"),
                         },
                     }]),
                 },
