@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,14 +116,8 @@ impl ChatGptAuth {
         let path = Self::token_path(&self.token_dir);
         match serde_json::to_string_pretty(token) {
             Ok(body) => {
-                if let Err(e) = fs::write(&path, body) {
+                if let Err(e) = write_token_file(&path, &body) {
                     warn!("Failed to save ChatGPT token: {e}");
-                    return;
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
                 }
             }
             Err(e) => warn!("Failed to serialize ChatGPT token: {e}"),
@@ -357,6 +352,24 @@ impl ChatGptAuth {
     }
 }
 
+fn write_token_file(path: &Path, body: &str) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(body.as_bytes())
+}
+
 fn token_from_response(data: TokenResponse, fallback_refresh: Option<&str>) -> ChatGptToken {
     let account_id = extract_account_id(&data);
     let refresh_token = data
@@ -424,10 +437,14 @@ mod tests {
     use super::*;
 
     fn auth_with_token(token: Option<ChatGptToken>) -> ChatGptAuth {
+        auth_with_token_dir(token, PathBuf::new())
+    }
+
+    fn auth_with_token_dir(token: Option<ChatGptToken>, token_dir: PathBuf) -> ChatGptAuth {
         ChatGptAuth {
             token: RwLock::new(token),
             token_refresh_lock: Mutex::new(()),
-            token_dir: PathBuf::new(),
+            token_dir,
             http_client: Client::new(),
         }
     }
@@ -484,5 +501,34 @@ mod tests {
             extract_account_id_from_jwt(&token).as_deref(),
             Some("org-123")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_token_restricts_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let token_dir = std::env::temp_dir().join(format!(
+            "claude-proxy-chatgpt-auth-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&token_dir).unwrap();
+        let path = ChatGptAuth::token_path(&token_dir);
+        fs::write(&path, "old token").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let auth = auth_with_token_dir(None, token_dir.clone());
+        auth.save_token(&ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: 123,
+            account_id: Some("account".to_string()),
+        });
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(fs::read_to_string(&path).unwrap().contains("access"));
+
+        fs::remove_dir_all(token_dir).unwrap();
     }
 }
