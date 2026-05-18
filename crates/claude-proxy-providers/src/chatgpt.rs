@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use claude_proxy_config::Settings;
 use claude_proxy_core::*;
 use futures::stream::BoxStream;
-use reqwest::Client;
+use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 
 use crate::http::{
@@ -54,6 +54,30 @@ impl ChatGptProvider {
             auth,
         })
     }
+
+    async fn send_responses_request(
+        &self,
+        body: &Value,
+        token: &ChatGptToken,
+    ) -> Result<Response, ProviderError> {
+        let mut request_builder = self
+            .http_client
+            .post(&self.endpoint)
+            .bearer_auth(&token.access_token)
+            .header("Content-Type", "application/json")
+            .header("originator", "opencode")
+            .header("User-Agent", "opencode/claude-proxy");
+
+        if let Some(account_id) = token.account_id.as_deref() {
+            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        }
+
+        send_upstream_request_with_policy(
+            request_builder.json(body),
+            chatgpt_upstream_request_policy(),
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -71,23 +95,22 @@ impl Provider for ChatGptProvider {
         let body = build_chatgpt_responses_body(&request);
         log_request_observability("chatgpt", "/responses", &body);
 
-        let mut request_builder = self
-            .http_client
-            .post(&self.endpoint)
-            .bearer_auth(&token.access_token)
-            .header("Content-Type", "application/json")
-            .header("originator", "opencode")
-            .header("User-Agent", "opencode/claude-proxy");
-
-        if let Some(account_id) = token.account_id.as_deref() {
-            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        let mut response = self.send_responses_request(&body, &token).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            let refreshed = match self.auth.force_refresh_token().await {
+                Ok(token) => token,
+                Err(error) => {
+                    if matches!(error, ProviderError::Authentication(_)) {
+                        self.auth.clear_token().await;
+                    }
+                    return Err(error);
+                }
+            };
+            response = self.send_responses_request(&body, &refreshed).await?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                self.auth.clear_token().await;
+            }
         }
-
-        let response = send_upstream_request_with_policy(
-            request_builder.json(&body),
-            chatgpt_upstream_request_policy(),
-        )
-        .await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);

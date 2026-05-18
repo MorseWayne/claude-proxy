@@ -252,6 +252,23 @@ impl ChatGptAuth {
         self.current_token().await
     }
 
+    pub async fn force_refresh_token(&self) -> Result<ChatGptToken, ProviderError> {
+        let _refresh_guard = self.token_refresh_lock.lock().await;
+        self.refresh_access_token().await?;
+        self.current_token().await
+    }
+
+    pub async fn clear_token(&self) {
+        let path = Self::token_path(&self.token_dir);
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!("Failed to remove ChatGPT token: {e}");
+        }
+        let mut current = self.token.write().await;
+        *current = None;
+    }
+
     async fn token_needs_refresh(&self) -> bool {
         let token = self.token.read().await;
         token.as_ref().is_none_or(|token| {

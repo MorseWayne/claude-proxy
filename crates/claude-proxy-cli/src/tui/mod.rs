@@ -1549,9 +1549,7 @@ fn sync_claude_code_settings(
         .map_err(|e| format!("failed to serialize Claude Code settings: {e}"))?;
     std::fs::write(&path, format!("{content}\n"))
         .map_err(|e| format!("failed to write Claude Code settings: {e}"))?;
-    if mark_onboarding_complete {
-        mark_claude_onboarding_complete()?;
-    }
+    sync_claude_user_config(&settings.server.auth_token, mark_onboarding_complete)?;
     Ok(path)
 }
 
@@ -1577,13 +1575,29 @@ fn same_model_config(left: &Settings, right: &Settings) -> bool {
         && left.model.haiku == right.model.haiku
 }
 
-fn mark_claude_onboarding_complete() -> Result<PathBuf, String> {
-    let path = claude_code_user_config_path()?;
-    mark_claude_onboarding_complete_at(&path)?;
-    Ok(path)
+#[cfg(test)]
+fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
+    sync_claude_user_config_at(path, "", true)
 }
 
-fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
+fn sync_claude_user_config(
+    auth_token: &str,
+    mark_onboarding_complete: bool,
+) -> Result<Option<PathBuf>, String> {
+    if auth_token.trim().is_empty() && !mark_onboarding_complete {
+        return Ok(None);
+    }
+
+    let path = claude_code_user_config_path()?;
+    sync_claude_user_config_at(&path, auth_token, mark_onboarding_complete)?;
+    Ok(Some(path))
+}
+
+fn sync_claude_user_config_at(
+    path: &Path,
+    auth_token: &str,
+    mark_onboarding_complete: bool,
+) -> Result<(), String> {
     let mut value = if path.exists() {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read Claude user config: {e}"))?;
@@ -1601,7 +1615,10 @@ fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
         return Err("Claude user config root must be a JSON object".to_string());
     }
     let root = value.as_object_mut().expect("value is an object");
-    root.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
+    if mark_onboarding_complete {
+        root.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
+    }
+    approve_claude_code_api_key(root, auth_token);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1612,6 +1629,50 @@ fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
     std::fs::write(path, format!("{content}\n"))
         .map_err(|e| format!("failed to write Claude user config: {e}"))?;
     Ok(())
+}
+
+fn approve_claude_code_api_key(root: &mut Map<String, Value>, auth_token: &str) {
+    let auth_token = auth_token.trim();
+    if auth_token.is_empty() {
+        return;
+    }
+
+    let responses = root
+        .entry("customApiKeyResponses".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !responses.is_object() {
+        *responses = Value::Object(Map::new());
+    }
+    let responses = responses
+        .as_object_mut()
+        .expect("customApiKeyResponses is an object");
+
+    responses.insert(
+        "rejected".to_string(),
+        Value::Array(
+            responses
+                .get("rejected")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|value| value.as_str() != Some(auth_token))
+                .cloned()
+                .collect(),
+        ),
+    );
+
+    let mut approved = responses
+        .get("approved")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !approved
+        .iter()
+        .any(|value| value.as_str() == Some(auth_token))
+    {
+        approved.push(Value::String(auth_token.to_string()));
+    }
+    responses.insert("approved".to_string(), Value::Array(approved));
 }
 
 fn claude_code_user_config_path() -> Result<PathBuf, String> {
@@ -2086,6 +2147,58 @@ mod tests {
 
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["hasCompletedOnboarding"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_sync_approves_proxy_api_key() {
+        let dir = temp_path("claude-api-key-approval");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "customApiKeyResponses": {
+    "approved": ["existing-key"],
+    "rejected": ["proxy-token", "other-rejected"]
+  },
+  "theme": "dark"
+}"#,
+        )
+        .unwrap();
+
+        sync_claude_user_config_at(&path, "proxy-token", false).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+        assert_eq!(value.get("hasCompletedOnboarding"), None);
+        assert_eq!(
+            value["customApiKeyResponses"]["approved"],
+            json!(["existing-key", "proxy-token"])
+        );
+        assert_eq!(
+            value["customApiKeyResponses"]["rejected"],
+            json!(["other-rejected"])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_sync_creates_api_key_responses() {
+        let dir = temp_path("claude-api-key-create");
+        let path = dir.join(".claude.json");
+
+        sync_claude_user_config_at(&path, "proxy-token", true).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+        assert_eq!(
+            value["customApiKeyResponses"]["approved"],
+            json!(["proxy-token"])
+        );
+        assert_eq!(value["customApiKeyResponses"]["rejected"], json!([]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
