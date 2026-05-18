@@ -54,7 +54,7 @@ reasoning_effort = "none"
   - `name: String`
   - `reasoning_effort: Option<ModelReasoningEffort>`
 - `ModelReasoningEffort`
-  - `Default`
+  - `Auto`（序列化为 `"default"`）
   - `Disabled`（序列化为 `"none"`）
   - `Low`
   - `Medium`
@@ -80,33 +80,51 @@ opus = "anthropic/claude-opus-4-7"
 
 ## 请求解析与优先级
 
-新增一个解析结果类型，例如 `ResolvedModelAlias`：
+模型解析应作为一个明确的领域边界，而不是只返回 `provider/model` 字符串。新增结构化解析结果，例如 `ResolvedModel`：
 
-- `model_ref: String`
-- `reasoning_effort: Option<ModelReasoningEffort>`
+- `requested_model: String`：客户端原始请求模型名。
+- `provider_id: String`：最终 provider。
+- `upstream_model: String`：发送给 provider 的模型名。
+- `source: ModelResolutionSource`：解析来源。
+- `reasoning_effort: Option<ModelReasoningEffort>`：仅当来源是配置 alias 时来自 alias；直接模型或 provider fallback 不携带 alias effort。
 
-`Settings::resolve_model()` 可继续保留字符串返回值以降低调用方破坏面；新增方法负责返回结构化解析结果。server 请求路径使用结构化解析结果：
+`ModelResolutionSource` 建议包含：
 
-1. 如果请求模型本身包含 `/`，视为直接 `provider/model`，不应用别名推理强度。
-2. 否则按 alias 规则解析：
-   - 请求模型名包含 `opus` 时优先使用 `model.opus`。
-   - 请求模型名包含 `haiku` 时使用 `model.haiku`。
-   - 请求模型名包含 `sonnet` 时使用 `model.sonnet`。
-   - 请求模型名包含 `reasoning`，或请求 `metadata.intent` 为 `deep_think` / `reasoning`，并且未命中上面的家族 alias 时，使用 `model.reasoning`。
-   - 未命中任何 alias 时，沿用 `model.default.name` 的 provider + 请求模型名；这条路径没有 alias-specific reasoning effort。
-3. 将 `model_ref` 拆为 `provider_id` 和 `upstream_model`。
-4. 如果请求没有显式 `reasoning`、`reasoning_effort` 或 `thinking`，并且别名配置的 `reasoning_effort` 是固定值，则注入到请求 `extra["reasoning_effort"]`。
-5. 如果别名配置是 `Default` 或字段缺失（Rust `Option::None`），不注入字段，继续让现有 provider intent 逻辑决定是否设置 effort。
+- `DirectProviderModel`：请求本身是 `provider/model`。
+- `Alias(ModelAliasKind)`：命中 `default`、`reasoning`、`opus`、`sonnet` 或 `haiku` alias。
+- `DefaultProviderFallback`：未命中 alias，用 `model.default.name` 的 provider 承载原始请求模型名。
 
-固定值映射：
+`ModelAliasKind` 建议包含 `DefaultAlias`、`Reasoning`、`Opus`、`Sonnet`、`Haiku`，避免和 `ModelReasoningEffort::Auto` 混淆。
 
+解析职责：
+
+1. 如果请求模型本身包含 `/`，解析为 `DirectProviderModel`，直接拆出 provider 与 upstream model，不应用任何 alias reasoning effort。
+2. 否则按模型角色解析 alias：
+   - 请求模型名包含 `opus` → `Alias(Opus)`。
+   - 请求模型名包含 `haiku` → `Alias(Haiku)`。
+   - 请求模型名包含 `sonnet` → `Alias(Sonnet)`。
+   - 请求模型名包含 `reasoning`，或请求 `metadata.intent` 为 `deep_think` / `reasoning`，且未命中家族 alias → `Alias(Reasoning)`。
+   - 请求模型名为 `default` → `Alias(DefaultAlias)`。
+   - 其他模型名 → `DefaultProviderFallback`。
+3. `Alias(...)` 解析使用对应 alias 的 `name` 与 `reasoning_effort`。
+4. `DefaultProviderFallback` 只复用 `model.default.name` 的 provider，不复用 default alias 的 upstream model 或 reasoning effort。
+
+请求 enrichment 是解析之后的独立步骤：
+
+1. 如果请求已经显式携带 `reasoning`、`reasoning_effort` 或 `thinking`，保持请求不变；客户端显式字段优先。
+2. 如果 `ResolvedModel.reasoning_effort` 是固定值，则注入到 `request.extra["reasoning_effort"]`。
+3. 如果 `ResolvedModel.reasoning_effort` 是 `Auto` 或字段缺失（Rust `Option::None`），不注入字段，继续让 provider 层现有 intent 逻辑决定是否设置 effort。
+
+配置值到请求字段的映射：
+
+- `Auto`（配置序列化为 `"default"`）→ 不注入请求字段
 - `Disabled` → `"none"`
 - `Low` → `"low"`
 - `Medium` → `"medium"`
 - `High` → `"high"`
 - `XHigh` → `"xhigh"`
 
-注意：配置枚举中的 `Disabled` 是显式关闭/最低 reasoning 的用户配置值，对应字符串 `none`，会注入 `reasoning_effort = "none"`；Rust `Option::None` 表示未配置，不注入字段。`Default` 是显式记录“使用默认策略”，行为与未配置相同，但会在结构化配置中保留用户意图。
+注意：配置枚举中的 `Disabled` 是显式关闭/最低 reasoning 的用户配置值，对应字符串 `none`，会注入 `reasoning_effort = "none"`；Rust `Option::None` 表示未配置，不注入字段。`Auto` 是显式记录“使用默认策略”，行为与未配置相同，但会在结构化配置中保留用户意图。
 
 ## TUI 与 CLI 体验
 
@@ -137,14 +155,20 @@ Claude Code env 同步仍只同步模型名相关环境变量，不同步 reason
   - `to_toml()` 输出结构化字段。
   - validation 校验所有 alias 的 `name` 必须是 `provider_id/model_name`。
   - invalid `reasoning_effort` 被拒绝。
-- server/request 单元测试：
+- model resolver 单元测试：
+  - 直接 `provider/model` 解析为 `DirectProviderModel`，不携带 alias effort。
+  - opus/haiku/sonnet/reasoning/default alias 解析为对应 `Alias(ModelAliasKind)`，并携带 alias effort。
+  - `DefaultProviderFallback` 只复用 default provider，不复用 default alias 的 upstream model 或 reasoning effort。
+  - `model.reasoning` 在请求模型名或 intent 命中 reasoning 规则时生效，且不覆盖 opus/haiku/sonnet 家族 alias。
+- request enrichment 单元测试：
   - alias 固定 effort 在无显式请求字段时注入。
   - alias `reasoning_effort = "none"` 注入 `reasoning_effort = "none"`。
   - 请求显式 `reasoning_effort`、`reasoning`、`thinking` 优先。
-  - `default` 与未配置都不注入，保留现有 intent 推导。
-  - 直接 `provider/model` 不应用 alias effort。
+  - `default`（映射到 `ModelReasoningEffort::Auto`）与未配置都不注入，保留现有 intent 推导。
+  - resolver 到 enrichment 的边界集成：`DirectProviderModel`、`DefaultProviderFallback`、`Alias(...)` 分别传入 enrichment 时，只由 `reasoning_effort` 是否为固定值决定注入，不由 `source` 产生隐藏副作用。
+- server/request 单元测试：
+  - server 请求路径使用 `ResolvedModel.provider_id` 与 `ResolvedModel.upstream_model`。
   - 旧格式配置读取后可完成解析并代理请求。
-  - `model.reasoning` 在请求模型名或 intent 命中 reasoning 规则时生效，且不覆盖 opus/haiku/sonnet 家族 alias。
 - TUI 单元测试：
   - Model 页面编辑模型名与 effort 字段后正确写入 settings。
   - 空 effort 清空配置。
@@ -162,6 +186,6 @@ Claude Code env 同步仍只同步模型名相关环境变量，不同步 reason
 
 - 风险：结构化 TOML 可能破坏旧配置读取。缓解：为 alias 字段实现兼容反序列化，并加旧格式测试。
 - 风险：显式关闭和未配置语义混淆。缓解：代码中使用 `ModelReasoningEffort::Disabled` 表示序列化字符串 `"none"`，并保留 `Option::None` 专门表示未配置。
-- 风险：`Default` 与未配置运行时行为相同，可能让用户困惑。缓解：文档和 TUI copy 中说明 `default` 是显式记录“使用默认策略”，用于可见配置与人工审阅；空值表示未表达偏好。
+- 风险：`default` effort 与未配置运行时行为相同，可能让用户困惑。缓解：代码中命名为 `ModelReasoningEffort::Auto`，序列化仍为 `"default"`；文档和 TUI copy 中说明 `default` 是显式记录“使用默认策略”，用于可见配置与人工审阅；空值表示未表达偏好。
 - 风险：server 解析调用方过多。缓解：保留 `resolve_model()`，新增结构化方法供请求路径使用。
 - 风险：TUI 页面列宽不足或现有组件不支持表格单元格编辑。缓解：仍保持 alias 行 + Model / Reasoning Effort 左右并列；必要时用当前选中 alias 的 inline detail panel 展示两个并列字段，不退回每个 alias 上下拆成两行。
