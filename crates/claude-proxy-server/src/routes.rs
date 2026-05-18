@@ -436,7 +436,24 @@ fn join_inflight_stream(
                         break;
                     }
                 }
-                Ok(InflightEvent::Done) | Err(_) => break,
+                Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let error_event = SseEvent {
+                        event: "error".to_string(),
+                        data: json!({
+                            "error": {
+                                "type": "api_error",
+                                "message": format!(
+                                    "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                                )
+                            }
+                        }),
+                    };
+                    let _ = tx
+                        .send(Ok(format_sse_event(&error_event).into_bytes()))
+                        .await;
+                    break;
+                }
                 Ok(InflightEvent::Error(msg)) => {
                     let error_event = SseEvent {
                         event: "error".to_string(),
@@ -462,7 +479,15 @@ async fn join_inflight_non_stream(
     loop {
         match receiver.recv().await {
             Ok(InflightEvent::Event(event)) => events.push(event),
-            Ok(InflightEvent::Done) | Err(_) => break,
+            Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &ErrorResponse::api_error(&format!(
+                        "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                    )),
+                );
+            }
             Ok(InflightEvent::Error(msg)) => {
                 return error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&msg));
             }
@@ -1221,6 +1246,71 @@ mod tests {
         }
 
         assert_eq!(received, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn inflight_stream_follower_reports_lagged_broadcast() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(1);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        for text in ["first", "second"] {
+            broadcast_tx
+                .send(InflightEvent::Event(SseEvent {
+                    event: String::new(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "delta": {"text": text}
+                    }),
+                }))
+                .unwrap();
+        }
+
+        let response = join_inflight_stream(
+            receiver,
+            StreamPermits {
+                _request: request_permit,
+                _provider: None,
+            },
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("event: error"));
+        assert!(body.contains("missed 1 event"));
+    }
+
+    #[tokio::test]
+    async fn inflight_non_stream_follower_reports_lagged_broadcast() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(1);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        for text in ["first", "second"] {
+            broadcast_tx
+                .send(InflightEvent::Event(SseEvent {
+                    event: String::new(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "delta": {"text": text}
+                    }),
+                }))
+                .unwrap();
+        }
+
+        let response = join_inflight_non_stream(receiver, request_permit).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missed 1 event")
+        );
     }
 
     #[tokio::test]
