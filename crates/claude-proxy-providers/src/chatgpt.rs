@@ -620,7 +620,7 @@ fn rate_limit_snapshot_from_sse_event(
             .and_then(Value::as_str)
             .map(str::to_string),
         rate_limit_reached_type: None,
-        source: RateLimitSource::ResponseHeaders,
+        source: RateLimitSource::StreamEvent,
         updated_at_unix_secs,
     })
 }
@@ -1035,7 +1035,7 @@ mod tests {
             snapshot.credits.as_ref().unwrap().balance.as_deref(),
             Some("2.25")
         );
-        assert_eq!(snapshot.source, RateLimitSource::ResponseHeaders);
+        assert_eq!(snapshot.source, RateLimitSource::StreamEvent);
     }
 
     #[test]

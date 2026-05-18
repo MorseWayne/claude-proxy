@@ -354,6 +354,7 @@ fn format_rate_limit_extra(snapshot: &RateLimitSnapshot) -> String {
     parts.push(match snapshot.source {
         RateLimitSource::UsageEndpoint => "usage".to_string(),
         RateLimitSource::ResponseHeaders => "headers".to_string(),
+        RateLimitSource::StreamEvent => "stream".to_string(),
     });
     parts.join(" · ")
 }
@@ -542,5 +543,20 @@ fn format_number(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_extra_labels_stream_event_source() {
+        let snapshot = RateLimitSnapshot {
+            source: RateLimitSource::StreamEvent,
+            ..Default::default()
+        };
+
+        assert_eq!(format_rate_limit_extra(&snapshot), "stream");
     }
 }

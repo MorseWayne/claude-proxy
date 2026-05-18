@@ -90,6 +90,7 @@ pub enum RateLimitSource {
     #[default]
     UsageEndpoint,
     ResponseHeaders,
+    StreamEvent,
 }
 
 /// Trait implemented by upstream provider adapters.
