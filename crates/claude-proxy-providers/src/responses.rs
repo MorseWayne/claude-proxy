@@ -21,6 +21,7 @@ const MAX_HISTORICAL_TEXT_BYTES: usize = 32 * 1024;
 const SMALL_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 256 * 1024;
 const DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
 const LARGE_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 1024 * 1024;
+const MAX_MALFORMED_STREAM_PREVIEW_BYTES: usize = 1024;
 
 #[derive(Debug, Default)]
 struct HistoryCompressionStats {
@@ -819,11 +820,19 @@ pub fn stream_responses_response(
     response: reqwest::Response,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
     tokio::spawn(async move {
         let mut converter = ResponsesStreamConverter::new();
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
+        let mut preview = Vec::new();
 
         loop {
             let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
@@ -837,6 +846,7 @@ pub fn stream_responses_response(
 
             match chunk_result {
                 Ok(chunk) => {
+                    append_stream_preview(&mut preview, &chunk);
                     decoder.push(&chunk);
                     while let Some(event) = decoder.next_frame() {
                         if let Some(value) = parse_sse_json(&event) {
@@ -867,6 +877,17 @@ pub fn stream_responses_response(
             }
         }
 
+        if !converter.started {
+            let _ = tx
+                .send(Err(malformed_responses_stream_error(
+                    status,
+                    &content_type,
+                    &preview,
+                )))
+                .await;
+            return;
+        }
+
         for event in converter.finish() {
             if tx.send(Ok(event)).await.is_err() {
                 break;
@@ -879,6 +900,37 @@ pub fn stream_responses_response(
 
 fn parse_sse_json(text: &str) -> Option<Value> {
     parse_sse_json_value(text)
+}
+
+fn append_stream_preview(preview: &mut Vec<u8>, chunk: &[u8]) {
+    let remaining = MAX_MALFORMED_STREAM_PREVIEW_BYTES.saturating_sub(preview.len());
+    if remaining > 0 {
+        preview.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+    }
+}
+
+fn malformed_responses_stream_error(
+    status: u16,
+    content_type: &str,
+    preview: &[u8],
+) -> ProviderError {
+    let mut message = format!(
+        "empty or malformed Responses API stream from upstream (content-type: {content_type})"
+    );
+    let preview = String::from_utf8_lossy(preview);
+    let preview = preview.trim();
+    if preview.is_empty() {
+        message.push_str("; response body was empty");
+    } else {
+        message.push_str("; response preview: ");
+        message.push_str(preview);
+    }
+    message.push_str("; check for a proxy or gateway intercepting the request");
+
+    ProviderError::UpstreamError {
+        status,
+        body: message,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1555,11 +1607,62 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn response_from_body(content_type: &str, body: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn test_parse_sse_json_accepts_data_without_space() {
         let value = parse_sse_json(r#"data:{"type":"response.output_text.delta"}"#).unwrap();
         assert_eq!(value["type"], "response.output_text.delta");
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_reports_malformed_http_200_body() {
+        let response =
+            response_from_body("text/html", "<html><title>login required</title></html>").await;
+        let mut stream = stream_responses_response(response);
+
+        let error = stream
+            .next()
+            .await
+            .expect("malformed stream error")
+            .expect_err("malformed HTTP 200 body should not finish empty");
+
+        match error {
+            ProviderError::UpstreamError { status, body } => {
+                assert_eq!(status, 200);
+                assert!(body.contains("empty or malformed Responses API stream"));
+                assert!(body.contains("content-type: text/html"));
+                assert!(body.contains("login required"));
+                assert!(body.contains("check for a proxy or gateway"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

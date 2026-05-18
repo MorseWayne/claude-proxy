@@ -438,27 +438,16 @@ fn join_inflight_stream(
                 }
                 Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let error_event = SseEvent {
-                        event: "error".to_string(),
-                        data: json!({
-                            "error": {
-                                "type": "api_error",
-                                "message": format!(
-                                    "duplicate request stream fell behind and missed {skipped} event(s); please retry"
-                                )
-                            }
-                        }),
-                    };
+                    let error_event = stream_api_error_event(format!(
+                        "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                    ));
                     let _ = tx
                         .send(Ok(format_sse_event(&error_event).into_bytes()))
                         .await;
                     break;
                 }
                 Ok(InflightEvent::Error(msg)) => {
-                    let error_event = SseEvent {
-                        event: "error".to_string(),
-                        data: json!({"error": {"type": "api_error", "message": msg}}),
-                    };
+                    let error_event = stream_api_error_event(msg);
                     let _ = tx
                         .send(Ok(format_sse_event(&error_event).into_bytes()))
                         .await;
@@ -541,10 +530,7 @@ async fn stream_leader_response(
                     had_error = true;
                     let error_message = e.to_string();
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
-                    let error_event = SseEvent {
-                        event: "error".to_string(),
-                        data: json!({"error": {"type": "api_error", "message": error_message}}),
-                    };
+                    let error_event = stream_api_error_event(error_message);
                     if leader_tx_open {
                         let sse_text = format_sse_event(&error_event);
                         let _ = sender.send(Ok(sse_text.into_bytes())).await;
@@ -851,6 +837,19 @@ fn format_sse_event(event: &SseEvent) -> String {
     }
 }
 
+fn stream_api_error_event(message: impl Into<String>) -> SseEvent {
+    SseEvent {
+        event: "error".to_string(),
+        data: json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message.into()
+            }
+        }),
+    }
+}
+
 fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -1096,6 +1095,19 @@ mod tests {
             http: HttpConfig::default(),
             log: LogConfig::default(),
         }
+    }
+
+    #[test]
+    fn stream_api_error_event_uses_anthropic_error_shape() {
+        let event = stream_api_error_event("upstream stream was malformed");
+
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data["type"], "error");
+        assert_eq!(event.data["error"]["type"], "api_error");
+        assert_eq!(
+            event.data["error"]["message"],
+            "upstream stream was malformed"
+        );
     }
 
     fn request_with_system(system: Option<SystemPrompt>) -> MessagesRequest {
