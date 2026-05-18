@@ -51,6 +51,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             rate_window: 60,
             max_concurrency: 10,
             provider_max_concurrency: 10,
+            model_cache_ttl_seconds: 3600,
         },
         http: HttpConfig::default(),
         log: LogConfig::default(),

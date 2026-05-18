@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use crate::middleware::{RateLimitConfig, RateLimitRuntime};
 use crate::persistence::{MetricsStore, StoredTotals};
 
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Token usage breakdown for a single request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -250,6 +250,7 @@ mod tests {
                 rate_window,
                 max_concurrency,
                 provider_max_concurrency,
+                model_cache_ttl_seconds: DEFAULT_MODEL_CACHE_TTL.as_secs(),
             },
             http: HttpConfig::default(),
             log: LogConfig::default(),
@@ -353,11 +354,40 @@ mod tests {
                 max_thinking_budget: None,
                 reasoning_effort_levels: Vec::new(),
             }],
-            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+            Instant::now() - DEFAULT_MODEL_CACHE_TTL - Duration::from_secs(1),
         );
 
         assert!(registry.cached_models("openai").is_none());
         assert_eq!(registry.all_cached_models().len(), 1);
+    }
+
+    #[test]
+    fn provider_registry_uses_configured_model_cache_ttl() {
+        let mut registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(10));
+        registry.cache_models_at(
+            "openai",
+            vec![ModelInfo {
+                model_id: "still-fresh".to_string(),
+                supports_thinking: None,
+                vendor: None,
+                max_output_tokens: None,
+                context_window: None,
+                supported_endpoints: Vec::new(),
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
+            }],
+            Instant::now() - Duration::from_secs(6),
+        );
+
+        assert!(registry.cached_models("openai").is_some());
+
+        registry.set_model_cache_ttl(Duration::from_secs(5));
+
+        assert!(registry.cached_models("openai").is_none());
     }
 
     #[tokio::test]
@@ -468,7 +498,7 @@ mod tests {
                 max_thinking_budget: None,
                 reasoning_effort_levels: Vec::new(),
             }],
-            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+            Instant::now() - DEFAULT_MODEL_CACHE_TTL - Duration::from_secs(1),
         );
 
         let models = state.get_or_refresh_models("anthropic").await.unwrap();
@@ -521,6 +551,7 @@ pub enum InflightEvent {
 pub struct ProviderRegistry {
     providers: std::collections::HashMap<String, Arc<dyn Provider>>,
     model_cache: std::collections::HashMap<String, ModelCacheEntry>,
+    model_cache_ttl: Duration,
 }
 
 struct ModelCacheEntry {
@@ -541,8 +572,8 @@ impl ModelCacheEntry {
         Self { models, cached_at }
     }
 
-    fn is_fresh_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.cached_at) < MODEL_CACHE_TTL
+    fn is_fresh_at(&self, now: Instant, ttl: Duration) -> bool {
+        now.saturating_duration_since(self.cached_at) < ttl
     }
 }
 
@@ -554,10 +585,19 @@ impl Default for ProviderRegistry {
 
 impl ProviderRegistry {
     pub fn new() -> Self {
+        Self::with_model_cache_ttl(DEFAULT_MODEL_CACHE_TTL)
+    }
+
+    pub fn with_model_cache_ttl(model_cache_ttl: Duration) -> Self {
         Self {
             providers: std::collections::HashMap::new(),
             model_cache: std::collections::HashMap::new(),
+            model_cache_ttl: sanitize_model_cache_ttl(model_cache_ttl),
         }
+    }
+
+    pub fn set_model_cache_ttl(&mut self, model_cache_ttl: Duration) {
+        self.model_cache_ttl = sanitize_model_cache_ttl(model_cache_ttl);
     }
 
     pub fn get(&self, provider_id: &str) -> Option<Arc<dyn Provider>> {
@@ -606,7 +646,7 @@ impl ProviderRegistry {
     ) -> Option<&Vec<claude_proxy_core::ModelInfo>> {
         self.model_cache
             .get(provider_id)
-            .filter(|entry| entry.is_fresh_at(now))
+            .filter(|entry| entry.is_fresh_at(now, self.model_cache_ttl))
             .map(|entry| &entry.models)
     }
 
@@ -661,7 +701,9 @@ impl AppState {
         let limits = settings.limits.clone();
         Self {
             settings: Arc::new(RwLock::new(settings)),
-            provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
+            provider_registry: Arc::new(RwLock::new(ProviderRegistry::with_model_cache_ttl(
+                model_cache_ttl_from_limits(&limits),
+            ))),
             provider_creation_locks: Arc::new(Mutex::new(HashMap::new())),
             model_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             concurrency_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
@@ -691,6 +733,10 @@ impl AppState {
             max_requests: limits.rate_limit,
             per_seconds: limits.rate_window,
         });
+        self.provider_registry
+            .write()
+            .await
+            .set_model_cache_ttl(model_cache_ttl_from_limits(limits));
         *self.concurrency_semaphore.write().await =
             Arc::new(Semaphore::new(limits.max_concurrency as usize));
         self.provider_concurrency_semaphores.lock().await.clear();
@@ -775,6 +821,14 @@ impl AppState {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
+}
+
+fn model_cache_ttl_from_limits(limits: &LimitsConfig) -> Duration {
+    Duration::from_secs(limits.model_cache_ttl_seconds.max(1))
+}
+
+fn sanitize_model_cache_ttl(ttl: Duration) -> Duration {
+    ttl.max(Duration::from_secs(1))
 }
 
 async fn create_provider_from_settings(

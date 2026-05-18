@@ -290,6 +290,8 @@ pub struct LimitsConfig {
     pub max_concurrency: u32,
     #[serde(default = "default_provider_max_concurrency")]
     pub provider_max_concurrency: u32,
+    #[serde(default = "default_model_cache_ttl_seconds")]
+    pub model_cache_ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +361,9 @@ fn default_max_concurrency() -> u32 {
 fn default_provider_max_concurrency() -> u32 {
     4
 }
+fn default_model_cache_ttl_seconds() -> u64 {
+    60 * 60
+}
 fn default_read_timeout() -> u64 {
     300
 }
@@ -401,6 +406,7 @@ impl Default for LimitsConfig {
             rate_window: default_rate_window(),
             max_concurrency: default_max_concurrency(),
             provider_max_concurrency: default_provider_max_concurrency(),
+            model_cache_ttl_seconds: default_model_cache_ttl_seconds(),
         }
     }
 }
@@ -540,6 +546,11 @@ impl Settings {
         if self.limits.provider_max_concurrency == 0 {
             return Err(ConfigError::Validation(
                 "limits.provider_max_concurrency must be > 0".to_string(),
+            ));
+        }
+        if self.limits.model_cache_ttl_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "limits.model_cache_ttl_seconds must be > 0".to_string(),
             ));
         }
         // Validate model format: must contain provider_id/model_name
