@@ -4,6 +4,60 @@
 
 ## Active（进行中）
 
+### WF-2026-05-18-003 — TUI ChatGPT 额度显示规划
+
+Status: Done
+Level: 3
+Started: 2026-05-18
+Updated: 2026-05-18
+Current phase: Phase 1 — 实现、验证与收尾
+
+Goal（目标）:
+
+- 在 TUI 中展示真实 ChatGPT/Codex 账号额度或用量信息，接近 ChatGPT analytics usage 页面体验。
+
+#### Phase 0 — 需求澄清与设计
+
+Status: Done
+Depends on:
+
+- Phase 0 user approval on 2026-05-18: use direct `/wham/usage` or `/api/codex/usage` fetch as primary source, plus `x-codex-*` response header capture as fallback/update source.
+
+Tasks:
+
+- [x] 用 GitNexus 和源码确认现有 TUI Dashboard、metrics、ChatGPT OAuth token 边界。
+- [x] 澄清额度数据来源、展示粒度和失败降级行为。
+- [x] 比较可行方案并形成用户批准的设计。
+
+#### Phase 1 — 实现、验证与收尾
+
+Status: Done
+Depends on:
+
+- Phase 0
+
+Tasks:
+
+- [x] 实施 ChatGPT/Codex usage fetcher。
+- [x] 捕获 ChatGPT/Codex 响应 header 中的 quota/rate-limit snapshot。
+- [x] 通过 `/admin/metrics` 暴露 `provider_rate_limits`。
+- [x] 在 TUI Dashboard Usage Overview 中展示 ChatGPT/Codex quota rows。
+- [x] 补充 provider usage/header parser 与 TUI metrics parser 回归测试。
+
+Acceptance / Review:
+
+- Review: 已新增 provider-level `RateLimitSnapshot` 数据契约和默认 `Provider::rate_limit_snapshots`；ChatGPT provider 会用现有 OAuth token 直接调用 `/wham/usage` 或 `/api/codex/usage`，无 token 时不触发 device flow；上游响应 header 会缓存为 fallback/update source；server admin metrics 仅对 ChatGPT providers 拉取快照并忽略空/失败结果；TUI Dashboard 展示 `ChatGPT / Codex Quota`、5h/weekly 百分比、credits、plan type 和来源。
+- Validation: `cargo fmt --check`、目标 provider tests、目标 TUI parser test、目标 server admin metrics test、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前已对 `render_dashboard`、`ChatGptProvider`、`Provider` trait、`admin_metrics` 等修改点做 upstream impact；实施后 `detect_changes(scope=all)` 返回 HIGH，影响集中在 TUI render 主路径、ChatGPT provider、provider trait 边界和 server admin metrics，符合本次跨 provider/server/TUI 功能范围。
+- External research: 第三方 `codex-ratelimit-vscode` 通过解析 `~/.codex/sessions/**/rollout-*.jsonl` 的 `token_count` 事件显示 5h/weekly 用量；官方 `openai/codex` 有 `RateLimitSnapshot` 与 `rate_limits.rs`，会从上游响应 headers 解析 `x-codex-primary-used-percent`、`x-codex-secondary-*`、credits 等字段，也支持 `codex.rate_limits` 事件。
+- GitNexus Codex index: 官方 `codex` 已索引；`backend-client::Client.get_rate_limits_many` 会调用 CodexApi `/api/codex/usage` 或 ChatGptApi `/wham/usage` 获取 usage payload；`codex-api::spawn_response_stream` 会从流响应 headers 解析所有 rate-limit buckets 并发出 `ResponseEvent::RateLimits`；app-server 把 `TokenCountEvent.rate_limits` 转成 `AccountRateLimitsUpdatedNotification`；TUI `/status` 通过 `compose_rate_limit_data_many` 渲染 5h/weekly/credits/stale 状态。
+- Tests: 新增 ChatGPT usage endpoint derivation、usage payload parser、response header parser、TUI `provider_rate_limits` parser 覆盖；workspace 全量测试通过。
+- Gaps: 未做真实 ChatGPT/Codex 账号端到端额度接口请求验证；避免在本地验证中暴露账号/token，实际显示依赖已登录 ChatGPT provider 且官方接口字段保持兼容。
+
+Resume next（下次继续）:
+
+- 提交本次功能变更并运行 `npx gitnexus analyze` 刷新索引。
+
 ### WF-2026-05-18-002 — Claude onboarding 跳过同步
 
 Status: Active（进行中）

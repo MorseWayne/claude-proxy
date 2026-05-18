@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::ProviderType;
+use claude_proxy_providers::provider::RateLimitSnapshot;
 
 // ── Navigation ──
 
@@ -341,6 +342,7 @@ pub struct LiveMetrics {
     pub providers: Vec<(String, LiveModelMetrics)>,
     pub initiators: Vec<(String, LiveModelMetrics)>,
     pub model_capabilities: Vec<(String, ModelCapability)>,
+    pub provider_rate_limits: Vec<(String, Vec<RateLimitSnapshot>)>,
     /// All-time stored totals (persisted across restarts).
     pub stored: Option<StoredMetrics>,
 }

@@ -837,19 +837,48 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
         );
     }
     let provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
+    let rate_limit_provider_ids = settings
+        .providers
+        .iter()
+        .filter(|(provider_id, config)| config.resolve_type(provider_id) == ProviderType::ChatGPT)
+        .map(|(provider_id, _)| provider_id.clone())
+        .collect::<Vec<_>>();
     drop(settings);
 
     let model_capabilities = state.provider_registry.read().await.model_capabilities();
+    let provider_rate_limits = provider_rate_limit_snapshots(&state, rate_limit_provider_ids).await;
     let provider_health = state.provider_health_snapshot(provider_ids).await;
     let mut metrics = state.metrics.to_json().await;
     if let Some(object) = metrics.as_object_mut() {
         object.insert("model_capabilities".to_string(), model_capabilities);
+        object.insert(
+            "provider_rate_limits".to_string(),
+            serde_json::to_value(provider_rate_limits).unwrap_or_default(),
+        );
         object.insert(
             "provider_health".to_string(),
             serde_json::to_value(provider_health).unwrap_or_default(),
         );
     }
     Json(metrics).into_response()
+}
+
+async fn provider_rate_limit_snapshots(
+    state: &AppState,
+    provider_ids: Vec<String>,
+) -> std::collections::HashMap<String, Vec<claude_proxy_providers::provider::RateLimitSnapshot>> {
+    let mut snapshots = std::collections::HashMap::new();
+    for provider_id in provider_ids {
+        let Ok(provider) = state.get_or_create_provider(&provider_id).await else {
+            continue;
+        };
+        if let Ok(provider_snapshots) = provider.rate_limit_snapshots().await
+            && !provider_snapshots.is_empty()
+        {
+            snapshots.insert(provider_id, provider_snapshots);
+        }
+    }
+    snapshots
 }
 
 fn format_sse_event(event: &SseEvent) -> String {

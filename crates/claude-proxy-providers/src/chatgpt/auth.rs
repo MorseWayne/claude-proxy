@@ -245,6 +245,24 @@ impl ChatGptAuth {
         self.current_token().await
     }
 
+    pub async fn get_existing_token(&self) -> Result<ChatGptToken, ProviderError> {
+        self.current_token().await?;
+        if !self.token_needs_refresh().await {
+            return self.current_token().await;
+        }
+
+        let _refresh_guard = self.token_refresh_lock.lock().await;
+        if self.token.read().await.is_none() {
+            return Err(ProviderError::Authentication(
+                "no ChatGPT token".to_string(),
+            ));
+        }
+        if self.token_needs_refresh().await {
+            self.refresh_access_token().await?;
+        }
+        self.current_token().await
+    }
+
     pub async fn force_refresh_token(&self) -> Result<ChatGptToken, ProviderError> {
         let _refresh_guard = self.token_refresh_lock.lock().await;
         self.refresh_access_token().await?;

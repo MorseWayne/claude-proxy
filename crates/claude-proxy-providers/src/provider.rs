@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,6 +40,42 @@ pub enum ProviderError {
     Network(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitSnapshot {
+    pub provider_id: String,
+    pub feature: Option<String>,
+    pub limit_name: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+    pub credits: Option<RateLimitCredits>,
+    pub plan_type: Option<String>,
+    pub rate_limit_reached_type: Option<String>,
+    pub source: RateLimitSource,
+    pub updated_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<u64>,
+    pub reset_at_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitCredits {
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub balance: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitSource {
+    #[default]
+    UsageEndpoint,
+    ResponseHeaders,
+}
+
 /// Trait implemented by upstream provider adapters.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -53,4 +90,9 @@ pub trait Provider: Send + Sync {
 
     /// List available models from this provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
+
+    /// Return provider account quota/rate-limit snapshots when available.
+    async fn rate_limit_snapshots(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {
+        Ok(Vec::new())
+    }
 }

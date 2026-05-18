@@ -10,6 +10,7 @@ use super::super::app::App;
 use super::super::app::LiveModelMetrics;
 use super::super::app::ModelCapability;
 use super::super::{theme, widgets};
+use claude_proxy_providers::provider::{RateLimitSnapshot, RateLimitSource, RateLimitWindow};
 
 pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     // Three-row layout for dashboard cards
@@ -170,6 +171,7 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
         && provider_list.is_empty()
         && initiator_list.is_empty()
         && metrics.model_capabilities.is_empty()
+        && metrics.provider_rate_limits.is_empty()
     {
         let lines = vec![Line::from(Span::styled(
             "   No requests recorded yet",
@@ -181,6 +183,8 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
 
     let max_rows = content_area.height as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let available = max_rows.saturating_sub(lines.len());
+    push_rate_limit_rows(&mut lines, &metrics.provider_rate_limits, available);
     let available = max_rows.saturating_sub(lines.len());
     push_usage_table(&mut lines, "Models", &model_list, available);
     let available = max_rows.saturating_sub(lines.len());
@@ -223,6 +227,97 @@ fn add_usage(target: &mut LiveModelMetrics, source: &LiveModelMetrics) {
     target.output_tokens += source.output_tokens;
     target.cache_creation_input_tokens += source.cache_creation_input_tokens;
     target.cache_read_input_tokens += source.cache_read_input_tokens;
+}
+
+fn push_rate_limit_rows(
+    lines: &mut Vec<Line>,
+    provider_rate_limits: &[(String, Vec<RateLimitSnapshot>)],
+    available: usize,
+) {
+    if available < 3 || provider_rate_limits.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "   ChatGPT / Codex Quota",
+        Style::default().fg(theme::ACCENT),
+    )));
+
+    let row_budget = available.saturating_sub(1);
+    let mut used_rows = 0;
+    for (provider_id, snapshots) in provider_rate_limits {
+        for snapshot in snapshots {
+            if used_rows >= row_budget {
+                return;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   {:<18}", truncate_name(provider_id, 16)),
+                    Style::default().fg(theme::FG),
+                ),
+                Span::styled(
+                    format!(" {:<14}", truncate_name(&rate_limit_label(snapshot), 12)),
+                    Style::default().fg(theme::ACCENT2),
+                ),
+                Span::styled(
+                    format!(
+                        " 5h {:>7}",
+                        format_rate_limit_window(snapshot.primary.as_ref())
+                    ),
+                    Style::default().fg(theme::FG),
+                ),
+                Span::styled(
+                    format!(
+                        " weekly {:>7}",
+                        format_rate_limit_window(snapshot.secondary.as_ref())
+                    ),
+                    Style::default().fg(theme::FG),
+                ),
+                Span::styled(
+                    format!(" {}", format_rate_limit_extra(snapshot)),
+                    Style::default().fg(theme::FG_DIM),
+                ),
+            ]));
+            used_rows += 1;
+        }
+    }
+}
+
+fn rate_limit_label(snapshot: &RateLimitSnapshot) -> String {
+    snapshot
+        .limit_name
+        .clone()
+        .or_else(|| snapshot.feature.clone())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn format_rate_limit_window(window: Option<&RateLimitWindow>) -> String {
+    window
+        .map(|window| format!("{:>5.1}%", window.used_percent))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_rate_limit_extra(snapshot: &RateLimitSnapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(credits) = snapshot.credits.as_ref() {
+        if credits.unlimited == Some(true) {
+            parts.push("credits unlimited".to_string());
+        } else if let Some(balance) = credits.balance {
+            parts.push(format!("credits {balance}"));
+        } else if credits.has_credits == Some(false) {
+            parts.push("no credits".to_string());
+        }
+    }
+    if let Some(plan_type) = snapshot.plan_type.as_ref() {
+        parts.push(plan_type.clone());
+    }
+    parts.push(match snapshot.source {
+        RateLimitSource::UsageEndpoint => "usage".to_string(),
+        RateLimitSource::ResponseHeaders => "headers".to_string(),
+    });
+    parts.join(" · ")
 }
 
 fn push_usage_table(

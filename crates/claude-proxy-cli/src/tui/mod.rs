@@ -1939,6 +1939,31 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
     items
 }
 
+fn parse_provider_rate_limits(
+    value: Option<&Value>,
+) -> Vec<(
+    String,
+    Vec<claude_proxy_providers::provider::RateLimitSnapshot>,
+)> {
+    let Some(providers) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<_> = providers
+        .iter()
+        .filter_map(|(provider_id, value)| {
+            let snapshots = value
+                .as_array()?
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect::<Vec<_>>();
+            (!snapshots.is_empty()).then_some((provider_id.clone(), snapshots))
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
 /// Poll for completed metrics fetch results (called every tick).
 fn poll_metrics(app: &mut App) {
     let data = if let Some(ref rx) = app.metrics_rx {
@@ -1974,6 +1999,7 @@ fn poll_metrics(app: &mut App) {
         providers: parse_usage_metrics(data.get("providers")),
         initiators: parse_usage_metrics(data.get("initiators")),
         model_capabilities: parse_model_capabilities(data.get("model_capabilities")),
+        provider_rate_limits: parse_provider_rate_limits(data.get("provider_rate_limits")),
         stored: None,
     };
 
@@ -2317,6 +2343,42 @@ mod tests {
         assert_eq!(metrics[0].1.cache_read_input_tokens, 20);
         assert_eq!(metrics[1].0, "openai");
         assert_eq!(metrics[1].1.total_tokens(), 7);
+    }
+
+    #[test]
+    fn parse_provider_rate_limits_reads_quota_snapshots() {
+        let limits = parse_provider_rate_limits(Some(&json!({
+            "chatgpt": [{
+                "provider_id": "chatgpt",
+                "feature": "codex",
+                "limit_name": null,
+                "primary": {
+                    "used_percent": 20.0,
+                    "window_minutes": 300,
+                    "reset_at_unix_secs": 1800000000
+                },
+                "secondary": {
+                    "used_percent": 60.0,
+                    "window_minutes": 10080,
+                    "reset_at_unix_secs": null
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": 5
+                },
+                "plan_type": "plus",
+                "rate_limit_reached_type": null,
+                "source": "usage_endpoint",
+                "updated_at_unix_secs": 123
+            }]
+        })));
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].0, "chatgpt");
+        assert_eq!(limits[0].1[0].feature.as_deref(), Some("codex"));
+        assert_eq!(limits[0].1[0].primary.as_ref().unwrap().used_percent, 20.0);
+        assert_eq!(limits[0].1[0].credits.as_ref().unwrap().balance, Some(5));
     }
 
     #[test]
