@@ -12,7 +12,9 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::http::{apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response};
+use crate::http::{
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+};
 use crate::provider::{Provider, ProviderError};
 
 pub struct AnthropicProvider {
@@ -92,19 +94,7 @@ impl Provider for AnthropicProvider {
 
         debug!("Anthropic request to {url}");
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })?;
+        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -375,6 +365,10 @@ fn count_existing_cache_controls(body: &Value) -> u32 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn base_request(messages: Vec<Message>) -> MessagesRequest {
         MessagesRequest {
@@ -393,6 +387,41 @@ mod tests {
             metadata: None,
             extra: HashMap::new(),
         }
+    }
+
+    async fn retry_then_success_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let attempt = server_attempts.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if attempt == 0 {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":{"message":"temporary upstream failure"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{addr}"), attempts, handle)
     }
 
     #[test]
@@ -453,5 +482,26 @@ mod tests {
             )),
             MessageContent::Text(_) => panic!("expected content blocks"),
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_retries_transient_upstream_status() {
+        let (base_url, attempts, server) = retry_then_success_server().await;
+        let provider =
+            AnthropicProvider::new("anthropic", "test-key", &base_url, "", 5, 5, &[]).unwrap();
+        let mut request = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_string()),
+        }]);
+        request.stream = false;
+
+        let mut stream = provider.chat(request).await.unwrap();
+        let event = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(event.event, "message");
+        assert_eq!(event.data["id"], "msg_test");
+        assert!(stream.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
     }
 }
