@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,7 +65,23 @@ pub struct RateLimitWindow {
 pub struct RateLimitCredits {
     pub has_credits: Option<bool>,
     pub unlimited: Option<bool>,
-    pub balance: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub balance: Option<String>,
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        serde_json::Value::String(value) => {
+            Some(value.trim().to_string()).filter(|value| !value.is_empty())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

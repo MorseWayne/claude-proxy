@@ -7,6 +7,7 @@ mod auth;
 mod responses;
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +52,7 @@ struct UsagePayload {
 #[derive(Debug, Deserialize)]
 struct RateLimitReachedPayload {
     #[serde(default)]
+    #[serde(alias = "type")]
     kind: Option<String>,
 }
 
@@ -66,8 +68,10 @@ struct AdditionalRateLimitPayload {
 #[derive(Debug, Deserialize)]
 struct RateLimitWindowPayload {
     #[serde(default)]
+    #[serde(alias = "primary_window")]
     primary: Option<RateLimitBucketPayload>,
     #[serde(default)]
+    #[serde(alias = "secondary_window")]
     secondary: Option<RateLimitBucketPayload>,
 }
 
@@ -76,6 +80,8 @@ struct RateLimitBucketPayload {
     used_percent: f64,
     #[serde(default)]
     window_minutes: Option<u64>,
+    #[serde(default)]
+    limit_window_seconds: Option<u64>,
     #[serde(default)]
     reset_at: Option<serde_json::Value>,
     #[serde(default)]
@@ -89,7 +95,7 @@ struct CreditsPayload {
     #[serde(default)]
     unlimited: Option<bool>,
     #[serde(default)]
-    balance: Option<i64>,
+    balance: Option<serde_json::Value>,
 }
 
 struct CachedRateLimits {
@@ -104,8 +110,9 @@ pub struct ChatGptProvider {
     http_client: Client,
     endpoint: String,
     usage_endpoint: String,
+    installation_id: String,
     auth: Arc<ChatGptAuth>,
-    cached_rate_limits: Mutex<CachedRateLimits>,
+    cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
 }
 
 impl ChatGptProvider {
@@ -123,11 +130,12 @@ impl ChatGptProvider {
             http_client,
             endpoint: codex_responses_endpoint(base_url),
             usage_endpoint: codex_usage_endpoint(base_url),
+            installation_id: chatgpt_installation_id(),
             auth,
-            cached_rate_limits: Mutex::new(CachedRateLimits {
+            cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
-            }),
+            })),
         })
     }
 
@@ -188,12 +196,7 @@ impl ChatGptProvider {
     }
 
     async fn cache_rate_limits(&self, snapshots: Vec<RateLimitSnapshot>) {
-        if snapshots.is_empty() {
-            return;
-        }
-        let mut cached = self.cached_rate_limits.lock().await;
-        cached.snapshots = snapshots;
-        cached.fetched_at = Some(Instant::now());
+        cache_rate_limits_into(&self.cached_rate_limits, snapshots).await;
     }
 
     async fn cached_rate_limits(&self) -> Vec<RateLimitSnapshot> {
@@ -210,6 +213,56 @@ impl ChatGptProvider {
     }
 }
 
+async fn cache_rate_limits_into(
+    cache: &Arc<Mutex<CachedRateLimits>>,
+    snapshots: Vec<RateLimitSnapshot>,
+) {
+    if snapshots.is_empty() {
+        return;
+    }
+
+    let mut cached = cache.lock().await;
+    for snapshot in snapshots {
+        if let Some(existing) = cached.snapshots.iter_mut().find(|existing| {
+            rate_limit_snapshot_key(existing) == rate_limit_snapshot_key(&snapshot)
+        }) {
+            *existing = merge_rate_limit_snapshot(existing.clone(), snapshot);
+        } else {
+            cached.snapshots.push(snapshot);
+        }
+    }
+    cached.fetched_at = Some(Instant::now());
+}
+
+fn rate_limit_snapshot_key(snapshot: &RateLimitSnapshot) -> String {
+    snapshot
+        .feature
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("codex")
+        .to_string()
+}
+
+fn merge_rate_limit_snapshot(
+    previous: RateLimitSnapshot,
+    update: RateLimitSnapshot,
+) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        provider_id: update.provider_id,
+        feature: update.feature.or(previous.feature),
+        limit_name: update.limit_name.or(previous.limit_name),
+        primary: update.primary.or(previous.primary),
+        secondary: update.secondary.or(previous.secondary),
+        credits: update.credits.or(previous.credits),
+        plan_type: update.plan_type.or(previous.plan_type),
+        rate_limit_reached_type: update
+            .rate_limit_reached_type
+            .or(previous.rate_limit_reached_type),
+        source: update.source,
+        updated_at_unix_secs: update.updated_at_unix_secs,
+    }
+}
+
 #[async_trait]
 impl Provider for ChatGptProvider {
     fn id(&self) -> &str {
@@ -222,7 +275,7 @@ impl Provider for ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
-        let body = build_chatgpt_responses_body(&request);
+        let body = build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
         log_request_observability("chatgpt", "/responses", &body);
 
         let mut response = self.send_responses_request(&body, &token).await?;
@@ -250,7 +303,18 @@ impl Provider for ChatGptProvider {
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
         self.cache_rate_limits(header_snapshots).await;
 
-        Ok(responses::stream_response(response))
+        let cache = Arc::clone(&self.cached_rate_limits);
+        let provider_id = self.id.clone();
+        Ok(responses::stream_response(response, move |event| {
+            if let Some(snapshot) =
+                rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
+            {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    cache_rate_limits_into(&cache, vec![snapshot]).await;
+                });
+            }
+        }))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -310,26 +374,18 @@ fn chatgpt_upstream_request_policy() -> UpstreamRequestPolicy {
 }
 
 fn codex_responses_endpoint(base_url: &str) -> String {
-    let base = if base_url.trim().is_empty() {
-        DEFAULT_CODEX_BASE_URL
-    } else {
-        base_url.trim_end_matches('/')
-    };
+    let base = normalized_codex_base_url(base_url);
 
     if base.ends_with("/responses") {
-        base.to_string()
+        base
     } else {
         format!("{base}/responses")
     }
 }
 
 fn codex_usage_endpoint(base_url: &str) -> String {
-    let base = if base_url.trim().is_empty() {
-        DEFAULT_CODEX_BASE_URL
-    } else {
-        base_url.trim_end_matches('/')
-    };
-    let base = base.strip_suffix("/responses").unwrap_or(base);
+    let base = normalized_codex_base_url(base_url);
+    let base = base.strip_suffix("/responses").unwrap_or(&base);
 
     if base.ends_with("/api/codex") {
         format!("{base}/usage")
@@ -338,6 +394,48 @@ fn codex_usage_endpoint(base_url: &str) -> String {
     } else {
         format!("{base}/wham/usage")
     }
+}
+
+fn normalized_codex_base_url(base_url: &str) -> String {
+    let mut base = if base_url.trim().is_empty() {
+        DEFAULT_CODEX_BASE_URL.to_string()
+    } else {
+        base_url.trim().trim_end_matches('/').to_string()
+    };
+
+    if (base.starts_with("https://chatgpt.com") || base.starts_with("https://chat.openai.com"))
+        && !base.contains("/backend-api")
+        && !base.contains("/api/codex")
+    {
+        base.push_str("/backend-api");
+    }
+
+    if base.ends_with("/backend-api") {
+        base.push_str("/codex");
+    }
+
+    base
+}
+
+fn chatgpt_installation_id() -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let Some(path) = Settings::config_dir().map(|dir| dir.join("chatgpt").join("installation_id"))
+    else {
+        return id;
+    };
+
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, &id);
+    id
 }
 
 fn rate_limit_snapshots_from_usage_payload(
@@ -403,7 +501,11 @@ fn rate_limit_snapshots_from_usage_payload(
 fn rate_limit_window_from_payload(payload: &RateLimitBucketPayload) -> RateLimitWindow {
     RateLimitWindow {
         used_percent: payload.used_percent,
-        window_minutes: payload.window_minutes,
+        window_minutes: payload.window_minutes.or_else(|| {
+            payload
+                .limit_window_seconds
+                .map(window_minutes_from_seconds)
+        }),
         reset_at_unix_secs: payload
             .reset_at
             .as_ref()
@@ -416,8 +518,58 @@ fn credits_from_payload(payload: &CreditsPayload) -> RateLimitCredits {
     RateLimitCredits {
         has_credits: payload.has_credits,
         unlimited: payload.unlimited,
-        balance: payload.balance,
+        balance: payload.balance.as_ref().and_then(balance_value_to_string),
     }
+}
+
+fn rate_limit_snapshot_from_sse_event(
+    provider_id: &str,
+    event: &Value,
+    updated_at_unix_secs: u64,
+) -> Option<RateLimitSnapshot> {
+    if event.get("type").and_then(Value::as_str) != Some("codex.rate_limits") {
+        return None;
+    }
+
+    let rate_limits = event
+        .get("rate_limits")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<RateLimitWindowPayload>(value).ok());
+    let credits = event
+        .get("credits")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CreditsPayload>(value).ok());
+    let feature = event
+        .get("metered_limit_name")
+        .or_else(|| event.get("limit_name"))
+        .and_then(Value::as_str)
+        .map(normalize_limit_id)
+        .unwrap_or_else(|| "codex".to_string());
+
+    Some(RateLimitSnapshot {
+        provider_id: provider_id.to_string(),
+        feature: Some(feature),
+        limit_name: event
+            .get("limit_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        primary: rate_limits
+            .as_ref()
+            .and_then(|rate_limit| rate_limit.primary.as_ref())
+            .map(rate_limit_window_from_payload),
+        secondary: rate_limits
+            .as_ref()
+            .and_then(|rate_limit| rate_limit.secondary.as_ref())
+            .map(rate_limit_window_from_payload),
+        credits: credits.as_ref().map(credits_from_payload),
+        plan_type: event
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        rate_limit_reached_type: None,
+        source: RateLimitSource::ResponseHeaders,
+        updated_at_unix_secs,
+    })
 }
 
 fn rate_limit_snapshots_from_headers(
@@ -484,14 +636,18 @@ fn credits_from_headers(headers: &HeaderMap, prefix: &str) -> Option<RateLimitCr
     let credits = RateLimitCredits {
         has_credits: header_bool(headers, &format!("{prefix}-credits-has-credits")),
         unlimited: header_bool(headers, &format!("{prefix}-credits-unlimited")),
-        balance: header_i64(headers, &format!("{prefix}-credits-balance")),
+        balance: header_string(headers, &format!("{prefix}-credits-balance")),
     };
     (credits.has_credits.is_some() || credits.unlimited.is_some() || credits.balance.is_some())
         .then_some(credits)
 }
 
 fn has_rate_limit_snapshot_data(snapshot: &RateLimitSnapshot) -> bool {
-    snapshot.primary.is_some() || snapshot.secondary.is_some() || snapshot.credits.is_some()
+    snapshot.primary.is_some()
+        || snapshot.secondary.is_some()
+        || snapshot.credits.is_some()
+        || snapshot.plan_type.is_some()
+        || snapshot.rate_limit_reached_type.is_some()
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -508,10 +664,6 @@ fn header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
 }
 
 fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
-    header_string(headers, name)?.parse().ok()
-}
-
-fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
     header_string(headers, name)?.parse().ok()
 }
 
@@ -551,8 +703,32 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+fn window_minutes_from_seconds(seconds: u64) -> u64 {
+    seconds.saturating_add(59) / 60
+}
+
+fn balance_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_limit_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+#[cfg(test)]
 fn build_chatgpt_responses_body(request: &MessagesRequest) -> Value {
-    responses::build_body(request, DEFAULT_CHATGPT_INSTRUCTIONS)
+    build_chatgpt_responses_body_with_context(request, None)
+}
+
+fn build_chatgpt_responses_body_with_context(
+    request: &MessagesRequest,
+    installation_id: Option<&str>,
+) -> Value {
+    responses::build_body(request, DEFAULT_CHATGPT_INSTRUCTIONS, installation_id)
 }
 
 fn chatgpt_models() -> Vec<ModelInfo> {
@@ -585,6 +761,14 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
+            codex_responses_endpoint("https://chatgpt.com"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            codex_responses_endpoint("https://chat.openai.com/"),
+            "https://chat.openai.com/backend-api/codex/responses"
+        );
+        assert_eq!(
             codex_responses_endpoint("https://example.test/base"),
             "https://example.test/base/responses"
         );
@@ -599,6 +783,14 @@ mod tests {
         assert_eq!(
             codex_usage_endpoint(""),
             "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_endpoint("https://chatgpt.com"),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_endpoint("https://chat.openai.com/"),
+            "https://chat.openai.com/backend-api/wham/usage"
         );
         assert_eq!(
             codex_usage_endpoint("https://chatgpt.com/backend-api/codex/responses"),
@@ -648,9 +840,87 @@ mod tests {
         assert_eq!(snapshots[0].feature.as_deref(), Some("codex"));
         assert_eq!(snapshots[0].plan_type.as_deref(), Some("plus"));
         assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 12.5);
-        assert_eq!(snapshots[0].credits.as_ref().unwrap().balance, Some(42));
+        assert_eq!(
+            snapshots[0].credits.as_ref().unwrap().balance.as_deref(),
+            Some("42")
+        );
         assert_eq!(snapshots[1].feature.as_deref(), Some("agent"));
         assert_eq!(snapshots[1].limit_name.as_deref(), Some("Agent"));
+    }
+
+    #[test]
+    fn parses_official_codex_usage_payload_rate_limits() {
+        let payload: UsagePayload = serde_json::from_value(json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 42,
+                    "limit_window_seconds": 3600,
+                    "reset_after_seconds": 120,
+                    "reset_at": 1735689720
+                },
+                "secondary_window": {
+                    "used_percent": 5,
+                    "limit_window_seconds": 86400,
+                    "reset_after_seconds": 43200,
+                    "reset_at": 1735693200
+                }
+            },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_usage_limit_reached"
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "9.99"
+            },
+            "additional_rate_limits": [{
+                "limit_name": "codex_other",
+                "metered_feature": "codex_other",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 88,
+                        "limit_window_seconds": 1800,
+                        "reset_after_seconds": 600,
+                        "reset_at": 1735693200
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+
+        let snapshots = rate_limit_snapshots_from_usage_payload("chatgpt", payload, 123);
+
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].feature.as_deref(), Some("codex"));
+        assert_eq!(snapshots[0].plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            snapshots[0].rate_limit_reached_type.as_deref(),
+            Some("workspace_member_usage_limit_reached")
+        );
+        assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 42.0);
+        assert_eq!(
+            snapshots[0].primary.as_ref().unwrap().window_minutes,
+            Some(60)
+        );
+        assert_eq!(
+            snapshots[0].secondary.as_ref().unwrap().window_minutes,
+            Some(1440)
+        );
+        assert_eq!(
+            snapshots[0].credits.as_ref().unwrap().balance.as_deref(),
+            Some("9.99")
+        );
+        assert_eq!(snapshots[1].feature.as_deref(), Some("codex_other"));
+        assert_eq!(snapshots[1].limit_name.as_deref(), Some("codex_other"));
+        assert_eq!(
+            snapshots[1].primary.as_ref().unwrap().window_minutes,
+            Some(30)
+        );
     }
 
     #[test]
@@ -659,7 +929,9 @@ mod tests {
         headers.insert("x-codex-primary-used-percent", "40".parse().unwrap());
         headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
         headers.insert("x-codex-secondary-used-percent", "75".parse().unwrap());
-        headers.insert("x-codex-credits-balance", "7".parse().unwrap());
+        headers.insert("x-codex-credits-has-credits", "true".parse().unwrap());
+        headers.insert("x-codex-credits-unlimited", "false".parse().unwrap());
+        headers.insert("x-codex-credits-balance", "7.50".parse().unwrap());
         headers.insert("x-agent-primary-used-percent", "9.5".parse().unwrap());
         headers.insert("x-agent-limit-name", "Agent".parse().unwrap());
 
@@ -671,7 +943,46 @@ mod tests {
         assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 9.5);
         assert_eq!(snapshots[1].feature.as_deref(), Some("codex"));
         assert_eq!(snapshots[1].secondary.as_ref().unwrap().used_percent, 75.0);
-        assert_eq!(snapshots[1].credits.as_ref().unwrap().balance, Some(7));
+        assert_eq!(
+            snapshots[1].credits.as_ref().unwrap().balance.as_deref(),
+            Some("7.50")
+        );
+    }
+
+    #[test]
+    fn parses_codex_rate_limit_sse_event() {
+        let snapshot = rate_limit_snapshot_from_sse_event(
+            "chatgpt",
+            &json!({
+                "type": "codex.rate_limits",
+                "plan_type": "plus",
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 61.5,
+                        "window_minutes": 300,
+                        "reset_at": 1800000000
+                    }
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": "2.25"
+                },
+                "metered_limit_name": "codex_other"
+            }),
+            999,
+        )
+        .expect("codex.rate_limits event should parse");
+
+        assert_eq!(snapshot.provider_id, "chatgpt");
+        assert_eq!(snapshot.feature.as_deref(), Some("codex_other"));
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        assert_eq!(snapshot.primary.as_ref().unwrap().used_percent, 61.5);
+        assert_eq!(
+            snapshot.credits.as_ref().unwrap().balance.as_deref(),
+            Some("2.25")
+        );
+        assert_eq!(snapshot.source, RateLimitSource::ResponseHeaders);
     }
 
     #[test]
@@ -731,6 +1042,43 @@ mod tests {
         assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
         assert_eq!(body["stream"], true);
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn chatgpt_responses_body_adds_codex_metadata_from_stable_sources() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({
+                "prompt_cache_key": "thread-123",
+                "client_metadata": {
+                    "x-codex-window-id": "window-123"
+                }
+            })),
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body_with_context(&req, Some("install-123"));
+
+        assert_eq!(body["prompt_cache_key"], "thread-123");
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "install-123"
+        );
+        assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-123");
     }
 
     #[test]

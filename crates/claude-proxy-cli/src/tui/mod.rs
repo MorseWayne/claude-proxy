@@ -2509,7 +2509,10 @@ mod tests {
         assert_eq!(limits[0].0, "chatgpt");
         assert_eq!(limits[0].1[0].feature.as_deref(), Some("codex"));
         assert_eq!(limits[0].1[0].primary.as_ref().unwrap().used_percent, 20.0);
-        assert_eq!(limits[0].1[0].credits.as_ref().unwrap().balance, Some(5));
+        assert_eq!(
+            limits[0].1[0].credits.as_ref().unwrap().balance.as_deref(),
+            Some("5")
+        );
     }
 
     #[test]

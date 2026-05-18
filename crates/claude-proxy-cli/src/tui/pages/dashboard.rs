@@ -342,7 +342,7 @@ fn format_rate_limit_extra(snapshot: &RateLimitSnapshot) -> String {
     if let Some(credits) = snapshot.credits.as_ref() {
         if credits.unlimited == Some(true) {
             parts.push("credits unlimited".to_string());
-        } else if let Some(balance) = credits.balance {
+        } else if let Some(balance) = credits.balance.as_deref() {
             parts.push(format!("credits {balance}"));
         } else if credits.has_credits == Some(false) {
             parts.push("no credits".to_string());

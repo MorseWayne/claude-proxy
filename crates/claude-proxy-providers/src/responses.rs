@@ -3,6 +3,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
@@ -819,6 +820,16 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
 pub fn stream_responses_response(
     response: reqwest::Response,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    stream_responses_response_with_observer(response, |_| {})
+}
+
+pub fn stream_responses_response_with_observer<F>(
+    response: reqwest::Response,
+    on_event: F,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
     let status = response.status().as_u16();
     let content_type = response
@@ -827,6 +838,7 @@ pub fn stream_responses_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
+    let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
         let mut converter = ResponsesStreamConverter::new();
@@ -850,6 +862,7 @@ pub fn stream_responses_response(
                     decoder.push(&chunk);
                     while let Some(event) = decoder.next_frame() {
                         if let Some(value) = parse_sse_json(&event) {
+                            on_event(&value);
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -873,6 +886,7 @@ pub fn stream_responses_response(
         if let Some(event) = decoder.finish()
             && let Some(value) = parse_sse_json(&event)
         {
+            on_event(&value);
             for event in converter.process_event(&value) {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -1716,6 +1730,31 @@ mod tests {
                 .iter()
                 .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_observer_sees_raw_events() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"codex.rate_limits\",\"plan_type\":\"plus\",\"rate_limits\":{\"primary\":{\"used_percent\":55}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = std::sync::Arc::clone(&observed);
+        let mut stream = stream_responses_response_with_observer(response, move |event| {
+            observed_for_hook
+                .lock()
+                .unwrap()
+                .push(event["type"].clone());
+        });
+
+        while let Some(item) = stream.next().await {
+            item.expect("stream should convert regular Responses events");
+        }
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().any(|kind| kind == "codex.rate_limits"));
     }
 
     #[test]
