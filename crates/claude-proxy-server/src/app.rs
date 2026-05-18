@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
@@ -12,6 +13,8 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::middleware::{RateLimitConfig, RateLimitRuntime};
 use crate::persistence::{MetricsStore, StoredTotals};
+
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Token usage breakdown for a single request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -331,6 +334,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_registry_treats_expired_models_as_stale() {
+        let mut registry = ProviderRegistry::new();
+        registry.cache_models_at(
+            "openai",
+            vec![ModelInfo {
+                model_id: "stale-model".to_string(),
+                supports_thinking: None,
+                vendor: None,
+                max_output_tokens: None,
+                context_window: None,
+                supported_endpoints: Vec::new(),
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
+            }],
+            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+        );
+
+        assert!(registry.cached_models("openai").is_none());
+        assert_eq!(registry.all_cached_models().len(), 1);
+    }
+
     #[tokio::test]
     async fn apply_settings_refreshes_runtime_limits() {
         let state = AppState::new(settings_with_limits(1, 1, 1, 60), None);
@@ -407,6 +436,58 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "gpt-4.1");
     }
+
+    #[tokio::test]
+    async fn get_or_refresh_models_refreshes_expired_cache() {
+        let mut settings = settings_with_limits(1, 1, 10, 60);
+        settings.providers.clear();
+        settings.providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                api_key: "test-key".to_string(),
+                base_url: String::new(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::Anthropic),
+                copilot: None,
+            },
+        );
+        let state = AppState::new(settings, None);
+        state.provider_registry.write().await.cache_models_at(
+            "anthropic",
+            vec![ModelInfo {
+                model_id: "stale-model".to_string(),
+                supports_thinking: None,
+                vendor: None,
+                max_output_tokens: None,
+                context_window: None,
+                supported_endpoints: Vec::new(),
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
+            }],
+            Instant::now() - MODEL_CACHE_TTL - Duration::from_secs(1),
+        );
+
+        let models = state.get_or_refresh_models("anthropic").await.unwrap();
+
+        assert!(
+            models
+                .iter()
+                .any(|model| model.model_id == "claude-sonnet-4-20250514")
+        );
+        assert!(!models.iter().any(|model| model.model_id == "stale-model"));
+        assert!(
+            state
+                .provider_registry
+                .read()
+                .await
+                .cached_models("anthropic")
+                .is_some()
+        );
+    }
 }
 
 /// Shared application state.
@@ -439,7 +520,30 @@ pub enum InflightEvent {
 /// Registry of provider instances and cached model lists.
 pub struct ProviderRegistry {
     providers: std::collections::HashMap<String, Arc<dyn Provider>>,
-    model_cache: std::collections::HashMap<String, Vec<claude_proxy_core::ModelInfo>>,
+    model_cache: std::collections::HashMap<String, ModelCacheEntry>,
+}
+
+struct ModelCacheEntry {
+    models: Vec<claude_proxy_core::ModelInfo>,
+    cached_at: Instant,
+}
+
+impl ModelCacheEntry {
+    fn new(models: Vec<claude_proxy_core::ModelInfo>) -> Self {
+        Self {
+            models,
+            cached_at: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timestamp(models: Vec<claude_proxy_core::ModelInfo>, cached_at: Instant) -> Self {
+        Self { models, cached_at }
+    }
+
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.cached_at) < MODEL_CACHE_TTL
+    }
 }
 
 impl Default for ProviderRegistry {
@@ -473,25 +577,54 @@ impl ProviderRegistry {
 
     /// Cache model list for a provider.
     pub fn cache_models(&mut self, provider_id: &str, models: Vec<claude_proxy_core::ModelInfo>) {
-        self.model_cache.insert(provider_id.to_string(), models);
+        self.model_cache
+            .insert(provider_id.to_string(), ModelCacheEntry::new(models));
+    }
+
+    #[cfg(test)]
+    fn cache_models_at(
+        &mut self,
+        provider_id: &str,
+        models: Vec<claude_proxy_core::ModelInfo>,
+        cached_at: Instant,
+    ) {
+        self.model_cache.insert(
+            provider_id.to_string(),
+            ModelCacheEntry::with_timestamp(models, cached_at),
+        );
     }
 
     /// Get cached models for a provider.
     pub fn cached_models(&self, provider_id: &str) -> Option<&Vec<claude_proxy_core::ModelInfo>> {
-        self.model_cache.get(provider_id)
+        self.cached_models_at(provider_id, Instant::now())
+    }
+
+    fn cached_models_at(
+        &self,
+        provider_id: &str,
+        now: Instant,
+    ) -> Option<&Vec<claude_proxy_core::ModelInfo>> {
+        self.model_cache
+            .get(provider_id)
+            .filter(|entry| entry.is_fresh_at(now))
+            .map(|entry| &entry.models)
     }
 
     /// Get all cached models across all providers.
     pub fn all_cached_models(&self) -> Vec<claude_proxy_core::ModelInfo> {
-        self.model_cache.values().flatten().cloned().collect()
+        self.model_cache
+            .values()
+            .flat_map(|entry| entry.models.iter())
+            .cloned()
+            .collect()
     }
 
     pub fn model_capabilities(&self) -> Value {
         let capabilities = self
             .model_cache
             .iter()
-            .flat_map(|(provider_id, models)| {
-                models.iter().map(move |model| {
+            .flat_map(|(provider_id, entry)| {
+                entry.models.iter().map(move |model| {
                     (
                         format!("{provider_id}/{}", model.model_id),
                         json!({
