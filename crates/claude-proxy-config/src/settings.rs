@@ -652,7 +652,7 @@ impl Settings {
                 Self::parse_provider_id(claude_model),
                 Self::parse_model_name(claude_model),
                 ModelResolutionSource::DirectProviderModel,
-                None,
+                self.reasoning_effort_for_model_ref(claude_model),
             );
         }
 
@@ -707,6 +707,20 @@ impl Settings {
             ModelResolutionSource::Alias(kind),
             alias.reasoning_effort,
         )
+    }
+
+    fn reasoning_effort_for_model_ref(&self, model_ref: &str) -> Option<ModelReasoningEffort> {
+        [
+            self.model.reasoning.as_ref(),
+            self.model.opus.as_ref(),
+            self.model.sonnet.as_ref(),
+            self.model.haiku.as_ref(),
+            Some(&self.model.default),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|alias| alias.name == model_ref)
+        .and_then(|alias| alias.reasoning_effort)
     }
 
     /// Extract the provider ID from a `provider_id/model` string (first `/` only).
@@ -922,6 +936,31 @@ mod tests {
             ModelResolutionSource::DefaultProviderFallback
         );
         assert_eq!(fallback.reasoning_effort, None);
+    }
+
+    #[test]
+    fn direct_model_ref_uses_matching_alias_reasoning_effort() {
+        let mut default = ModelAliasConfig::new("chatgpt/gpt-5.5");
+        default.reasoning_effort = Some(ModelReasoningEffort::Low);
+        let mut reasoning = ModelAliasConfig::new("chatgpt/gpt-5.5");
+        reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        let settings = Settings {
+            model: ModelConfig {
+                default,
+                reasoning: Some(reasoning),
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let resolved = settings.resolve_model_with_intent("chatgpt/gpt-5.5", None);
+
+        assert_eq!(resolved.source, ModelResolutionSource::DirectProviderModel);
+        assert_eq!(resolved.provider_id, "chatgpt");
+        assert_eq!(resolved.upstream_model, "gpt-5.5");
+        assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
     }
 
     #[test]
