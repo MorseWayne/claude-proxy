@@ -30,6 +30,7 @@ const MAX_SEND_ATTEMPTS: usize = 3;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const UPSTREAM_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamRequestPolicy {
@@ -259,11 +260,30 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
 }
 
 async fn read_limited_response_text(response: reqwest::Response, limit: usize) -> String {
+    read_limited_response_text_with_timeout(response, limit, UPSTREAM_ERROR_BODY_IDLE_TIMEOUT).await
+}
+
+async fn read_limited_response_text_with_timeout(
+    response: reqwest::Response,
+    limit: usize,
+    idle_timeout: Duration,
+) -> String {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     let mut truncated = false;
+    let mut timed_out = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next_chunk = match timeout(idle_timeout, stream.next()).await {
+            Ok(next_chunk) => next_chunk,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(_) => break,
@@ -284,6 +304,9 @@ async fn read_limited_response_text(response: reqwest::Response, limit: usize) -
     let mut text = String::from_utf8_lossy(&body).into_owned();
     if truncated {
         text.push_str("\n[upstream error body truncated]");
+    }
+    if timed_out {
+        text.push_str("\n[upstream error body read timed out]");
     }
     text
 }
@@ -336,6 +359,34 @@ pub fn apply_extra_ca_certs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn response_with_stalled_body(body_prefix: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_prefix = body_prefix.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n",
+                body_prefix.len() + 64
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body_prefix.as_bytes()).await.unwrap();
+            let _socket = socket;
+            std::future::pending::<()>().await;
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn retryable_statuses_include_transient_failures() {
@@ -411,6 +462,21 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ProviderError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_body_read_times_out_when_idle() {
+        let response = response_with_stalled_body("partial upstream failure").await;
+
+        let body = read_limited_response_text_with_timeout(
+            response,
+            MAX_UPSTREAM_ERROR_BODY_BYTES,
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(body.contains("partial upstream failure"));
+        assert!(body.contains("[upstream error body read timed out]"));
     }
 
     #[tokio::test]
