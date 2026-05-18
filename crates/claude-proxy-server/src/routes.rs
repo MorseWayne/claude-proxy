@@ -17,7 +17,7 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::time::Duration;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::app::{AppState, InflightEvent, TokenUsage};
@@ -90,31 +90,26 @@ pub async fn messages(
     // Compute a hash of the full request to identify identical inflight requests.
     let request_hash = compute_request_hash(&resolved.request);
 
-    // Check if an identical request is already in flight
-    if let Some(receiver) = subscribe_inflight_request(&state, request_hash).await {
-        let response = if request.stream {
-            join_inflight_stream(
-                receiver,
-                StreamPermits {
-                    _request: request_permit,
-                    _provider: None,
-                },
-            )
-        } else {
-            join_inflight_non_stream(receiver, request_permit).await
-        };
-        state
-            .metrics
-            .record_latency(start.elapsed().as_millis() as u64);
-        return response;
-    }
-
-    // Register this request as inflight (we are the "leader")
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<InflightEvent>(256);
-    {
-        let mut inflight = state.inflight.lock().await;
-        inflight.insert(request_hash, broadcast_tx.clone());
-    }
+    let broadcast_tx = match register_or_subscribe_inflight_request(&state, request_hash).await {
+        InflightRegistration::Leader(sender) => sender,
+        InflightRegistration::Follower(receiver) => {
+            let response = if request.stream {
+                join_inflight_stream(
+                    receiver,
+                    StreamPermits {
+                        _request: request_permit,
+                        _provider: None,
+                    },
+                )
+            } else {
+                join_inflight_non_stream(receiver, request_permit).await
+            };
+            state
+                .metrics
+                .record_latency(start.elapsed().as_millis() as u64);
+            return response;
+        }
+    };
 
     // Get or create provider — lock is released after obtaining the Arc
     let provider = match get_provider(&state, &resolved.provider_id).await {
@@ -404,21 +399,30 @@ async fn acquire_provider_permit(
     }
 }
 
-async fn subscribe_inflight_request(
+enum InflightRegistration {
+    Leader(broadcast::Sender<InflightEvent>),
+    Follower(broadcast::Receiver<InflightEvent>),
+}
+
+async fn register_or_subscribe_inflight_request(
     state: &AppState,
     request_hash: u64,
-) -> Option<tokio::sync::broadcast::Receiver<InflightEvent>> {
-    let inflight = state.inflight.lock().await;
-    let sender = inflight.get(&request_hash)?;
-    let receiver = sender.subscribe();
-    drop(inflight);
+) -> InflightRegistration {
+    let mut inflight = state.inflight.lock().await;
+    if let Some(sender) = inflight.get(&request_hash) {
+        let receiver = sender.subscribe();
+        debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
+        return InflightRegistration::Follower(receiver);
+    }
 
-    debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
-    Some(receiver)
+    let (sender, _) = broadcast::channel::<InflightEvent>(256);
+    inflight.insert(request_hash, sender.clone());
+    debug!("Dedup: registered new inflight request (hash={request_hash:016x})");
+    InflightRegistration::Leader(sender)
 }
 
 fn join_inflight_stream(
-    mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
+    mut receiver: broadcast::Receiver<InflightEvent>,
     permits: StreamPermits,
 ) -> Response {
     let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
@@ -451,7 +455,7 @@ fn join_inflight_stream(
 }
 
 async fn join_inflight_non_stream(
-    mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
+    mut receiver: broadcast::Receiver<InflightEvent>,
     _request_permit: OwnedSemaphorePermit,
 ) -> Response {
     let mut events = Vec::new();
@@ -475,7 +479,7 @@ async fn stream_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
     request_hash: u64,
-    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
     permits: StreamPermits,
     start: std::time::Instant,
@@ -540,7 +544,7 @@ async fn collect_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
     request_hash: u64,
-    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
     _permits: StreamPermits,
     start: std::time::Instant,
@@ -593,7 +597,7 @@ async fn handle_provider_error(
     state: &AppState,
     request: &RequestMetricsContext,
     request_hash: u64,
-    broadcast_tx: tokio::sync::broadcast::Sender<InflightEvent>,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
     error: ProviderError,
     start: std::time::Instant,
 ) -> Response {
@@ -1119,6 +1123,32 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn concurrent_inflight_registration_produces_single_leader() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request_hash = 0xfeed_f00d;
+        let tasks = (0..32)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    matches!(
+                        register_or_subscribe_inflight_request(&state, request_hash).await,
+                        InflightRegistration::Leader(_)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = futures::future::join_all(tasks).await;
+        let leader_count = results
+            .into_iter()
+            .filter(|result| *result.as_ref().unwrap())
+            .count();
+
+        assert_eq!(leader_count, 1);
+        assert_eq!(state.inflight.lock().await.len(), 1);
     }
 
     #[tokio::test]
