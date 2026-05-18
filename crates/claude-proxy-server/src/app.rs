@@ -361,6 +361,17 @@ mod tests {
                 .await
                 .is_empty()
         );
+        assert!(state.provider_creation_locks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_or_create_provider_reuses_cached_provider() {
+        let state = AppState::new(settings_with_limits(1, 1, 10, 60), None);
+
+        let first = state.get_or_create_provider("openai").await.unwrap();
+        let second = state.get_or_create_provider("openai").await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
 
@@ -369,6 +380,7 @@ mod tests {
 pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
+    provider_creation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub concurrency_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pub rate_limit_runtime: Arc<RateLimitRuntime>,
@@ -409,28 +421,19 @@ impl ProviderRegistry {
         }
     }
 
-    /// Get or create a provider for the given ID.
-    /// Returns an Arc clone so the caller can use the provider without holding the registry lock.
-    pub async fn get_or_create(
+    pub fn get(&self, provider_id: &str) -> Option<Arc<dyn Provider>> {
+        self.providers.get(provider_id).cloned()
+    }
+
+    pub fn insert_if_absent(
         &mut self,
         provider_id: &str,
-        settings: &Settings,
-    ) -> Result<Arc<dyn Provider>, String> {
-        if !self.providers.contains_key(provider_id) {
-            let provider_config = settings
-                .providers
-                .get(provider_id)
-                .ok_or_else(|| format!("provider '{provider_id}' not configured"))?;
-
-            let provider: Arc<dyn Provider> =
-                claude_proxy_providers::create_provider(provider_id, provider_config, settings)
-                    .await
-                    .map_err(|e| format!("failed to create provider '{provider_id}': {e}"))?;
-
-            self.providers.insert(provider_id.to_string(), provider);
-        }
-
-        Ok(Arc::clone(self.providers.get(provider_id).unwrap()))
+        provider: Arc<dyn Provider>,
+    ) -> Arc<dyn Provider> {
+        self.providers
+            .entry(provider_id.to_string())
+            .or_insert(provider)
+            .clone()
     }
 
     /// Cache model list for a provider.
@@ -491,6 +494,7 @@ impl AppState {
         Self {
             settings: Arc::new(RwLock::new(settings)),
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
+            provider_creation_locks: Arc::new(Mutex::new(HashMap::new())),
             concurrency_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
                 limits.max_concurrency as usize,
             )))),
@@ -508,6 +512,7 @@ impl AppState {
         let limits = settings.limits.clone();
         *self.settings.write().await = settings;
         self.provider_registry.write().await.clear();
+        self.provider_creation_locks.lock().await.clear();
         self.apply_limits(&limits).await;
     }
 
@@ -520,4 +525,52 @@ impl AppState {
             Arc::new(Semaphore::new(limits.max_concurrency as usize));
         self.provider_concurrency_semaphores.lock().await.clear();
     }
+
+    pub async fn get_or_create_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Arc<dyn Provider>, String> {
+        if let Some(provider) = self.provider_registry.read().await.get(provider_id) {
+            return Ok(provider);
+        }
+
+        let creation_lock = self.provider_creation_lock(provider_id).await;
+        let _creation_guard = creation_lock.lock().await;
+
+        if let Some(provider) = self.provider_registry.read().await.get(provider_id) {
+            return Ok(provider);
+        }
+
+        let settings = self.settings.read().await.clone();
+        let provider = create_provider_from_settings(provider_id, &settings).await?;
+
+        Ok(self
+            .provider_registry
+            .write()
+            .await
+            .insert_if_absent(provider_id, provider))
+    }
+
+    async fn provider_creation_lock(&self, provider_id: &str) -> Arc<Mutex<()>> {
+        self.provider_creation_locks
+            .lock()
+            .await
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+async fn create_provider_from_settings(
+    provider_id: &str,
+    settings: &Settings,
+) -> Result<Arc<dyn Provider>, String> {
+    let provider_config = settings
+        .providers
+        .get(provider_id)
+        .ok_or_else(|| format!("provider '{provider_id}' not configured"))?;
+
+    claude_proxy_providers::create_provider(provider_id, provider_config, settings)
+        .await
+        .map_err(|e| format!("failed to create provider '{provider_id}': {e}"))
 }

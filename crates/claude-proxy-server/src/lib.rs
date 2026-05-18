@@ -18,7 +18,6 @@ use middleware::RateLimitLayer;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use persistence::MetricsStore;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -69,7 +68,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     spawn_sigusr1_handler(state.clone());
 
     // Spawn model cache warmup
-    spawn_model_warmup(state.settings.clone(), state.provider_registry.clone());
+    spawn_model_warmup(state.clone());
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -104,37 +103,29 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
 }
 
 /// Spawn a background task to warm up model cache for all configured providers.
-fn spawn_model_warmup(
-    settings: Arc<RwLock<Settings>>,
-    registry: Arc<RwLock<app::ProviderRegistry>>,
-) {
+fn spawn_model_warmup(state: AppState) {
     tokio::spawn(async move {
         // Small delay to let the server start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let provider_ids: Vec<String> = {
-            let s = settings.read().await;
+            let s = state.settings.read().await;
             s.providers.keys().cloned().collect()
         };
 
         for provider_id in &provider_ids {
-            // Create provider (lock released after obtaining Arc)
-            let provider = {
-                let mut reg = registry.write().await;
-                let s = settings.read().await;
-                match reg.get_or_create(provider_id, &s).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("Failed to create provider '{provider_id}' for warmup: {e}");
-                        continue;
-                    }
+            let provider = match state.get_or_create_provider(provider_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to create provider '{provider_id}' for warmup: {e}");
+                    continue;
                 }
             };
 
             // Fetch models without holding the registry lock
             match provider.list_models().await {
                 Ok(models) => {
-                    let mut reg = registry.write().await;
+                    let mut reg = state.provider_registry.write().await;
                     reg.cache_models(provider_id, models.clone());
                     info!(
                         "Warmed up model cache for '{}': {} models",

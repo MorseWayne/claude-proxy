@@ -328,9 +328,7 @@ fn has_subagent_marker(system: &Option<SystemPrompt>) -> bool {
 }
 
 async fn get_provider(state: &AppState, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
-    let mut registry = state.provider_registry.write().await;
-    let settings = state.settings.read().await;
-    registry.get_or_create(provider_id, &settings).await
+    state.get_or_create_provider(provider_id).await
 }
 
 fn record_request_error(state: &AppState, start: std::time::Instant) {
