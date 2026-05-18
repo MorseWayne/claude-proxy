@@ -55,7 +55,7 @@ reasoning_effort = "none"
   - `reasoning_effort: Option<ModelReasoningEffort>`
 - `ModelReasoningEffort`
   - `Default`
-  - `None`
+  - `Disabled`（序列化为 `"none"`）
   - `Low`
   - `Medium`
   - `High`
@@ -76,7 +76,7 @@ reasoning = "openai/gpt-5"
 opus = "anthropic/claude-opus-4-7"
 ```
 
-旧字符串反序列化为 `{ name = <string>, reasoning_effort = None }`。保存配置时可以输出新的结构化形态；这是可接受的格式迁移，因为旧输入仍兼容。
+旧字符串反序列化为 `{ name = <string>, reasoning_effort = None }`。保存配置时可以输出新的结构化形态；这是可接受的格式迁移，因为旧输入仍兼容。同一个 alias 不支持同时出现旧字符串值和同名子表，例如 `default = "..."` 与 `[model.default]` 并存应按 TOML 解析错误处理。不同 alias 可以混用新旧格式，以便用户逐步迁移。
 
 ## 请求解析与优先级
 
@@ -88,35 +88,39 @@ opus = "anthropic/claude-opus-4-7"
 `Settings::resolve_model()` 可继续保留字符串返回值以降低调用方破坏面；新增方法负责返回结构化解析结果。server 请求路径使用结构化解析结果：
 
 1. 如果请求模型本身包含 `/`，视为直接 `provider/model`，不应用别名推理强度。
-2. 否则按现有 alias 规则匹配 `opus`、`haiku`、`sonnet`，并补充 `reasoning` 别名匹配；未命中时沿用 default provider + 请求模型名。
+2. 否则按 alias 规则解析：
+   - 请求模型名包含 `opus` 时优先使用 `model.opus`。
+   - 请求模型名包含 `haiku` 时使用 `model.haiku`。
+   - 请求模型名包含 `sonnet` 时使用 `model.sonnet`。
+   - 请求模型名包含 `reasoning`，或请求 `metadata.intent` 为 `deep_think` / `reasoning`，并且未命中上面的家族 alias 时，使用 `model.reasoning`。
+   - 未命中任何 alias 时，沿用 `model.default.name` 的 provider + 请求模型名；这条路径没有 alias-specific reasoning effort。
 3. 将 `model_ref` 拆为 `provider_id` 和 `upstream_model`。
 4. 如果请求没有显式 `reasoning`、`reasoning_effort` 或 `thinking`，并且别名配置的 `reasoning_effort` 是固定值，则注入到请求 `extra["reasoning_effort"]`。
-5. 如果别名配置是 `Default` 或 `None`，不注入字段，继续让现有 provider intent 逻辑决定是否设置 effort。
+5. 如果别名配置是 `Default` 或字段缺失（Rust `Option::None`），不注入字段，继续让现有 provider intent 逻辑决定是否设置 effort。
 
 固定值映射：
 
-- `None` → `"none"`
+- `Disabled` → `"none"`
 - `Low` → `"low"`
 - `Medium` → `"medium"`
 - `High` → `"high"`
 - `XHigh` → `"xhigh"`
 
-注意：配置枚举中的 `None` 是显式关闭/最低 reasoning 的用户配置值，对应字符串 `none`；Rust `Option::None` 表示未配置。
+注意：配置枚举中的 `Disabled` 是显式关闭/最低 reasoning 的用户配置值，对应字符串 `none`，会注入 `reasoning_effort = "none"`；Rust `Option::None` 表示未配置，不注入字段。`Default` 是显式记录“使用默认策略”，行为与未配置相同，但会在结构化配置中保留用户意图。
 
 ## TUI 与 CLI 体验
 
-TUI Model 页面从“每个别名单行模型字符串”扩展为“别名名 + model name + reasoning effort”的编辑能力。最小实现可采用每个别名两行：
+TUI Model 页面从“每个别名单行模型字符串”扩展为两列配置表：第一列编辑模型名，第二列编辑对应的推理强度。行仍按 alias 组织，避免把每个 alias 展开成多行。
 
-- `Default Model`
-- `Default Reasoning Effort`
-- `Reasoning Model`
-- `Reasoning Effort`
-- `Opus Alias`
-- `Opus Reasoning Effort`
-- `Sonnet Alias`
-- `Sonnet Reasoning Effort`
-- `Haiku Alias`
-- `Haiku Reasoning Effort`
+| Alias | Model | Reasoning Effort |
+| --- | --- | --- |
+| Default | `model.default.name` | `model.default.reasoning_effort` |
+| Reasoning | `model.reasoning.name` | `model.reasoning.reasoning_effort` |
+| Opus | `model.opus.name` | `model.opus.reasoning_effort` |
+| Sonnet | `model.sonnet.name` | `model.sonnet.reasoning_effort` |
+| Haiku | `model.haiku.name` | `model.haiku.reasoning_effort` |
+
+键盘交互沿用现有 Model 页编辑方式：上下选择 alias 行，左右切换 Model / Reasoning Effort 列，Enter 编辑当前单元格。
 
 空 effort 表示未配置；可输入值为 `default`、`none`、`low`、`medium`、`high`、`xhigh`。TUI 保存时写回结构化配置。
 
@@ -129,18 +133,24 @@ Claude Code env 同步仍只同步模型名相关环境变量，不同步 reason
 - config 单元测试：
   - 新结构化 TOML 可反序列化。
   - 旧字符串 TOML 可反序列化为结构化 alias。
+  - 不同 alias 新旧格式混用可反序列化；同一个 alias 的字符串值与子表并存按 TOML 错误处理。
   - `to_toml()` 输出结构化字段。
   - validation 校验所有 alias 的 `name` 必须是 `provider_id/model_name`。
   - invalid `reasoning_effort` 被拒绝。
 - server/request 单元测试：
   - alias 固定 effort 在无显式请求字段时注入。
+  - alias `reasoning_effort = "none"` 注入 `reasoning_effort = "none"`。
   - 请求显式 `reasoning_effort`、`reasoning`、`thinking` 优先。
   - `default` 与未配置都不注入，保留现有 intent 推导。
   - 直接 `provider/model` 不应用 alias effort。
+  - 旧格式配置读取后可完成解析并代理请求。
+  - `model.reasoning` 在请求模型名或 intent 命中 reasoning 规则时生效，且不覆盖 opus/haiku/sonnet 家族 alias。
 - TUI 单元测试：
   - Model 页面编辑模型名与 effort 字段后正确写入 settings。
   - 空 effort 清空配置。
+  - 清空可选 alias 的 model name 会删除对应 alias section，而不是保留空 name。
   - invalid effort 显示错误且不保存。
+  - `provider switch` 和 provider add 更新默认模型名时保留已有 `model.default.reasoning_effort`。
 - 工作区验证：
   - `cargo fmt --check`
   - `cargo test -p claude-proxy-config`
@@ -151,6 +161,7 @@ Claude Code env 同步仍只同步模型名相关环境变量，不同步 reason
 ## 风险与缓解
 
 - 风险：结构化 TOML 可能破坏旧配置读取。缓解：为 alias 字段实现兼容反序列化，并加旧格式测试。
-- 风险：`None` 作为枚举值和 `Option::None` 语义混淆。缓解：代码中使用清晰命名，例如 `ModelReasoningEffort::NoReasoning` 或 `Disabled`，序列化仍为 `"none"`。
+- 风险：显式关闭和未配置语义混淆。缓解：代码中使用 `ModelReasoningEffort::Disabled` 表示序列化字符串 `"none"`，并保留 `Option::None` 专门表示未配置。
+- 风险：`Default` 与未配置运行时行为相同，可能让用户困惑。缓解：文档和 TUI copy 中说明 `default` 是显式记录“使用默认策略”，用于可见配置与人工审阅；空值表示未表达偏好。
 - 风险：server 解析调用方过多。缓解：保留 `resolve_model()`，新增结构化方法供请求路径使用。
-- 风险：TUI 页面行数增加后布局拥挤。缓解：先采用简单可滚动/现有 field rows 机制；若现有页面不支持滚动，再拆成当前选中别名的 name/effort 两个字段。
+- 风险：TUI 页面列宽不足或现有组件不支持表格单元格编辑。缓解：仍保持 alias 行 + Model / Reasoning Effort 左右并列；必要时用当前选中 alias 的 inline detail panel 展示两个并列字段，不退回每个 alias 上下拆成两行。
