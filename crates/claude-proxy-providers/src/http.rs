@@ -21,6 +21,7 @@ use crate::provider::ProviderError;
 use chrono::DateTime;
 use futures::StreamExt;
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
@@ -31,6 +32,7 @@ const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_SUCCESS_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamRequestPolicy {
@@ -157,6 +159,40 @@ where
     } else {
         request.await
     }
+}
+
+pub async fn read_upstream_response_text(
+    response: reqwest::Response,
+) -> Result<String, ProviderError> {
+    read_upstream_response_text_with_timeout(response, UPSTREAM_SUCCESS_BODY_TIMEOUT).await
+}
+
+async fn read_upstream_response_text_with_timeout(
+    response: reqwest::Response,
+    read_timeout: Duration,
+) -> Result<String, ProviderError> {
+    timeout(read_timeout, response.text())
+        .await
+        .map_err(|_| ProviderError::Timeout)?
+        .map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Network(fmt_reqwest_err(&e))
+            }
+        })
+}
+
+pub async fn read_upstream_response_json<T>(
+    response: reqwest::Response,
+    parse_error_context: &str,
+) -> Result<T, ProviderError>
+where
+    T: DeserializeOwned,
+{
+    let body = read_upstream_response_text(response).await?;
+    serde_json::from_str(&body)
+        .map_err(|e| ProviderError::Network(format!("{parse_error_context}: {e}")))
 }
 
 fn warn_retrying_upstream_request(
@@ -477,6 +513,16 @@ mod tests {
 
         assert!(body.contains("partial upstream failure"));
         assert!(body.contains("[upstream error body read timed out]"));
+    }
+
+    #[tokio::test]
+    async fn upstream_success_body_read_times_out_when_idle() {
+        let response = response_with_stalled_body("partial upstream success").await;
+
+        let result =
+            read_upstream_response_text_with_timeout(response, Duration::from_millis(20)).await;
+
+        assert!(matches!(result, Err(ProviderError::Timeout)));
     }
 
     #[tokio::test]

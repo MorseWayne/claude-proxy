@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
-use crate::http::fmt_reqwest_err;
+use crate::http::{fmt_reqwest_err, read_upstream_response_json, read_upstream_response_text};
 use crate::provider::ProviderError;
 
 const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -238,18 +238,13 @@ impl CopilotAuth {
             };
 
             if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = read_upstream_response_text(resp).await.unwrap_or_default();
                 return Err(ProviderError::Authentication(format!(
                     "device code request rejected: {body}"
                 )));
             }
 
-            return resp.json::<DeviceCodeResponse>().await.map_err(|e| {
-                ProviderError::Network(format!(
-                    "invalid device code response: {}",
-                    fmt_reqwest_err(&e)
-                ))
-            });
+            return read_upstream_response_json(resp, "invalid device code response").await;
         }
 
         unreachable!("device code request loop must return");
@@ -277,7 +272,7 @@ impl CopilotAuth {
                     ProviderError::Network(format!("token poll failed: {}", fmt_reqwest_err(&e)))
                 })?;
 
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = read_upstream_response_text(resp).await?;
             let parsed: AccessTokenResponse = serde_json::from_str(&body_text)
                 .map_err(|e| ProviderError::Network(format!("invalid token response: {e}")))?;
 
@@ -362,7 +357,7 @@ impl CopilotAuth {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_upstream_response_text(resp).await.unwrap_or_default();
 
             if status == 401 {
                 let mut token = self.github_token.write().await;
@@ -377,12 +372,8 @@ impl CopilotAuth {
             return Err(ProviderError::UpstreamError { status, body });
         }
 
-        let data: Value = resp.json().await.map_err(|e| {
-            ProviderError::Network(format!(
-                "invalid copilot token response: {}",
-                fmt_reqwest_err(&e)
-            ))
-        })?;
+        let data: Value =
+            read_upstream_response_json(resp, "invalid copilot token response").await?;
 
         let token_str = data["token"]
             .as_str()

@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::http::{fmt_reqwest_err, map_upstream_response};
+use crate::http::{fmt_reqwest_err, map_upstream_response, read_upstream_response_json};
 use crate::provider::ProviderError;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -144,12 +144,8 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: DeviceCodeResponse = response.json().await.map_err(|e| {
-            ProviderError::Network(format!(
-                "invalid ChatGPT device code response: {}",
-                fmt_reqwest_err(&e)
-            ))
-        })?;
+        let data: DeviceCodeResponse =
+            read_upstream_response_json(response, "invalid ChatGPT device code response").await?;
 
         Ok(DeviceCodeInfo {
             device_auth_id: data.device_auth_id,
@@ -183,12 +179,9 @@ impl ChatGptAuth {
                 })?;
 
             if response.status().is_success() {
-                let data: DeviceTokenResponse = response.json().await.map_err(|e| {
-                    ProviderError::Network(format!(
-                        "invalid ChatGPT device token response: {}",
-                        fmt_reqwest_err(&e)
-                    ))
-                })?;
+                let data: DeviceTokenResponse =
+                    read_upstream_response_json(response, "invalid ChatGPT device token response")
+                        .await?;
                 let token = self
                     .exchange_authorization_code(
                         &data.authorization_code,
@@ -312,12 +305,8 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: TokenResponse = response.json().await.map_err(|e| {
-            ProviderError::Network(format!(
-                "invalid ChatGPT token refresh response: {}",
-                fmt_reqwest_err(&e)
-            ))
-        })?;
+        let data: TokenResponse =
+            read_upstream_response_json(response, "invalid ChatGPT token refresh response").await?;
         let token = token_from_response(data, Some(&current.refresh_token));
         self.store_token(token).await;
         Ok(())
@@ -353,12 +342,9 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: TokenResponse = response.json().await.map_err(|e| {
-            ProviderError::Network(format!(
-                "invalid ChatGPT token exchange response: {}",
-                fmt_reqwest_err(&e)
-            ))
-        })?;
+        let data: TokenResponse =
+            read_upstream_response_json(response, "invalid ChatGPT token exchange response")
+                .await?;
         Ok(token_from_response(data, None))
     }
 

@@ -13,7 +13,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, read_upstream_response_text,
+    send_upstream_request,
 };
 use crate::provider::{Provider, ProviderError};
 
@@ -108,10 +109,7 @@ impl Provider for AnthropicProvider {
             });
             Ok(Box::pin(stream))
         } else {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
+            let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = SseEvent {
                 event: "message".to_string(),

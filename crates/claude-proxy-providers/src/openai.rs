@@ -14,7 +14,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, send_upstream_request,
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, read_upstream_response_json,
+    read_upstream_response_text, send_upstream_request,
 };
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
@@ -117,10 +118,7 @@ impl OpenAiProvider {
         if request.stream {
             Ok(crate::chat_completions::stream_openai_response(response))
         } else {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
+            let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let events = crate::chat_completions::convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
@@ -146,10 +144,7 @@ impl OpenAiProvider {
         if request.stream {
             Ok(crate::responses::stream_responses_response(response))
         } else {
-            let body = response
-                .text()
-                .await
-                .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))?;
+            let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let events = crate::responses::convert_non_streaming_response(&data);
             let stream = futures::stream::iter(events.into_iter().map(Ok));
@@ -184,10 +179,8 @@ impl Provider for OpenAiProvider {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: Value = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::Network(format!("failed to parse models response: {e}")))?;
+        let data: Value =
+            read_upstream_response_json(response, "failed to parse models response").await?;
 
         let models = data["data"]
             .as_array()
