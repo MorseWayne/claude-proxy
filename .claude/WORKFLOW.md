@@ -10,7 +10,7 @@ Status: Done
 Level: 3
 Started: 2026-05-18
 Updated: 2026-05-18
-Current phase: Phase 1 — 实现、验证与收尾
+Current phase: Phase 2 — Dashboard quota 独立区域
 
 Goal（目标）:
 
@@ -57,6 +57,32 @@ Acceptance / Review:
 Resume next（下次继续）:
 
 - 提交本次功能变更并运行 `npx gitnexus analyze` 刷新索引。
+
+#### Phase 2 — Dashboard quota 独立区域
+
+Status: Done
+Depends on:
+
+- Phase 1
+
+Tasks:
+
+- [x] 确认用户希望 quota 不再挤在 Usage Overview 内。
+- [x] 对 `render_dashboard` 运行 GitNexus upstream impact。
+- [x] 将 ChatGPT/Codex quota 渲染移动到 Dashboard 独立卡片。
+- [x] 运行格式化、测试、GitNexus detect_changes、提交并刷新索引。
+
+Acceptance / Review:
+
+- Review: Dashboard 现在在 Usage Overview 上方新增独立 `ChatGPT / Codex Quota` 卡片；Usage Overview 回到只展示本地 usage/capability 数据。quota 卡片在 metrics 尚未连接时显示 waiting 状态，在没有 quota snapshot 时显示 not available/login required/waiting 提示。
+- Validation: `cargo fmt --check` 通过；`cargo test -p claude-proxy-cli tui::tests::parse_provider_rate_limits_reads_quota_snapshots` 通过。
+- GitNexus: `render_dashboard` upstream impact 为 HIGH，影响 TUI 主渲染链路 `render_content` → `render` → `run_app`，符合 Dashboard layout 局部调整预期；实施后 `detect_changes(scope=all)` 为 MEDIUM，影响集中在 `render_dashboard` / `render_model_usage` / `push_rate_limit_rows` 和 TUI render flows。
+- Tests: TUI quota parser 回归测试通过。
+- Gaps: 未进行真实终端 TUI 视觉验收；变更为 ratatui 布局/渲染逻辑局部调整。
+
+Resume next（下次继续）:
+
+- 提交 Dashboard quota 独立卡片布局调整并运行 `npx gitnexus analyze` 刷新索引。
 
 ### WF-2026-05-18-002 — Claude onboarding 跳过同步
 

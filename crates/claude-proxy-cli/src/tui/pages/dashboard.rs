@@ -13,12 +13,13 @@ use super::super::{theme, widgets};
 use claude_proxy_providers::provider::{RateLimitSnapshot, RateLimitSource, RateLimitWindow};
 
 pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
-    // Three-row layout for dashboard cards
+    // Four-row layout for dashboard cards
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
             Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Min(0),
         ])
         .split(area);
@@ -136,8 +137,45 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         ],
     );
 
+    // ChatGPT quota card
+    render_rate_limit_card(f, app, rows[2]);
+
     // Usage overview section (takes remaining space)
-    render_model_usage(f, app, rows[2]);
+    render_model_usage(f, app, rows[3]);
+}
+
+fn render_rate_limit_card(f: &mut Frame, app: &App, area: Rect) {
+    if area.height < 3 {
+        return;
+    }
+
+    let content_area = widgets::render_content_frame(f, area, app, "ChatGPT / Codex Quota");
+    let Some(ref metrics) = app.live_metrics else {
+        let lines = vec![Line::from(Span::styled(
+            "   Waiting for server connection...",
+            Style::default().fg(theme::FG_DIM),
+        ))];
+        f.render_widget(Paragraph::new(lines), content_area);
+        return;
+    };
+
+    if metrics.provider_rate_limits.is_empty() {
+        let lines = vec![Line::from(Span::styled(
+            "   Not available yet — login required or waiting for quota data",
+            Style::default().fg(theme::FG_DIM),
+        ))];
+        f.render_widget(Paragraph::new(lines), content_area);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    push_rate_limit_rows(
+        &mut lines,
+        &metrics.provider_rate_limits,
+        content_area.height as usize,
+        false,
+    );
+    f.render_widget(Paragraph::new(lines), content_area);
 }
 
 fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
@@ -171,7 +209,6 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
         && provider_list.is_empty()
         && initiator_list.is_empty()
         && metrics.model_capabilities.is_empty()
-        && metrics.provider_rate_limits.is_empty()
     {
         let lines = vec![Line::from(Span::styled(
             "   No requests recorded yet",
@@ -183,8 +220,6 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
 
     let max_rows = content_area.height as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let available = max_rows.saturating_sub(lines.len());
-    push_rate_limit_rows(&mut lines, &metrics.provider_rate_limits, available);
     let available = max_rows.saturating_sub(lines.len());
     push_usage_table(&mut lines, "Models", &model_list, available);
     let available = max_rows.saturating_sub(lines.len());
@@ -233,19 +268,22 @@ fn push_rate_limit_rows(
     lines: &mut Vec<Line>,
     provider_rate_limits: &[(String, Vec<RateLimitSnapshot>)],
     available: usize,
+    show_title: bool,
 ) {
-    if available < 3 || provider_rate_limits.is_empty() {
+    if available < 2 || provider_rate_limits.is_empty() {
         return;
     }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        "   ChatGPT / Codex Quota",
-        Style::default().fg(theme::ACCENT),
-    )));
+    if show_title {
+        lines.push(Line::from(Span::styled(
+            "   ChatGPT / Codex Quota",
+            Style::default().fg(theme::ACCENT),
+        )));
+    }
 
-    let row_budget = available.saturating_sub(1);
+    let row_budget = available.saturating_sub(usize::from(show_title));
     let mut used_rows = 0;
     for (provider_id, snapshots) in provider_rate_limits {
         for snapshot in snapshots {
