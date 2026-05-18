@@ -39,7 +39,7 @@ struct HistoryCompressionState {
 #[derive(Debug)]
 enum ResponsesMessagePart {
     Text(String),
-    ImageUrl(String),
+    Input(Value),
 }
 
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
@@ -316,7 +316,7 @@ fn append_message_items(
                             is_current_message,
                             compression,
                         );
-                        let output = tool_result_text(
+                        let output = tool_result_output(
                             content,
                             *is_error,
                             should_truncate_tool_output(content, is_current_message, compression),
@@ -328,9 +328,7 @@ fn append_message_items(
                         }));
                     }
                     Content::Unknown(value) => {
-                        if let Some(image_url) = unknown_image_url(value) {
-                            parts.push(ResponsesMessagePart::ImageUrl(image_url));
-                        }
+                        parts.push(content_part_from_unknown(value));
                     }
                 }
             }
@@ -356,16 +354,16 @@ fn flush_message_parts(
         return;
     }
 
-    let has_image = parts
+    let has_input = parts
         .iter()
-        .any(|part| matches!(part, ResponsesMessagePart::ImageUrl(_)));
+        .any(|part| matches!(part, ResponsesMessagePart::Input(_)));
 
-    if !has_image {
+    if !has_input {
         let text = parts
             .iter()
             .filter_map(|part| match part {
                 ResponsesMessagePart::Text(text) => Some(text.as_str()),
-                ResponsesMessagePart::ImageUrl(_) => None,
+                ResponsesMessagePart::Input(_) => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -385,10 +383,7 @@ fn flush_message_parts(
                 "type": "input_text",
                 "text": compressed_text_item(text, is_current_message, compression),
             })),
-            ResponsesMessagePart::ImageUrl(image_url) => Some(json!({
-                "type": "input_image",
-                "image_url": image_url,
-            })),
+            ResponsesMessagePart::Input(value) => Some(value.clone()),
         })
         .collect::<Vec<_>>();
 
@@ -499,21 +494,52 @@ fn message_content_item(role: &Role, content: Vec<Value>) -> Value {
     })
 }
 
+fn content_part_from_unknown(value: &Value) -> ResponsesMessagePart {
+    if let Some(part) = content_part_from_value(value) {
+        return part;
+    }
+    ResponsesMessagePart::Text(value.to_string())
+}
+
+fn content_part_from_value(value: &Value) -> Option<ResponsesMessagePart> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| ResponsesMessagePart::Text(text.to_string())),
+        Some("image") | Some("input_image") | Some("image_url") => {
+            unknown_image_url(value).map(input_image_part)
+        }
+        Some("document") | Some("input_file") | Some("file") => {
+            input_file_part(value).map(ResponsesMessagePart::Input)
+        }
+        _ => None,
+    }
+}
+
+fn input_image_part(image_url: String) -> ResponsesMessagePart {
+    ResponsesMessagePart::Input(json!({
+        "type": "input_image",
+        "image_url": image_url,
+    }))
+}
+
 fn unknown_image_url(value: &Value) -> Option<String> {
     match value.get("type").and_then(Value::as_str) {
         Some("image") => image_source_url(value.get("source")?),
-        Some("input_image") => value
-            .get("image_url")
+        Some("input_image") => image_url_string(value.get("image_url")?),
+        Some("image_url") => image_url_string(value.get("image_url")?),
+        _ => None,
+    }
+}
+
+fn image_url_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(url) => Some(url.clone()),
+        Value::Object(image_url) => image_url
+            .get("url")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        Some("image_url") => match value.get("image_url") {
-            Some(Value::String(url)) => Some(url.clone()),
-            Some(Value::Object(image_url)) => image_url
-                .get("url")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -521,7 +547,7 @@ fn unknown_image_url(value: &Value) -> Option<String> {
 fn image_source_url(source: &Value) -> Option<String> {
     match source.get("type").and_then(Value::as_str) {
         Some("base64") => {
-            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            let media_type = string_field(source, &["media_type", "mediaType"])?;
             let data = source.get("data").and_then(Value::as_str)?;
             (!media_type.is_empty() && !data.is_empty())
                 .then(|| format!("data:{media_type};base64,{data}"))
@@ -534,15 +560,91 @@ fn image_source_url(source: &Value) -> Option<String> {
     }
 }
 
+fn input_file_part(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("input_file") => normalize_input_file_part(value),
+        Some("file") => value
+            .get("file")
+            .and_then(normalize_input_file_part)
+            .or_else(|| normalize_input_file_part(value)),
+        Some("document") => {
+            let source = value.get("source")?;
+            let mut part = match source.get("type").and_then(Value::as_str) {
+                Some("base64") => {
+                    let data = source.get("data").and_then(Value::as_str)?;
+                    (!data.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_data": data,
+                        })
+                    })?
+                }
+                Some("url") => {
+                    let url = source.get("url").and_then(Value::as_str)?;
+                    (!url.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_url": url,
+                        })
+                    })?
+                }
+                Some("file") => {
+                    let file_id = string_field(source, &["file_id", "fileId", "id"])?;
+                    (!file_id.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_id": file_id,
+                        })
+                    })?
+                }
+                _ => return None,
+            };
+            if let Some(filename) = string_field(value, &["filename", "name", "title"])
+                .or_else(|| string_field(source, &["filename", "name", "title"]))
+            {
+                part["filename"] = json!(filename);
+            }
+            Some(part)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_input_file_part(value: &Value) -> Option<Value> {
+    let mut part = json!({"type": "input_file"});
+    let mut has_payload = false;
+    for field in ["file_data", "file_id", "file_url", "filename"] {
+        if let Some(text) = value.get(field).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            part[field] = json!(text);
+            if field != "filename" {
+                has_payload = true;
+            }
+        }
+    }
+    has_payload.then_some(part)
+}
+
+fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+}
+
 fn tool_result_text(
     content: &Option<Value>,
     is_error: Option<bool>,
     truncate_if_large: bool,
 ) -> String {
-    let text = match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(value) => value.to_string(),
-        None => String::new(),
+    let text = if is_error == Some(true) {
+        tool_result_error_text(content)
+    } else {
+        match content {
+            Some(Value::String(text)) => text.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
     };
     let text = if truncate_if_large && text.len() > MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
         format!(
@@ -557,6 +659,83 @@ fn tool_result_text(
         format!("ERROR: {text}")
     } else {
         text
+    }
+}
+
+fn tool_result_error_text(content: &Option<Value>) -> String {
+    match content {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(tool_result_error_text_item)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+fn tool_result_error_text_item(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("image") | Some("input_image") | Some("image_url") => {
+            Some("[image omitted from error tool result]".to_string())
+        }
+        Some("document") | Some("input_file") | Some("file") => {
+            Some("[document omitted from error tool result]".to_string())
+        }
+        Some(_) => Some(value.to_string()),
+        None => None,
+    }
+}
+
+fn tool_result_output(
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    truncate_if_large: bool,
+) -> Value {
+    if is_error == Some(true) || truncate_if_large {
+        return json!(tool_result_text(content, is_error, truncate_if_large));
+    }
+
+    match content {
+        Some(Value::Array(items)) => {
+            if !items
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str).is_some())
+            {
+                return json!(tool_result_text(content, is_error, truncate_if_large));
+            }
+            let parts = items
+                .iter()
+                .map(tool_result_content_part)
+                .filter_map(responses_message_part_to_value)
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                json!("")
+            } else {
+                json!(parts)
+            }
+        }
+        _ => json!(tool_result_text(content, is_error, truncate_if_large)),
+    }
+}
+
+fn tool_result_content_part(value: &Value) -> ResponsesMessagePart {
+    content_part_from_value(value).unwrap_or_else(|| ResponsesMessagePart::Text(value.to_string()))
+}
+
+fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> {
+    match part {
+        ResponsesMessagePart::Text(text) if text.is_empty() => None,
+        ResponsesMessagePart::Text(text) => Some(json!({
+            "type": "input_text",
+            "text": text,
+        })),
+        ResponsesMessagePart::Input(value) => Some(value),
     }
 }
 
@@ -1493,6 +1672,223 @@ mod tests {
         assert_eq!(
             body["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_accepts_camel_case_image_media_type() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::Unknown(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "mediaType": "image/jpeg",
+                        "data": "/9j/4AAQSkZJRg=="
+                    }
+                }))]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][0]["image_url"],
+            "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_anthropic_document_blocks() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    Content::Text {
+                        text: "Summarize this PDF.".to_string(),
+                    },
+                    Content::Unknown(json!({
+                        "type": "document",
+                        "title": "report.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0x"
+                        }
+                    })),
+                ]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
+        assert_eq!(body["input"][0]["content"][1]["file_data"], "JVBERi0x");
+        assert_eq!(body["input"][0]["content"][1]["filename"], "report.pdf");
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_tool_result_image_content() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Blocks(vec![Content::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "screenshot".to_string(),
+                        input: json!({}),
+                    }]),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(vec![Content::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: Some(json!([
+                            {"type": "text", "text": "Captured screenshot."},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgo="
+                                }
+                            }
+                        ])),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["output"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][1]["output"][0]["text"],
+            "Captured screenshot."
+        );
+        assert_eq!(body["input"][1]["output"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][1]["output"][1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_json_array_tool_result_as_text() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([{"path": "README.md"}])),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["input"][0]["output"], r#"[{"path":"README.md"}]"#);
+    }
+
+    #[test]
+    fn test_convert_to_responses_keeps_error_tool_result_text_only() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([
+                        {"type": "text", "text": "Permission denied."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo="
+                            }
+                        }
+                    ])),
+                    is_error: Some(true),
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(
+            body["input"][0]["output"],
+            "ERROR: Permission denied.\n[image omitted from error tool result]"
         );
     }
 
