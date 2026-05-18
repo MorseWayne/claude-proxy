@@ -464,6 +464,10 @@ impl Settings {
 
     /// Resolve a Claude model name to a `provider_id/upstream_model` string.
     pub fn resolve_model(&self, claude_model: &str) -> String {
+        if claude_model.contains('/') {
+            return claude_model.to_string();
+        }
+
         let lower = claude_model.to_lowercase();
         if lower.contains("opus")
             && let Some(ref m) = self.model.opus
@@ -477,9 +481,6 @@ impl Settings {
             && let Some(ref m) = self.model.sonnet
         {
             return m.clone();
-        }
-        if claude_model.contains('/') {
-            return claude_model.to_string();
         }
         let provider = Self::parse_provider_id(&self.model.default);
         format!("{}/{}", provider, claude_model)
@@ -614,6 +615,29 @@ mod tests {
         assert_eq!(
             settings.resolve_model("opencode-go/deepseek-v4-pro"),
             "opencode-go/deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn explicit_provider_model_takes_precedence_over_role_aliases() {
+        let settings = Settings {
+            model: ModelConfig {
+                default: "openai/gpt-4.1".to_string(),
+                reasoning: None,
+                opus: Some("anthropic/claude-opus-4-20250514".to_string()),
+                sonnet: Some("openai/gpt-4.1".to_string()),
+                haiku: Some("openai/gpt-4.1-mini".to_string()),
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            settings.resolve_model("copilot/claude-sonnet-4"),
+            "copilot/claude-sonnet-4"
+        );
+        assert_eq!(
+            settings.resolve_model("custom/claude-3-5-haiku-latest"),
+            "custom/claude-3-5-haiku-latest"
         );
     }
 
