@@ -4,6 +4,28 @@
 
 ## Active（进行中）
 
+### WF-2026-05-18-004 — 模型别名推理强度配置
+Status: In Progress
+Level: 2
+Started: 2026-05-18
+Last updated: 2026-05-18
+Current phase: 需求澄清与设计
+
+Intent:
+- 支持 default/reasoning/opus/sonnet/haiku 每个模型别名单独设置可选推理强度，允许不设置或显式使用默认值。
+
+Current todo:
+- [ ] 完成语义澄清、提出方案并取得设计确认。
+
+Changes:
+- Scope confirmed: reasoning effort is per model alias, not a single global default.
+
+Prerequisites:
+- 用户确认配置语义和兼容策略。
+
+Resume next:
+- 继续澄清 explicit default 的含义，并提出 2-3 种配置表示方案。
+
 ### WF-2026-05-18-003 — TUI ChatGPT 额度显示规划
 
 Status: Done
