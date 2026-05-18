@@ -1849,26 +1849,26 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
     env.remove("ANTHROPIC_AUTH_TOKEN");
-    set_env(env, "ANTHROPIC_MODEL", &settings.model.default.name);
+    set_env(env, "ANTHROPIC_MODEL", "default");
     set_optional_env(
         env,
         "ANTHROPIC_REASONING_MODEL",
-        settings.model.reasoning_name(),
+        configured_alias_env_value(settings.model.reasoning.as_ref(), "reasoning"),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        settings.model.haiku_name(),
+        configured_alias_env_value(settings.model.haiku.as_ref(), "haiku"),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        settings.model.sonnet_name(),
+        configured_alias_env_value(settings.model.sonnet.as_ref(), "sonnet"),
     );
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        settings.model.opus_name(),
+        configured_alias_env_value(settings.model.opus.as_ref(), "opus"),
     );
     env.remove("ANTHROPIC_SMALL_FAST_MODEL");
 }
@@ -1880,6 +1880,15 @@ fn claude_code_base_url(settings: &Settings) -> String {
         host => host.to_string(),
     };
     format!("http://{}:{}", host, settings.server.port)
+}
+
+fn configured_alias_env_value<'a>(
+    alias: Option<&ModelAliasConfig>,
+    env_value: &'a str,
+) -> Option<&'a str> {
+    alias
+        .filter(|alias| !alias.name.trim().is_empty())
+        .map(|_| env_value)
 }
 
 fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
@@ -2223,27 +2232,27 @@ mod tests {
         );
         assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
-            Some("copilot/claude-sonnet-4")
+            Some("default")
         );
         assert_eq!(
             env.get("ANTHROPIC_REASONING_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("copilot/deepseek-v4-flash")
+            Some("reasoning")
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("copilot/claude-opus-4")
+            Some("opus")
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("openai/gpt-5")
+            Some("sonnet")
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("openai/gpt-5-mini")
+            Some("haiku")
         );
         assert_eq!(env.get("KEEP_ME").and_then(|v| v.as_str()), Some("yes"));
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
@@ -2292,7 +2301,7 @@ mod tests {
         let env = value["env"].as_object().expect("env object");
         assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
-            Some("openai/gpt-5")
+            Some("default")
         );
         assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));

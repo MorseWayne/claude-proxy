@@ -298,17 +298,12 @@ fn apply_alias_reasoning_effort(
     request: &mut MessagesRequest,
     effort: Option<ModelReasoningEffort>,
 ) {
-    if request.extra.contains_key("reasoning")
-        || request.extra.contains_key("reasoning_effort")
-        || request.thinking.is_some()
-    {
-        return;
-    }
-
     if let Some(value) = effort.and_then(ModelReasoningEffort::request_value) {
+        request.extra.remove("reasoning");
         request
             .extra
             .insert("reasoning_effort".to_string(), json!(value));
+        request.thinking = None;
     }
 }
 
@@ -1235,11 +1230,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_reasoning_fields_override_alias_reasoning_effort() {
+    fn alias_reasoning_effort_overrides_request_reasoning_fields() {
         let mut request = request_with_system(None);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("adaptive".to_string()),
+            budget_tokens: None,
+        });
         request
             .extra
-            .insert("reasoning_effort".to_string(), json!("low"));
+            .insert("reasoning".to_string(), json!({"effort": "low"}));
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("medium"));
 
         apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::High));
 
@@ -1248,8 +1250,10 @@ mod tests {
                 .extra
                 .get("reasoning_effort")
                 .and_then(Value::as_str),
-            Some("low")
+            Some("high")
         );
+        assert!(!request.extra.contains_key("reasoning"));
+        assert!(request.thinking.is_none());
     }
 
     #[test]
