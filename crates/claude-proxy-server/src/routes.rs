@@ -496,25 +496,34 @@ async fn stream_leader_response(
         let task_start = std::time::Instant::now();
         let mut usage = TokenUsage::default();
         let mut had_error = false;
+        let mut leader_tx_open = true;
         while let Some(event_result) = stream.next().await {
             match event_result {
                 Ok(event) => {
                     extract_usage_from_event(&event.data, &mut usage);
-                    let sse_text = format_sse_event(&event);
+                    let sse_text = leader_tx_open.then(|| format_sse_event(&event));
                     let _ = broadcast_tx.send(InflightEvent::Event(event));
-                    if sender.send(Ok(sse_text.into_bytes())).await.is_err() {
+                    if let Some(sse_text) = sse_text
+                        && sender.send(Ok(sse_text.into_bytes())).await.is_err()
+                    {
+                        leader_tx_open = false;
+                    }
+                    if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
                         break;
                     }
                 }
                 Err(e) => {
                     had_error = true;
-                    let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
+                    let error_message = e.to_string();
+                    let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     let error_event = SseEvent {
                         event: "error".to_string(),
-                        data: json!({"error": {"type": "api_error", "message": e.to_string()}}),
+                        data: json!({"error": {"type": "api_error", "message": error_message}}),
                     };
-                    let sse_text = format_sse_event(&error_event);
-                    let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                    if leader_tx_open {
+                        let sse_text = format_sse_event(&error_event);
+                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                    }
                     break;
                 }
             }
@@ -1020,6 +1029,7 @@ impl<H: Hasher> io::Write for HashWriter<'_, H> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use axum::body::to_bytes;
     use claude_proxy_config::settings::{
@@ -1149,6 +1159,68 @@ mod tests {
 
         assert_eq!(leader_count, 1);
         assert_eq!(state.inflight.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_leader_continues_for_followers_after_leader_disconnect() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(2);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = stream_leader_response(
+            &state,
+            &request,
+            0xdead_beef,
+            broadcast_tx,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            StreamPermits {
+                _request: request_permit,
+                _provider: None,
+            },
+            std::time::Instant::now(),
+        )
+        .await;
+        drop(response);
+
+        for text in ["first", "second"] {
+            event_tx
+                .send(Ok(SseEvent {
+                    event: String::new(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "delta": {"text": text}
+                    }),
+                }))
+                .await
+                .unwrap();
+        }
+        drop(event_tx);
+
+        let mut received = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), follower.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                InflightEvent::Event(event) => {
+                    received.push(event.data["delta"]["text"].as_str().unwrap().to_string());
+                }
+                InflightEvent::Done => break,
+                InflightEvent::Error(message) => panic!("unexpected error event: {message}"),
+            }
+        }
+
+        assert_eq!(received, ["first", "second"]);
     }
 
     #[tokio::test]
