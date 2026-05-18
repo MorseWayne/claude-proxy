@@ -859,6 +859,9 @@ pub fn stream_responses_response(
                     }
                 }
                 Err(e) => {
+                    if converter.stopped {
+                        break;
+                    }
                     let _ = tx
                         .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
                         .await;
@@ -1634,6 +1637,33 @@ mod tests {
             .unwrap()
     }
 
+    async fn response_from_unterminated_chunked_body(
+        content_type: &str,
+        body: &str,
+    ) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn test_parse_sse_json_accepts_data_without_space() {
         let value = parse_sse_json(r#"data:{"type":"response.output_text.delta"}"#).unwrap();
@@ -1663,6 +1693,29 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_trailing_chunk_eof_after_completed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("completed stream should ignore trailing chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
+        );
     }
 
     #[test]
