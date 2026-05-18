@@ -641,9 +641,10 @@ fn rate_limit_snapshots_from_headers(
         .into_iter()
         .filter_map(|limit_id| {
             let prefix = format!("x-{limit_id}");
+            let feature = normalize_limit_id(&limit_id);
             let snapshot = RateLimitSnapshot {
                 provider_id: provider_id.to_string(),
-                feature: Some(limit_id.clone()),
+                feature: Some(feature),
                 limit_name: header_string(headers, &format!("{prefix}-limit-name")),
                 primary: rate_limit_window_from_headers(headers, &prefix, "primary"),
                 secondary: rate_limit_window_from_headers(headers, &prefix, "secondary"),
@@ -985,12 +986,16 @@ mod tests {
         headers.insert("x-codex-credits-has-credits", "true".parse().unwrap());
         headers.insert("x-codex-credits-unlimited", "false".parse().unwrap());
         headers.insert("x-codex-credits-balance", "7.50".parse().unwrap());
+        headers.insert(
+            "x-codex-other-primary-used-percent",
+            "12.5".parse().unwrap(),
+        );
         headers.insert("x-agent-primary-used-percent", "9.5".parse().unwrap());
         headers.insert("x-agent-limit-name", "Agent".parse().unwrap());
 
         let snapshots = rate_limit_snapshots_from_headers("chatgpt", &headers, 456);
 
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[0].feature.as_deref(), Some("agent"));
         assert_eq!(snapshots[0].limit_name.as_deref(), Some("Agent"));
         assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 9.5);
@@ -1000,6 +1005,8 @@ mod tests {
             snapshots[1].credits.as_ref().unwrap().balance.as_deref(),
             Some("7.50")
         );
+        assert_eq!(snapshots[2].feature.as_deref(), Some("codex_other"));
+        assert_eq!(snapshots[2].primary.as_ref().unwrap().used_percent, 12.5);
     }
 
     #[test]
