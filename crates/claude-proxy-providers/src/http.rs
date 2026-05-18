@@ -15,9 +15,10 @@
 
 use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::provider::ProviderError;
+use chrono::DateTime;
 use futures::StreamExt;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -200,11 +201,21 @@ fn retry_delay(attempt: usize, response: Option<&reqwest::Response>) -> Duration
 }
 
 fn retry_after_delay_secs(value: &str) -> Option<Duration> {
-    value
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .map(|delay| delay.min(MAX_RETRY_AFTER_DELAY))
+    retry_after_delay_from_now(value, SystemTime::now())
+}
+
+fn retry_after_delay_from_now(value: &str, now: SystemTime) -> Option<Duration> {
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER_DELAY));
+    }
+
+    let retry_at: SystemTime = DateTime::parse_from_rfc2822(value).ok()?.to_utc().into();
+    let delay = retry_at.duration_since(now).unwrap_or(Duration::ZERO);
+    Some(delay.min(MAX_RETRY_AFTER_DELAY))
+}
+
+fn retry_after_seconds(value: &str) -> Option<u64> {
+    retry_after_delay_secs(value).map(|delay| delay.as_secs())
 }
 
 fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
@@ -221,7 +232,7 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(retry_after_seconds);
     let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let message = extract_upstream_error_message(&body);
 
@@ -341,6 +352,24 @@ mod tests {
         assert_eq!(retry_after_delay_secs("1"), Some(Duration::from_secs(1)));
         assert_eq!(retry_after_delay_secs("60"), Some(MAX_RETRY_AFTER_DELAY));
         assert_eq!(retry_after_delay_secs("not-a-number"), None);
+    }
+
+    #[test]
+    fn retry_after_delay_accepts_http_date() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        assert_eq!(
+            retry_after_delay_from_now("Tue, 14 Nov 2023 22:13:23 GMT", now),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            retry_after_delay_from_now("Tue, 14 Nov 2023 22:13:10 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            retry_after_delay_from_now("Tue, 14 Nov 2023 22:14:30 GMT", now),
+            Some(MAX_RETRY_AFTER_DELAY)
+        );
     }
 
     #[test]
