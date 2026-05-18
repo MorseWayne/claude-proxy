@@ -28,6 +28,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             proxy: String::new(),
             provider_type: Some(ProviderType::OpenAI),
             copilot: None,
+            chatgpt: None,
         },
     );
 

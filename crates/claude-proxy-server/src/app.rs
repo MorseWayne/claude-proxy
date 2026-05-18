@@ -259,6 +259,7 @@ mod tests {
                 proxy: String::new(),
                 provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
+                chatgpt: None,
             },
         );
 
@@ -544,6 +545,7 @@ mod tests {
                 proxy: String::new(),
                 provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
+                chatgpt: None,
             },
         );
         let state = AppState::new(settings, None);

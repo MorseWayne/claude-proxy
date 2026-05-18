@@ -135,6 +135,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 proxy: openai_proxy,
                 provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
+                chatgpt: None,
             },
         );
     }
@@ -147,6 +148,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 proxy: anthropic_proxy,
                 provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
+                chatgpt: None,
             },
         );
     }

@@ -1149,6 +1149,7 @@ mod tests {
                 proxy: String::new(),
                 provider_type: Some(provider_type),
                 copilot: None,
+                chatgpt: None,
             },
         );
 

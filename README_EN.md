@@ -128,6 +128,10 @@ enable_agent_marking = true             # Enable sub-agent traffic marking
 [providers.chatgpt]
 base_url = "https://chatgpt.com/backend-api/codex"
 
+[providers.chatgpt.chatgpt]
+originator = "opencode"
+user_agent = "opencode/claude-proxy"
+
 [model]
 default = "openai/gpt-4.1"
 reasoning = "openai/o4-mini"                    # Optional, synced as ANTHROPIC_REASONING_MODEL

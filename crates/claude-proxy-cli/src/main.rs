@@ -345,6 +345,7 @@ async fn handle_provider(action: ProviderAction) {
                     proxy,
                     provider_type: Some(provider_type.clone()),
                     copilot,
+                    chatgpt: None,
                 },
             );
 

@@ -12,10 +12,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use claude_proxy_config::Settings;
+use claude_proxy_config::{
+    Settings,
+    settings::{
+        ChatGptProviderConfig, DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT,
+        ProviderConfig,
+    },
+};
 use claude_proxy_core::*;
 use futures::stream::BoxStream;
-use reqwest::{Client, Response, StatusCode, header::HeaderMap};
+use reqwest::{
+    Client, Response, StatusCode,
+    header::{HeaderMap, HeaderValue},
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -103,6 +112,12 @@ struct CachedRateLimits {
     fetched_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone)]
+struct ChatGptRequestHeaders {
+    originator: HeaderValue,
+    user_agent: HeaderValue,
+}
+
 pub use auth::{ChatGptAuth, ChatGptToken, DeviceCodeInfo};
 
 pub struct ChatGptProvider {
@@ -111,6 +126,7 @@ pub struct ChatGptProvider {
     endpoint: String,
     usage_endpoint: String,
     installation_id: String,
+    request_headers: ChatGptRequestHeaders,
     auth: Arc<ChatGptAuth>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
 }
@@ -118,19 +134,20 @@ pub struct ChatGptProvider {
 impl ChatGptProvider {
     pub async fn new(
         id: &str,
-        base_url: &str,
-        proxy: &str,
+        config: &ProviderConfig,
         settings: &Settings,
     ) -> Result<Self, ProviderError> {
-        let http_client = build_http_client(proxy, settings)?;
+        let http_client = build_http_client(&config.proxy, settings)?;
         let auth = ChatGptAuth::new(http_client.clone()).await?;
+        let chatgpt_config = config.chatgpt.clone().unwrap_or_default();
 
         Ok(Self {
             id: id.to_string(),
             http_client,
-            endpoint: codex_responses_endpoint(base_url),
-            usage_endpoint: codex_usage_endpoint(base_url),
+            endpoint: codex_responses_endpoint(&config.base_url),
+            usage_endpoint: codex_usage_endpoint(&config.base_url),
             installation_id: chatgpt_installation_id(),
+            request_headers: chatgpt_request_headers(&chatgpt_config)?,
             auth,
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
@@ -149,8 +166,8 @@ impl ChatGptProvider {
             .post(&self.endpoint)
             .bearer_auth(&token.access_token)
             .header("Content-Type", "application/json")
-            .header("originator", "opencode")
-            .header("User-Agent", "opencode/claude-proxy");
+            .header("originator", self.request_headers.originator.clone())
+            .header("User-Agent", self.request_headers.user_agent.clone());
 
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
@@ -169,7 +186,7 @@ impl ChatGptProvider {
             .http_client
             .get(&self.usage_endpoint)
             .bearer_auth(&token.access_token)
-            .header("User-Agent", "opencode/claude-proxy");
+            .header("User-Agent", self.request_headers.user_agent.clone());
 
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
@@ -342,6 +359,42 @@ impl Provider for ChatGptProvider {
             }
         }
     }
+}
+
+fn chatgpt_request_headers(
+    config: &ChatGptProviderConfig,
+) -> Result<ChatGptRequestHeaders, ProviderError> {
+    Ok(ChatGptRequestHeaders {
+        originator: chatgpt_header_value(
+            "originator",
+            &config.originator,
+            DEFAULT_CHATGPT_ORIGINATOR,
+        )?,
+        user_agent: chatgpt_header_value(
+            "User-Agent",
+            &config.user_agent,
+            DEFAULT_CHATGPT_USER_AGENT,
+        )?,
+    })
+}
+
+fn chatgpt_header_value(
+    header_name: &str,
+    configured_value: &str,
+    default_value: &'static str,
+) -> Result<HeaderValue, ProviderError> {
+    let value = configured_value.trim();
+    let value = if value.is_empty() {
+        default_value
+    } else {
+        value
+    };
+
+    HeaderValue::from_str(value).map_err(|error| {
+        ProviderError::InvalidRequest(format!(
+            "invalid ChatGPT {header_name} header value: {error}"
+        ))
+    })
 }
 
 fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, ProviderError> {
@@ -1013,6 +1066,30 @@ mod tests {
 
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn chatgpt_request_headers_use_configured_values_and_default_empty_values() {
+        let config = claude_proxy_config::settings::ChatGptProviderConfig {
+            originator: "codex_cli".to_string(),
+            user_agent: "CodexCLI/1.2.3".to_string(),
+        };
+
+        let headers = chatgpt_request_headers(&config).unwrap();
+        assert_eq!(headers.originator.to_str().unwrap(), "codex_cli");
+        assert_eq!(headers.user_agent.to_str().unwrap(), "CodexCLI/1.2.3");
+
+        let config = claude_proxy_config::settings::ChatGptProviderConfig {
+            originator: "  ".to_string(),
+            user_agent: "\t".to_string(),
+        };
+
+        let headers = chatgpt_request_headers(&config).unwrap();
+        assert_eq!(headers.originator.to_str().unwrap(), "opencode");
+        assert_eq!(
+            headers.user_agent.to_str().unwrap(),
+            "opencode/claude-proxy"
+        );
     }
 
     #[test]

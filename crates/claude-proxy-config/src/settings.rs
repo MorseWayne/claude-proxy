@@ -44,6 +44,9 @@ pub struct ProviderConfig {
     /// Copilot-specific OAuth and optimization configuration.
     #[serde(default)]
     pub copilot: Option<CopilotProviderConfig>,
+    /// ChatGPT-specific Codex request configuration.
+    #[serde(default)]
+    pub chatgpt: Option<ChatGptProviderConfig>,
 }
 
 impl ProviderConfig {
@@ -87,6 +90,37 @@ pub struct CopilotProviderConfig {
     /// Enable /responses routing when Copilot reports model support.
     #[serde(default = "default_true")]
     pub enable_responses_api: bool,
+}
+
+pub const DEFAULT_CHATGPT_ORIGINATOR: &str = "opencode";
+pub const DEFAULT_CHATGPT_USER_AGENT: &str = "opencode/claude-proxy";
+
+/// ChatGPT provider configuration (OAuth + Codex backend request metadata).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGptProviderConfig {
+    /// originator header sent to ChatGPT Codex requests.
+    #[serde(default = "default_chatgpt_originator")]
+    pub originator: String,
+    /// User-Agent header sent to ChatGPT Codex requests.
+    #[serde(default = "default_chatgpt_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for ChatGptProviderConfig {
+    fn default() -> Self {
+        Self {
+            originator: default_chatgpt_originator(),
+            user_agent: default_chatgpt_user_agent(),
+        }
+    }
+}
+
+fn default_chatgpt_originator() -> String {
+    DEFAULT_CHATGPT_ORIGINATOR.to_string()
+}
+
+fn default_chatgpt_user_agent() -> String {
+    DEFAULT_CHATGPT_USER_AGENT.to_string()
 }
 
 fn default_oauth_app() -> String {
@@ -1027,6 +1061,26 @@ auth_token = "test-token"
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.port, 9090);
         assert_eq!(settings.server.auth_token, "test-token");
+    }
+
+    #[test]
+    fn chatgpt_provider_config_parses_codex_header_overrides() {
+        let toml = r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[providers.chatgpt.chatgpt]
+originator = "codex_cli"
+user_agent = "CodexCLI/1.2.3"
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let provider = settings.providers.get("chatgpt").unwrap();
+        let chatgpt = provider.chatgpt.as_ref().unwrap();
+
+        assert_eq!(chatgpt.originator, "codex_cli");
+        assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
     }
 
     #[test]

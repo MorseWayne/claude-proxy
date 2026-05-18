@@ -573,6 +573,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                     proxy: String::new(),
                                     provider_type: Some(provider_type),
                                     copilot,
+                                    chatgpt: None,
                                 },
                             );
                             app.mark_dirty();
