@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">claude-proxy TUI ChatGPT OAuth 设备码认证</title>
+  <desc id="desc">终端 TUI 中 ChatGPT OAuth 设备码认证弹窗的示例截图。</desc>
+  <defs>
+    <style>
+      .bg{fill:#0b1020}.panel{fill:#111827;stroke:#334155;stroke-width:2}.panel2{fill:#0f172a;stroke:#38bdf8;stroke-width:2}.muted{fill:#94a3b8}.text{fill:#e5e7eb}.accent{fill:#22d3ee}.accent2{fill:#a7f3d0}.warn{fill:#fbbf24}.key{fill:#0b1020}.keybg{fill:#22d3ee}.overlay{fill:#020617;stroke:#22d3ee;stroke-width:2}.ok{fill:#34d399}.mono{font-family:"JetBrains Mono","Cascadia Mono","SFMono-Regular",Consolas,monospace;font-size:23px}.small{font-size:19px}.title{font-size:26px;font-weight:700}.bold{font-weight:700}
+    </style>
+  </defs>
+  <rect class="bg" width="1200" height="720"/>
+  <rect class="panel" x="24" y="24" width="1152" height="60" rx="6"/>
+  <text class="mono title text" x="48" y="62">⬡ claude-proxy ●</text>
+  <rect x="850" y="38" width="132" height="32" rx="5" fill="#1f2937"/>
+  <text class="mono small text" x="869" y="61">1 providers</text>
+  <rect x="996" y="38" width="152" height="32" rx="5" fill="#22d3ee"/>
+  <text class="mono small key bold" x="1016" y="61">chatgpt/gpt-5.3-codex</text>
+
+  <rect class="panel" x="24" y="96" width="230" height="560" rx="6"/>
+  <text class="mono small accent bold" x="48" y="130">Menu</text>
+  <text class="mono muted" x="48" y="177">◉ Dashboard</text>
+  <text class="mono text bold" x="48" y="221">▶ ◆ Providers</text>
+  <text class="mono muted" x="48" y="265">⬡ Server</text>
+  <text class="mono muted" x="48" y="309">⏻ Limits</text>
+  <text class="mono muted" x="48" y="353">↗ HTTP</text>
+  <text class="mono muted" x="48" y="397">☰ Logging</text>
+  <text class="mono muted" x="48" y="441">◇ Model</text>
+  <text class="mono muted" x="48" y="485">⚙ System</text>
+
+  <rect class="panel2" x="278" y="96" width="898" height="560" rx="6"/>
+  <rect class="panel" x="304" y="128" width="305" height="494" rx="6"/>
+  <text class="mono small muted" x="328" y="164">Providers</text>
+  <rect x="322" y="186" width="260" height="42" rx="4" fill="#22d3ee"/>
+  <text class="mono key bold" x="342" y="215">chatgpt  [checking]</text>
+  <rect class="panel" x="630" y="128" width="520" height="494" rx="6"/>
+  <text class="mono small muted" x="654" y="164">Detail</text>
+  <text class="mono muted" x="654" y="214">API Key</text>
+  <text class="mono text" x="846" y="214">OAuth (auto)</text>
+  <text class="mono muted" x="654" y="258">Base URL</text>
+  <text class="mono text" x="846" y="258">https://chatgpt.com/backend-api/codex</text>
+  <text class="mono muted" x="654" y="302">Proxy</text>
+  <text class="mono text" x="846" y="302">(none)</text>
+
+  <rect class="overlay" x="310" y="168" width="820" height="368" rx="10"/>
+  <text class="mono title text" x="350" y="214">ChatGPT OAuth</text>
+  <text class="mono muted" x="350" y="258">1. 复制验证码，打开验证页面登录 ChatGPT。</text>
+  <text class="mono muted" x="350" y="296">2. 授权成功后，TUI 会自动保存 OAuth token。</text>
+  <text class="mono accent bold" x="350" y="354">Verification URL</text>
+  <rect x="350" y="374" width="708" height="44" rx="5" fill="#111827" stroke="#334155"/>
+  <text class="mono text" x="372" y="404">https://chatgpt.com/activate</text>
+  <text class="mono accent bold" x="350" y="459">User Code</text>
+  <rect x="350" y="479" width="310" height="44" rx="5" fill="#22d3ee"/>
+  <text class="mono key bold" x="373" y="510">ABCD-EFGH</text>
+  <text class="mono small ok" x="690" y="508">Polling after authorization...</text>
+
+  <rect x="24" y="668" width="1152" height="32" fill="#0f766e"/>
+  <text class="mono small text" x="44" y="691"> c copy code  u copy url  Esc cancel</text>
+</svg>

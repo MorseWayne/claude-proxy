@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">claude-proxy TUI 添加 ChatGPT Provider</title>
+  <desc id="desc">终端 TUI 中在 Providers 页面选择 ChatGPT provider 的示例截图。</desc>
+  <defs>
+    <style>
+      .bg{fill:#0b1020}.panel{fill:#111827;stroke:#334155;stroke-width:2}.panel2{fill:#0f172a;stroke:#38bdf8;stroke-width:2}.muted{fill:#94a3b8}.text{fill:#e5e7eb}.accent{fill:#22d3ee}.accent2{fill:#a7f3d0}.warn{fill:#fbbf24}.key{fill:#0b1020}.keybg{fill:#22d3ee}.overlay{fill:#020617;stroke:#22d3ee;stroke-width:2}.mono{font-family:"JetBrains Mono","Cascadia Mono","SFMono-Regular",Consolas,monospace;font-size:23px}.small{font-size:19px}.title{font-size:26px;font-weight:700}.bold{font-weight:700}
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1200" height="720" rx="0"/>
+  <rect class="panel" x="24" y="24" width="1152" height="60" rx="6"/>
+  <text class="mono title text" x="48" y="62">⬡ claude-proxy</text>
+  <rect x="850" y="38" width="132" height="32" rx="5" fill="#1f2937"/>
+  <text class="mono small text" x="869" y="61">0 providers</text>
+  <rect x="996" y="38" width="152" height="32" rx="5" fill="#22d3ee"/>
+  <text class="mono small key bold" x="1016" y="61">openai/gpt-4.1</text>
+
+  <rect class="panel" x="24" y="96" width="230" height="560" rx="6"/>
+  <text class="mono small accent bold" x="48" y="130">Menu</text>
+  <text class="mono muted" x="48" y="177">◉ Dashboard</text>
+  <text class="mono text bold" x="48" y="221">▶ ◆ Providers</text>
+  <text class="mono muted" x="48" y="265">⬡ Server</text>
+  <text class="mono muted" x="48" y="309">⏻ Limits</text>
+  <text class="mono muted" x="48" y="353">↗ HTTP</text>
+  <text class="mono muted" x="48" y="397">☰ Logging</text>
+  <text class="mono muted" x="48" y="441">◇ Model</text>
+  <text class="mono muted" x="48" y="485">⚙ System</text>
+
+  <rect class="panel2" x="278" y="96" width="898" height="560" rx="6"/>
+  <text class="mono title text" x="310" y="138">Providers</text>
+  <text class="mono text bold" x="322" y="215">No providers configured</text>
+  <text class="mono muted" x="322" y="262">Add a provider to get started.</text>
+  <rect class="keybg" x="322" y="305" width="36" height="32" rx="4"/>
+  <text class="mono small key bold" x="335" y="328">a</text>
+  <text class="mono text" x="374" y="328">Add provider</text>
+
+  <rect class="overlay" x="360" y="178" width="720" height="356" rx="10"/>
+  <text class="mono title text" x="397" y="222">Add Provider — Select Type</text>
+  <text class="mono muted" x="397" y="267">↑↓ / j k 选择，Enter 确认，Esc 取消</text>
+  <text class="mono muted" x="418" y="316">OpenAI — API key</text>
+  <text class="mono muted" x="418" y="356">Anthropic — API key</text>
+  <text class="mono muted" x="418" y="396">GitHub Copilot — OAuth, no API key needed</text>
+  <rect x="394" y="415" width="628" height="44" rx="5" fill="#22d3ee"/>
+  <text class="mono key bold" x="418" y="445">▸ ChatGPT — ChatGPT OAuth</text>
+  <text class="mono muted" x="418" y="492">OpenRouter — API key, OpenAI-compatible</text>
+
+  <rect x="24" y="668" width="1152" height="32" fill="#0f766e"/>
+  <text class="mono small text" x="44" y="691"> ←→ menu/content  ↑↓ move   Enter select  Esc cancel</text>
+</svg>

@@ -226,6 +226,137 @@ TUI 提供 8 个页面：Dashboard、Providers、Server、Limits、HTTP、Loggin
 - 管理 Provider、默认模型、服务器监听地址、限流、HTTP 超时和日志开关。
 - 在终端里完成配置编辑，避免手动修改 TOML 时漏字段。
 
+### 用 TUI 完整配置 ChatGPT
+
+下面以 ChatGPT provider 为例，从零完成 provider、OAuth、模型路由、服务端口和 Claude Code 环境同步配置。
+
+#### 1. 启动 TUI 并进入 Providers
+
+```bash
+claude-proxy tui
+```
+
+- 用 `↑↓` 选择左侧菜单的 **Providers**，按 `Enter` 进入内容区。
+- 在 Providers 页按 `a` 添加 provider。
+- 在弹出的 **Add Provider — Select Type** 中选择 `ChatGPT — ChatGPT OAuth`，按 `Enter`。
+
+![TUI 添加 ChatGPT Provider](images/tui-chatgpt-add-provider.svg)
+
+#### 2. 完成 ChatGPT OAuth 登录
+
+选择 ChatGPT 后，TUI 会自动创建 `chatgpt` provider，并立即进入 OAuth 设备码流程：
+
+- 弹窗中会显示验证地址和一次性 user code。
+- 按 `u` 可复制验证地址，按 `c` 可复制 user code。
+- 在浏览器中打开验证地址，登录 ChatGPT Pro/Plus 账号并确认授权。
+- 授权完成后，TUI 会自动保存 OAuth token；后续也可以在 Providers 页选中 `chatgpt` 后按 `o` 重新认证。
+
+![TUI ChatGPT OAuth 设备码](images/tui-chatgpt-oauth.svg)
+
+ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `OAuth (auto)`，不需要手动填写。通常只需要确认：
+
+| 字段 | 推荐值 | 说明 |
+|------|--------|------|
+| `API Key` | `OAuth (auto)` | ChatGPT provider 自动维护 token |
+| `Base URL` | `https://chatgpt.com/backend-api/codex` | 默认值即可 |
+| `Proxy` | 留空或代理地址 | 需要 HTTP/SOCKS 代理时填写 |
+
+如果需要修改 `Base URL` 或 `Proxy`：在 Providers 详情页按 `→` / `Enter` 进入详情，移动到字段后按 `e` 编辑，确认后按 `Ctrl+S` 保存。
+
+#### 3. 设置默认模型和 Claude 模型别名
+
+进入左侧 **Model** 页面，为 Claude Code 常用模型名配置路由。字段格式都是：
+
+```text
+provider_id/model_name
+```
+
+ChatGPT provider 的 provider id 默认为 `chatgpt`。可以先把所有别名都指到同一个 ChatGPT Codex 模型，例如：
+
+```toml
+[model]
+default = "chatgpt/gpt-5.3-codex"
+reasoning = "chatgpt/gpt-5.3-codex"
+opus = "chatgpt/gpt-5.3-codex"
+sonnet = "chatgpt/gpt-5.3-codex"
+haiku = "chatgpt/gpt-5.3-codex"
+```
+
+在 TUI 中编辑方式：
+
+- 在 **Model** 页选择 `Default`、`Reasoning`、`Opus Alias`、`Sonnet Alias` 或 `Haiku Alias`。
+- 按 `e` / `Enter` 后，先选择 `chatgpt` provider。
+- TUI 会拉取模型列表；选择目标模型后按 `Enter` 写入字段。
+- 重复设置需要的 alias，最后按 `Ctrl+S` 保存。
+
+![TUI 设置 ChatGPT 模型别名](images/tui-chatgpt-model-aliases.svg)
+
+> 如果拉取模型列表失败，先回到 Providers 页选中 `chatgpt` 按 `t` 做连通性检查；如果 OAuth 过期，按 `o` 重新登录。
+
+#### 4. 配置本地服务和 Claude Code 连接参数
+
+进入 **Server** 页面确认本地代理监听参数：
+
+| 字段 | 示例 | 说明 |
+|------|------|------|
+| `Host` | `127.0.0.1` | 只给本机 Claude Code 使用时推荐保留本地地址 |
+| `Port` | `8082` | 本地代理端口 |
+| `Auth Token` | `freecc` | Claude Code 连接本地代理时使用的 API key |
+| `Admin Token` | 留空或自定义 | 管理接口 token；留空时复用 `Auth Token` |
+
+按 `Ctrl+S` 保存后，TUI 会写入 `~/.config/claude-proxy/config.toml`，并同步 Claude Code 配置里的环境变量：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+    "ANTHROPIC_API_KEY": "freecc",
+    "ANTHROPIC_MODEL": "chatgpt/gpt-5.3-codex",
+    "ANTHROPIC_REASONING_MODEL": "chatgpt/gpt-5.3-codex",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "chatgpt/gpt-5.3-codex",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "chatgpt/gpt-5.3-codex",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "chatgpt/gpt-5.3-codex",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+  }
+}
+```
+
+#### 5. 启动服务并验证
+
+退出 TUI 后启动代理：
+
+```bash
+claude-proxy server start
+```
+
+再用 Claude Code 或任意 Anthropic Messages API 客户端访问本地代理。请求模型名可以直接使用：
+
+- `chatgpt/gpt-5.3-codex`：精确路由到 ChatGPT provider。
+- `opus` / `sonnet` / `haiku` / `reasoning`：由上面的 alias 路由到 ChatGPT。
+
+如果要确认配置是否生效：
+
+```bash
+claude-proxy provider list
+claude-proxy provider current
+claude-proxy provider test chatgpt
+claude-proxy config show
+```
+
+常用按键速查：
+
+| 按键 | 作用 |
+|------|------|
+| `↑↓` / `j k` | 移动选择 |
+| `←→` / `h l` | 左侧菜单和内容区切换；Providers 页也用于列表/详情切换 |
+| `a` | 添加 provider |
+| `e` / `Enter` | 编辑当前字段或进入详情 |
+| `t` | 测试当前 provider |
+| `o` | OAuth provider 重新认证 |
+| `Space` | Logging 页切换布尔开关 |
+| `Ctrl+S` | 保存配置并同步 Claude Code 环境变量 |
+| `Esc` / `q` | 返回或退出；有未保存改动时会提示保存 |
+
 ## 配置文件
 
 路径：`~/.config/claude-proxy/config.toml`

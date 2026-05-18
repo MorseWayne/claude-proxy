@@ -4,6 +4,38 @@
 
 ## Active（进行中）
 
+### WF-2026-05-18-001 — README ChatGPT TUI 配置文档
+
+Status: Active（进行中）
+Level: 2
+Started: 2026-05-18
+Updated: 2026-05-18
+Current phase: Phase 1 — README TUI guide and screenshots
+
+Goal（目标）:
+
+- 完善 README 中 TUI 模式完整配置说明，以 ChatGPT provider 为例覆盖添加 provider、OAuth、模型别名、Server 参数、保存同步和验证命令。
+
+#### Phase 1 — README TUI guide and screenshots
+Status: Done
+Depends on:
+- None
+Tasks:
+- [x] 用 GitNexus 和源码核对 TUI provider/OAuth/model/server 配置流程。
+- [x] 新增 ChatGPT TUI 配置说明和本地 SVG 截图。
+- [x] 验证 README 链接、SVG 文件存在性、GitNexus detect_changes，并提交与刷新索引。
+
+Acceptance / Review:
+- Review: README 已新增 ChatGPT TUI 完整配置流程，覆盖 Providers 添加、OAuth 设备码、模型别名、Server 参数、保存同步 Claude Code env、启动服务与验证命令；新增 3 张本地 SVG TUI 截图。
+- Validation: `git diff --check` 通过；README 中 3 个新增图片引用均已确认对应文件存在；3 个新增 SVG 已通过 Windows Python `xml.etree.ElementTree` XML 解析。
+- GitNexus: `detect_changes(scope=all)` 返回 LOW，affected_count=0，affected_processes=[]；同时检测到本任务外已有 AGENTS.md / CLAUDE.md 等未提交改动。
+- Tests: 文档和 SVG 资源变更，无 Rust 测试运行。
+- Gaps: SVG 为按当前 TUI 实现绘制的示例截图，未执行真实 ChatGPT OAuth 登录截图以避免账号信息泄露。
+
+Resume next（下次继续）:
+
+- 提交本次文档变更并运行 `npx gitnexus analyze` 刷新索引。
+
 ### WF-2026-05-17-005 — WebSearch tool_choice 兼容修复
 
 Status: Active（进行中）
