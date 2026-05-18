@@ -4,6 +4,43 @@
 
 ## Active（进行中）
 
+### WF-2026-05-18-002 — Claude onboarding 跳过同步
+
+Status: Active（进行中）
+Level: 2
+Started: 2026-05-18
+Updated: 2026-05-18
+Current phase: Phase 1 — 实现与验证
+
+Goal（目标）:
+
+- 在保存模型配置并同步 Claude Code 设置时，自动写入 Claude Code onboarding 完成标记，避免 Claude Code 下次启动进入首次登录/初始化流程。
+
+#### Phase 1 — 实现与验证
+
+Status: Done
+Depends on:
+
+- None
+
+Tasks:
+
+- [x] 定位 TUI 模型配置保存与 Claude Code settings 同步路径。
+- [x] 增量写入 Claude 用户级配置 `hasCompletedOnboarding = true`，保留原有字段。
+- [x] 补充回归测试并运行相关验证。
+
+Acceptance / Review:
+
+- Review: 已在 TUI 保存模型配置路径接入 Claude onboarding 完成标记写入；保留 `~/.claude.json` 既有字段。
+- Validation: `cargo fmt --check` 通过；`cargo test -p claude-proxy-cli` 通过；`cargo test` 受本任务外 `claude-proxy-server` 既有编译错误阻塞。
+- GitNexus: MCP context 当前被用户禁用；已使用 `npx gitnexus impact` CLI 检查 `sync_claude_code_settings` / `apply_claude_code_env`，风险 LOW；`npx gitnexus detect-changes --scope staged --repo claude-proxy` 返回 MEDIUM，影响 TUI 保存链路 `Handle_key → Config_file_path` / `Handle_key → To_toml`。
+- Tests: 新增 onboarding 标记创建、保留字段、非对象拒绝、路径推导、触发时机测试。
+- Gaps: 工作区存在本任务外未提交改动与 server 编译错误，未在本任务中修改。
+
+Resume next（下次继续）:
+
+- 完成实现、验证、提交并刷新 GitNexus 索引。
+
 ### WF-2026-05-18-001 — README ChatGPT TUI 配置文档
 
 Status: Active（进行中）

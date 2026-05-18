@@ -5,7 +5,7 @@ pub mod ui;
 pub mod widgets;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -1508,19 +1508,23 @@ enum SaveOutcome {
 
 fn save_settings(app: &App) -> Result<SaveOutcome, String> {
     let path = Settings::config_file_path().unwrap_or_else(|| PathBuf::from("config.toml"));
+    let mark_onboarding_complete = should_mark_claude_onboarding_complete_on_save(app, &path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create config directory: {e}"))?;
     }
     std::fs::write(&path, app.settings.to_toml())
         .map_err(|e| format!("failed to save config: {e}"))?;
-    match sync_claude_code_settings(&app.settings) {
+    match sync_claude_code_settings(&app.settings, mark_onboarding_complete) {
         Ok(path) => Ok(SaveOutcome::Synced(path)),
         Err(err) => Ok(SaveOutcome::ConfigSavedSyncFailed(err)),
     }
 }
 
-fn sync_claude_code_settings(settings: &Settings) -> Result<PathBuf, String> {
+fn sync_claude_code_settings(
+    settings: &Settings,
+    mark_onboarding_complete: bool,
+) -> Result<PathBuf, String> {
     let path = claude_code_settings_path()?;
     let mut value = if path.exists() {
         let content = std::fs::read_to_string(&path)
@@ -1545,7 +1549,90 @@ fn sync_claude_code_settings(settings: &Settings) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to serialize Claude Code settings: {e}"))?;
     std::fs::write(&path, format!("{content}\n"))
         .map_err(|e| format!("failed to write Claude Code settings: {e}"))?;
+    if mark_onboarding_complete {
+        mark_claude_onboarding_complete()?;
+    }
     Ok(path)
+}
+
+fn should_mark_claude_onboarding_complete_on_save(app: &App, config_path: &Path) -> bool {
+    if app.nav == NavItem::Model {
+        return true;
+    }
+
+    if config_path.exists() {
+        return Settings::load(config_path)
+            .map(|existing| !same_model_config(&existing, &app.settings))
+            .unwrap_or(false);
+    }
+
+    !same_model_config(&Settings::default(), &app.settings)
+}
+
+fn same_model_config(left: &Settings, right: &Settings) -> bool {
+    left.model.default == right.model.default
+        && left.model.reasoning == right.model.reasoning
+        && left.model.opus == right.model.opus
+        && left.model.sonnet == right.model.sonnet
+        && left.model.haiku == right.model.haiku
+}
+
+fn mark_claude_onboarding_complete() -> Result<PathBuf, String> {
+    let path = claude_code_user_config_path()?;
+    mark_claude_onboarding_complete_at(&path)?;
+    Ok(path)
+}
+
+fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
+    let mut value = if path.exists() {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read Claude user config: {e}"))?;
+        if content.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse Claude user config JSON: {e}"))?
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    if !value.is_object() {
+        return Err("Claude user config root must be a JSON object".to_string());
+    }
+    let root = value.as_object_mut().expect("value is an object");
+    root.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create Claude user config directory: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to serialize Claude user config: {e}"))?;
+    std::fs::write(path, format!("{content}\n"))
+        .map_err(|e| format!("failed to write Claude user config: {e}"))?;
+    Ok(())
+}
+
+fn claude_code_user_config_path() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && !dir.to_string_lossy().trim().is_empty() {
+            return claude_user_config_path_for_dir(&dir);
+        }
+    }
+
+    home_dir()
+        .map(|home| home.join(".claude.json"))
+        .ok_or_else(|| "could not determine home directory for Claude user config".to_string())
+}
+
+fn claude_user_config_path_for_dir(dir: &Path) -> Result<PathBuf, String> {
+    let file_name = dir
+        .file_name()
+        .ok_or_else(|| "CLAUDE_CONFIG_DIR must point to a named directory".to_string())?;
+    let parent = dir.parent().unwrap_or_else(|| Path::new(""));
+    Ok(parent.join(format!("{}.json", file_name.to_string_lossy())))
 }
 
 fn claude_code_settings_path() -> Result<PathBuf, String> {
@@ -1841,6 +1928,18 @@ mod tests {
     use super::*;
     use claude_proxy_config::settings::{ModelConfig, ServerConfig};
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "claude-proxy-{name}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn claude_code_env_sync_sets_proxy_and_model_keys() {
@@ -1948,6 +2047,106 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    }
+
+    #[test]
+    fn onboarding_skip_preserves_existing_user_config_fields() {
+        let dir = temp_path("onboarding-preserve");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "mcpServers": { "existing": { "command": "echo" } },
+  "theme": "dark",
+  "hasCompletedOnboarding": false
+}"#,
+        )
+        .unwrap();
+
+        mark_claude_onboarding_complete_at(&path).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+        assert_eq!(
+            value["mcpServers"]["existing"]["command"].as_str(),
+            Some("echo")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onboarding_skip_creates_user_config_when_missing() {
+        let dir = temp_path("onboarding-create");
+        let path = dir.join(".claude.json");
+
+        mark_claude_onboarding_complete_at(&path).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onboarding_skip_rejects_non_object_user_config() {
+        let dir = temp_path("onboarding-non-object");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+
+        let err = mark_claude_onboarding_complete_at(&path).unwrap_err();
+
+        assert!(err.contains("root must be a JSON object"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_path_derives_from_config_dir() {
+        assert_eq!(
+            claude_user_config_path_for_dir(Path::new("/tmp/custom/.claude")).unwrap(),
+            PathBuf::from("/tmp/custom/.claude.json")
+        );
+        assert_eq!(
+            claude_user_config_path_for_dir(Path::new("/tmp/claude-config")).unwrap(),
+            PathBuf::from("/tmp/claude-config.json")
+        );
+    }
+
+    #[test]
+    fn onboarding_skip_triggers_on_model_page_or_changed_model() {
+        let dir = temp_path("onboarding-trigger");
+        let config_path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut model_page_app = App::new(Settings::default());
+        model_page_app.nav = NavItem::Model;
+        assert!(should_mark_claude_onboarding_complete_on_save(
+            &model_page_app,
+            &config_path
+        ));
+
+        let existing = Settings::default();
+        std::fs::write(&config_path, existing.to_toml()).unwrap();
+        let mut unchanged_app = App::new(existing.clone());
+        unchanged_app.nav = NavItem::Providers;
+        assert!(!should_mark_claude_onboarding_complete_on_save(
+            &unchanged_app,
+            &config_path
+        ));
+
+        let mut changed_app = App::new(existing);
+        changed_app.nav = NavItem::Providers;
+        changed_app.settings.model.default = "openai/gpt-5".to_string();
+        assert!(should_mark_claude_onboarding_complete_on_save(
+            &changed_app,
+            &config_path
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
