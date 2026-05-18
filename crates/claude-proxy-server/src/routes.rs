@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use claude_proxy_config::settings::ProviderType;
 use claude_proxy_core::*;
@@ -349,12 +349,8 @@ async fn acquire_request_permit(
     state: &AppState,
     start: std::time::Instant,
 ) -> Result<OwnedSemaphorePermit, Response> {
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        state.concurrency_semaphore.clone().acquire_owned(),
-    )
-    .await
-    {
+    let semaphore = state.concurrency_semaphore.read().await.clone();
+    match tokio::time::timeout(Duration::from_secs(10), semaphore.acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => {
             error!("Semaphore closed unexpectedly");
@@ -460,10 +456,10 @@ async fn join_inflight_non_stream(
     mut receiver: tokio::sync::broadcast::Receiver<InflightEvent>,
     _request_permit: OwnedSemaphorePermit,
 ) -> Response {
-    let mut last_event = None;
+    let mut events = Vec::new();
     loop {
         match receiver.recv().await {
-            Ok(InflightEvent::Event(event)) => last_event = Some(event),
+            Ok(InflightEvent::Event(event)) => events.push(event),
             Ok(InflightEvent::Done) | Err(_) => break,
             Ok(InflightEvent::Error(msg)) => {
                 return error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&msg));
@@ -471,8 +467,8 @@ async fn join_inflight_non_stream(
         }
     }
 
-    let response_data = last_event
-        .map(|e| e.data)
+    let response_data = crate::non_stream::response_from_events(&events)
+        .or_else(|| events.last().map(|e| e.data.clone()))
         .unwrap_or(json!({"error": "no response from provider"}));
     Json(response_data).into_response()
 }
@@ -551,14 +547,14 @@ async fn collect_leader_response(
     _permits: StreamPermits,
     start: std::time::Instant,
 ) -> Response {
-    let mut last_event = None;
+    let mut events = Vec::new();
     let mut usage = TokenUsage::default();
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => {
                 extract_usage_from_event(&event.data, &mut usage);
                 let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
-                last_event = Some(event);
+                events.push(event);
             }
             Err(e) => {
                 let _ = broadcast_tx.send(InflightEvent::Error(e.to_string()));
@@ -574,8 +570,8 @@ async fn collect_leader_response(
     let _ = broadcast_tx.send(InflightEvent::Done);
     state.inflight.lock().await.remove(&request_hash);
 
-    let response_data = last_event
-        .map(|e| e.data)
+    let response_data = crate::non_stream::response_from_events(&events)
+        .or_else(|| events.last().map(|e| e.data.clone()))
         .unwrap_or(json!({"error": "no response from provider"}));
 
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -717,14 +713,11 @@ pub async fn admin_update_config(
                 );
             }
 
-            let mut settings = state.settings.write().await;
-            *settings = new_settings.clone();
-            let mut registry = state.provider_registry.write().await;
-            registry.clear();
-            state.provider_concurrency_semaphores.lock().await.clear();
+            let config_toml = new_settings.to_toml();
+            state.apply_settings(new_settings).await;
 
             if let Some(path) = claude_proxy_config::Settings::config_file_path()
-                && let Err(e) = std::fs::write(&path, new_settings.to_toml())
+                && let Err(e) = std::fs::write(&path, config_toml)
             {
                 error!("Failed to write config to disk: {e}");
             }
@@ -753,11 +746,13 @@ pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) ->
     if let Some(path) = claude_proxy_config::Settings::config_file_path() {
         match claude_proxy_config::Settings::load(&path) {
             Ok(new_settings) => {
-                let mut settings = state.settings.write().await;
-                *settings = new_settings;
-                let mut registry = state.provider_registry.write().await;
-                registry.clear();
-                state.provider_concurrency_semaphores.lock().await.clear();
+                if let Err(e) = new_settings.validate() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorResponse::invalid_request(&format!("validation failed: {e}")),
+                    );
+                }
+                state.apply_settings(new_settings).await;
                 info!("Config reloaded via admin restart");
                 Json(json!({"status": "reloaded"})).into_response()
             }
@@ -805,6 +800,33 @@ fn format_sse_event(event: &SseEvent) -> String {
     }
 }
 
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn overloaded_error(message: &str) -> ErrorResponse {
+    ErrorResponse {
+        r#type: "error".to_string(),
+        error: AnthropicError {
+            error_type: "overloaded_error".to_string(),
+            message: message.to_string(),
+        },
+    }
+}
+
+fn overloaded_response(message: &str, retry_after: Option<u64>) -> Response {
+    let mut response = error_response(overloaded_status(), &overloaded_error(message));
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("true"));
+    if let Some(secs) = retry_after
+        && let Ok(header_value) = HeaderValue::from_str(&secs.to_string())
+    {
+        response.headers_mut().insert("retry-after", header_value);
+    }
+    response
+}
+
 fn provider_error_to_response(error: &ProviderError) -> Response {
     match error {
         ProviderError::Authentication(msg) => error_response(
@@ -834,18 +856,7 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
         ProviderError::Overloaded {
             message,
             retry_after,
-        } => {
-            let mut response = error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error(message),
-            );
-            if let Some(secs) = retry_after
-                && let Ok(header_value) = axum::http::HeaderValue::from_str(&secs.to_string())
-            {
-                response.headers_mut().insert("retry-after", header_value);
-            }
-            response
-        }
+        } => overloaded_response(message, *retry_after),
         ProviderError::ModelNotFound(msg) => {
             error_response(StatusCode::NOT_FOUND, &ErrorResponse::not_found(msg))
         }
@@ -883,10 +894,11 @@ fn upstream_error_to_response(status: u16, body: &str) -> Response {
             StatusCode::GATEWAY_TIMEOUT,
             &ErrorResponse::timeout(&message),
         ),
-        503 | 529 => error_response(
+        503 => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &ErrorResponse::api_error(&message),
         ),
+        529 => overloaded_response(&message, None),
         _ => error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&message)),
     }
 }
@@ -996,6 +1008,7 @@ impl<H: Hasher> io::Write for HashWriter<'_, H> {
 mod tests {
     use std::collections::HashMap;
 
+    use axum::body::to_bytes;
     use claude_proxy_config::settings::{
         AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelConfig, ProviderConfig,
         ProviderType, ServerConfig,
@@ -1097,6 +1110,48 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn provider_overloaded_maps_to_retryable_529_response() {
+        let response = provider_error_to_response(&ProviderError::Overloaded {
+            message: "upstream overloaded".to_string(),
+            retry_after: Some(3),
+        });
+
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            HeaderValue::from_static("3")
+        );
+        assert_eq!(
+            response.headers().get("x-should-retry").unwrap(),
+            HeaderValue::from_static("true")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[tokio::test]
+    async fn upstream_529_maps_to_overloaded_error_response() {
+        let response = upstream_error_to_response(
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"too busy"}}"#,
+        );
+
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(
+            response.headers().get("x-should-retry").unwrap(),
+            HeaderValue::from_static("true")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "too busy");
     }
 
     #[test]

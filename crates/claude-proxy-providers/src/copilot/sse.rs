@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::http::fmt_reqwest_err;
 use crate::provider::ProviderError;
+use crate::sse::{SseDecoder, parse_sse_frame};
 
 pub(super) fn stream_anthropic_sse_response(
     response: reqwest::Response,
@@ -13,16 +14,14 @@ pub(super) fn stream_anthropic_sse_response(
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
 
     tokio::spawn(async move {
-        let mut buffer = String::new();
+        let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
 
         while let Some(chunk_result) = byte_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let event_text = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
+                    decoder.push(&chunk);
+                    while let Some(event_text) = decoder.next_frame() {
                         if let Some(event) = parse_anthropic_sse_text(&event_text)
                             && tx.send(Ok(event)).await.is_err()
                         {
@@ -39,7 +38,9 @@ pub(super) fn stream_anthropic_sse_response(
             }
         }
 
-        if let Some(event) = parse_anthropic_sse_text(&buffer) {
+        if let Some(event_text) = decoder.finish()
+            && let Some(event) = parse_anthropic_sse_text(&event_text)
+        {
             let _ = tx.send(Ok(event)).await;
         }
     });
@@ -57,27 +58,11 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
 }
 
 fn parse_anthropic_sse_text(text: &str) -> Option<SseEvent> {
-    if text.trim().is_empty() {
-        return None;
-    }
-
-    let mut event_type = String::new();
-    let mut data = Value::Null;
-
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = rest.trim().to_string();
-        } else if let Some(rest) = line
-            .strip_prefix("data: ")
-            .or_else(|| line.strip_prefix("data:"))
-            && let Ok(parsed) = serde_json::from_str::<Value>(rest.trim())
-        {
-            data = parsed;
-        }
-    }
+    let frame = parse_sse_frame(text)?;
+    let data = serde_json::from_str::<Value>(frame.data.trim()).unwrap_or(Value::Null);
 
     Some(SseEvent {
-        event: event_type,
+        event: frame.event.unwrap_or_default(),
         data,
     })
 }

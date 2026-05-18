@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::provider::ProviderError;
+use crate::sse::{SseDecoder, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
 
 // --- SSE Conversion ---
@@ -71,7 +72,7 @@ pub(crate) fn stream_openai_response(
 
     tokio::spawn(async move {
         let mut converter = StreamConverter::new();
-        let mut buffer = String::new();
+        let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
 
         loop {
@@ -86,12 +87,8 @@ pub(crate) fn stream_openai_response(
 
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let event_str = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
-
+                    decoder.push(&chunk);
+                    while let Some(event_str) = decoder.next_frame() {
                         if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
                             let events = converter.process_chunk(&openai_chunk);
                             for event in events {
@@ -106,6 +103,16 @@ pub(crate) fn stream_openai_response(
                     let _ = tx
                         .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
                         .await;
+                    return;
+                }
+            }
+        }
+
+        if let Some(event_str) = decoder.finish()
+            && let Some(openai_chunk) = parse_openai_chunk(&event_str)
+        {
+            for event in converter.process_chunk(&openai_chunk) {
+                if tx.send(Ok(event)).await.is_err() {
                     return;
                 }
             }
@@ -528,19 +535,7 @@ impl StreamConverter {
 
 /// Parse raw SSE text into an OpenAI chunk.
 fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
-    let mut data_str = None;
-
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("data: ") {
-            let trimmed = rest.trim();
-            if trimmed == "[DONE]" {
-                return None;
-            }
-            data_str = Some(trimmed.to_string());
-        }
-    }
-
-    let data: Value = serde_json::from_str(&data_str?).ok()?;
+    let data = parse_sse_json_value(text)?;
 
     let id = data["id"].as_str().unwrap_or("").to_string();
     let model = data["model"].as_str().unwrap_or("").to_string();
@@ -759,6 +754,14 @@ mod tests {
     #[test]
     fn test_parse_openai_chunk_text() {
         let text = r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}"#;
+        let chunk = parse_openai_chunk(text).unwrap();
+        assert_eq!(chunk.id, "chatcmpl-123");
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn test_parse_openai_chunk_accepts_data_without_space() {
+        let text = r#"data:{"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
         let chunk = parse_openai_chunk(text).unwrap();
         assert_eq!(chunk.id, "chatcmpl-123");
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));

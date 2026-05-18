@@ -10,6 +10,7 @@ use crate::openai_compat::{
     default_adaptive_reasoning_effort, thinking_budget_to_reasoning_effort,
 };
 use crate::provider::ProviderError;
+use crate::sse::{SseDecoder, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
 
@@ -821,7 +822,7 @@ pub fn stream_responses_response(
 
     tokio::spawn(async move {
         let mut converter = ResponsesStreamConverter::new();
-        let mut buffer = String::new();
+        let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
 
         loop {
@@ -836,11 +837,8 @@ pub fn stream_responses_response(
 
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let event = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
-
+                    decoder.push(&chunk);
+                    while let Some(event) = decoder.next_frame() {
                         if let Some(value) = parse_sse_json(&event) {
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
@@ -859,6 +857,16 @@ pub fn stream_responses_response(
             }
         }
 
+        if let Some(event) = decoder.finish()
+            && let Some(value) = parse_sse_json(&event)
+        {
+            for event in converter.process_event(&value) {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+
         for event in converter.finish() {
             if tx.send(Ok(event)).await.is_err() {
                 break;
@@ -870,23 +878,7 @@ pub fn stream_responses_response(
 }
 
 fn parse_sse_json(text: &str) -> Option<Value> {
-    let mut data = String::new();
-    for line in text.lines() {
-        if let Some(rest) = line
-            .strip_prefix("data: ")
-            .or_else(|| line.strip_prefix("data:"))
-        {
-            let rest = rest.trim();
-            if rest == "[DONE]" {
-                return None;
-            }
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest);
-        }
-    }
-    serde_json::from_str(&data).ok()
+    parse_sse_json_value(text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1565,6 +1557,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_sse_json_accepts_data_without_space() {
+        let value = parse_sse_json(r#"data:{"type":"response.output_text.delta"}"#).unwrap();
+        assert_eq!(value["type"], "response.output_text.delta");
+    }
+
+    #[test]
     fn test_convert_to_responses_maps_tools_and_outputs() {
         let req = MessagesRequest {
             model: "gpt-5".to_string(),
@@ -2176,12 +2174,11 @@ mod tests {
         let body = convert_to_responses(&req);
         let input = body["input"].as_array().expect("input items");
 
-        assert_eq!(
+        assert!(
             input[0]["output"]
                 .as_str()
                 .unwrap()
-                .starts_with("ERROR: [tool output truncated:"),
-            true
+                .starts_with("ERROR: [tool output truncated:")
         );
         assert!(
             input[1]["output"]

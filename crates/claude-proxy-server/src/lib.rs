@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod middleware;
+mod non_stream;
 pub mod persistence;
 pub mod routes;
 
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post, put};
 use claude_proxy_config::Settings;
-use middleware::{RateLimitConfig, RateLimitLayer};
+use middleware::RateLimitLayer;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use persistence::MetricsStore;
 use tokio::net::TcpListener;
@@ -24,11 +25,8 @@ use tracing::{error, info, warn};
 const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build the Axum router with all routes and middleware.
-pub fn build_router(state: AppState, settings: &Settings) -> Router {
-    let rate_limit_layer = RateLimitLayer::new(RateLimitConfig {
-        max_requests: settings.limits.rate_limit,
-        per_seconds: settings.limits.rate_window,
-    });
+pub fn build_router(state: AppState, _settings: &Settings) -> Router {
+    let rate_limit_layer = RateLimitLayer::new(state.rate_limit_runtime.clone());
 
     Router::new()
         .route("/health", get(routes::health))
@@ -65,10 +63,10 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let router = build_router(state.clone(), &settings);
 
     // Spawn config file watcher
-    let _watcher = spawn_config_watcher(state.settings.clone(), state.provider_registry.clone());
+    let _watcher = spawn_config_watcher(state.clone());
 
     // Spawn SIGUSR1 handler for in-process config reload
-    spawn_sigusr1_handler(state.settings.clone(), state.provider_registry.clone());
+    spawn_sigusr1_handler(state.clone());
 
     // Spawn model cache warmup
     spawn_model_warmup(state.settings.clone(), state.provider_registry.clone());
@@ -156,10 +154,7 @@ fn spawn_model_warmup(
 
 /// Spawn a background task that watches the config file for changes.
 /// Returns the watcher handle (dropped on shutdown).
-fn spawn_config_watcher(
-    settings: Arc<RwLock<Settings>>,
-    registry: Arc<RwLock<app::ProviderRegistry>>,
-) -> Option<RecommendedWatcher> {
+fn spawn_config_watcher(state: AppState) -> Option<RecommendedWatcher> {
     let config_path = Settings::config_file_path()?;
     if !config_path.exists() {
         warn!(
@@ -211,10 +206,7 @@ fn spawn_config_watcher(
                                     error!("Config validation failed after reload: {e}");
                                     continue;
                                 }
-                                let mut s = settings.write().await;
-                                *s = new_settings;
-                                let mut reg = registry.write().await;
-                                reg.clear();
+                                state.apply_settings(new_settings).await;
                                 info!("Config reloaded successfully");
                             }
                             Err(e) => {
@@ -243,10 +235,7 @@ fn spawn_config_watcher(
 
 /// Spawn a background task that listens for SIGUSR1 and reloads config.
 #[cfg(unix)]
-fn spawn_sigusr1_handler(
-    settings: Arc<RwLock<Settings>>,
-    registry: Arc<RwLock<app::ProviderRegistry>>,
-) {
+fn spawn_sigusr1_handler(state: AppState) {
     tokio::spawn(async move {
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
@@ -261,10 +250,7 @@ fn spawn_sigusr1_handler(
                             error!("Config validation failed after SIGUSR1 reload: {e}");
                             continue;
                         }
-                        let mut s = settings.write().await;
-                        *s = new_settings;
-                        let mut reg = registry.write().await;
-                        reg.clear();
+                        state.apply_settings(new_settings).await;
                         info!("Config reloaded via SIGUSR1");
                     }
                     Err(e) => {
@@ -277,10 +263,7 @@ fn spawn_sigusr1_handler(
 }
 
 #[cfg(not(unix))]
-fn spawn_sigusr1_handler(
-    _settings: Arc<RwLock<Settings>>,
-    _registry: Arc<RwLock<app::ProviderRegistry>>,
-) {
+fn spawn_sigusr1_handler(_state: AppState) {
     // No-op on non-Unix platforms
 }
 

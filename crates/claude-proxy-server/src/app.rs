@@ -3,11 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claude_proxy_config::Settings;
+use claude_proxy_config::settings::LimitsConfig;
 use claude_proxy_providers::provider::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
+use crate::middleware::{RateLimitConfig, RateLimitRuntime};
 use crate::persistence::{MetricsStore, StoredTotals};
 
 /// Token usage breakdown for a single request.
@@ -202,6 +204,53 @@ impl Default for Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_proxy_config::settings::{
+        AdminConfig, HttpConfig, LogConfig, ModelConfig, ProviderConfig, ProviderType, ServerConfig,
+    };
+
+    fn settings_with_limits(
+        max_concurrency: u32,
+        provider_max_concurrency: u32,
+        rate_limit: u32,
+        rate_window: u32,
+    ) -> Settings {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                api_key: "test-key".to_string(),
+                base_url: "http://127.0.0.1:9".to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::OpenAI),
+                copilot: None,
+            },
+        );
+
+        Settings {
+            providers,
+            model: ModelConfig {
+                default: "openai/gpt-4".to_string(),
+                reasoning: None,
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                auth_token: String::new(),
+            },
+            admin: AdminConfig { auth_token: None },
+            limits: LimitsConfig {
+                rate_limit,
+                rate_window,
+                max_concurrency,
+                provider_max_concurrency,
+            },
+            http: HttpConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
 
     #[test]
     fn total_tokens_excludes_cache_tokens() {
@@ -280,6 +329,39 @@ mod tests {
             "high"
         );
     }
+
+    #[tokio::test]
+    async fn apply_settings_refreshes_runtime_limits() {
+        let state = AppState::new(settings_with_limits(1, 1, 1, 60), None);
+        let original_semaphore = state.concurrency_semaphore.read().await.clone();
+        let _permit = original_semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(
+            state.concurrency_semaphore.read().await.available_permits(),
+            0
+        );
+
+        state
+            .provider_concurrency_semaphores
+            .lock()
+            .await
+            .insert("openai".to_string(), Arc::new(Semaphore::new(1)));
+
+        state
+            .apply_settings(settings_with_limits(3, 2, 2, 60))
+            .await;
+
+        assert_eq!(
+            state.concurrency_semaphore.read().await.available_permits(),
+            3
+        );
+        assert!(
+            state
+                .provider_concurrency_semaphores
+                .lock()
+                .await
+                .is_empty()
+        );
+    }
 }
 
 /// Shared application state.
@@ -287,8 +369,9 @@ mod tests {
 pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
-    pub concurrency_semaphore: Arc<Semaphore>,
+    pub concurrency_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    pub rate_limit_runtime: Arc<RateLimitRuntime>,
     pub metrics: Arc<Metrics>,
     /// Inflight request deduplication: maps request hash → broadcast sender.
     /// Multiple identical concurrent requests share one upstream call.
@@ -404,14 +487,37 @@ impl ProviderRegistry {
 
 impl AppState {
     pub fn new(settings: Settings, store: Option<Arc<MetricsStore>>) -> Self {
-        let max_concurrency = settings.limits.max_concurrency as usize;
+        let limits = settings.limits.clone();
         Self {
             settings: Arc::new(RwLock::new(settings)),
             provider_registry: Arc::new(RwLock::new(ProviderRegistry::new())),
-            concurrency_semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            concurrency_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
+                limits.max_concurrency as usize,
+            )))),
             provider_concurrency_semaphores: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_runtime: Arc::new(RateLimitRuntime::new(RateLimitConfig {
+                max_requests: limits.rate_limit,
+                per_seconds: limits.rate_window,
+            })),
             metrics: Arc::new(Metrics::new(store)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub async fn apply_settings(&self, settings: Settings) {
+        let limits = settings.limits.clone();
+        *self.settings.write().await = settings;
+        self.provider_registry.write().await.clear();
+        self.apply_limits(&limits).await;
+    }
+
+    async fn apply_limits(&self, limits: &LimitsConfig) {
+        self.rate_limit_runtime.update(RateLimitConfig {
+            max_requests: limits.rate_limit,
+            per_seconds: limits.rate_window,
+        });
+        *self.concurrency_semaphore.write().await =
+            Arc::new(Semaphore::new(limits.max_concurrency as usize));
+        self.provider_concurrency_semaphores.lock().await.clear();
     }
 }

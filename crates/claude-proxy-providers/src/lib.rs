@@ -9,6 +9,7 @@ pub mod openai;
 mod openai_compat;
 pub mod provider;
 pub(crate) mod responses;
+mod sse;
 mod tool_args;
 mod tool_choice;
 

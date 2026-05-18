@@ -6,7 +6,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
@@ -75,8 +75,30 @@ async fn start_mock_openai() -> String {
     base_url
 }
 
-/// Mock /chat/completions endpoint — returns a simple SSE stream.
-async fn mock_chat_completions() -> Response {
+/// Mock /chat/completions endpoint.
+async fn mock_chat_completions(Json(payload): Json<serde_json::Value>) -> Response {
+    if !payload["stream"].as_bool().unwrap_or(false) {
+        return Json(json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello world"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6
+            }
+        }))
+        .into_response();
+    }
+
     let sse_data = r#"data: {"id":"chatcmpl-test","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-test","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}
@@ -169,6 +191,38 @@ async fn test_messages_with_valid_auth() {
     assert!(body.contains("event: message_start"));
     assert!(body.contains("event: content_block_start"));
     assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn test_non_streaming_messages_returns_complete_message() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", proxy_url))
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 100,
+            "stream": false,
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "Hello world");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["usage"]["input_tokens"], 4);
+    assert_eq!(body["usage"]["output_tokens"], 2);
 }
 
 #[tokio::test]
