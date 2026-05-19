@@ -1731,7 +1731,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             }),
         });
         self.events
-            .push(content_delta(idx, "text_delta", "text", &text));
+            .push(content_delta(idx, "text_delta", "text", text));
         self.events.push(block_stop(idx));
     }
 
