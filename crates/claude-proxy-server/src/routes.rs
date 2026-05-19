@@ -552,8 +552,14 @@ async fn stream_leader_response(
                     }
                 }
                 Err(e) => {
-                    had_error = true;
                     let error_message = e.to_string();
+                    error!(
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        error = %error_message,
+                        "stream error from provider"
+                    );
+                    had_error = true;
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     let error_event = stream_api_error_event(error_message);

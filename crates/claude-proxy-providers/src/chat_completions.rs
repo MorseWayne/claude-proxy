@@ -100,6 +100,9 @@ pub(crate) fn stream_openai_response(
                     }
                 }
                 Err(e) => {
+                    if converter.stopped {
+                        break;
+                    }
                     let _ = tx
                         .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
                         .await;
@@ -750,6 +753,9 @@ pub(crate) fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_parse_openai_chunk_text() {
@@ -771,6 +777,43 @@ mod tests {
     fn test_parse_openai_chunk_done() {
         let text = "data: [DONE]";
         assert!(parse_openai_chunk(text).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_ignores_trailing_chunk_eof_after_finish_reason() {
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_openai_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("completed stream should ignore trailing chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_errors_on_midstream_chunk_eof() {
+        let body = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_openai_response(response);
+        let mut saw_network_error = false;
+
+        while let Some(item) = stream.next().await {
+            if matches!(item, Err(ProviderError::Network(_))) {
+                saw_network_error = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_network_error,
+            "mid-stream chunk EOF must produce an error"
+        );
     }
 
     #[test]
@@ -997,6 +1040,33 @@ mod tests {
         assert_eq!(input["offset"], 520);
         assert_eq!(input["limit"], 5);
         let _ = std::fs::remove_file(path);
+    }
+
+    async fn response_from_unterminated_chunked_body(
+        content_type: &str,
+        body: &str,
+    ) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
     }
 
     fn temp_read_fixture(lines: usize) -> std::path::PathBuf {

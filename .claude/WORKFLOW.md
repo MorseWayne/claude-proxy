@@ -4,6 +4,31 @@
 
 ## Active（进行中）
 
+### WF-2026-05-19-001 — 流式 chunked EOF 错误处理
+Status: In Progress
+Level: 3
+Started: 2026-05-19
+Last updated: 2026-05-19
+Current phase: 实现与验证
+
+Intent:
+- 修复 OpenAI Chat Completions 流式响应在终止事件后的尾部 chunked EOF 被误报为网络错误，同时保留中途断流错误并补充服务端日志。
+
+Current todo:
+- [ ] 修改 Chat Completions 流式 EOF 容错。
+- [ ] 补充中途断流日志和回归测试。
+- [ ] 运行验证、GitNexus 变更检测、提交并刷新索引。
+
+Changes:
+- GitNexus impact: `stream_openai_response` LOW；`stream_leader_response` LOW，直接影响 `messages` 与相关测试流。
+- 用户确认失败场景是回答不完整的中途断流，不能吞错；仅终止事件后的尾部 EOF 可忽略。
+
+Prerequisites:
+- 用户已批准实现计划。
+
+Resume next:
+- 修改 `chat_completions.rs` 的 chunk read error 分支并添加回归测试。
+
 ### WF-2026-05-18-004 — 模型别名推理强度配置
 Status: In Progress
 Level: 2
