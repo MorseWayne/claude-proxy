@@ -392,6 +392,19 @@ Resume next（下次继续）:
 
 ## Completed（已完成）
 
+### WF-2026-05-19-001 — Thinking budget xhigh 映射优化
+
+Status: Done（已完成）
+Completed: 2026-05-19
+Level: 2
+Acceptance summary（验收摘要）:
+
+- Review: `thinking_budget_to_reasoning_effort` 现在按 `0..=2048 low`、`2049..=8192 medium`、`8193..=16384 high`、`16385+ xhigh` 映射，并在目标模型不支持 `xhigh` 时降级为 `high`；OpenAI-compatible 日志和 Responses 请求体转换共用该 model-aware 映射。
+- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `thinking_budget_to_reasoning_effort` upstream impact 为 CRITICAL，`request_reasoning_effort` 为 HIGH，`convert_reasoning` 为 CRITICAL；变更后 `detect_changes(scope=all)` 为 CRITICAL，主要因工作区含本任务外 AGENTS.md/CLAUDE.md 改动，实际本任务影响集中在 OpenAI log reasoning 映射和 Responses reasoning body 转换测试。
+- Tests: 新增/更新 provider 回归测试覆盖 `16385+` 映射到 `xhigh`，以及非 reasoning-capable model 降级为 `high`。
+- Gaps: 未做真实 ChatGPT 请求端到端验证；本地验证覆盖日志映射函数和 Responses 请求体转换。
+
 ### WF-2026-05-17-006 — Model context window metadata
 
 Status: Done（已完成）

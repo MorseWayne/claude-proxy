@@ -804,7 +804,7 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
         return Some(json!({"effort": "none"}));
     }
     if let Some(budget_tokens) = thinking.budget_tokens {
-        let effort = thinking_budget_to_reasoning_effort(budget_tokens);
+        let effort = thinking_budget_to_reasoning_effort(budget_tokens, &req.model);
         return Some(json!({"effort": effort, "summary": "detailed"}));
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
@@ -2234,8 +2234,12 @@ mod tests {
 
     #[test]
     fn test_convert_to_responses_maps_thinking_budget_to_reasoning_effort() {
-        for (budget_tokens, expected_effort) in [(2048, "low"), (8192, "medium"), (12_000, "high")]
-        {
+        for (budget_tokens, expected_effort) in [
+            (2048, "low"),
+            (8192, "medium"),
+            (16_384, "high"),
+            (16_385, "xhigh"),
+        ] {
             let req = MessagesRequest {
                 model: "gpt-5".to_string(),
                 system: None,
@@ -2264,6 +2268,37 @@ mod tests {
             assert_eq!(body["reasoning"]["effort"], expected_effort);
             assert_eq!(body["reasoning"]["summary"], "detailed");
         }
+    }
+
+    #[test]
+    fn test_convert_to_responses_downgrades_xhigh_budget_without_model_support() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: Some(31_999),
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
     }
 
     #[test]

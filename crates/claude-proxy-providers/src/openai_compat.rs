@@ -110,7 +110,9 @@ fn request_reasoning_effort(request: &MessagesRequest) -> Option<String> {
         return Some("none".to_string());
     }
     if let Some(budget_tokens) = thinking.budget_tokens {
-        return Some(thinking_budget_to_reasoning_effort(budget_tokens).to_string());
+        return Some(
+            thinking_budget_to_reasoning_effort(budget_tokens, &request.model).to_string(),
+        );
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
         return Some(default_adaptive_reasoning_effort(&request.model).to_string());
@@ -121,10 +123,12 @@ fn request_reasoning_effort(request: &MessagesRequest) -> Option<String> {
     None
 }
 
-pub(crate) fn thinking_budget_to_reasoning_effort(budget_tokens: u32) -> &'static str {
+pub(crate) fn thinking_budget_to_reasoning_effort(budget_tokens: u32, model: &str) -> &'static str {
     match budget_tokens {
         0..=2048 => "low",
         2049..=8192 => "medium",
+        8193..=16384 => "high",
+        _ if supports_reasoning_effort(model, "xhigh") => "xhigh",
         _ => "high",
     }
 }
@@ -788,8 +792,12 @@ mod tests {
 
     #[test]
     fn request_log_info_maps_thinking_budget_to_reasoning_effort() {
-        for (budget_tokens, expected_effort) in [(2048, "low"), (8192, "medium"), (12_000, "high")]
-        {
+        for (budget_tokens, expected_effort) in [
+            (2048, "low"),
+            (8192, "medium"),
+            (16_384, "high"),
+            (16_385, "xhigh"),
+        ] {
             let req = MessagesRequest {
                 model: "gpt-5.5".to_string(),
                 system: None,
@@ -818,6 +826,37 @@ mod tests {
             assert_eq!(info.reasoning_effort.as_deref(), Some(expected_effort));
             assert_eq!(info.reasoning_source, "thinking");
         }
+    }
+
+    #[test]
+    fn request_log_info_downgrades_xhigh_budget_without_model_support() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("think".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: Some(31_999),
+            }),
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let info = openai_request_log_info(&req);
+
+        assert_eq!(info.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(info.reasoning_source, "thinking");
     }
 
     #[test]
