@@ -31,18 +31,26 @@ use tokio::sync::Mutex;
 
 use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
-    send_upstream_request_with_policy,
+    read_upstream_response_text, send_upstream_request_with_policy,
 };
-use crate::openai_compat::{apply_openai_intent, log_request_observability, openai_model_info};
+use crate::openai_compat::{
+    apply_openai_intent, is_compact_request_body, log_compact_request_observability,
+    log_request_observability, openai_model_info,
+};
 use crate::provider::{
     Provider, ProviderError, RateLimitCredits, RateLimitSnapshot, RateLimitSource, RateLimitWindow,
 };
+use tracing::{info, warn};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
 const CHATGPT_SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
+const CHATGPT_PTL_RETRY_MARKER: &str =
+    "[earlier conversation truncated for ChatGPT prompt-too-long retry]";
+const CHATGPT_PTL_MAX_RETRIES: usize = 3;
+const CHATGPT_PTL_FALLBACK_DROP_DIVISOR: usize = 5;
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -180,6 +188,80 @@ impl ChatGptProvider {
         .await
     }
 
+    async fn send_responses_request_with_prompt_too_long_retry(
+        &self,
+        body: &mut Value,
+        token: &ChatGptToken,
+        compact_request: bool,
+    ) -> Result<Response, ProviderError> {
+        let mut prompt_too_long_attempts = 0;
+
+        loop {
+            let response = self.send_responses_request(body, token).await?;
+            let status = response.status();
+            if status.is_success() || status == StatusCode::UNAUTHORIZED {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = prompt_too_long_attempts > 0,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
+                return Ok(response);
+            }
+
+            if !is_prompt_too_long_candidate_status(status) {
+                return Err(map_upstream_response(response).await);
+            }
+
+            let error_body = read_upstream_response_text(response).await?;
+            if !is_prompt_too_long_error(status, &error_body) {
+                return Err(map_chatgpt_error_status_body(status, error_body));
+            }
+
+            if prompt_too_long_attempts >= CHATGPT_PTL_MAX_RETRIES {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = true,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        prompt_too_long_retry_exhausted = true,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
+                return Err(map_chatgpt_error_status_body(status, error_body));
+            }
+
+            let Some(stats) =
+                shrink_prompt_too_long_body(body, prompt_too_long_token_gap(&error_body))
+            else {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = true,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        prompt_too_long_retry_shrinkable = false,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
+                return Err(map_chatgpt_error_status_body(status, error_body));
+            };
+            prompt_too_long_attempts += 1;
+            warn!(
+                attempt = prompt_too_long_attempts,
+                compact_request,
+                dropped_groups = stats.dropped_groups,
+                dropped_items = stats.dropped_items,
+                inserted_marker = stats.inserted_marker,
+                truncated_text_items = stats.truncated_text_items,
+                original_body_bytes = stats.original_body_bytes,
+                shrunk_body_bytes = stats.shrunk_body_bytes,
+                "Retrying ChatGPT request after prompt-too-long response"
+            );
+        }
+    }
+
     async fn fetch_usage_rate_limits(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {
         let token = self.auth.get_existing_token().await?;
         let mut request_builder = self
@@ -292,10 +374,15 @@ impl Provider for ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
-        let body = build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
+        let mut body =
+            build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
         log_request_observability("chatgpt", "/responses", &body);
+        let compact_request = is_compact_request_body(&body);
+        log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
 
-        let mut response = self.send_responses_request(&body, &token).await?;
+        let mut response = self
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, compact_request)
+            .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let refreshed = match self.auth.force_refresh_token().await {
                 Ok(token) => token,
@@ -306,7 +393,13 @@ impl Provider for ChatGptProvider {
                     return Err(error);
                 }
             };
-            response = self.send_responses_request(&body, &refreshed).await?;
+            response = self
+                .send_responses_request_with_prompt_too_long_retry(
+                    &mut body,
+                    &refreshed,
+                    compact_request,
+                )
+                .await?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 self.auth.clear_token().await;
             }
@@ -785,6 +878,394 @@ fn build_chatgpt_responses_body_with_context(
     responses::build_body(request, DEFAULT_CHATGPT_INSTRUCTIONS, installation_id)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PromptTooLongShrinkStats {
+    dropped_groups: usize,
+    dropped_items: usize,
+    inserted_marker: bool,
+    truncated_text_items: usize,
+    original_body_bytes: usize,
+    shrunk_body_bytes: usize,
+}
+
+#[derive(Debug)]
+struct RetryGroup {
+    end: usize,
+    estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextPath {
+    InputContentString(usize),
+    InputContentPartText(usize, usize),
+    InputOutput(usize),
+    Instructions,
+}
+
+fn is_prompt_too_long_error(status: StatusCode, body: &str) -> bool {
+    if serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code == "context_length_exceeded")
+    }) {
+        return true;
+    }
+
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    ) && body.to_ascii_lowercase().contains("prompt is too long")
+}
+
+fn is_prompt_too_long_candidate_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
+fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderError {
+    let message = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| body.clone());
+
+    match status {
+        StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
+        StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
+        StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
+        StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
+        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited { retry_after: None },
+        status if status.is_server_error() => ProviderError::Overloaded {
+            message,
+            retry_after: None,
+        },
+        status => ProviderError::UpstreamError {
+            status: status.as_u16(),
+            body,
+        },
+    }
+}
+
+fn prompt_too_long_token_gap(body: &str) -> Option<usize> {
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("prompt is too long")?;
+    let numbers = ascii_numbers(&lower[start..]);
+    let actual = numbers.first().copied()?;
+    let limit = numbers.get(1).copied()?;
+    actual.checked_sub(limit).filter(|gap| *gap > 0)
+}
+
+fn ascii_numbers(text: &str) -> Vec<usize> {
+    let mut numbers = Vec::new();
+    let mut current: Option<usize> = None;
+    for byte in text.bytes() {
+        if byte.is_ascii_digit() {
+            let digit = (byte - b'0') as usize;
+            current = Some(
+                current
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            );
+        } else if let Some(value) = current.take() {
+            numbers.push(value);
+        }
+    }
+    if let Some(value) = current {
+        numbers.push(value);
+    }
+    numbers
+}
+
+fn shrink_prompt_too_long_body(
+    body: &mut Value,
+    token_gap: Option<usize>,
+) -> Option<PromptTooLongShrinkStats> {
+    let original_body_bytes = json_len(body);
+
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let groups = retry_groups_for_responses_input(input);
+        if groups.len() >= 2 {
+            let drop_groups = prompt_too_long_drop_group_count(&groups, token_gap);
+            let drop_end = groups[drop_groups - 1].end;
+            input.drain(0..drop_end);
+            let inserted_marker = ensure_retry_input_starts_with_user(input);
+            return Some(PromptTooLongShrinkStats {
+                dropped_groups: drop_groups,
+                dropped_items: drop_end,
+                inserted_marker,
+                truncated_text_items: 0,
+                original_body_bytes,
+                shrunk_body_bytes: json_len(body),
+            });
+        }
+    }
+
+    truncate_largest_text_for_retry(body, token_gap).map(|()| PromptTooLongShrinkStats {
+        dropped_groups: 0,
+        dropped_items: 0,
+        inserted_marker: false,
+        truncated_text_items: 1,
+        original_body_bytes,
+        shrunk_body_bytes: json_len(body),
+    })
+}
+
+fn retry_groups_for_responses_input(input: &[Value]) -> Vec<RetryGroup> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+
+    while index < input.len() {
+        let start = index;
+        let mut pending_call_ids = BTreeSet::new();
+
+        if is_function_call(&input[index]) {
+            collect_call_id(&input[index], &mut pending_call_ids);
+            index += 1;
+
+            while index < input.len() {
+                if is_function_call(&input[index]) {
+                    collect_call_id(&input[index], &mut pending_call_ids);
+                    index += 1;
+                    continue;
+                }
+
+                if is_function_call_output(&input[index]) {
+                    if let Some(call_id) = input[index].get("call_id").and_then(Value::as_str) {
+                        pending_call_ids.remove(call_id);
+                    }
+                    index += 1;
+                    if pending_call_ids.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+
+                if pending_call_ids.is_empty() {
+                    break;
+                }
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+
+        groups.push(RetryGroup {
+            end: index,
+            estimated_tokens: estimate_retry_group_tokens(&input[start..index]),
+        });
+    }
+
+    groups
+}
+
+fn is_function_call(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call")
+}
+
+fn is_function_call_output(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call_output")
+}
+
+fn collect_call_id(item: &Value, call_ids: &mut BTreeSet<String>) {
+    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+        call_ids.insert(call_id.to_string());
+    }
+}
+
+fn estimate_retry_group_tokens(items: &[Value]) -> usize {
+    let bytes = items.iter().map(json_len).sum::<usize>();
+    (bytes / 4).max(1)
+}
+
+fn prompt_too_long_drop_group_count(groups: &[RetryGroup], token_gap: Option<usize>) -> usize {
+    let drop_groups = if let Some(token_gap) = token_gap {
+        let mut tokens = 0;
+        let mut count = 0;
+        for group in groups {
+            tokens += group.estimated_tokens;
+            count += 1;
+            if tokens >= token_gap {
+                break;
+            }
+        }
+        count
+    } else {
+        (groups.len() / CHATGPT_PTL_FALLBACK_DROP_DIVISOR).max(1)
+    };
+
+    drop_groups.clamp(1, groups.len().saturating_sub(1))
+}
+
+fn ensure_retry_input_starts_with_user(input: &mut Vec<Value>) -> bool {
+    if input.first().is_none_or(is_user_message_item) {
+        return false;
+    }
+
+    input.insert(
+        0,
+        serde_json::json!({
+            "role": "user",
+            "content": CHATGPT_PTL_RETRY_MARKER,
+        }),
+    );
+    true
+}
+
+fn is_user_message_item(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn truncate_largest_text_for_retry(body: &mut Value, token_gap: Option<usize>) -> Option<()> {
+    let path = largest_retry_text_path(body)?;
+    let original = retry_text_at_path(body, path)?.to_string();
+    let truncated = truncated_retry_text(&original, token_gap)?;
+    set_retry_text_at_path(body, path, truncated)?;
+    Some(())
+}
+
+fn largest_retry_text_path(body: &Value) -> Option<TextPath> {
+    let mut largest: Option<(TextPath, usize)> = None;
+
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        for (item_index, item) in input.iter().enumerate() {
+            if let Some(text) = item.get("content").and_then(Value::as_str) {
+                update_largest(
+                    &mut largest,
+                    TextPath::InputContentString(item_index),
+                    text.len(),
+                );
+            }
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        update_largest(
+                            &mut largest,
+                            TextPath::InputContentPartText(item_index, part_index),
+                            text.len(),
+                        );
+                    }
+                }
+            }
+            if let Some(output) = item.get("output").and_then(Value::as_str) {
+                update_largest(
+                    &mut largest,
+                    TextPath::InputOutput(item_index),
+                    output.len(),
+                );
+            }
+        }
+    }
+
+    largest.map(|(path, _)| path).or_else(|| {
+        body.get("instructions")
+            .and_then(Value::as_str)
+            .map(|_| TextPath::Instructions)
+    })
+}
+
+fn update_largest(largest: &mut Option<(TextPath, usize)>, path: TextPath, len: usize) {
+    if largest.as_ref().is_none_or(|(_, current)| len > *current) {
+        *largest = Some((path, len));
+    }
+}
+
+fn retry_text_at_path(body: &Value, path: TextPath) -> Option<&str> {
+    match path {
+        TextPath::InputContentString(item_index) => {
+            body.get("input")?.get(item_index)?.get("content")?.as_str()
+        }
+        TextPath::InputContentPartText(item_index, part_index) => body
+            .get("input")?
+            .get(item_index)?
+            .get("content")?
+            .get(part_index)?
+            .get("text")?
+            .as_str(),
+        TextPath::InputOutput(item_index) => {
+            body.get("input")?.get(item_index)?.get("output")?.as_str()
+        }
+        TextPath::Instructions => body.get("instructions")?.as_str(),
+    }
+}
+
+fn set_retry_text_at_path(body: &mut Value, path: TextPath, text: String) -> Option<()> {
+    let target = match path {
+        TextPath::InputContentString(item_index) => body
+            .get_mut("input")?
+            .get_mut(item_index)?
+            .get_mut("content")?,
+        TextPath::InputContentPartText(item_index, part_index) => body
+            .get_mut("input")?
+            .get_mut(item_index)?
+            .get_mut("content")?
+            .get_mut(part_index)?
+            .get_mut("text")?,
+        TextPath::InputOutput(item_index) => body
+            .get_mut("input")?
+            .get_mut(item_index)?
+            .get_mut("output")?,
+        TextPath::Instructions => body.get_mut("instructions")?,
+    };
+    *target = Value::String(text);
+    Some(())
+}
+
+fn truncated_retry_text(text: &str, token_gap: Option<usize>) -> Option<String> {
+    let bytes_to_remove = token_gap
+        .map(|gap| gap.saturating_mul(4))
+        .unwrap_or_else(|| text.len() / 2)
+        .max(1);
+    let target_bytes = text.len().saturating_sub(bytes_to_remove);
+    if target_bytes >= text.len() {
+        return None;
+    }
+
+    let marker = format!(
+        "[chatgpt prompt truncated for retry: original_bytes={}]",
+        text.len()
+    );
+    let visible_budget = target_bytes.saturating_sub(marker.len());
+    let head_budget = visible_budget / 2;
+    let tail_budget = visible_budget.saturating_sub(head_budget);
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+
+    Some(format!(
+        "{}{}{}",
+        &text[..head_end],
+        marker,
+        &text[tail_start..]
+    ))
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
 fn chatgpt_models() -> Vec<ModelInfo> {
     [
         "gpt-5.5",
@@ -807,6 +1288,8 @@ fn chatgpt_models() -> Vec<ModelInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn builds_default_codex_responses_endpoint() {
@@ -1312,5 +1795,254 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "none");
         assert!(body["reasoning"].get("summary").is_none());
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn chatgpt_retries_prompt_too_long_with_shrunk_body() {
+        let (endpoint, requests) = prompt_too_long_retry_server().await;
+        let provider = test_chatgpt_provider(endpoint).await;
+        let token = ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account".to_string()),
+        };
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": "old"},
+                {"role": "user", "content": "current"}
+            ],
+            "stream": true
+        });
+
+        let response = provider
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false)
+            .await
+            .expect("retry should succeed");
+
+        assert!(response.status().is_success());
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
+        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["input"][0]["content"], "current");
+    }
+
+    #[test]
+    fn prompt_too_long_error_detection_accepts_text_and_context_code() {
+        assert!(is_prompt_too_long_error(
+            StatusCode::BAD_REQUEST,
+            "Prompt is too long: 137500 tokens > 135000 maximum"
+        ));
+        assert!(is_prompt_too_long_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":{"code":"context_length_exceeded","message":"context limit"}}"#
+        ));
+        assert!(!is_prompt_too_long_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"invalid_request","message":"bad tool schema"}}"#
+        ));
+    }
+
+    #[test]
+    fn prompt_too_long_token_gap_parses_actual_and_limit() {
+        assert_eq!(
+            prompt_too_long_token_gap("Prompt is too long: 137500 tokens > 135000 maximum"),
+            Some(2500)
+        );
+        assert_eq!(
+            prompt_too_long_token_gap(
+                r#"{"error":{"message":"prompt is too long: 400001 tokens > 400000 maximum"}}"#
+            ),
+            Some(1)
+        );
+        assert_eq!(prompt_too_long_token_gap("Prompt is too long"), None);
+    }
+
+    #[test]
+    fn prompt_too_long_retry_drops_oldest_responses_input_group() {
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": "old"},
+                {"role": "user", "content": "current"}
+            ],
+            "stream": true
+        });
+
+        let stats =
+            shrink_prompt_too_long_body(&mut body, None).expect("body should shrink by group");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(stats.dropped_items, 1);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"], "current");
+    }
+
+    #[test]
+    fn prompt_too_long_retry_keeps_function_call_and_output_together() {
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"type": "function_call", "call_id": "call_old", "name": "Read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_old", "output": "old output"},
+                {"role": "user", "content": "current"}
+            ],
+            "stream": true
+        });
+
+        let stats =
+            shrink_prompt_too_long_body(&mut body, None).expect("body should shrink by group");
+        let input = body["input"].as_array().expect("input");
+
+        assert_eq!(stats.dropped_items, 2);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"], "current");
+    }
+
+    #[test]
+    fn prompt_too_long_retry_inserts_marker_when_retry_would_start_with_assistant() {
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "assistant starts remaining context"},
+                {"role": "user", "content": "current"}
+            ],
+            "stream": true
+        });
+
+        let stats =
+            shrink_prompt_too_long_body(&mut body, None).expect("body should shrink by group");
+        let input = body["input"].as_array().expect("input");
+
+        assert!(stats.inserted_marker);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], CHATGPT_PTL_RETRY_MARKER);
+        assert_eq!(input[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn prompt_too_long_retry_truncates_single_oversized_text_when_no_group_can_drop() {
+        let huge = "x".repeat(200_000);
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": huge}
+            ],
+            "stream": true
+        });
+
+        let stats = shrink_prompt_too_long_body(&mut body, Some(10_000))
+            .expect("single large text should truncate");
+        let content = body["input"][0]["content"].as_str().expect("content");
+
+        assert_eq!(stats.dropped_items, 0);
+        assert_eq!(stats.truncated_text_items, 1);
+        assert!(content.len() < 200_000);
+        assert!(content.contains("[chatgpt prompt truncated for retry:"));
+    }
+
+    #[test]
+    fn prompt_too_long_retry_prefers_truncating_input_over_instructions() {
+        let instructions = "i".repeat(250_000);
+        let content = "x".repeat(200_000);
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "instructions": instructions,
+            "input": [
+                {"role": "user", "content": content}
+            ],
+            "stream": true
+        });
+
+        shrink_prompt_too_long_body(&mut body, Some(10_000)).expect("body should shrink");
+
+        assert_eq!(body["instructions"].as_str().unwrap().len(), 250_000);
+        assert!(body["input"][0]["content"].as_str().unwrap().len() < 200_000);
+    }
+
+    async fn test_chatgpt_provider(endpoint: String) -> ChatGptProvider {
+        ChatGptProvider {
+            id: "chatgpt".to_string(),
+            http_client: Client::new(),
+            endpoint,
+            usage_endpoint: "http://127.0.0.1/usage".to_string(),
+            installation_id: "install-test".to_string(),
+            request_headers: ChatGptRequestHeaders {
+                originator: HeaderValue::from_static("opencode"),
+                user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
+            },
+            auth: ChatGptAuth::new(Client::new()).await.unwrap(),
+            cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
+                snapshots: Vec::new(),
+                fetched_at: None,
+            })),
+        }
+    }
+
+    async fn prompt_too_long_retry_server() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_http_request_body(&mut socket).await;
+                captured_requests
+                    .lock()
+                    .await
+                    .push(serde_json::from_slice(&body).unwrap());
+
+                let (status, response_body) = if attempt == 0 {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"Prompt is too long: 20 tokens > 10 maximum"}}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"ok":true}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{addr}/responses"), requests)
+    }
+
+    async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some((body_start, content_length)) = http_body_start_and_len(&buffer)
+                && buffer.len() >= body_start + content_length
+            {
+                return buffer[body_start..body_start + content_length].to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    fn http_body_start_and_len(buffer: &[u8]) -> Option<(usize, usize)> {
+        let header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+        let headers = std::str::from_utf8(&buffer[..header_end]).ok()?;
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })?;
+        Some((header_end, content_length))
     }
 }
