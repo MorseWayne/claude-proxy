@@ -1612,6 +1612,33 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_omits_unsupported_stop_parameter() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Some(vec!["</stop>".to_string()]),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert!(body.get("stop").is_none());
+    }
+
+    #[test]
     fn chatgpt_responses_body_adds_codex_metadata_from_stable_sources() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
