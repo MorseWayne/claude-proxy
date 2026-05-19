@@ -1,6 +1,7 @@
 use claude_proxy_core::*;
 use serde_json::{Value, json};
 
+use crate::openai_compat::supports_sampling_parameters;
 use crate::tool_choice::normalize_for_chat_completions;
 
 /// Convert an Anthropic MessagesRequest to an OpenAI ChatCompletion request body.
@@ -106,11 +107,13 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
     if let Some(max_tokens) = req.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    if let Some(temperature) = req.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = json!(top_p);
+    if supports_sampling_parameters(req) {
+        if let Some(temperature) = req.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = json!(top_p);
+        }
     }
     if let Some(stop) = &req.stop_sequences {
         body["stop"] = json!(stop);
@@ -225,5 +228,38 @@ mod tests {
             body["tool_choice"],
             json!({"type": "function", "function": {"name": "WebSearch"}})
         );
+    }
+
+    #[test]
+    fn convert_request_omits_sampling_for_reasoning_requests() {
+        let mut req = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("Think deeply".to_string()),
+        }]);
+        req.model = "deepseek-v4-pro".to_string();
+        req.temperature = Some(0.2);
+        req.top_p = Some(0.9);
+        req.extra
+            .insert("reasoning_effort".to_string(), json!("medium"));
+
+        let body = convert_request(&req);
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn convert_request_keeps_sampling_for_non_reasoning_requests() {
+        let mut req = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("Answer briefly".to_string()),
+        }]);
+        req.temperature = Some(0.2);
+        req.top_p = Some(0.9);
+
+        let body = convert_request(&req);
+
+        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
     }
 }

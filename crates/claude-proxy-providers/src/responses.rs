@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::openai_compat::{
-    default_adaptive_reasoning_effort, thinking_budget_to_reasoning_effort,
+    default_adaptive_reasoning_effort, supports_reasoning_summary, supports_sampling_parameters,
+    thinking_budget_to_reasoning_effort,
 };
 use crate::provider::ProviderError;
 use crate::sse::{SseDecoder, parse_sse_json_value};
@@ -102,11 +103,13 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     if let Some(max_tokens) = req.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
     }
-    if let Some(temperature) = req.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = json!(top_p);
+    if supports_sampling_parameters(req) {
+        if let Some(temperature) = req.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = json!(top_p);
+        }
     }
     if let Some(stop) = &req.stop_sequences {
         body["stop"] = json!(stop);
@@ -791,13 +794,10 @@ fn normalize_tool_schema(schema: &Value) -> Value {
 
 fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
     if let Some(reasoning) = req.extra.get("reasoning") {
-        return Some(reasoning.clone());
+        return Some(reasoning_for_model(req, reasoning.clone()));
     }
     if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
-        if effort == "none" {
-            return Some(json!({"effort": "none"}));
-        }
-        return Some(json!({"effort": effort, "summary": "detailed"}));
+        return Some(reasoning_effort_for_model(req, effort));
     }
     let thinking = req.thinking.as_ref()?;
     if thinking.r#type.as_deref() == Some("disabled") {
@@ -805,16 +805,34 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
     }
     if let Some(budget_tokens) = thinking.budget_tokens {
         let effort = thinking_budget_to_reasoning_effort(budget_tokens, &req.model);
-        return Some(json!({"effort": effort, "summary": "detailed"}));
+        return Some(reasoning_effort_for_model(req, effort));
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
         let effort = default_adaptive_reasoning_effort(&req.model);
-        return Some(json!({"effort": effort, "summary": "detailed"}));
+        return Some(reasoning_effort_for_model(req, effort));
     }
     if thinking.r#type.as_deref() == Some("enabled") {
-        return Some(json!({"effort": "medium", "summary": "detailed"}));
+        return Some(reasoning_effort_for_model(req, "medium"));
     }
     None
+}
+
+fn reasoning_effort_for_model(req: &MessagesRequest, effort: &str) -> Value {
+    if effort == "none" {
+        return json!({"effort": "none"});
+    }
+
+    let reasoning = json!({"effort": effort, "summary": "detailed"});
+    reasoning_for_model(req, reasoning)
+}
+
+fn reasoning_for_model(req: &MessagesRequest, mut reasoning: Value) -> Value {
+    if !supports_reasoning_summary(&req.model)
+        && let Some(object) = reasoning.as_object_mut()
+    {
+        object.remove("summary");
+    }
+    reasoning
 }
 
 pub fn stream_responses_response(
@@ -1820,6 +1838,62 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_to_responses_omits_sampling_for_reasoning_requests() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: None,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_keeps_sampling_for_non_reasoning_requests() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: None,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_convert_to_responses_maps_anthropic_image_blocks() {
         let req = MessagesRequest {
             model: "gpt-5.3-codex".to_string(),
@@ -2230,6 +2304,36 @@ mod tests {
 
         assert!(body.get("include").is_none());
         assert_eq!(body["reasoning"], json!({"effort": "none"}));
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_reasoning_summary_for_codex_spark() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex-spark".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     }
 
     #[test]

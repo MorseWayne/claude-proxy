@@ -18,7 +18,7 @@ Windows PowerShell:
 irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
 ```
 
-Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases).
+Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases). On Linux x86_64, the installer downloads the statically linked `x86_64-unknown-linux-musl` build by default; the `x86_64-unknown-linux-gnu` build remains available for manual download from Releases.
 
 ## Quick Start
 

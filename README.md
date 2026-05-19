@@ -86,7 +86,7 @@ Windows PowerShell:
 irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
 ```
 
-或从 [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases) 下载预编译二进制。
+或从 [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases) 下载预编译二进制。Linux x86_64 安装脚本默认下载静态链接的 `x86_64-unknown-linux-musl` 版本；`x86_64-unknown-linux-gnu` 版本仍可在 Releases 中手动下载。
 
 ## 快速开始
 

@@ -202,6 +202,21 @@ fn supports_reasoning_effort(model: &str, effort: &str) -> bool {
     model_reasoning_efforts(model).contains(&effort)
 }
 
+pub(crate) fn supports_sampling_parameters(request: &MessagesRequest) -> bool {
+    if request.extra.contains_key("reasoning")
+        || request.extra.contains_key("reasoning_effort")
+        || request.thinking.is_some()
+    {
+        return false;
+    }
+
+    model_reasoning_efforts(&request.model).is_empty()
+}
+
+pub(crate) fn supports_reasoning_summary(model: &str) -> bool {
+    !is_codex_model(model)
+}
+
 fn model_reasoning_efforts(model: &str) -> Vec<&'static str> {
     if is_reasoning_model(model) || model.starts_with("gpt-5") {
         REASONING_EFFORTS.to_vec()
