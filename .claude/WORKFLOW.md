@@ -4,6 +4,31 @@
 
 ## Active（进行中）
 
+### WF-2026-05-19-002 — thinking 文本泄漏治理
+Status: In Progress
+Level: 3
+Started: 2026-05-19
+Last updated: 2026-05-20
+Current phase: 设计文档审阅
+
+Intent:
+- 彻底治理 `[thinking]...[/thinking]` 或等价 reasoning 文本被当作用户可见正文输出的问题，覆盖源头表示、响应边界、测试门禁和观测。
+
+Current todo:
+- [ ] 用户审阅 `docs/superpowers/specs/2026-05-20-thinking-leak-governance-design.md`。
+- [ ] 用户确认后转入实现计划与编码。
+
+Changes:
+- 用户已同意从定位分析升级为彻底治理方案，并要求开始规划。
+- 既有定位显示 Responses/ChatGPT-Codex 路径会把历史 `Content::Thinking` 序列化为普通 `[thinking]` 文本，响应侧 `output_text` 又会原样转成正文。
+- 已写入 thinking 泄漏治理设计文档；独立审阅代理被用户中断，已改为本地只读审阅并补充“净化后再打开 text block”的实现约束。
+
+Prerequisites:
+- 用户审阅并确认设计文档。
+
+Resume next:
+- 等待用户确认设计文档；确认后进入实现计划与编码。
+
 ### WF-2026-05-19-001 — 流式 chunked EOF 错误处理
 Status: In Progress
 Level: 3
