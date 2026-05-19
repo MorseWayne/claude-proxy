@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::provider::ProviderError;
 use crate::sse::{SseDecoder, parse_sse_json_value};
+use crate::thinking_sanitizer::{ThinkingSanitizer, sanitize_thinking_markers};
 use crate::tool_args::sanitize_tool_arguments;
 
 // --- SSE Conversion ---
@@ -138,6 +139,7 @@ struct StreamConverter {
     model: String,
     content_blocks: Vec<ContentBlockState>,
     current_text_index: Option<u32>,
+    text_sanitizer: ThinkingSanitizer,
     current_thinking_index: Option<u32>,
     tool_call_indices: HashMap<u32, u32>, // tool_call.index -> content_block index
     tool_call_names: HashMap<u32, String>,
@@ -170,6 +172,7 @@ impl StreamConverter {
             model: String::new(),
             content_blocks: Vec::new(),
             current_text_index: None,
+            text_sanitizer: ThinkingSanitizer::new(),
             current_thinking_index: None,
             tool_call_indices: HashMap::new(),
             tool_call_names: HashMap::new(),
@@ -248,40 +251,7 @@ impl StreamConverter {
             if let Some(ref content) = choice.delta.content
                 && !content.is_empty()
             {
-                // Close thinking block if open
-                if self.current_thinking_index.is_some() {
-                    let idx = self.current_thinking_index.take().unwrap();
-                    events.push(SseEvent {
-                        event: "content_block_stop".to_string(),
-                        data: json!({"type": "content_block_stop", "index": idx}),
-                    });
-                }
-
-                if self.current_text_index.is_none() {
-                    let idx = self.content_blocks.len() as u32;
-                    self.current_text_index = Some(idx);
-                    self.content_blocks.push(ContentBlockState {
-                        block_type: "text".to_string(),
-                        index: idx,
-                    });
-                    events.push(SseEvent {
-                        event: "content_block_start".to_string(),
-                        data: json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    });
-                }
-                let idx = self.current_text_index.unwrap();
-                events.push(SseEvent {
-                    event: "content_block_delta".to_string(),
-                    data: json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "text_delta", "text": content}
-                    }),
-                });
+                self.emit_text_content(content, &mut events);
             }
 
             // Handle tool calls
@@ -292,6 +262,7 @@ impl StreamConverter {
                     }
 
                     // Close text/thinking blocks if open
+                    self.flush_text_content(&mut events);
                     if self.current_text_index.is_some() {
                         let idx = self.current_text_index.take().unwrap();
                         events.push(SseEvent {
@@ -357,6 +328,7 @@ impl StreamConverter {
             // Handle finish_reason
             if let Some(ref reason) = choice.finish_reason {
                 // Close any open blocks
+                self.flush_text_content(&mut events);
                 if self.current_text_index.is_some() {
                     let idx = self.current_text_index.take().unwrap();
                     events.push(SseEvent {
@@ -418,6 +390,79 @@ impl StreamConverter {
         }
 
         events
+    }
+
+    fn emit_text_content(&mut self, content: &str, events: &mut Vec<SseEvent>) {
+        if self.current_thinking_index.is_some() {
+            let idx = self.current_thinking_index.take().unwrap();
+            events.push(SseEvent {
+                event: "content_block_stop".to_string(),
+                data: json!({"type": "content_block_stop", "index": idx}),
+            });
+        }
+
+        let visible = self.text_sanitizer.push(content);
+        if visible.is_empty() {
+            return;
+        }
+
+        if self.current_text_index.is_none() {
+            let idx = self.content_blocks.len() as u32;
+            self.current_text_index = Some(idx);
+            self.content_blocks.push(ContentBlockState {
+                block_type: "text".to_string(),
+                index: idx,
+            });
+            events.push(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            });
+        }
+        let idx = self.current_text_index.unwrap();
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "text_delta", "text": visible}
+            }),
+        });
+    }
+
+    fn flush_text_content(&mut self, events: &mut Vec<SseEvent>) {
+        let visible = self.text_sanitizer.finish();
+        if visible.is_empty() {
+            return;
+        }
+        if self.current_text_index.is_none() {
+            let idx = self.content_blocks.len() as u32;
+            self.current_text_index = Some(idx);
+            self.content_blocks.push(ContentBlockState {
+                block_type: "text".to_string(),
+                index: idx,
+            });
+            events.push(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            });
+        }
+        let idx = self.current_text_index.unwrap();
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "text_delta", "text": visible}
+            }),
+        });
     }
 
     fn emit_tool_arguments(
@@ -482,6 +527,7 @@ impl StreamConverter {
         }
 
         // Close any remaining open blocks
+        self.flush_text_content(&mut events);
         if self.current_text_index.is_some() {
             let idx = self.current_text_index.take().unwrap();
             events.push(SseEvent {
@@ -669,27 +715,30 @@ pub(crate) fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
         if let Some(content) = message["content"].as_str()
             && !content.is_empty()
         {
-            events.push(SseEvent {
-                event: "content_block_start".to_string(),
-                data: json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "text", "text": ""}
-                }),
-            });
-            events.push(SseEvent {
-                event: "content_block_delta".to_string(),
-                data: json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": content}
-                }),
-            });
-            events.push(SseEvent {
-                event: "content_block_stop".to_string(),
-                data: json!({"type": "content_block_stop", "index": block_index}),
-            });
-            block_index += 1;
+            let content = sanitize_thinking_markers(content);
+            if !content.is_empty() {
+                events.push(SseEvent {
+                    event: "content_block_start".to_string(),
+                    data: json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                });
+                events.push(SseEvent {
+                    event: "content_block_delta".to_string(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": content}
+                    }),
+                });
+                events.push(SseEvent {
+                    event: "content_block_stop".to_string(),
+                    data: json!({"type": "content_block_stop", "index": block_index}),
+                });
+                block_index += 1;
+            }
         }
 
         // Handle tool calls
@@ -756,6 +805,19 @@ mod tests {
     use futures::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn text_deltas(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "text_delta")
+                    .then(|| event.data["delta"]["text"].as_str())
+                    .flatten()
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
 
     #[test]
     fn test_parse_openai_chunk_text() {
@@ -858,6 +920,87 @@ mod tests {
         assert_eq!(events.len(), 2); // content_block_start + content_block_delta
         assert_eq!(events[0].event, "content_block_start");
         assert_eq!(events[1].event, "content_block_delta");
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_thinking_markers_in_text() {
+        let mut converter = StreamConverter::new();
+        converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+
+        let events = converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: None,
+                    content: Some("hello [thinking]secret[/thinking] world".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+
+        assert_eq!(text_deltas(&events), vec!["hello  world"]);
+        assert!(!text_deltas(&events).join("").contains("secret"));
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_split_thinking_markers_in_text() {
+        let mut converter = StreamConverter::new();
+        converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+
+        let mut events = Vec::new();
+        for content in ["hello [think", "ing]secret", "[/think", "ing] world"] {
+            events.extend(converter.process_chunk(&OpenAiChunk {
+                id: "test".to_string(),
+                model: "gpt-4".to_string(),
+                choices: vec![OpenAiChoice {
+                    index: 0,
+                    delta: OpenAiDelta {
+                        role: None,
+                        content: Some(content.to_string()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            }));
+        }
+
+        assert_eq!(text_deltas(&events), vec!["hello ", " world"]);
+        assert!(!text_deltas(&events).join("").contains("secret"));
     }
 
     #[test]
@@ -1003,6 +1146,23 @@ mod tests {
             1
         );
         assert!(converter.finish().is_empty());
+    }
+
+    #[test]
+    fn test_non_streaming_response_sanitizes_thinking_markers_in_text() {
+        let events = convert_non_streaming_response(&json!({
+            "model": "gpt-4.1",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "hello [thinking]secret[/thinking] world"
+                }
+            }]
+        }));
+
+        assert_eq!(text_deltas(&events), vec!["hello  world"]);
+        assert!(!text_deltas(&events).join("").contains("secret"));
     }
 
     #[test]

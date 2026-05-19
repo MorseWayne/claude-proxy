@@ -447,6 +447,10 @@ fn add_responses_item_breakdown(item: &Value, breakdown: &mut PayloadBreakdown) 
 fn add_chat_message_breakdown(message: &Value, breakdown: &mut PayloadBreakdown) {
     add_item_size(message, breakdown);
     add_message_content_breakdown(message, breakdown);
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+        breakdown.thinking_items += 1;
+        breakdown.thinking_bytes += reasoning.len();
+    }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         breakdown.function_call_items += tool_calls.len();
         breakdown.tool_call_bytes += serde_json::to_vec(tool_calls).map_or(0, |bytes| bytes.len());
@@ -469,13 +473,8 @@ fn add_message_content_breakdown(item: &Value, breakdown: &mut PayloadBreakdown)
 
 fn add_text_or_thinking_bytes(text: &str, breakdown: &mut PayloadBreakdown) {
     add_truncation_breakdown(text, breakdown);
-    if text.contains("[thinking]") {
-        breakdown.thinking_items += 1;
-        breakdown.thinking_bytes += text.len();
-    } else {
-        breakdown.text_items += 1;
-        breakdown.text_bytes += text.len();
-    }
+    breakdown.text_items += 1;
+    breakdown.text_bytes += text.len();
 }
 
 fn add_truncation_breakdown(text: &str, breakdown: &mut PayloadBreakdown) {
@@ -610,8 +609,8 @@ mod tests {
         assert!(stats.has_include);
         assert!(stats.has_instructions);
         assert!(stats.body_bytes > 0);
-        assert_eq!(stats.text_items, 2);
-        assert_eq!(stats.thinking_items, 1);
+        assert_eq!(stats.text_items, 3);
+        assert_eq!(stats.thinking_items, 0);
         assert_eq!(stats.function_call_items, 1);
         assert_eq!(stats.function_output_items, 1);
         assert_eq!(
@@ -619,6 +618,7 @@ mod tests {
             "secret prompt".len()
                 + "[text content truncated: original_bytes=1000, max_historical_text_bytes=32768]"
                     .len()
+                + "[thinking]\nprivate chain\n[/thinking]".len()
         );
         assert_eq!(
             stats.tool_output_bytes,
@@ -650,7 +650,7 @@ mod tests {
                 + stats.truncated_tool_output_bytes_saved
         );
         assert_eq!(stats.history_payload_budget_used_per_mille, 0);
-        assert!(stats.thinking_bytes > 0);
+        assert_eq!(stats.thinking_bytes, 0);
         assert!(stats.tool_call_bytes > 0);
         assert!(stats.largest_item_bytes > 0);
     }
@@ -659,7 +659,10 @@ mod tests {
     fn request_observability_summarizes_chat_completions_payload() {
         let body = json!({
             "model": "gpt-4.1",
-            "messages": [{"role": "user", "content": "secret prompt"}],
+            "messages": [
+                {"role": "user", "content": "secret prompt"},
+                {"role": "assistant", "reasoning_content": "private plan", "content": "answer"}
+            ],
             "stream": false
         });
 
@@ -667,19 +670,20 @@ mod tests {
 
         assert_eq!(stats.model, "gpt-4.1");
         assert!(!stats.stream);
-        assert_eq!(stats.input_items, 1);
+        assert_eq!(stats.input_items, 2);
         assert!(!stats.has_tools);
         assert!(!stats.has_parallel_tool_calls);
         assert!(!stats.has_reasoning);
         assert!(!stats.has_include);
         assert!(!stats.has_instructions);
         assert!(stats.body_bytes > 0);
-        assert_eq!(stats.text_items, 1);
-        assert_eq!(stats.text_bytes, "secret prompt".len());
-        assert_eq!(stats.thinking_items, 0);
+        assert_eq!(stats.text_items, 2);
+        assert_eq!(stats.text_bytes, "secret prompt".len() + "answer".len());
+        assert_eq!(stats.thinking_items, 1);
         assert_eq!(stats.function_call_items, 0);
         assert_eq!(stats.function_output_items, 0);
         assert_eq!(stats.tool_output_bytes, 0);
+        assert_eq!(stats.thinking_bytes, "private plan".len());
     }
 
     #[test]

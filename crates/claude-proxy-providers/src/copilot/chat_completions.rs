@@ -38,12 +38,7 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
                         Content::Text { text } => {
                             parts.push(serde_json::json!({"type": "text", "text": text}));
                         }
-                        Content::Thinking { thinking, .. } => {
-                            parts.push(serde_json::json!({
-                                "type": "text",
-                                "text": format!("[thinking]\n{thinking}\n[/thinking]")
-                            }));
-                        }
+                        Content::Thinking { .. } => {}
                         Content::ToolUse { id, name, input }
                         | Content::ServerToolUse { id, name, input } => {
                             messages.push(serde_json::json!({
@@ -176,5 +171,43 @@ mod tests {
             body["tool_choice"],
             json!({"type": "function", "function": {"name": "WebSearch"}})
         );
+    }
+
+    #[test]
+    fn convert_to_openai_chat_omits_thinking_text_markers() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    Content::Text {
+                        text: "visible".to_string(),
+                    },
+                    Content::Thinking {
+                        thinking: "private".to_string(),
+                        signature: None,
+                    },
+                ]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_openai_chat(&req);
+        let serialized = serde_json::to_string(&body).expect("body json");
+
+        assert!(serialized.contains("visible"));
+        assert!(!serialized.contains("[thinking]"));
+        assert!(!serialized.contains("private"));
     }
 }

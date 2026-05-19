@@ -4,31 +4,6 @@
 
 ## Active（进行中）
 
-### WF-2026-05-19-002 — thinking 文本泄漏治理
-Status: In Progress
-Level: 3
-Started: 2026-05-19
-Last updated: 2026-05-20
-Current phase: 设计文档审阅
-
-Intent:
-- 彻底治理 `[thinking]...[/thinking]` 或等价 reasoning 文本被当作用户可见正文输出的问题，覆盖源头表示、响应边界、测试门禁和观测。
-
-Current todo:
-- [ ] 用户审阅 `docs/superpowers/specs/2026-05-20-thinking-leak-governance-design.md`。
-- [ ] 用户确认后转入实现计划与编码。
-
-Changes:
-- 用户已同意从定位分析升级为彻底治理方案，并要求开始规划。
-- 既有定位显示 Responses/ChatGPT-Codex 路径会把历史 `Content::Thinking` 序列化为普通 `[thinking]` 文本，响应侧 `output_text` 又会原样转成正文。
-- 已写入 thinking 泄漏治理设计文档；独立审阅代理被用户中断，已改为本地只读审阅并补充“净化后再打开 text block”的实现约束。
-
-Prerequisites:
-- 用户审阅并确认设计文档。
-
-Resume next:
-- 等待用户确认设计文档；确认后进入实现计划与编码。
-
 ### WF-2026-05-19-001 — 流式 chunked EOF 错误处理
 Status: In Progress
 Level: 3
@@ -441,6 +416,19 @@ Resume next（下次继续）:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-19-002 — thinking 文本泄漏治理
+
+Status: Done（已完成）
+Completed: 2026-05-20
+Level: 3
+Acceptance summary（验收摘要）:
+
+- Review: 新增 `ThinkingSanitizer`，接入 Responses 与 Chat Completions 的普通 text 输出边界；移除 Responses/Copilot Chat Completions 请求侧 `[thinking]` 文本降级；结构化 reasoning 继续走 `thinking_delta`；observability 不再把 `[thinking]` 当正常 thinking 统计依据。
+- Validation: `cargo fmt --check`、目标 provider tests、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 变更前 `process_event` HIGH、`process_chunk` MEDIUM、`append_message_items` / `should_truncate_text_item` CRITICAL；变更后 `detect_changes(scope=all)` CRITICAL，影响集中在 provider conversion 与相关测试，符合治理范围。
+- Tests: 覆盖 sanitizer、Responses streaming/non-streaming、Chat Completions streaming/non-streaming、Copilot request conversion、observability。
+- Gaps: 未做真实上游端到端请求验证；本地验证覆盖转换层和 SSE shape。
 
 ### WF-2026-05-19-001 — Thinking budget xhigh 映射优化
 
