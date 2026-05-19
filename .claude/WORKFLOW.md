@@ -4,411 +4,30 @@
 
 ## Active（进行中）
 
-### WF-2026-05-19-001 — 流式 chunked EOF 错误处理
-Status: In Progress
-Level: 3
-Started: 2026-05-19
-Last updated: 2026-05-19
-Current phase: 实现与验证
-
-Intent:
-- 修复 OpenAI Chat Completions 流式响应在终止事件后的尾部 chunked EOF 被误报为网络错误，同时保留中途断流错误并补充服务端日志。
-
-Current todo:
-- [ ] 修改 Chat Completions 流式 EOF 容错。
-- [ ] 补充中途断流日志和回归测试。
-- [ ] 运行验证、GitNexus 变更检测、提交并刷新索引。
-
-Changes:
-- GitNexus impact: `stream_openai_response` LOW；`stream_leader_response` LOW，直接影响 `messages` 与相关测试流。
-- 用户确认失败场景是回答不完整的中途断流，不能吞错；仅终止事件后的尾部 EOF 可忽略。
-
-Prerequisites:
-- 用户已批准实现计划。
-
-Resume next:
-- 修改 `chat_completions.rs` 的 chunk read error 分支并添加回归测试。
-
-### WF-2026-05-18-004 — 模型别名推理强度配置
+### WF-2026-05-20-001 — 解决 main 分支推送冲突
 Status: In Progress
 Level: 2
-Started: 2026-05-18
-Last updated: 2026-05-18
-Current phase: 需求澄清与设计
+Started: 2026-05-20
+Last updated: 2026-05-20
+Current phase: 冲突解决与验证
 
 Intent:
-- 支持 default/reasoning/opus/sonnet/haiku 每个模型别名单独设置可选推理强度，允许不设置或显式使用默认值。
+- 解决本地 `main` 与 `origin/main` 分叉导致的推送冲突，并保持现有工作不丢失。
 
 Current todo:
-- [ ] 完成语义澄清、提出方案并取得设计确认。
+- [x] 检查本地/远端提交差异和未提交 `.claude/WORKFLOW.md` 改动。
+- [x] 确认合并语义：同时保留远端 tagged thinking 转换和本地 sanitizer 防泄漏。
+- [ ] 运行格式化、provider 测试、GitNexus detect_changes，提交并刷新索引。
 
 Changes:
-- Scope confirmed: reasoning effort is per model alias, not a single global default.
+- 初始状态：`main...origin/main [ahead 2, behind 2]`，未展开 merge conflict，工作区仅 `.claude/WORKFLOW.md` 有本地改动。
+- 合并 `origin/main` 后冲突集中在 `.claude/WORKFLOW.md`、`chat_completions.rs`、`responses.rs`、`lib.rs`；用户确认完整 tagged thinking 应转为 `thinking_delta`，未闭合或残留 marker 不应泄漏到普通 text。
 
 Prerequisites:
-- 用户确认配置语义和兼容策略。
+- None
 
 Resume next:
-- 继续澄清 explicit default 的含义，并提出 2-3 种配置表示方案。
-
-### WF-2026-05-18-003 — TUI ChatGPT 额度显示规划
-
-Status: Done
-Level: 3
-Started: 2026-05-18
-Updated: 2026-05-18
-Current phase: Phase 2 — Dashboard quota 独立区域
-
-Goal（目标）:
-
-- 在 TUI 中展示真实 ChatGPT/Codex 账号额度或用量信息，接近 ChatGPT analytics usage 页面体验。
-
-#### Phase 0 — 需求澄清与设计
-
-Status: Done
-Depends on:
-
-- Phase 0 user approval on 2026-05-18: use direct `/wham/usage` or `/api/codex/usage` fetch as primary source, plus `x-codex-*` response header capture as fallback/update source.
-
-Tasks:
-
-- [x] 用 GitNexus 和源码确认现有 TUI Dashboard、metrics、ChatGPT OAuth token 边界。
-- [x] 澄清额度数据来源、展示粒度和失败降级行为。
-- [x] 比较可行方案并形成用户批准的设计。
-
-#### Phase 1 — 实现、验证与收尾
-
-Status: Done
-Depends on:
-
-- Phase 0
-
-Tasks:
-
-- [x] 实施 ChatGPT/Codex usage fetcher。
-- [x] 捕获 ChatGPT/Codex 响应 header 中的 quota/rate-limit snapshot。
-- [x] 通过 `/admin/metrics` 暴露 `provider_rate_limits`。
-- [x] 在 TUI Dashboard Usage Overview 中展示 ChatGPT/Codex quota rows。
-- [x] 补充 provider usage/header parser 与 TUI metrics parser 回归测试。
-
-Acceptance / Review:
-
-- Review: 已新增 provider-level `RateLimitSnapshot` 数据契约和默认 `Provider::rate_limit_snapshots`；ChatGPT provider 会用现有 OAuth token 直接调用 `/wham/usage` 或 `/api/codex/usage`，无 token 时不触发 device flow；上游响应 header 会缓存为 fallback/update source；server admin metrics 仅对 ChatGPT providers 拉取快照并忽略空/失败结果；TUI Dashboard 展示 `ChatGPT / Codex Quota`、5h/weekly 百分比、credits、plan type 和来源。
-- Validation: `cargo fmt --check`、目标 provider tests、目标 TUI parser test、目标 server admin metrics test、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前已对 `render_dashboard`、`ChatGptProvider`、`Provider` trait、`admin_metrics` 等修改点做 upstream impact；实施后 `detect_changes(scope=all)` 返回 HIGH，影响集中在 TUI render 主路径、ChatGPT provider、provider trait 边界和 server admin metrics，符合本次跨 provider/server/TUI 功能范围。
-- External research: 第三方 `codex-ratelimit-vscode` 通过解析 `~/.codex/sessions/**/rollout-*.jsonl` 的 `token_count` 事件显示 5h/weekly 用量；官方 `openai/codex` 有 `RateLimitSnapshot` 与 `rate_limits.rs`，会从上游响应 headers 解析 `x-codex-primary-used-percent`、`x-codex-secondary-*`、credits 等字段，也支持 `codex.rate_limits` 事件。
-- GitNexus Codex index: 官方 `codex` 已索引；`backend-client::Client.get_rate_limits_many` 会调用 CodexApi `/api/codex/usage` 或 ChatGptApi `/wham/usage` 获取 usage payload；`codex-api::spawn_response_stream` 会从流响应 headers 解析所有 rate-limit buckets 并发出 `ResponseEvent::RateLimits`；app-server 把 `TokenCountEvent.rate_limits` 转成 `AccountRateLimitsUpdatedNotification`；TUI `/status` 通过 `compose_rate_limit_data_many` 渲染 5h/weekly/credits/stale 状态。
-- Tests: 新增 ChatGPT usage endpoint derivation、usage payload parser、response header parser、TUI `provider_rate_limits` parser 覆盖；workspace 全量测试通过。
-- Gaps: 未做真实 ChatGPT/Codex 账号端到端额度接口请求验证；避免在本地验证中暴露账号/token，实际显示依赖已登录 ChatGPT provider 且官方接口字段保持兼容。
-
-Resume next（下次继续）:
-
-- 提交本次功能变更并运行 `npx gitnexus analyze` 刷新索引。
-
-#### Phase 2 — Dashboard quota 独立区域
-
-Status: Done
-Depends on:
-
-- Phase 1
-
-Tasks:
-
-- [x] 确认用户希望 quota 不再挤在 Usage Overview 内。
-- [x] 对 `render_dashboard` 运行 GitNexus upstream impact。
-- [x] 将 ChatGPT/Codex quota 渲染移动到 Dashboard 独立卡片。
-- [x] 运行格式化、测试、GitNexus detect_changes、提交并刷新索引。
-
-Acceptance / Review:
-
-- Review: Dashboard 现在在 Usage Overview 上方新增独立 `ChatGPT / Codex Quota` 卡片；Usage Overview 回到只展示本地 usage/capability 数据。quota 卡片在 metrics 尚未连接时显示 waiting 状态，在没有 quota snapshot 时显示 not available/login required/waiting 提示。
-- Validation: `cargo fmt --check` 通过；`cargo test -p claude-proxy-cli tui::tests::parse_provider_rate_limits_reads_quota_snapshots` 通过。
-- GitNexus: `render_dashboard` upstream impact 为 HIGH，影响 TUI 主渲染链路 `render_content` → `render` → `run_app`，符合 Dashboard layout 局部调整预期；实施后 `detect_changes(scope=all)` 为 MEDIUM，影响集中在 `render_dashboard` / `render_model_usage` / `push_rate_limit_rows` 和 TUI render flows。
-- Tests: TUI quota parser 回归测试通过。
-- Gaps: 未进行真实终端 TUI 视觉验收；变更为 ratatui 布局/渲染逻辑局部调整。
-
-Resume next（下次继续）:
-
-- 提交 Dashboard quota 独立卡片布局调整并运行 `npx gitnexus analyze` 刷新索引。
-
-### WF-2026-05-18-002 — Claude onboarding 跳过同步
-
-Status: Active（进行中）
-Level: 2
-Started: 2026-05-18
-Updated: 2026-05-18
-Current phase: Phase 1 — 实现与验证
-
-Goal（目标）:
-
-- 在保存模型配置并同步 Claude Code 设置时，自动写入 Claude Code onboarding 完成标记，避免 Claude Code 下次启动进入首次登录/初始化流程。
-
-#### Phase 1 — 实现与验证
-
-Status: Done
-Depends on:
-
-- None
-
-Tasks:
-
-- [x] 定位 TUI 模型配置保存与 Claude Code settings 同步路径。
-- [x] 增量写入 Claude 用户级配置 `hasCompletedOnboarding = true`，保留原有字段。
-- [x] 补充回归测试并运行相关验证。
-
-Acceptance / Review:
-
-- Review: 已在 TUI 保存模型配置路径接入 Claude onboarding 完成标记写入；保留 `~/.claude.json` 既有字段。
-- Validation: `cargo fmt --check` 通过；`cargo test -p claude-proxy-cli` 通过；`cargo test` 受本任务外 `claude-proxy-server` 既有编译错误阻塞。
-- GitNexus: MCP context 当前被用户禁用；已使用 `npx gitnexus impact` CLI 检查 `sync_claude_code_settings` / `apply_claude_code_env`，风险 LOW；`npx gitnexus detect-changes --scope staged --repo claude-proxy` 返回 MEDIUM，影响 TUI 保存链路 `Handle_key → Config_file_path` / `Handle_key → To_toml`。
-- Tests: 新增 onboarding 标记创建、保留字段、非对象拒绝、路径推导、触发时机测试。
-- Gaps: 工作区存在本任务外未提交改动与 server 编译错误，未在本任务中修改。
-
-Resume next（下次继续）:
-
-- 完成实现、验证、提交并刷新 GitNexus 索引。
-
-### WF-2026-05-18-001 — README ChatGPT TUI 配置文档
-
-Status: Active（进行中）
-Level: 2
-Started: 2026-05-18
-Updated: 2026-05-18
-Current phase: Phase 1 — README TUI guide and screenshots
-
-Goal（目标）:
-
-- 完善 README 中 TUI 模式完整配置说明，以 ChatGPT provider 为例覆盖添加 provider、OAuth、模型别名、Server 参数、保存同步和验证命令。
-
-#### Phase 1 — README TUI guide and screenshots
-Status: Done
-Depends on:
-- None
-Tasks:
-- [x] 用 GitNexus 和源码核对 TUI provider/OAuth/model/server 配置流程。
-- [x] 新增 ChatGPT TUI 配置说明和本地 SVG 截图。
-- [x] 验证 README 链接、SVG 文件存在性、GitNexus detect_changes，并提交与刷新索引。
-
-Acceptance / Review:
-- Review: README 已新增 ChatGPT TUI 完整配置流程，覆盖 Providers 添加、OAuth 设备码、模型别名、Server 参数、保存同步 Claude Code env、启动服务与验证命令；新增 3 张本地 SVG TUI 截图。
-- Validation: `git diff --check` 通过；README 中 3 个新增图片引用均已确认对应文件存在；3 个新增 SVG 已通过 Windows Python `xml.etree.ElementTree` XML 解析。
-- GitNexus: `detect_changes(scope=all)` 返回 LOW，affected_count=0，affected_processes=[]；同时检测到本任务外已有 AGENTS.md / CLAUDE.md 等未提交改动。
-- Tests: 文档和 SVG 资源变更，无 Rust 测试运行。
-- Gaps: SVG 为按当前 TUI 实现绘制的示例截图，未执行真实 ChatGPT OAuth 登录截图以避免账号信息泄露。
-
-Resume next（下次继续）:
-
-- 提交本次文档变更并运行 `npx gitnexus analyze` 刷新索引。
-
-### WF-2026-05-17-005 — WebSearch tool_choice 兼容修复
-
-Status: Active（进行中）
-Level: 2
-Started: 2026-05-17
-Updated: 2026-05-17
-Current phase: Phase 1 — 影响评估与最小修复已完成
-
-Goal（目标）:
-
-- 修复 WebSearch 触发 DeepSeek/OpenAI-compatible 请求时 `tool_choice.type` 被发送为 `tool` 导致上游 400 的问题。
-
-Decisions（决策）:
-
-- 用户批准采用“抽共享 helper”方案：复用 Responses 路径已有的 tool_choice 归一化语义，并接入 Chat Completions 请求转换。
-- Copilot Chat Completions 也存在同类 `tool_choice` 原样透传点，impact 为 LOW，已一并接入共享 helper。
-
-#### Phase 1 — 影响评估与最小修复
-Status: Done
-Depends on:
-- None
-Tasks:
-- [x] 对拟修改转换函数运行 GitNexus upstream impact。
-- [x] 抽取共享 `tool_choice` 归一化 helper。
-- [x] 接入 Chat Completions 与 Responses 请求转换路径。
-- [x] 补充 WebSearch/指定工具选择回归测试。
-- [x] 运行格式化、测试、GitNexus detect_changes、提交并刷新索引。
-
-Acceptance / Review:
-- Review: 已新增共享 `tool_choice` helper；OpenAI Chat Completions 与 Copilot Chat Completions 将 Anthropic `{"type":"tool","name":"WebSearch"}` 转换为 OpenAI Chat Completions `{"type":"function","function":{"name":"WebSearch"}}`，Responses 路径继续输出 `{"type":"function","name":"WebSearch"}`，保持原有 endpoint shape。
-- Validation: `cargo fmt --check`、目标 provider 测试、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `convert_request` impact LOW，`normalize_tool_choice` impact CRITICAL（Responses/ChatGPT 主路径），`convert_to_openai_chat` impact LOW；实施后 `detect_changes(scope=all)` 为 CRITICAL，影响集中在 `convert_to_responses` 与相关 Responses/ChatGPT 测试流程，符合移动并复用原 Responses 归一化语义的预期。
-- Tests: 新增 OpenAI Chat Completions、Copilot Chat Completions、Responses 三个 named tool_choice 回归测试；provider crate 84/84、workspace 全量测试通过。
-- Gaps: 未做真实 DeepSeek WebSearch 端到端请求验证；本地验证覆盖请求体 shape。
-
-Resume next（下次继续）:
-
-- 提交本次变更并运行 `npx gitnexus analyze` 刷新索引。
-
-### WF-2026-05-17-004 — Provider 稳定性优化规划
-
-Status: Active（进行中）
-Level: 3
-Started: 2026-05-17
-Updated: 2026-05-17
-Current phase: Phase 5C — TUI metrics display 已完成
-
-Goal（目标）:
-
-- 基于当前重构后的 OpenAI/ChatGPT/Copilot provider 边界，分阶段提升上游调用稳定性、streaming 鲁棒性、tool 参数诊断和 usage/cost 可观测性。
-
-Decisions（决策）:
-
-- 先推进 provider-level retry / error classification；这是收益最高且边界最清晰的稳定性优化。
-- 当前 Phase 1 已实施：共享 HTTP retry helper 已接入 OpenAI、ChatGPT、Copilot 的 chat 与 model listing 请求路径；OAuth/device-flow 轮询请求暂不纳入本阶段。
-- Phase 2 已实施：OpenAI Chat Completions 与 Responses streaming loop 现在通过共享 idle timeout helper 读取上游 chunk，半开连接会返回 `ProviderError::Timeout`。
-- Phase 3 已实施：Chat Completions `StreamConverter` 收到 `finish_reason` 后会标记 stopped，EOF `finish()` 不再重复发送 `message_delta` / `message_stop`。
-- Phase 4 已拆分并先实施 provider 侧 PII-safe tool diagnostics：只记录 tool name、字段名、sanitization 类型与长度，不记录参数内容；usage/cost metrics 因涉及 server schema/API/TUI，延后单独处理。
-- Phase 5 规划结论：usage/cost metrics 应先做“模型能力与用量可观测性”而不是价格估算；cost 需要可维护 pricing source，否则只暴露 billable token 维度与模型 context/max output metadata；不保留旧 metrics JSON 兼容，server 与 TUI 同步更新新契约。
-- Phase 5A 已实施 server-only metrics shape enrichment：session 与 stored metrics 均新增 provider / initiator 维度聚合；SQLite schema 无需变更。
-- Phase 5B 已实施 model capability metadata：`/admin/metrics` 顶层新增 `model_capabilities`，从 provider registry cached models 暴露现有可信字段；当前 `ModelInfo` 不包含 context window，因此不猜测或新增 context 字段。
-- Phase 5C 已实施 TUI metrics display：Dashboard 按新 metrics 契约解析并展示 models / providers / initiators 与 model capabilities；不保留旧 metrics shape 兼容。
-
-#### Phase 1 — Retry / error classification 设计与影响评估
-Status: Done
-Depends on:
-- None
-Tasks:
-- [x] 确认 OpenAI/ChatGPT/Copilot 当前 HTTP 请求共用边界与可抽取点。
-- [x] 对拟修改符号运行 GitNexus upstream impact，若 HIGH/CRITICAL 先向用户确认。
-- [x] 设计最小 retry 策略：覆盖 timeout、408、409、429、5xx、`retry-after`，避免 fallback model 和复杂全局策略。
-- [x] 明确测试覆盖：可重试错误、不可重试错误、retry-after、最终错误映射。
-
-Acceptance / Review:
-- Review: 已在 [http.rs](crates/claude-proxy-providers/src/http.rs) 新增共享 `send_upstream_request` helper，最多 3 次发送可 clone 请求；对 timeout/network、408、409、429、5xx 做 transient retry，并尊重秒数形式 `retry-after`（上限 5 秒）。OpenAI、ChatGPT、Copilot 的 chat 请求路径及 OpenAI/Copilot model listing 已接入；OAuth/device-flow 轮询路径暂不纳入本阶段。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers http::tests`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `map_upstream_response`、OpenAI `chat_via_completions` / `chat_via_responses` / `list_models`、ChatGPT `chat`、Copilot `chat_via_messages` / `chat_via_completions` / `chat_via_responses` / `list_models` upstream impact 均为 LOW；实施后 `detect_changes(scope=all)` 为 LOW，changed_count=15，affected_count=0，affected_processes=[]。
-- Tests: 新增 HTTP helper 单元测试覆盖 retryable status、non-retryable status、`retry-after` clamp、timeout/network retry 判定；provider crate 77/77、workspace 全量测试通过。
-- Gaps: 未覆盖 Anthropic provider 与 ChatGPT/Copilot OAuth/device-code 请求；这些认证/轮询路径有不同节奏与语义，后续如需处理应单独评估。
-
-#### Phase 2 — Streaming idle / half-open detection
-Status: Done
-Depends on:
-- Phase 1
-Tasks:
-- [x] 评估 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming loop 是否需要统一 idle timeout。
-- [x] 设计 provider stream idle timeout 行为，超时返回明确 `ProviderError::Timeout`。
-- [x] 添加 stream 卡住/无 chunk 的回归测试或可执行验证。
-
-Acceptance / Review:
-- Review: 已在 [http.rs](crates/claude-proxy-providers/src/http.rs) 增加共享 `next_upstream_stream_item` helper，使用 120 秒 idle timeout 包装上游 `bytes_stream().next()`；[chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 与 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 的 streaming loop 均已接入，超时会向下游发送 `ProviderError::Timeout` 并结束任务。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers http::tests`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `stream_openai_response` 与 `stream_responses_response` upstream impact 均为 LOW；实施后 `detect_changes(scope=all)` 为 LOW，changed_count=5，affected_count=0，affected_processes=[]。
-- Tests: 新增 `upstream_stream_item_times_out_when_idle`，覆盖 pending upstream item 在零时长 timeout 下返回 `ProviderError::Timeout`；provider crate 78/78、workspace 全量测试通过。
-- Gaps: 当前 idle timeout 固定为 120 秒，未暴露配置项；如后续用户需要可配置化，应作为独立配置变更处理。
-
-#### Phase 3 — Chat Completions finalization parity
-Status: Done
-Depends on:
-- Phase 2
-Tasks:
-- [x] 复核 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 中 `finish_reason` 与 stream EOF 后 `finish()` 的交互。
-- [x] 补充重复 `message_stop` / `message_delta.usage` / tool argument flush 的回归测试。
-- [x] 仅在测试证明存在问题时调整状态机。
-
-Acceptance / Review:
-- Review: 回归测试先确认 `finish_reason` 后再调用 EOF `finish()` 会重复 finalization；随后在 [chat_completions.rs](crates/claude-proxy-providers/src/chat_completions.rs) 的 `StreamConverter` 增加 `stopped` 状态，`process_chunk` 处理 `finish_reason` 后标记停止，`finish()` 对已停止状态直接返回空事件。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers test_stream_converter_does_not_finish_twice_after_finish_reason`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: `stream_openai_response` upstream impact 为 LOW；`process_chunk` upstream impact 为 LOW（4 direct，包括入口和测试）；`finish` upstream impact 为 LOW（1 direct）。实施后 `detect_changes(scope=all)` 为 LOW，changed_count=9，affected_count=0，affected_processes=[]。
-- Tests: 新增 `test_stream_converter_does_not_finish_twice_after_finish_reason`，覆盖 `finish_reason` chunk 已产生一次 `message_stop` 后 EOF `finish()` 不再产生事件；provider crate 79/79、workspace 全量测试通过。
-- Gaps: 当前只修正 Chat Completions converter；Responses converter 已有 stopped 状态，本阶段无需改动。
-
-#### Phase 4 — PII-safe tool diagnostics
-Status: Done
-Depends on:
-- Phase 3
-Tasks:
-- [x] 在 [tool_args.rs](crates/claude-proxy-providers/src/tool_args.rs) 加入 PII-safe 诊断，只记录 tool name、字段名、长度、sanitization 类型。
-- [x] 评估 per-model cost / context window / max output tokens 指标是否应加入 server metrics。
-- [x] 将 usage/cost metrics 拆出为后续独立任务，避免与 provider sanitizer 诊断混合。
-
-Acceptance / Review:
-- Review: 已在 [tool_args.rs](crates/claude-proxy-providers/src/tool_args.rs) 为 `Read` argument sanitizer 增加结构化诊断路径；公开 sanitizer 行为保持 `Option<String>` 不变，Chat Completions 与 Responses 调用点无需改动。诊断使用 DEBUG 日志，只记录 `tool_name`、字段名、sanitization 类型、原始/修正后长度，不记录 `file_path` 或 argument 内容。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers tool_args`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: Phase 4 探索显示 provider sanitizer 与 server metrics 是两条独立边界；`sanitize_tool_arguments` 与 `sanitize_read_line_window` upstream impact 为 HIGH（共享 Chat Completions/Responses sanitizer 与测试流程），已向用户确认后继续。实施后 `detect_changes(scope=all)` 为 HIGH，changed_count=9，affected_count=8，affected_processes 均集中在 `tool_args.rs` sanitizer 测试/辅助流程，符合预期。
-- Tests: provider crate 81/81、workspace 全量测试通过；新增 `read_sanitizer_reports_pii_safe_diagnostics` 与 `read_sanitizer_reports_removed_unverifiable_offset` 覆盖诊断字段、sanitization 类型与长度，不断言敏感参数内容。
-- Gaps: usage/cost metrics 未在本阶段实现；因会影响 server metrics schema、admin API 与 TUI 展示，保留为独立后续任务。
-
-#### Phase 5 — Usage/cost metrics 规划
-Status: Done
-Depends on:
-- Phase 4
-Tasks:
-- [x] 用 GitNexus 复核 server metrics、persistence、admin API 与 TUI dashboard 的执行边界。
-- [x] 明确第一步不直接做价格估算，先补齐 per-provider/per-initiator/per-model 的可观测性与模型能力 metadata。
-- [x] 拆分实施顺序，降低 schema/API/TUI 同时变更风险。
-
-Planned implementation order:
-1. **Phase 5A — Metrics shape enrichment（server-only）**：扩展 `Metrics` / `StoredTotals` 的聚合输出，保留现有 token snapshot 语义，新增 provider+initiator 维度聚合；直接定义新的 `/admin/metrics` JSON shape，不为旧 shape 添加兼容 shim。
-2. **Phase 5B — Model capability metadata（provider/server boundary）**：把 provider `ModelInfo` 中已有的 max output tokens、supported endpoints、vision/thinking/reasoning metadata 暴露到新的 metrics/admin 响应契约，供 TUI 展示；当前 `ModelInfo` 不包含 context window，避免混入猜测字段或 request path 的实时计费逻辑。
-3. **Phase 5C — TUI metrics display**：按新 metrics JSON 契约更新 Dashboard 解析与展示 provider/initiator 维度、模型能力列；不支持旧 server 的旧 metrics shape，发现字段缺失时按新契约默认空值处理即可。
-4. **Phase 5D — Cost estimate（optional）**：仅在有明确 pricing table 来源和更新策略后实现估算；否则只展示 billable token 分解，避免误导性成本数字。
-
-Acceptance / Review:
-- Review: 已确认当前 [app.rs](crates/claude-proxy-server/src/app.rs) 的 `TokenUsage` / `ModelMetrics` 只按 model 聚合 token，`MetricsStore` 只持久化 provider、initiator、model、token、error、latency，`/admin/metrics` 输出 session/stored totals，TUI Dashboard 只解析并合并 model token totals；用户明确要求不考虑兼容，因此后续实施可同步替换 server/TUI 的 metrics 契约。
-- Validation: 规划阶段未修改业务代码；读取并复核 [routes.rs](crates/claude-proxy-server/src/routes.rs)、[persistence.rs](crates/claude-proxy-server/src/persistence.rs)、[dashboard.rs](crates/claude-proxy-cli/src/tui/pages/dashboard.rs) 与 [app.rs](crates/claude-proxy-cli/src/tui/app.rs)。
-- GitNexus: `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`admin_metrics`、`fetch_live_metrics`、`render_model_usage` 是主要边界；server 与 TUI 变更会跨 crate，应分阶段实施。
-- Tests: N/A（规划阶段）。
-- Gaps: 尚未选择 pricing source；未运行具体符号 impact，实施前仍需对拟修改符号逐一运行 GitNexus upstream impact；无需为旧 metrics JSON shape 设计兼容层。
-
-#### Phase 5A — Metrics shape enrichment（server-only）
-Status: Done
-Depends on:
-- Phase 5
-Tasks:
-- [x] 对 `record_completed_request`、`MetricsStore.record_usage`、`MetricsStore.load_totals`、`Metrics.to_json` 运行 GitNexus upstream impact。
-- [x] 扩展 session metrics 输出，新增 provider / initiator 维度聚合。
-- [x] 扩展 stored totals 聚合，按 model / provider / initiator 输出统一 token usage metrics。
-- [x] 补充 server metrics shape 与 persistence aggregation 回归测试。
-
-Acceptance / Review:
-- Review: 已在 [app.rs](crates/claude-proxy-server/src/app.rs) 将 `ModelMetrics` 泛化为 `UsageMetrics`，保留 `ModelMetrics` alias，并为 session metrics 新增 `providers` 与 `initiators` 输出；已在 [persistence.rs](crates/claude-proxy-server/src/persistence.rs) 复用现有 `usage_events.provider` / `initiator` 字段聚合 stored totals，无需 SQLite schema migration。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `Metrics.record_completed_request#6`、`MetricsStore.record_usage#6`、`MetricsStore.load_totals#0`、`Metrics.to_json#0` upstream impact 均为 LOW；实施后 `detect_changes(scope=all)` 为 MEDIUM，changed_count=31，affected_count=1，affected_processes=[`Handle_server → Load_stored_totals`]，符合启动加载 stored totals 的预期影响。
-- Tests: 新增 `completed_request_records_provider_and_initiator_metrics` 覆盖 session `models` / `providers` / `initiators` JSON；新增 `load_totals_groups_usage_by_model_provider_and_initiator` 覆盖 stored model/provider/initiator 聚合与 error totals。
-- Gaps: TUI 仍只解析旧 Dashboard model usage 展示；按规划留到 Phase 5C 与新 metrics contract 同步更新。模型能力 metadata 未实现，留到 Phase 5B。
-
-#### Phase 5B — Model capability metadata（provider/server boundary）
-Status: Done
-Depends on:
-- Phase 5A
-Tasks:
-- [x] 用 GitNexus 确认 model cache、`ProviderRegistry` 与 `admin_metrics` 的影响边界。
-- [x] 从 provider registry cached models 暴露 `model_capabilities`。
-- [x] 只使用 `ModelInfo` 现有可信字段，不新增 context window 或 pricing 字段。
-- [x] 补充 registry 与 `/admin/metrics` 路由级回归测试。
-
-Acceptance / Review:
-- Review: 已在 [app.rs](crates/claude-proxy-server/src/app.rs) 新增 `ProviderRegistry::model_capabilities()`，按 `provider/model` key 输出 provider、model、vendor、max output tokens、supported endpoints、vision/thinking/adaptive thinking、thinking budget 与 reasoning effort levels；已在 [routes.rs](crates/claude-proxy-server/src/routes.rs) 将 cached model capabilities 注入 `/admin/metrics` 顶层 `model_capabilities`。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: `ProviderRegistry.all_cached_models#0` upstream impact 为 LOW（direct=1，仅 `/v1/models`）；`Metrics.to_json#0` upstream impact 为 LOW（direct=2，`admin_metrics` 与测试）。实施后 `detect_changes(scope=all)` 为 LOW，changed_count=15，affected_count=0，affected_processes=[]。
-- Tests: 新增 `provider_registry_exports_model_capabilities` 覆盖 capability JSON shape；新增 `admin_metrics_includes_model_capabilities` 覆盖 `/admin/metrics` 注入 cached model metadata。
-- Gaps: TUI 尚未消费 `model_capabilities`，留到 Phase 5C；当前不暴露 context window，因为 `ModelInfo` 尚无可信字段。
-
-#### Phase 5C — TUI metrics display
-Status: Done
-Depends on:
-- Phase 5B
-Tasks:
-- [x] 对 TUI metrics polling 与 Dashboard usage rendering 运行 GitNexus upstream impact。
-- [x] 按新 `/admin/metrics` 契约解析 session/stored models、providers、initiators。
-- [x] 解析并展示 `model_capabilities` 中现有可信模型能力字段。
-- [x] 补充 TUI metrics parser 回归测试。
-
-Acceptance / Review:
-- Review: 已在 [app.rs](crates/claude-proxy-cli/src/tui/app.rs) 扩展 `LiveMetrics` / `StoredMetrics` 并新增 `ModelCapability`；已在 [mod.rs](crates/claude-proxy-cli/src/tui/mod.rs) 将 metrics parser 抽成统一 usage/capability 解析；已在 [dashboard.rs](crates/claude-proxy-cli/src/tui/pages/dashboard.rs) 将 Dashboard usage 区更新为 Models / Providers / Initiators / Model Capabilities 展示。Capability metadata 可在无请求记录时展示；不支持旧 metrics JSON shape。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-cli`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `poll_metrics` 与 `render_model_usage` upstream impact 为 HIGH，影响集中在 TUI run/render 主路径，已按预期限制为解析与展示变更。实施后 `detect_changes(scope=all)` 为 HIGH，changed_count=19，affected_count=7，affected_processes 包含 TUI render/run 相关流程，符合 Dashboard metrics 展示变更预期。
-- Tests: 新增 `parse_metrics_contract_reads_new_usage_dimensions` 覆盖新 usage dimensions 解析；新增 `parse_model_capabilities_reads_metadata_fields` 覆盖 capability metadata 字段解析。
-- Gaps: 未做交互式 TUI 截图/浏览器级视觉验证；Phase 5D cost estimate 仍仅在明确 pricing source 与更新策略后再评估；当前仍不展示 context window，因为 `ModelInfo` 尚无可信字段。
-
-Discovered tasks（发现的后续任务）:
-
-- 若上游后续强制要求 Responses `instructions`，再评估 OpenAI/Copilot provider-specific 处理。
-- usage/cost metrics 增强需单独规划：可能涉及 server metrics schema、admin API 响应、SQLite migration/aggregation 与 TUI 展示。
-
-Resume next（下次继续）:
-
-- Phase 5C 已完成 TUI metrics display；下一步不要启动 Phase 5D，除非先明确 pricing source 与更新策略。可先提交本阶段并刷新 GitNexus 索引。
+- 运行格式化和 provider 级测试，修正失败后完成 merge commit。
 
 ## Backlog / Future（待办 / 未来）
 
@@ -418,117 +37,136 @@ Resume next（下次继续）:
 ## Completed（已完成）
 
 ### WF-2026-05-19-002 — thinking 文本泄漏治理
-
-Status: Done（已完成）
 Completed: 2026-05-20
 Level: 3
-Acceptance summary（验收摘要）:
 
-- Review: 新增 `ThinkingSanitizer`，接入 Responses 与 Chat Completions 的普通 text 输出边界；移除 Responses/Copilot Chat Completions 请求侧 `[thinking]` 文本降级；结构化 reasoning 继续走 `thinking_delta`；observability 不再把 `[thinking]` 当正常 thinking 统计依据。
+Close summary:
+- Outcome: 新增 `ThinkingSanitizer`，接入 Responses 与 Chat Completions 的普通 text 输出边界；移除请求侧 `[thinking]` 文本降级；结构化 reasoning 继续走 `thinking_delta`。
 - Validation: `cargo fmt --check`、目标 provider tests、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 变更前 `process_event` HIGH、`process_chunk` MEDIUM、`append_message_items` / `should_truncate_text_item` CRITICAL；变更后 `detect_changes(scope=all)` CRITICAL，影响集中在 provider conversion 与相关测试，符合治理范围。
-- Tests: 覆盖 sanitizer、Responses streaming/non-streaming、Chat Completions streaming/non-streaming、Copilot request conversion、observability。
 - Gaps: 未做真实上游端到端请求验证；本地验证覆盖转换层和 SSE shape。
 
-### WF-2026-05-19-001 — Thinking budget xhigh 映射优化
-
-Status: Done（已完成）
+### WF-2026-05-19-003 — Thinking 渲染异常检修
 Completed: 2026-05-19
 Level: 2
-Acceptance summary（验收摘要）:
 
-- Review: `thinking_budget_to_reasoning_effort` 现在按 `0..=2048 low`、`2049..=8192 medium`、`8193..=16384 high`、`16385+ xhigh` 映射，并在目标模型不支持 `xhigh` 时降级为 `high`；OpenAI-compatible 日志和 Responses 请求体转换共用该 model-aware 映射。
+Close summary:
+- Outcome: 新增 provider 内部 tagged-thinking splitter，并在 Chat Completions / Responses 的 streaming 与 non-streaming 普通文本输出路径识别 `[thinking]...[/thinking]` 和 `<thinking>...</thinking>`，转换为 Anthropic `thinking_delta`。
+- Validation: `cargo fmt --check`、tagged-thinking 单测、tagged streaming/non-streaming 目标回归、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- Gaps: 未做真实 Claude Code 端到端 UI 验证；本地协议转换和完整 workspace 测试已覆盖事件形状。
+
+### WF-2026-05-19-004 — 流式 chunked EOF 错误处理
+Completed: 2026-05-20
+Level: 3
+
+Close summary:
+- Outcome: 修复 OpenAI Chat Completions 流式响应在终止事件后的尾部 chunked EOF 误报，同时保留中途断流错误语义。
+- Validation: 对应提交 `c3354e0 Fix streaming EOF handling` 已包含回归测试与验证。
+- Gaps: None。
+
+### WF-2026-05-18-004 — 模型别名推理强度配置
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+- Outcome: 支持结构化模型别名推理强度，并修正 direct model ref / Claude Code model alias 路由相关语义。
+- Validation: 对应提交 `c802943`、`bd04e33`、`6ed92e5` 以及设计文档提交已完成。
+- Gaps: None。
+
+### WF-2026-05-18-003 — TUI ChatGPT 额度显示规划
+Completed: 2026-05-20
+Level: 3
+
+Close summary:
+- Outcome: 实现 ChatGPT/Codex quota 获取、metrics 暴露和 TUI Dashboard 独立 quota 卡片。
+- Validation: 对应提交 `ed12898`、`cbfdb00`、`36ca923`、`175b368` 已完成相关 provider/server/TUI 测试。
+- Gaps: 未做真实账号端到端额度接口验证。
+
+### WF-2026-05-18-002 — Claude onboarding 跳过同步
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+- Outcome: TUI 保存模型配置并同步 Claude Code 设置时写入 onboarding 完成标记。
+- Validation: 对应提交 `7d89680 feat(tui): skip Claude onboarding on model save` 已完成。
+- Gaps: None。
+
+### WF-2026-05-18-001 — README ChatGPT TUI 配置文档
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+- Outcome: README 增加 ChatGPT TUI 配置流程和相关截图说明。
+- Validation: 对应提交 `a593571 Document ChatGPT TUI setup flow` 已完成。
+- Gaps: 示例截图不是实时账号登录截图。
+
+### WF-2026-05-17-005 — WebSearch tool_choice 兼容修复
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+- Outcome: 统一 OpenAI/Copilot Chat Completions 与 Responses 的 named tool_choice 归一化语义。
+- Validation: 对应提交 `bf7dc93 Normalize OpenAI tool choices for named tools` 已完成。
+- Gaps: 未做真实 DeepSeek WebSearch 端到端请求验证。
+
+### WF-2026-05-17-004 — Provider 稳定性优化规划
+Completed: 2026-05-20
+Level: 3
+
+Close summary:
+- Outcome: 完成 provider retry、stream idle timeout、finalization parity、PII-safe tool diagnostics、metrics dimensions、model capability metadata 和 TUI metrics display 分阶段优化。
+- Validation: 对应提交包含 `72e697b`、`b50f8a8`、`eb6fec2`、`f2fc29e` 等，相关阶段均已记录测试通过。
+- Gaps: usage/cost pricing estimate 仍在 Backlog 中，需明确 pricing source 后另行规划。
+
+### WF-2026-05-19-001 — Thinking budget xhigh 映射优化
+Completed: 2026-05-19
+Level: 2
+
+Close summary:
+- Outcome: `thinking_budget_to_reasoning_effort` 现在按 `0..=2048 low`、`2049..=8192 medium`、`8193..=16384 high`、`16385+ xhigh` 映射，并在目标模型不支持 `xhigh` 时降级为 `high`。
 - Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `thinking_budget_to_reasoning_effort` upstream impact 为 CRITICAL，`request_reasoning_effort` 为 HIGH，`convert_reasoning` 为 CRITICAL；变更后 `detect_changes(scope=all)` 为 CRITICAL，主要因工作区含本任务外 AGENTS.md/CLAUDE.md 改动，实际本任务影响集中在 OpenAI log reasoning 映射和 Responses reasoning body 转换测试。
-- Tests: 新增/更新 provider 回归测试覆盖 `16385+` 映射到 `xhigh`，以及非 reasoning-capable model 降级为 `high`。
 - Gaps: 未做真实 ChatGPT 请求端到端验证；本地验证覆盖日志映射函数和 Responses 请求体转换。
 
 ### WF-2026-05-17-006 — Model context window metadata
-
-Status: Done（已完成）
 Completed: 2026-05-17
 Level: 3
-Commits（提交）:
 
-- 2bf7124 Add model context window metadata
-- 5d62164 Refresh GitNexus index metadata
-
-Acceptance summary（验收摘要）:
-
-- Review: 已在 core `ModelInfo`、OpenAI/ChatGPT known model metadata、Copilot model parser、server `/v1/models` 与 `/admin/metrics` capability export、TUI capability parser/Dashboard rows 接入 `context_window`。Dashboard 现在分开展示 `ctx` 与 `out`，避免将 max output 误读为上下文窗口。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test -p claude-proxy-server`、`cargo test -p claude-proxy-cli`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: 实施前 `ModelInfo` upstream impact 为 HIGH（5 direct，3 modules），`openai_model_info`、`model_capabilities`、`push_capability_rows` 为 LOW；实施后 `detect_changes(scope=all)` 为 MEDIUM，影响集中在 TUI capability 解析/运行流程，符合预期。`npx gitnexus analyze` 已刷新索引至 1,763 nodes / 4,293 edges / 155 flows。
-- Tests: 更新 provider/server/TUI 回归测试覆盖 gpt-5.5 `context_window`、Copilot context parser、server capability JSON、TUI capability parser。
-- Gaps: 未做交互式 TUI 视觉验证；Cargo.toml 存在本任务外的未提交版本号变更。
+Close summary:
+- Outcome: 在 core `ModelInfo`、OpenAI/ChatGPT known model metadata、Copilot model parser、server capability export、TUI capability parser/Dashboard rows 接入 `context_window`。
+- Validation: `cargo fmt --check`、相关 crate 测试、完整 `cargo test`、`cargo clippy -- -D warnings` 均通过。
+- Gaps: 未做交互式 TUI 视觉验证；Cargo.toml 存在本任务外版本号变更。
 
 ### WF-2026-05-17-003 — ChatGPT/Codex Responses 优化
-
-Status: Done（已完成）
 Completed: 2026-05-17
 Level: 3
-Commits（提交）:
 
-- cb66177 Prepare v0.3.4 release fixes
-- 5e1a146 Fix streaming usage snapshot accounting
-- ef6163a Refresh GitNexus index metadata
-
-Acceptance summary（验收摘要）:
-
-- Review: 完成 ChatGPT/Codex Responses 路径优化：稳定 tool schema normalization、split function arguments buffering/sanitization、empty completed output 的 `tool_use` stop reason，并修正 server streaming usage 统计为最终累计快照语义，避免重复 `message_delta.usage` 导致 token 翻倍。
-- Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test -p claude-proxy-server usage_extraction`、`cargo test -p claude-proxy-server`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
-- GitNexus: Phase 1 推进前 `detect_changes` 为 medium，集中在 Responses converter；Phase 2 评估显示 `convert_to_responses` 上游影响为 CRITICAL，因此暂缓抽取；Phase 3 中 `extract_usage_from_event` 上游 impact 为 LOW，变更后 `detect_changes` 为 low 且无 affected processes。最终 `npx gitnexus analyze` 已刷新索引至 1,608 nodes / 3,892 edges / 141 flows。
-- Tests: provider crate 62/62 通过；server crate 10/10 与 integration 7/7 通过；完整 workspace 测试全部通过。新增 usage snapshot 回归覆盖重复 `message_delta.usage` 与 cache token snapshot。
-- Gaps: provider-neutral Responses 模块抽取保留为后续独立重构；当前 ChatGPT/Codex 行为优化已完成。
+Close summary:
+- Outcome: 完成 Responses 路径 tool schema normalization、function arguments buffering/sanitization、empty completed output `tool_use` stop reason，并修正 server streaming usage 累计快照统计。
+- Validation: provider/server/workspace 测试与 clippy 均通过。
+- Gaps: provider-neutral Responses 模块抽取保留为后续独立重构。
 
 ### WF-2026-05-17-002 — v0.3.4 发布
-
-Status: Done（已完成）
 Completed: 2026-05-17
 Level: 2
-Commits / Tag（提交 / 标签）:
 
-- cb66177 Prepare v0.3.4 release fixes
-- c5d145a Refresh v0.3.4 release metadata
-- v0.3.4 tag: 4524ceb（本地 tag 存在，指向 `c5d145a`）
-
-Acceptance summary（验收摘要）:
-
-- Review: 确认 v0.3.4 包含 Responses tool schema normalization、split function arguments buffering/sanitization、empty completed output `tool_use` stop reason、版本号更新和发布元数据刷新。
-- Validation: 发布准备阶段已验证 `./target/release/claude-proxy --version` 输出 `claude-proxy 0.3.4`；`cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings`、`cargo build --release` 均通过。
-- GitNexus: 文件级 impact 对 `chatgpt.rs` 和 `copilot/responses.rs` 为 LOW；最终发布准备 `detect_changes` 为 medium，主要变更集中在 `ResponsesStreamConverter`、`normalize_tool_schema` 和相关测试。发布后 GitNexus 元数据已刷新。
-- Tests: provider crate 与完整 workspace 验证通过。
-- Gaps: 用户确认发布任务已由其他 agent 完成；本 ledger 已据本地 tag 状态补记完成。
+Close summary:
+- Outcome: 完成 v0.3.4 发布准备、版本号更新和发布元数据刷新。
+- Validation: release build、workspace 测试与 clippy 均通过。
+- Gaps: 发布任务已由其他 agent 完成；ledger 据本地 tag 状态补记完成。
 
 ### WF-2026-05-17-001 — ChatGPT Read pages 参数清理
-
-Status: Done（已完成）
 Completed: 2026-05-17
 Level: 2
-Commits（提交）:
 
-- a907eb7 Sanitize empty Read pages arguments
-
-Acceptance summary（验收摘要）:
-
-- Review: 添加了保守的 Responses argument sanitizer，仅在 `Read` tool call 的 argument JSON 完整且可解析时移除顶层 `pages: ""`；保留非 Read 工具和其他 empty string。
+Close summary:
+- Outcome: 添加保守的 Responses argument sanitizer，仅在 `Read` tool call 的 argument JSON 完整且可解析时移除顶层 `pages: ""`。
 - Validation: `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`cargo clippy -- -D warnings` 和 `cargo test` 均通过。
-- GitNexus: 对 `handle_function_call_arguments_done`、`handle_output_item_done` 和 `convert_function_call` 的 impact 检查为 LOW risk；`detect_changes` 报告 LOW risk，且无 affected processes。
-- Tests: 添加了 `Read.pages: ""` 移除、Bash command 保留、non-streaming sanitization、non-Read empty string 保留等回归覆盖。
-- Gaps: None（无）。
+- Gaps: None。
 
 ### WF-2026-05-16-001 — ChatGPT responses 默认 instructions
-
-Status: Done（已完成）
 Completed: 2026-05-16
 Level: 2
-Commits（提交）:
 
-- 83be0f9 Fix ChatGPT responses instructions fallback
-
-Acceptance summary（验收摘要）:
-
-- Review: 添加 `build_chatgpt_responses_body`，确保只有 ChatGPT Responses 请求获得 fallback instructions，同时保留已有 system instructions。
+Close summary:
+- Outcome: 添加 `build_chatgpt_responses_body`，确保只有 ChatGPT Responses 请求获得 fallback instructions，同时保留已有 system instructions。
 - Validation: `cargo fmt`、`cargo clippy -- -D warnings`、`cargo test -p claude-proxy-providers` 和 `cargo test` 均通过。
-- GitNexus: 初始对 `ChatGptProvider.chat` 的 `impact` 为 LOW risk；最终 `detect_changes` 因触及 `chatgpt.rs` 和相关测试流程报告 HIGH，经复核符合预期。`npx gitnexus analyze` 将索引更新为 1,584 nodes / 3,814 edges / 139 flows。
-- Tests: 添加了 missing ChatGPT instructions、保留 existing system instructions、fast-intent body generation 的覆盖。
-- Gaps: None（无）。
+- Gaps: None。

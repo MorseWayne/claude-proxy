@@ -13,6 +13,7 @@ use crate::openai_compat::{
 };
 use crate::provider::ProviderError;
 use crate::sse::{SseDecoder, parse_sse_json_value};
+use crate::tagged_thinking::{TaggedThinkingSplitter, TextSegment, split_tagged_thinking};
 use crate::thinking_sanitizer::{ThinkingSanitizer, sanitize_thinking_markers};
 use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
@@ -979,6 +980,8 @@ struct ResponsesStreamConverter {
     open_block: Option<OpenBlock>,
     text_sanitizers: HashMap<(u64, u64), ThinkingSanitizer>,
     output_blocks: HashMap<(u64, u64), u32>,
+    tagged_text: TaggedThinkingSplitter,
+    tagged_text_key: Option<(u64, u64)>,
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
@@ -1022,7 +1025,7 @@ impl ResponsesStreamConverter {
                 let content_index = event["content_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    self.emit_text_delta(output_index, content_index, delta, &mut events);
+                    self.emit_tagged_text(output_index, content_index, delta, &mut events);
                 }
             }
             "response.refusal.delta" => {
@@ -1031,11 +1034,12 @@ impl ResponsesStreamConverter {
                 let content_index = event["content_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    self.emit_text_delta(output_index, content_index, delta, &mut events);
+                    self.emit_tagged_text(output_index, content_index, delta, &mut events);
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_tagged_text(&mut events);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
                     let idx = self.ensure_thinking_block(&mut events);
@@ -1044,6 +1048,7 @@ impl ResponsesStreamConverter {
             }
             "response.function_call_arguments.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_tagged_text(&mut events);
                 let output_index = event["output_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
@@ -1057,15 +1062,18 @@ impl ResponsesStreamConverter {
             }
             "response.function_call_arguments.done" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_tagged_text(&mut events);
                 self.handle_function_call_arguments_done(event, &mut events);
             }
             "response.output_item.done" => {
+                self.flush_tagged_text(&mut events);
                 self.handle_output_item_done(event, &mut events);
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
                 if let Some(response) = event.get("response") {
                     self.ensure_started(response, &mut events);
                     self.set_usage(response);
+                    self.flush_tagged_text(&mut events);
                     self.stop_response(response, &mut events);
                 }
             }
@@ -1078,6 +1086,7 @@ impl ResponsesStreamConverter {
     fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if self.started && !self.stopped {
+            self.flush_tagged_text(&mut events);
             self.flush_text_sanitizers(&mut events);
             self.close_open_block(&mut events);
             self.stop_with_reason("end_turn", &mut events);
@@ -1119,6 +1128,7 @@ impl ResponsesStreamConverter {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
+            self.flush_tagged_text(events);
             self.saw_function_call = true;
             if let Some(name) = item["name"].as_str() {
                 self.function_names.insert(output_index, name.to_string());
@@ -1140,14 +1150,14 @@ impl ResponsesStreamConverter {
                 if let Some(text) = part["text"].as_str()
                     && !text.is_empty()
                 {
-                    self.emit_text_delta(output_index, content_index, text, events);
+                    self.emit_tagged_text(output_index, content_index, text, events);
                 }
             }
             Some("refusal") => {
                 if let Some(text) = part["refusal"].as_str()
                     && !text.is_empty()
                 {
-                    self.emit_text_delta(output_index, content_index, text, events);
+                    self.emit_tagged_text(output_index, content_index, text, events);
                 }
             }
             _ => {}
@@ -1301,6 +1311,60 @@ impl ResponsesStreamConverter {
         });
     }
 
+    fn emit_tagged_text(
+        &mut self,
+        output_index: u64,
+        content_index: u64,
+        text: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let key = (output_index, content_index);
+        if self.tagged_text_key != Some(key) {
+            self.flush_tagged_text(events);
+            self.tagged_text_key = Some(key);
+        }
+        for segment in self.tagged_text.push(text) {
+            self.emit_text_segment(key, segment, events);
+        }
+    }
+
+    fn flush_tagged_text(&mut self, events: &mut Vec<SseEvent>) {
+        let key = self.tagged_text_key.take();
+        for segment in self.tagged_text.finish() {
+            if let Some(key) = key {
+                self.emit_text_segment(key, segment, events);
+            } else if let TextSegment::Thinking(thinking) = segment {
+                self.emit_thinking_content(&thinking, events);
+            }
+        }
+        self.flush_text_sanitizers(events);
+    }
+
+    fn emit_text_segment(
+        &mut self,
+        (output_index, content_index): (u64, u64),
+        segment: TextSegment,
+        events: &mut Vec<SseEvent>,
+    ) {
+        match segment {
+            TextSegment::Text(text) => {
+                self.emit_text_delta(output_index, content_index, &text, events);
+            }
+            TextSegment::Thinking(thinking) => {
+                self.flush_text_sanitizers(events);
+                self.emit_thinking_content(&thinking, events);
+            }
+        }
+    }
+
+    fn emit_thinking_content(&mut self, thinking: &str, events: &mut Vec<SseEvent>) {
+        if thinking.is_empty() {
+            return;
+        }
+        let idx = self.ensure_thinking_block(events);
+        events.push(content_delta(idx, "thinking_delta", "thinking", thinking));
+    }
+
     fn ensure_text_block(
         &mut self,
         output_index: u64,
@@ -1401,7 +1465,11 @@ impl ResponsesStreamConverter {
     fn close_open_block(&mut self, events: &mut Vec<SseEvent>) {
         if let Some(block) = self.open_block.take() {
             let idx = match block {
-                OpenBlock::Text(idx) | OpenBlock::Thinking(idx) => idx,
+                OpenBlock::Text(idx) => {
+                    self.output_blocks.retain(|_, block_idx| *block_idx != idx);
+                    idx
+                }
+                OpenBlock::Thinking(idx) => idx,
             };
             events.push(block_stop(idx));
         }
@@ -1637,7 +1705,17 @@ impl<'a> NonStreamingResponsesConverter<'a> {
     }
 
     fn add_text_block(&mut self, text: &str) {
-        let text = sanitize_thinking_markers(text);
+        for segment in split_tagged_thinking(text) {
+            match segment {
+                TextSegment::Text(text) => {
+                    self.add_plain_text_block(&sanitize_thinking_markers(&text))
+                }
+                TextSegment::Thinking(thinking) => self.add_thinking_block(&thinking),
+            }
+        }
+    }
+
+    fn add_plain_text_block(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -2778,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_converter_sanitizes_thinking_markers_in_output_text() {
+    fn test_stream_converter_maps_tagged_output_text_to_thinking() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
 
@@ -2790,15 +2868,31 @@ mod tests {
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
-            "delta": "hello [thinking]secret[/thinking] world"
+            "delta": "hello [thinking]plan[/thinking] world"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
         })));
 
-        assert_eq!(text_deltas(&events), vec!["hello  world"]);
-        assert!(!text_deltas(&events).join("").contains("secret"));
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
     }
 
     #[test]
-    fn test_stream_converter_sanitizes_split_thinking_markers_in_output_text() {
+    fn test_stream_converter_maps_split_tagged_output_text_to_thinking() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
 
@@ -2806,17 +2900,34 @@ mod tests {
             "type": "response.created",
             "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
         })));
-        for delta in ["hello [think", "ing]secret", "[/think", "ing] world"] {
-            events.extend(converter.process_event(&json!({
-                "type": "response.output_text.delta",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": delta
-            })));
-        }
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello [thin"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "king]plan[/thin"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "king] world"
+        })));
 
-        assert_eq!(text_deltas(&events), vec!["hello ", " world"]);
-        assert!(!text_deltas(&events).join("").contains("secret"));
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
     }
 
     #[test]
@@ -2846,10 +2957,11 @@ mod tests {
 
         assert_eq!(text_deltas(&events), vec!["visible "]);
         assert!(!text_deltas(&events).join("").contains("secret"));
+        assert!(thinking_deltas(&events).is_empty());
     }
 
     #[test]
-    fn test_stream_converter_keeps_reasoning_text_as_thinking_delta() {
+    fn test_stream_converter_preserves_typed_reasoning_delta() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
 
@@ -2859,11 +2971,13 @@ mod tests {
         })));
         events.extend(converter.process_event(&json!({
             "type": "response.reasoning_text.delta",
-            "delta": "private reasoning"
+            "delta": "typed thought"
         })));
 
-        assert_eq!(thinking_deltas(&events), vec!["private reasoning"]);
-        assert!(text_deltas(&events).is_empty());
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![("thinking_delta".to_string(), "typed thought".to_string())]
+        );
     }
 
     #[test]
@@ -3179,22 +3293,51 @@ mod tests {
     }
 
     #[test]
-    fn test_non_streaming_response_sanitizes_thinking_markers_in_output_text() {
+    fn test_non_streaming_response_maps_tagged_output_text_to_thinking() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hello [thinking]plan[/thinking] world"}]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
+    }
+
+    #[test]
+    fn test_non_streaming_response_drops_unclosed_thinking_marker_in_output_text() {
         let data = json!({
             "id": "resp_1",
             "model": "gpt-5",
             "status": "completed",
             "output": [{
                 "type": "message",
-                "content": [{"type": "output_text", "text": "hello [thinking]secret[/thinking] world"}]
+                "content": [{"type": "output_text", "text": "visible [thinking]secret"}]
             }],
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
 
         let events = convert_non_streaming_response(&data);
 
-        assert_eq!(text_deltas(&events), vec!["hello  world"]);
+        assert_eq!(text_deltas(&events), vec!["visible "]);
         assert!(!text_deltas(&events).join("").contains("secret"));
+        assert!(thinking_deltas(&events).is_empty());
     }
 
     #[test]
@@ -3397,6 +3540,29 @@ mod tests {
             sanitize_tool_arguments("Other", "{\"pages\":\"\",\"value\":\"\"}"),
             None
         );
+    }
+
+    fn text_and_thinking_deltas(events: &[SseEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|event| {
+                if event.event != "content_block_delta" {
+                    return None;
+                }
+                let delta = &event.data["delta"];
+                match delta["type"].as_str()? {
+                    "text_delta" => Some((
+                        "text_delta".to_string(),
+                        delta["text"].as_str()?.to_string(),
+                    )),
+                    "thinking_delta" => Some((
+                        "thinking_delta".to_string(),
+                        delta["thinking"].as_str()?.to_string(),
+                    )),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     fn temp_read_fixture(lines: usize) -> PathBuf {

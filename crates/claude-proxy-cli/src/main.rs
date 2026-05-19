@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -8,6 +9,9 @@ use colored::Colorize;
 
 mod logging;
 mod tui;
+
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(7);
+const SERVER_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 #[command(
@@ -760,19 +764,33 @@ async fn handle_server(action: ServerAction) {
                     Some(pid) => {
                         if is_process_running(pid) {
                             println!("Stopping claude-proxy (PID {pid})...");
-                            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                            // Wait for process to exit
-                            for _ in 0..30 {
+                            if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+                                eprintln!(
+                                    "{} Failed to send SIGTERM to PID {pid}: {}",
+                                    "Error:".red().bold(),
+                                    std::io::Error::last_os_error()
+                                );
+                                process::exit(1);
+                            }
+
+                            let deadline = Instant::now() + SERVER_STOP_TIMEOUT;
+                            while Instant::now() < deadline {
                                 if !is_process_running(pid) {
                                     println!("{} Stopped.", "✓".green());
                                     cleanup_pid_file();
                                     return;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                tokio::time::sleep(SERVER_STOP_POLL_INTERVAL).await;
+                            }
+                            if !is_process_running(pid) {
+                                println!("{} Stopped.", "✓".green());
+                                cleanup_pid_file();
+                                return;
                             }
                             eprintln!(
-                                "{} Process did not stop within 3 seconds.",
-                                "Warning:".yellow()
+                                "{} Process did not stop within {} seconds.",
+                                "Warning:".yellow(),
+                                SERVER_STOP_TIMEOUT.as_secs()
                             );
                         } else {
                             println!(
@@ -949,7 +967,31 @@ fn read_pid_file() -> Option<u32> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if is_zombie_process(pid) {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn is_zombie_process(pid: u32) -> bool {
+    let status_path = format!("/proc/{pid}/status");
+    let Ok(status) = std::fs::read_to_string(status_path) else {
+        return false;
+    };
+
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .is_some_and(|state| state.trim_start().starts_with('Z'))
 }
 
 #[cfg(not(unix))]
