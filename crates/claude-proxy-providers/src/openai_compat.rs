@@ -1,6 +1,6 @@
 use claude_proxy_core::*;
 use serde_json::{Value, json};
-use tracing::{Level, debug, enabled};
+use tracing::{Level, debug, enabled, info};
 
 const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
@@ -386,6 +386,36 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
     }
 }
 
+const COMPACT_REQUEST_MARKERS: &[&str] = &[
+    "Your task is to create a detailed summary",
+    "This session is being continued from a previous conversation",
+    "This is a compacted conversation",
+    "This is a continuation from a previous conversation",
+    "conversation that ran out of context",
+];
+
+pub(crate) fn is_compact_request_body(body: &Value) -> bool {
+    ["instructions", "input", "messages"]
+        .iter()
+        .filter_map(|field| body.get(*field))
+        .any(value_contains_compact_marker)
+}
+
+fn value_contains_compact_marker(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text_contains_compact_marker(text),
+        Value::Array(items) => items.iter().any(value_contains_compact_marker),
+        Value::Object(map) => map.values().any(value_contains_compact_marker),
+        _ => false,
+    }
+}
+
+fn text_contains_compact_marker(text: &str) -> bool {
+    COMPACT_REQUEST_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 fn history_payload_budget_bytes_for_stats(model: &str) -> usize {
     let model = model.to_ascii_lowercase();
     if model.contains("mini") || model.contains("small") || model.contains("flash") {
@@ -541,6 +571,42 @@ pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &V
     );
 }
 
+pub(crate) fn log_compact_request_observability(
+    provider: &str,
+    endpoint: &str,
+    body: &Value,
+    compact_request: bool,
+) {
+    if !compact_request || !enabled!(Level::INFO) {
+        return;
+    }
+
+    let stats = request_observability(body);
+    info!(
+        provider,
+        endpoint,
+        model = %stats.model,
+        stream = stats.stream,
+        input_items = stats.input_items,
+        body_bytes = stats.body_bytes,
+        history_payload_budget_bytes = stats.history_payload_budget_bytes,
+        history_payload_bytes_after = stats.history_payload_bytes_after,
+        history_payload_bytes_before = stats.history_payload_bytes_before,
+        history_payload_budget_used_per_mille = stats.history_payload_budget_used_per_mille,
+        text_items = stats.text_items,
+        function_output_items = stats.function_output_items,
+        largest_item_bytes = stats.largest_item_bytes,
+        text_bytes = stats.text_bytes,
+        tool_output_bytes = stats.tool_output_bytes,
+        instructions_bytes = stats.instructions_bytes,
+        truncated_text_items = stats.truncated_text_items,
+        truncated_text_bytes_saved = stats.truncated_text_bytes_saved,
+        truncated_tool_output_items = stats.truncated_tool_output_items,
+        truncated_tool_output_bytes_saved = stats.truncated_tool_output_bytes_saved,
+        "Compact request payload stats"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +750,53 @@ mod tests {
         assert_eq!(stats.function_output_items, 0);
         assert_eq!(stats.tool_output_bytes, 0);
         assert_eq!(stats.thinking_bytes, "private plan".len());
+    }
+
+    #[test]
+    fn compact_request_detection_matches_claude_compact_prompt() {
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Your task is to create a detailed summary of the conversation so far."
+                    }]
+                }
+            ],
+            "stream": true
+        });
+
+        assert!(is_compact_request_body(&body));
+    }
+
+    #[test]
+    fn compact_request_detection_matches_compact_continuation() {
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "This session is being continued from a previous conversation that ran out of context."
+                }
+            ]
+        });
+
+        assert!(is_compact_request_body(&body));
+    }
+
+    #[test]
+    fn compact_request_detection_ignores_regular_summary_requests() {
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": "Please summarize README.md before we edit it."}
+            ],
+            "instructions": "You are a helpful coding assistant."
+        });
+
+        assert!(!is_compact_request_body(&body));
     }
 
     #[test]

@@ -33,11 +33,14 @@ use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
     read_upstream_response_text, send_upstream_request_with_policy,
 };
-use crate::openai_compat::{apply_openai_intent, log_request_observability, openai_model_info};
+use crate::openai_compat::{
+    apply_openai_intent, is_compact_request_body, log_compact_request_observability,
+    log_request_observability, openai_model_info,
+};
 use crate::provider::{
     Provider, ProviderError, RateLimitCredits, RateLimitSnapshot, RateLimitSource, RateLimitWindow,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
@@ -189,6 +192,7 @@ impl ChatGptProvider {
         &self,
         body: &mut Value,
         token: &ChatGptToken,
+        compact_request: bool,
     ) -> Result<Response, ProviderError> {
         let mut prompt_too_long_attempts = 0;
 
@@ -196,6 +200,14 @@ impl ChatGptProvider {
             let response = self.send_responses_request(body, token).await?;
             let status = response.status();
             if status.is_success() || status == StatusCode::UNAUTHORIZED {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = prompt_too_long_attempts > 0,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
                 return Ok(response);
             }
 
@@ -209,17 +221,36 @@ impl ChatGptProvider {
             }
 
             if prompt_too_long_attempts >= CHATGPT_PTL_MAX_RETRIES {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = true,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        prompt_too_long_retry_exhausted = true,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
                 return Err(map_chatgpt_error_status_body(status, error_body));
             }
 
             let Some(stats) =
                 shrink_prompt_too_long_body(body, prompt_too_long_token_gap(&error_body))
             else {
+                if compact_request {
+                    info!(
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = true,
+                        prompt_too_long_retries = prompt_too_long_attempts,
+                        prompt_too_long_retry_shrinkable = false,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
                 return Err(map_chatgpt_error_status_body(status, error_body));
             };
             prompt_too_long_attempts += 1;
             warn!(
                 attempt = prompt_too_long_attempts,
+                compact_request,
                 dropped_groups = stats.dropped_groups,
                 dropped_items = stats.dropped_items,
                 inserted_marker = stats.inserted_marker,
@@ -346,9 +377,11 @@ impl Provider for ChatGptProvider {
         let mut body =
             build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
         log_request_observability("chatgpt", "/responses", &body);
+        let compact_request = is_compact_request_body(&body);
+        log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
 
         let mut response = self
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token)
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, compact_request)
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let refreshed = match self.auth.force_refresh_token().await {
@@ -361,7 +394,11 @@ impl Provider for ChatGptProvider {
                 }
             };
             response = self
-                .send_responses_request_with_prompt_too_long_retry(&mut body, &refreshed)
+                .send_responses_request_with_prompt_too_long_retry(
+                    &mut body,
+                    &refreshed,
+                    compact_request,
+                )
                 .await?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 self.auth.clear_token().await;
@@ -1780,7 +1817,7 @@ mod tests {
         });
 
         let response = provider
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token)
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false)
             .await
             .expect("retry should succeed");
 
