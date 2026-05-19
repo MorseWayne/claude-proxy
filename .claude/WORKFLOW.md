@@ -417,6 +417,19 @@ Resume next（下次继续）:
 
 ## Completed（已完成）
 
+### WF-2026-05-19-002 — Thinking 渲染异常检修
+
+Status: Done（已完成）
+Completed: 2026-05-19
+Level: 2
+Acceptance summary（验收摘要）:
+
+- Review: 新增 provider 内部 tagged-thinking splitter，并在 Chat Completions / Responses 的 streaming 与 non-streaming 普通文本输出路径识别 `[thinking]...[/thinking]` 和 `<thinking>...</thinking>`，转换为 Anthropic `thinking_delta`；typed reasoning 字段仍优先走原生 thinking block，Anthropic passthrough 未改动。
+- Validation: `cargo fmt --check`、tagged-thinking 单测、tagged streaming/non-streaming 目标回归、`cargo test -p claude-proxy-providers`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 实施前 `ResponsesStreamConverter.process_event` upstream impact 为 HIGH，影响 ChatGPT/Copilot/Responses 主路径；`convert_non_streaming_response`、`ensure_text_block`、`add_text_block` 等为 LOW。提交前 `detect_changes(scope=all)` 为 HIGH，包含本任务外既有 CLI 未提交改动；本任务影响集中在 provider 文本到 thinking block 兼容转换。
+- Tests: 新增 splitter 单测、Chat Completions streaming split-tag/non-streaming 回归、Responses streaming split-tag/typed reasoning/non-streaming 回归。
+- Gaps: 未做真实 Claude Code 端到端 UI 验证；本地协议转换和完整 workspace 测试已覆盖事件形状。
+
 ### WF-2026-05-19-001 — Thinking budget xhigh 映射优化
 
 Status: Done（已完成）

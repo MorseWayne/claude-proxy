@@ -10,6 +10,7 @@ mod openai_compat;
 pub mod provider;
 pub(crate) mod responses;
 mod sse;
+mod tagged_thinking;
 mod tool_args;
 mod tool_choice;
 
