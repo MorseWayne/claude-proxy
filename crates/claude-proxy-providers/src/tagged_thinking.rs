@@ -10,8 +10,15 @@ enum Mode {
     Thinking,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QuoteState {
+    quote: Option<char>,
+    escaped: bool,
+}
+
 pub(crate) struct TaggedThinkingSplitter {
     mode: Mode,
+    quote: QuoteState,
     pending: String,
 }
 
@@ -19,6 +26,7 @@ impl Default for TaggedThinkingSplitter {
     fn default() -> Self {
         Self {
             mode: Mode::Text,
+            quote: QuoteState::default(),
             pending: String::new(),
         }
     }
@@ -43,7 +51,12 @@ impl TaggedThinkingSplitter {
                 Mode::Thinking => CLOSE_TAGS,
             };
 
-            if let Some((start, len)) = find_tag(&self.pending, tags) {
+            let tag = match self.mode {
+                Mode::Text => find_tag_outside_quoted_literals(&self.pending, tags, self.quote),
+                Mode::Thinking => find_tag(&self.pending, tags),
+            };
+
+            if let Some((start, len)) = tag {
                 self.push_segment(&mut segments, start);
                 self.pending.drain(..start + len);
                 self.mode = match self.mode {
@@ -51,6 +64,15 @@ impl TaggedThinkingSplitter {
                     Mode::Thinking => Mode::Text,
                 };
                 continue;
+            }
+
+            if self.mode == Mode::Thinking {
+                if finish {
+                    self.pending.clear();
+                    self.mode = Mode::Text;
+                    self.quote = QuoteState::default();
+                }
+                break;
             }
 
             let emit_len = if finish {
@@ -70,13 +92,16 @@ impl TaggedThinkingSplitter {
         segments
     }
 
-    fn push_segment(&self, segments: &mut Vec<TextSegment>, len: usize) {
+    fn push_segment(&mut self, segments: &mut Vec<TextSegment>, len: usize) {
         if len == 0 {
             return;
         }
         let value = self.pending[..len].to_string();
         match self.mode {
-            Mode::Text => push_text_segment(segments, value),
+            Mode::Text => {
+                self.quote = advance_quote_state(self.quote, &value);
+                push_text_segment(segments, value);
+            }
             Mode::Thinking => push_thinking_segment(segments, value),
         }
     }
@@ -96,6 +121,45 @@ fn find_tag(text: &str, tags: &[&str]) -> Option<(usize, usize)> {
     tags.iter()
         .filter_map(|tag| text.find(tag).map(|index| (index, tag.len())))
         .min_by_key(|(index, _)| *index)
+}
+
+fn find_tag_outside_quoted_literals(
+    text: &str,
+    tags: &[&str],
+    mut quote: QuoteState,
+) -> Option<(usize, usize)> {
+    for (index, ch) in text.char_indices() {
+        if quote.quote.is_none()
+            && let Some(tag) = tags.iter().find(|tag| text[index..].starts_with(**tag))
+        {
+            return Some((index, tag.len()));
+        }
+        quote = advance_quote_char(quote, ch);
+    }
+    None
+}
+
+fn advance_quote_state(mut quote: QuoteState, text: &str) -> QuoteState {
+    for ch in text.chars() {
+        quote = advance_quote_char(quote, ch);
+    }
+    quote
+}
+
+fn advance_quote_char(mut quote: QuoteState, ch: char) -> QuoteState {
+    if let Some(active) = quote.quote {
+        if quote.escaped {
+            quote.escaped = false;
+        } else if ch == '\\' {
+            quote.escaped = true;
+        } else if ch == active || ch == '\n' {
+            quote.quote = None;
+        }
+    } else if ch == '"' {
+        quote.quote = Some(ch);
+        quote.escaped = false;
+    }
+    quote
 }
 
 fn safe_emit_len(text: &str, tags: &[&str]) -> usize {
@@ -159,13 +223,13 @@ mod tests {
             splitter.push("hello [thin"),
             vec![TextSegment::Text("hello ".to_string())]
         );
-        assert_eq!(
-            splitter.push("king]plan[/thin"),
-            vec![TextSegment::Thinking("plan".to_string())]
-        );
+        assert!(splitter.push("king]plan[/thin").is_empty());
         assert_eq!(
             splitter.push("king] world"),
-            vec![TextSegment::Text(" world".to_string())]
+            vec![
+                TextSegment::Thinking("plan".to_string()),
+                TextSegment::Text(" world".to_string())
+            ]
         );
         assert!(splitter.finish().is_empty());
     }
@@ -179,13 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn treats_unclosed_opening_tag_as_thinking_until_finish() {
+    fn drops_unclosed_opening_tag_on_finish() {
         assert_eq!(
             split_tagged_thinking("hello [thinking]plan"),
-            vec![
-                TextSegment::Text("hello ".to_string()),
-                TextSegment::Thinking("plan".to_string()),
-            ]
+            vec![TextSegment::Text("hello ".to_string())]
         );
     }
 
@@ -196,6 +257,61 @@ mod tests {
             vec![
                 TextSegment::Thinking("plan".to_string()),
                 TextSegment::Text("answer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_thinking_tags_inside_quoted_code_literals() {
+        let summary = r#"```rust
+const OPEN_TAGS: &[&str] = &["[thinking]", "<thinking>"];
+const CLOSE_TAGS: &[&str] = &["[/thinking]", "</thinking>"];
+assert_eq!(split_tagged_thinking("hello [thinking]plan[/thinking] world"), segments);
+```"#;
+
+        assert_eq!(
+            split_tagged_thinking(summary),
+            vec![TextSegment::Text(summary.to_string())]
+        );
+    }
+
+    #[test]
+    fn preserves_split_thinking_tags_inside_quoted_code_literals() {
+        let mut splitter = TaggedThinkingSplitter::default();
+        let mut segments = Vec::new();
+
+        segments.extend(splitter.push(r#"assert_eq!(split_tagged_thinking("hello "#));
+        segments.extend(splitter.push("[thin"));
+        segments.extend(splitter.push("king]plan[/thin"));
+        segments.extend(splitter.push(r#"king] world"), segments);"#));
+        segments.extend(splitter.finish());
+
+        assert!(
+            segments
+                .iter()
+                .all(|segment| matches!(segment, TextSegment::Text(_)))
+        );
+        let visible = segments
+            .into_iter()
+            .map(|segment| match segment {
+                TextSegment::Text(text) => text,
+                TextSegment::Thinking(_) => unreachable!(),
+            })
+            .collect::<String>();
+        assert_eq!(
+            visible,
+            r#"assert_eq!(split_tagged_thinking("hello [thinking]plan[/thinking] world"), segments);"#
+        );
+    }
+
+    #[test]
+    fn treats_marker_after_apostrophe_as_real_tag() {
+        assert_eq!(
+            split_tagged_thinking("I'm ready [thinking]plan[/thinking] answer"),
+            vec![
+                TextSegment::Text("I'm ready ".to_string()),
+                TextSegment::Thinking("plan".to_string()),
+                TextSegment::Text(" answer".to_string()),
             ]
         );
     }
