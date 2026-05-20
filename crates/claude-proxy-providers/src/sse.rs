@@ -3,6 +3,7 @@ use serde_json::Value;
 #[derive(Debug, Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
+    start: usize,
 }
 
 impl SseDecoder {
@@ -11,23 +12,48 @@ impl SseDecoder {
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.compact_consumed();
         self.buffer.extend_from_slice(chunk);
     }
 
     pub(crate) fn next_frame(&mut self) -> Option<String> {
-        let (end, delimiter_len) = find_frame_end(&self.buffer)?;
-        let frame = self.buffer.drain(..end + delimiter_len).collect::<Vec<_>>();
-        Some(String::from_utf8_lossy(&frame[..end]).into_owned())
+        let search = &self.buffer[self.start..];
+        let (relative_end, delimiter_len) = find_frame_end(search)?;
+        let frame_start = self.start;
+        let frame_end = frame_start + relative_end;
+        self.start = frame_end + delimiter_len;
+        let frame = String::from_utf8_lossy(&self.buffer[frame_start..frame_end]).into_owned();
+        self.compact_consumed();
+        Some(frame)
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
-        if self.buffer.iter().all(|byte| matches!(byte, b'\r' | b'\n')) {
+        let remaining = &self.buffer[self.start..];
+        if remaining.iter().all(|byte| matches!(byte, b'\r' | b'\n')) {
             self.buffer.clear();
+            self.start = 0;
             return None;
         }
 
-        let frame = std::mem::take(&mut self.buffer);
-        Some(String::from_utf8_lossy(&frame).into_owned())
+        let frame = String::from_utf8_lossy(remaining).into_owned();
+        self.buffer.clear();
+        self.start = 0;
+        Some(frame)
+    }
+
+    fn compact_consumed(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+            return;
+        }
+        if self.start >= self.buffer.len() / 2 {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
     }
 }
 
@@ -117,6 +143,36 @@ mod tests {
         decoder.push(b"data: {\"a\":1}\r\n\r\n");
 
         assert_eq!(decoder.next_frame().unwrap(), "data: {\"a\":1}");
+    }
+
+    #[test]
+    fn decoder_supports_crlf_delimiter_split_across_chunks() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"data: {\"a\":1}\r\n");
+        decoder.push(b"\r\n");
+
+        assert_eq!(decoder.next_frame().unwrap(), "data: {\"a\":1}");
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn decoder_returns_adjacent_frames_with_mixed_delimiters() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"data: one\n\nevent: two\r\ndata: three\r\n\r\n\n\n");
+
+        assert_eq!(decoder.next_frame().unwrap(), "data: one");
+        assert_eq!(decoder.next_frame().unwrap(), "event: two\r\ndata: three");
+        assert_eq!(decoder.next_frame().unwrap(), "");
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn decoder_finish_returns_partial_tail_after_consumed_frames() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"data: one\n\ndata: partial");
+
+        assert_eq!(decoder.next_frame().unwrap(), "data: one");
+        assert_eq!(decoder.finish().unwrap(), "data: partial");
     }
 
     #[test]

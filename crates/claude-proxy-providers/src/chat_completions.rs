@@ -2,6 +2,7 @@
 //!
 //! Converts OpenAI-format chat completion responses into Anthropic SSE events.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use claude_proxy_core::SseEvent;
@@ -551,13 +552,13 @@ impl StreamConverter {
         require_valid_json: bool,
         events: &mut Vec<SseEvent>,
     ) {
-        let Some(arguments) = self.tool_argument_buffers.get(&tool_index).cloned() else {
+        let Some(arguments) = self.tool_argument_buffers.get(&tool_index) else {
             return;
         };
         if arguments.is_empty() {
             return;
         }
-        if require_valid_json && serde_json::from_str::<Value>(&arguments).is_err() {
+        if require_valid_json && serde_json::from_str::<Value>(arguments).is_err() {
             return;
         }
 
@@ -566,22 +567,24 @@ impl StreamConverter {
             .get(&tool_index)
             .map(String::as_str)
             .unwrap_or_default();
-        let sanitized = sanitize_tool_arguments(tool_name, &arguments).unwrap_or(arguments);
+        let sanitized = sanitize_tool_arguments(tool_name, arguments)
+            .map(Cow::Owned)
+            .unwrap_or(Cow::Borrowed(arguments.as_str()));
         let previous = self
             .tool_argument_emitted
             .get(&tool_index)
             .map(String::as_str)
             .unwrap_or("");
-        if sanitized == previous {
+        if sanitized.as_ref() == previous {
             return;
         }
 
         let delta = if previous.is_empty() {
-            sanitized.as_str()
+            sanitized.as_ref()
         } else if let Some(delta) = sanitized.strip_prefix(previous) {
             delta
         } else {
-            sanitized.as_str()
+            sanitized.as_ref()
         };
         if !delta.is_empty() {
             events.push(SseEvent {
@@ -596,7 +599,8 @@ impl StreamConverter {
                 }),
             });
         }
-        self.tool_argument_emitted.insert(tool_index, sanitized);
+        self.tool_argument_emitted
+            .insert(tool_index, sanitized.into_owned());
     }
 
     pub fn finish(&mut self) -> Vec<SseEvent> {

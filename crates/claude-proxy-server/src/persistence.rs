@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 use crate::app::{TokenUsage, UsageMetrics};
 
 const METRICS_RETENTION_DAYS: i64 = 90;
+const METRICS_WRITE_QUEUE_CAPACITY: usize = 4096;
 const METRICS_MAINTENANCE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -95,7 +96,7 @@ fn spawn_metrics_maintenance(conn: Arc<std::sync::Mutex<Connection>>) {
 /// Persisted metrics store backed by SQLite with a background writer task.
 pub struct MetricsStore {
     /// Channel to send writes to the background task.
-    write_tx: mpsc::UnboundedSender<UsageEvent>,
+    write_tx: mpsc::Sender<UsageEvent>,
     /// Shared connection for reads (load_totals).
     conn: Arc<std::sync::Mutex<Connection>>,
 }
@@ -136,7 +137,7 @@ impl MetricsStore {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| format!("failed to set WAL on writer: {e}"))?;
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<UsageEvent>();
+        let (write_tx, write_rx) = mpsc::channel::<UsageEvent>(METRICS_WRITE_QUEUE_CAPACITY);
 
         // Spawn the background writer task
         tokio::spawn(Self::writer_loop(write_conn, write_rx));
@@ -149,7 +150,7 @@ impl MetricsStore {
     }
 
     /// Background task that drains the write channel and batches inserts.
-    async fn writer_loop(conn: Connection, mut rx: mpsc::UnboundedReceiver<UsageEvent>) {
+    async fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<UsageEvent>) {
         let mut conn = Some(conn);
         while let Some(event) = rx.recv().await {
             // Drain any additional buffered events for batching
@@ -233,8 +234,14 @@ impl MetricsStore {
             is_error: is_error as i64,
             latency_ms: latency_ms as i64,
         };
-        if self.write_tx.send(event).is_err() {
-            warn!("Metrics writer channel closed, dropping usage event");
+        match self.write_tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Metrics writer channel full, dropping usage event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Metrics writer channel closed, dropping usage event");
+            }
         }
     }
 

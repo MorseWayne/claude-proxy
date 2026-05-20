@@ -7,6 +7,7 @@
 ### WF-2026-05-20-001 — 解决 main 分支推送冲突
 Status: In Progress
 Level: 2
+Priority: Paused while performance optimization commit/index refresh finishes
 Started: 2026-05-20
 Last updated: 2026-05-20
 Current phase: 冲突解决与验证
@@ -35,6 +36,17 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-20-002 — 性能热点优化
+Completed: 2026-05-20
+Level: 3
+
+Close summary:
+- Outcome: `SseDecoder` 改为 offset-based 缓冲消费；OpenAI Chat Completions 与 Responses 流式工具/函数参数输出减少全量 clone；SQLite metrics writer 改为有界队列并保持非阻塞 `try_send`；内存 metrics 维度合并为单个锁并保留 `/admin/metrics` JSON shape。
+- Validation: `cargo fmt --check`、provider SSE/streaming 参数目标测试、server persistence/metrics 目标测试、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 修改前 impact 中 `SseDecoder::next_frame` 与 `Metrics::record_completed_request` 为 HIGH；提交前 `detect_changes` 为 HIGH，影响集中在计划内 SSE streaming、metrics persistence/completed request 及相关测试路径。
+- Tests: 覆盖 CRLF split/mixed delimiters/partial tail SSE 边界、工具参数 sanitizer 增量输出、metrics persistence totals、并发 completed request snapshot。
+- Gaps: 未做真实上游流式端到端请求验证；`/admin/metrics` quota 缓存与 TUI merged row 预计算保留为后续优化。
 
 ### WF-2026-05-19-002 — thinking 文本泄漏治理
 Completed: 2026-05-20

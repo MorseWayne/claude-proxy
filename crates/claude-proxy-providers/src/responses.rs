@@ -2,6 +2,7 @@ use claude_proxy_core::*;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -1263,40 +1264,46 @@ impl ResponsesStreamConverter {
         require_valid_json: bool,
         events: &mut Vec<SseEvent>,
     ) {
-        let arguments = final_arguments
+        let Some(arguments) = final_arguments
             .filter(|arguments| !arguments.is_empty())
-            .map(str::to_string)
-            .or_else(|| self.function_argument_buffers.get(&output_index).cloned())
-            .unwrap_or_default();
+            .or_else(|| {
+                self.function_argument_buffers
+                    .get(&output_index)
+                    .map(String::as_str)
+            })
+        else {
+            return;
+        };
         if arguments.is_empty() {
             return;
         }
 
-        if require_valid_json && serde_json::from_str::<Value>(&arguments).is_err() {
+        if require_valid_json && serde_json::from_str::<Value>(arguments).is_err() {
             return;
         }
 
         let sanitized = self
             .function_names
             .get(&output_index)
-            .and_then(|name| sanitize_tool_arguments(name, &arguments))
-            .unwrap_or(arguments);
+            .and_then(|name| sanitize_tool_arguments(name, arguments))
+            .map(Cow::Owned)
+            .unwrap_or(Cow::Borrowed(arguments));
         let previous = self
             .function_argument_emitted
             .get(&output_index)
             .map(String::as_str)
             .unwrap_or("");
-        if sanitized == previous {
+        if sanitized.as_ref() == previous {
             return;
         }
         if let Some(delta) = sanitized.strip_prefix(previous) {
             Self::push_function_arguments_delta(idx, delta, events);
             self.function_argument_emitted
-                .insert(output_index, sanitized);
+                .insert(output_index, sanitized.into_owned());
         } else if previous.is_empty() {
-            Self::push_function_arguments_delta(idx, &sanitized, events);
+            Self::push_function_arguments_delta(idx, sanitized.as_ref(), events);
             self.function_argument_emitted
-                .insert(output_index, sanitized);
+                .insert(output_index, sanitized.into_owned());
         }
     }
 

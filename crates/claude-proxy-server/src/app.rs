@@ -58,18 +58,38 @@ impl UsageMetrics {
 
 pub type ModelMetrics = UsageMetrics;
 
+#[derive(Debug, Default)]
+pub struct MetricsDimensions {
+    pub models: HashMap<String, UsageMetrics>,
+    pub providers: HashMap<String, UsageMetrics>,
+    pub initiators: HashMap<String, UsageMetrics>,
+}
+
+impl MetricsDimensions {
+    fn add_usage(&mut self, provider: &str, initiator: &str, model: &str, usage: &TokenUsage) {
+        self.models
+            .entry(model.to_string())
+            .or_default()
+            .add_usage(usage);
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .add_usage(usage);
+        self.initiators
+            .entry(initiator.to_string())
+            .or_default()
+            .add_usage(usage);
+    }
+}
+
 /// Request metrics counters.
 pub struct Metrics {
     pub requests_total: AtomicU64,
     pub errors_total: AtomicU64,
     pub latency_sum_ms: AtomicU64,
     pub latency_count: AtomicU64,
-    /// Per-model token usage metrics (current session).
-    pub model_metrics: Mutex<HashMap<String, UsageMetrics>>,
-    /// Per-provider token usage metrics (current session).
-    pub provider_metrics: Mutex<HashMap<String, UsageMetrics>>,
-    /// Per-initiator token usage metrics (current session).
-    pub initiator_metrics: Mutex<HashMap<String, UsageMetrics>>,
+    /// Token usage metrics for the current session.
+    pub usage_metrics: Mutex<MetricsDimensions>,
     /// Persistent store for all-time metrics.
     store: Option<Arc<MetricsStore>>,
     /// All-time totals loaded from store at startup.
@@ -83,9 +103,7 @@ impl Metrics {
             errors_total: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
-            model_metrics: Mutex::new(HashMap::new()),
-            provider_metrics: Mutex::new(HashMap::new()),
-            initiator_metrics: Mutex::new(HashMap::new()),
+            usage_metrics: Mutex::new(MetricsDimensions::default()),
             store,
             stored_totals: Mutex::new(StoredTotals::default()),
         }
@@ -106,8 +124,12 @@ impl Metrics {
 
     /// Record token usage for a model (in-memory).
     pub async fn record_token_usage(&self, model: &str, usage: &TokenUsage) {
-        let mut map = self.model_metrics.lock().await;
-        map.entry(model.to_string()).or_default().add_usage(usage);
+        let mut dimensions = self.usage_metrics.lock().await;
+        dimensions
+            .models
+            .entry(model.to_string())
+            .or_default()
+            .add_usage(usage);
     }
 
     async fn record_usage_dimensions(
@@ -117,19 +139,10 @@ impl Metrics {
         model: &str,
         usage: &TokenUsage,
     ) {
-        self.record_token_usage(model, usage).await;
-        self.provider_metrics
+        self.usage_metrics
             .lock()
             .await
-            .entry(provider.to_string())
-            .or_default()
-            .add_usage(usage);
-        self.initiator_metrics
-            .lock()
-            .await
-            .entry(initiator.to_string())
-            .or_default()
-            .add_usage(usage);
+            .add_usage(provider, initiator, model, usage);
     }
 
     /// Record a completed request with usage, persisting to store if available.
@@ -164,14 +177,14 @@ impl Metrics {
         let latency_count = self.latency_count.load(Ordering::Relaxed);
         let avg_latency = latency_sum.checked_div(latency_count).unwrap_or(0);
 
-        let model_metrics = self.model_metrics.lock().await;
-        let models: serde_json::Value = serde_json::to_value(&*model_metrics).unwrap_or_default();
-        let provider_metrics = self.provider_metrics.lock().await;
+        let usage_metrics = self.usage_metrics.lock().await;
+        let models: serde_json::Value =
+            serde_json::to_value(&usage_metrics.models).unwrap_or_default();
         let providers: serde_json::Value =
-            serde_json::to_value(&*provider_metrics).unwrap_or_default();
-        let initiator_metrics = self.initiator_metrics.lock().await;
+            serde_json::to_value(&usage_metrics.providers).unwrap_or_default();
         let initiators: serde_json::Value =
-            serde_json::to_value(&*initiator_metrics).unwrap_or_default();
+            serde_json::to_value(&usage_metrics.initiators).unwrap_or_default();
+        drop(usage_metrics);
 
         let stored = self.stored_totals.lock().await;
         let stored_models: serde_json::Value =
@@ -326,6 +339,43 @@ mod tests {
             3
         );
         assert_eq!(data["stored"]["providers"].as_object().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_handles_concurrent_completed_requests() {
+        let metrics = Arc::new(Metrics::default());
+        let usage = TokenUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let metrics = metrics.clone();
+            let usage = usage.clone();
+            tasks.push(tokio::spawn(async move {
+                metrics
+                    .record_completed_request("openai", "user", "gpt-4.1", &usage, false, 10)
+                    .await;
+            }));
+        }
+
+        let snapshot_task = {
+            let metrics = metrics.clone();
+            tokio::spawn(async move { metrics.to_json().await })
+        };
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let _ = snapshot_task.await.unwrap();
+        let data = metrics.to_json().await;
+
+        assert_eq!(data["models"]["gpt-4.1"]["requests"], 32);
+        assert_eq!(data["providers"]["openai"]["input_tokens"], 64);
+        assert_eq!(data["initiators"]["user"]["output_tokens"], 96);
     }
 
     #[tokio::test]
