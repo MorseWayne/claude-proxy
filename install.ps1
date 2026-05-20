@@ -51,24 +51,27 @@ function Get-ClaudeProxyProcesses {
     @(Get-Process -Name "claude-proxy" -ErrorAction SilentlyContinue)
 }
 
-function Confirm-Continue {
-    $answer = Read-Host "Continue? [y/N]"
+function Confirm-YesNo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    $answer = Read-Host "$Prompt [y/N]"
     return $answer -in @("y", "Y", "yes", "YES", "Yes")
 }
 
 function Prepare-ExistingService {
-    if ((Get-ClaudeProxyProcesses).Count -eq 0) {
-        return
+    if ((Get-ClaudeProxyProcesses).Count -gt 0) {
+        $script:ServiceWasRunning = $true
+        Write-Host "A running claude-proxy process was detected."
+        Write-Host "Continuing installation will stop it before replacing the binary."
     }
 
-    Write-Host "A running claude-proxy process was detected."
-    Write-Host "The installer will stop it before replacing the binary and restart it afterward."
-    if (-not (Confirm-Continue)) {
+    if (-not (Confirm-YesNo -Prompt "Continue installing claude-proxy?")) {
         Write-Host "Installation cancelled."
         exit 1
     }
-
-    $script:ServiceWasRunning = $true
 }
 
 function Stop-ExistingService {
@@ -93,18 +96,23 @@ function Stop-ExistingService {
     }
 }
 
-function Restart-ExistingService {
+function Start-InstalledService {
     param(
         [Parameter(Mandatory = $true)]
         [string]$BinaryPath
     )
 
-    if (-not $script:ServiceWasRunning) {
+    if (-not (Confirm-YesNo -Prompt "Start claude-proxy now?")) {
         return
     }
 
-    Write-Host "Restarting claude-proxy..."
-    Start-Process -FilePath $BinaryPath -ArgumentList @("server", "start") -WindowStyle Hidden | Out-Null
+    if (Confirm-YesNo -Prompt "Run claude-proxy in the background?") {
+        Write-Host "Starting claude-proxy in the background..."
+        Start-Process -FilePath $BinaryPath -ArgumentList @("server", "start") -WindowStyle Hidden | Out-Null
+    } else {
+        Write-Host "Starting claude-proxy in the foreground..."
+        & $BinaryPath server start
+    }
 }
 
 function Install-ClaudeProxy {
@@ -132,8 +140,6 @@ function Install-ClaudeProxy {
         $binaryPath = Join-Path $InstallDir "claude-proxy.exe"
         Move-Item -Force (Join-Path $tempDir "claude-proxy.exe") $binaryPath
 
-        Restart-ExistingService -BinaryPath $binaryPath
-
         Write-Host ""
         Write-Host "Installed to $binaryPath"
         Write-Host ""
@@ -141,6 +147,8 @@ function Install-ClaudeProxy {
         Add-ToUserPath -PathToAdd $InstallDir
 
         & $binaryPath --version
+
+        Start-InstalledService -BinaryPath $binaryPath
     } finally {
         if (Test-Path $tempDir) {
             Remove-Item -Recurse -Force $tempDir

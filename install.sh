@@ -53,15 +53,16 @@ daemon_is_running() {
     grep -q "claude-proxy is running" <<<"$status"
 }
 
-confirm_continue() {
+confirm_prompt() {
+    local prompt="$1"
     local answer
 
     if [[ ! -r /dev/tty ]]; then
-        echo "No interactive terminal is available to confirm stopping claude-proxy." >&2
+        echo "No interactive terminal is available for confirmation." >&2
         return 1
     fi
 
-    printf "Continue? [y/N] " >/dev/tty
+    printf "%s [y/N] " "$prompt" >/dev/tty
     IFS= read -r answer </dev/tty || return 1
 
     case "$answer" in
@@ -74,13 +75,14 @@ prepare_existing_service() {
     SERVICE_BINARY="$(find_existing_binary || true)"
 
     if daemon_is_running "$SERVICE_BINARY"; then
-        echo "A running claude-proxy daemon was detected."
-        echo "The installer will stop it before replacing the binary and restart it afterward."
-        if ! confirm_continue; then
-            echo "Installation cancelled."
-            exit 1
-        fi
         SERVICE_WAS_RUNNING=1
+        echo "A running claude-proxy daemon was detected."
+        echo "Continuing installation will stop it before replacing the binary."
+    fi
+
+    if ! confirm_prompt "Continue installing claude-proxy?"; then
+        echo "Installation cancelled."
+        exit 1
     fi
 }
 
@@ -102,13 +104,18 @@ stop_existing_service() {
     fi
 }
 
-restart_existing_service() {
-    if [[ "$SERVICE_WAS_RUNNING" -ne 1 ]]; then
+start_installed_service() {
+    if ! confirm_prompt "Start claude-proxy now?"; then
         return
     fi
 
-    echo "Restarting claude-proxy daemon..."
-    "${INSTALL_DIR}/claude-proxy" server start --daemon
+    if confirm_prompt "Run claude-proxy in the background?"; then
+        echo "Starting claude-proxy daemon..."
+        "${INSTALL_DIR}/claude-proxy" server start --daemon
+    else
+        echo "Starting claude-proxy in the foreground..."
+        "${INSTALL_DIR}/claude-proxy" server start
+    fi
 }
 
 TMP_DIR=""
@@ -141,8 +148,6 @@ main() {
     mv "${TMP_DIR}/claude-proxy" "${INSTALL_DIR}/claude-proxy"
     chmod +x "${INSTALL_DIR}/claude-proxy"
 
-    restart_existing_service
-
     echo ""
     echo "Installed to ${INSTALL_DIR}/claude-proxy"
     echo ""
@@ -156,6 +161,8 @@ main() {
     fi
 
     "${INSTALL_DIR}/claude-proxy" --version
+
+    start_installed_service
 }
 
 main "$@"
