@@ -38,7 +38,9 @@ use crate::openai_compat::{
     log_request_observability, openai_model_info,
 };
 use crate::provider::{
-    Provider, ProviderError, RateLimitCredits, RateLimitSnapshot, RateLimitSource, RateLimitWindow,
+    Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, RateLimitCredits, RateLimitSnapshot, RateLimitSource,
+    RateLimitWindow,
 };
 use tracing::{info, warn};
 
@@ -193,6 +195,7 @@ impl ChatGptProvider {
         body: &mut Value,
         token: &ChatGptToken,
         compact_request: bool,
+        observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         let mut prompt_too_long_attempts = 0;
 
@@ -221,6 +224,12 @@ impl ChatGptProvider {
             }
 
             if prompt_too_long_attempts >= CHATGPT_PTL_MAX_RETRIES {
+                notify_prompt_too_long_observer(
+                    observer,
+                    ProviderRequestObserverEventKind::PromptTooLongRetryExhausted,
+                    prompt_too_long_attempts as u64,
+                    None,
+                );
                 if compact_request {
                     info!(
                         status = status.as_u16(),
@@ -236,6 +245,12 @@ impl ChatGptProvider {
             let Some(stats) =
                 shrink_prompt_too_long_body(body, prompt_too_long_token_gap(&error_body))
             else {
+                notify_prompt_too_long_observer(
+                    observer,
+                    ProviderRequestObserverEventKind::PromptTooLongRetryUnshrinkable,
+                    prompt_too_long_attempts as u64,
+                    None,
+                );
                 if compact_request {
                     info!(
                         status = status.as_u16(),
@@ -248,6 +263,12 @@ impl ChatGptProvider {
                 return Err(map_chatgpt_error_status_body(status, error_body));
             };
             prompt_too_long_attempts += 1;
+            notify_prompt_too_long_observer(
+                observer,
+                ProviderRequestObserverEventKind::PromptTooLongRetry,
+                prompt_too_long_attempts as u64,
+                Some(&stats),
+            );
             warn!(
                 attempt = prompt_too_long_attempts,
                 compact_request,
@@ -372,6 +393,14 @@ impl Provider for ChatGptProvider {
         &self,
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        self.chat_with_observer(request, None).await
+    }
+
+    async fn chat_with_observer(
+        &self,
+        request: MessagesRequest,
+        observer: Option<ProviderRequestObserver>,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
         let mut body =
@@ -381,7 +410,12 @@ impl Provider for ChatGptProvider {
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
 
         let mut response = self
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, compact_request)
+            .send_responses_request_with_prompt_too_long_retry(
+                &mut body,
+                &token,
+                compact_request,
+                observer.as_ref(),
+            )
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let refreshed = match self.auth.force_refresh_token().await {
@@ -398,6 +432,7 @@ impl Provider for ChatGptProvider {
                     &mut body,
                     &refreshed,
                     compact_request,
+                    observer.as_ref(),
                 )
                 .await?;
             if response.status() == StatusCode::UNAUTHORIZED {
@@ -951,6 +986,24 @@ fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderEr
             body,
         },
     }
+}
+
+fn notify_prompt_too_long_observer(
+    observer: Option<&ProviderRequestObserver>,
+    event: ProviderRequestObserverEventKind,
+    prompt_too_long_retries: u64,
+    stats: Option<&PromptTooLongShrinkStats>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    observer(ProviderRequestObserverEvent {
+        event,
+        prompt_too_long_retries,
+        original_body_bytes: stats.map_or(0, |stats| stats.original_body_bytes as u64),
+        shrunk_body_bytes: stats.map_or(0, |stats| stats.shrunk_body_bytes as u64),
+        dropped_items: stats.map_or(0, |stats| stats.dropped_items as u64),
+    });
 }
 
 fn prompt_too_long_token_gap(body: &str) -> Option<usize> {
@@ -1844,7 +1897,7 @@ mod tests {
         });
 
         let response = provider
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false)
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false, None)
             .await
             .expect("retry should succeed");
 
@@ -1854,6 +1907,51 @@ mod tests {
         assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
         assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
         assert_eq!(requests[1]["input"][0]["content"], "current");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_prompt_too_long_retry_notifies_observer() {
+        let (endpoint, _requests) = prompt_too_long_retry_server().await;
+        let provider = test_chatgpt_provider(endpoint).await;
+        let token = ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account".to_string()),
+        };
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [
+                {"role": "user", "content": "old"},
+                {"role": "user", "content": "current"}
+            ],
+            "stream": true
+        });
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: ProviderRequestObserver = {
+            let observed = observed.clone();
+            Arc::new(move |event| observed.lock().unwrap().push(event))
+        };
+
+        provider
+            .send_responses_request_with_prompt_too_long_retry(
+                &mut body,
+                &token,
+                false,
+                Some(&observer),
+            )
+            .await
+            .expect("retry should succeed");
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].event,
+            ProviderRequestObserverEventKind::PromptTooLongRetry
+        );
+        assert_eq!(observed[0].prompt_too_long_retries, 1);
+        assert!(observed[0].original_body_bytes > observed[0].shrunk_body_bytes);
+        assert_eq!(observed[0].dropped_items, 1);
     }
 
     #[test]

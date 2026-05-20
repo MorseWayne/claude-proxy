@@ -28,6 +28,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub log: LogConfig,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +517,14 @@ pub struct LogConfig {
     pub raw_sse_events: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_observability_idle_gap_ms")]
+    pub idle_gap_ms: u64,
+}
+
 // --- Defaults ---
 
 fn default_empty() -> String {
@@ -560,6 +571,9 @@ fn default_connect_timeout() -> u64 {
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_observability_idle_gap_ms() -> u64 {
+    30_000
 }
 
 impl Default for ModelConfig {
@@ -615,6 +629,15 @@ impl Default for LogConfig {
             with_stdout: true,
             raw_api_payloads: false,
             raw_sse_events: false,
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_gap_ms: default_observability_idle_gap_ms(),
         }
     }
 }
@@ -1061,6 +1084,27 @@ auth_token = "test-token"
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.port, 9090);
         assert_eq!(settings.server.auth_token, "test-token");
+    }
+
+    #[test]
+    fn observability_defaults_enabled_with_idle_gap() {
+        let settings = Settings::from_toml("", Path::new("test.toml")).unwrap();
+
+        assert!(settings.observability.enabled);
+        assert_eq!(settings.observability.idle_gap_ms, 30_000);
+    }
+
+    #[test]
+    fn observability_config_parses_overrides() {
+        let toml = r#"
+[observability]
+enabled = false
+idle_gap_ms = 45000
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert!(!settings.observability.enabled);
+        assert_eq!(settings.observability.idle_gap_ms, 45_000);
     }
 
     #[test]

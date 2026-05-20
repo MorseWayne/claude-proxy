@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
     AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelAliasConfig, ModelConfig,
-    ProviderConfig, ProviderType, ServerConfig,
+    ObservabilityConfig, ProviderConfig, ProviderType, ServerConfig,
 };
 use claude_proxy_server::AppState;
 use serde_json::json;
@@ -56,6 +56,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
         },
         http: HttpConfig::default(),
         log: LogConfig::default(),
+        observability: ObservabilityConfig::default(),
     }
 }
 

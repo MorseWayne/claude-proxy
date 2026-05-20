@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -93,6 +94,30 @@ pub enum RateLimitSource {
     StreamEvent,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRequestObserverEvent {
+    pub event: ProviderRequestObserverEventKind,
+    #[serde(default)]
+    pub prompt_too_long_retries: u64,
+    #[serde(default)]
+    pub original_body_bytes: u64,
+    #[serde(default)]
+    pub shrunk_body_bytes: u64,
+    #[serde(default)]
+    pub dropped_items: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRequestObserverEventKind {
+    #[default]
+    PromptTooLongRetry,
+    PromptTooLongRetryExhausted,
+    PromptTooLongRetryUnshrinkable,
+}
+
+pub type ProviderRequestObserver = Arc<dyn Fn(ProviderRequestObserverEvent) + Send + Sync>;
+
 /// Trait implemented by upstream provider adapters.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -104,6 +129,14 @@ pub trait Provider: Send + Sync {
         &self,
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError>;
+
+    async fn chat_with_observer(
+        &self,
+        request: MessagesRequest,
+        _observer: Option<ProviderRequestObserver>,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        self.chat(request).await
+    }
 
     /// List available models from this provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;

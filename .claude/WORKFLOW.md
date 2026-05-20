@@ -37,6 +37,18 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-05-20-003 — 长会话观测 metrics
+
+Completed: 2026-05-20
+Level: 3
+
+Close summary:
+
+- Outcome: 新增默认开启、可通过配置关闭的 request observability metrics；按请求持久化阶段耗时、上游连接、流式事件间隔、idle gap、prompt-too-long retry 和 payload stats；`/admin/metrics` 输出 summary/recent/stored，且不保存 prompt/response 内容。
+- Validation: `cargo check`、`cargo test --workspace --no-run`、目标测试、`cargo fmt --check`、`cargo test`、`cargo clippy -- -D warnings` 均通过。
+- GitNexus: 修改前已对核心符号做 impact analysis；提交前 `detect_changes` 为 CRITICAL，影响集中在计划内配置、Provider trait、ChatGPT retry、server metrics/persistence/routes/admin metrics 流程。
+- Gaps: 未做真实 Claude Code 长会话端到端观测验证；当前实现覆盖本地单元/集成验证和持久化路径。
+
 ### WF-2026-05-20-002 — 性能热点优化
 Completed: 2026-05-20
 Level: 3

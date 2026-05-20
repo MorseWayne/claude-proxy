@@ -248,6 +248,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
         limits,
         http,
         log: crate::settings::LogConfig::default(),
+        observability: crate::settings::ObservabilityConfig::default(),
     }
 }
 

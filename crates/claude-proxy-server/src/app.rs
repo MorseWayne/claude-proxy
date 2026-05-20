@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +16,113 @@ use crate::persistence::{MetricsStore, StoredTotals};
 
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_PROVIDER_HEALTH_ERROR_LEN: usize = 2048;
+const RECENT_OBSERVABILITY_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestPayloadStats {
+    pub messages: u64,
+    pub content_blocks: u64,
+    pub tool_results: u64,
+    pub text_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestObservabilityEvent {
+    pub request_id: String,
+    pub provider: String,
+    pub initiator: String,
+    pub model: String,
+    pub stream: bool,
+    pub is_error: bool,
+    pub terminal_reason: String,
+    pub total_latency_ms: u64,
+    pub provider_setup_ms: u64,
+    pub upstream_connect_ms: u64,
+    pub stream_duration_ms: u64,
+    pub first_event_ms: Option<u64>,
+    pub last_event_gap_ms: u64,
+    pub max_event_gap_ms: u64,
+    pub idle_gap_count: u64,
+    pub event_count: u64,
+    pub prompt_too_long_retries: u64,
+    pub prompt_too_long_original_body_bytes: u64,
+    pub prompt_too_long_shrunk_body_bytes: u64,
+    pub prompt_too_long_dropped_items: u64,
+    pub request_messages: u64,
+    pub request_content_blocks: u64,
+    pub request_tool_results: u64,
+    pub request_text_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestObservabilitySummary {
+    pub requests: u64,
+    pub errors: u64,
+    pub avg_total_latency_ms: u64,
+    pub avg_upstream_connect_ms: u64,
+    pub max_event_gap_ms: u64,
+    pub idle_gap_count: u64,
+    pub prompt_too_long_retries: u64,
+}
+
+impl RequestObservabilitySummary {
+    fn add_event(&mut self, event: &RequestObservabilityEvent) {
+        self.requests += 1;
+        self.errors += event.is_error as u64;
+        self.avg_total_latency_ms += event.total_latency_ms;
+        self.avg_upstream_connect_ms += event.upstream_connect_ms;
+        self.max_event_gap_ms = self.max_event_gap_ms.max(event.max_event_gap_ms);
+        self.idle_gap_count += event.idle_gap_count;
+        self.prompt_too_long_retries += event.prompt_too_long_retries;
+    }
+
+    pub(crate) fn finalize(&mut self) {
+        if self.requests == 0 {
+            return;
+        }
+        self.avg_total_latency_ms /= self.requests;
+        self.avg_upstream_connect_ms /= self.requests;
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestObservabilitySnapshot {
+    pub summary: RequestObservabilitySummary,
+    pub recent: Vec<RequestObservabilityEvent>,
+    pub stored: Option<RequestObservabilityStored>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestObservabilityStored {
+    pub summary: RequestObservabilitySummary,
+    pub recent: Vec<RequestObservabilityEvent>,
+}
+
+#[derive(Debug, Default)]
+pub struct RequestObservabilityMetrics {
+    summary: RequestObservabilitySummary,
+    recent: VecDeque<RequestObservabilityEvent>,
+}
+
+impl RequestObservabilityMetrics {
+    fn add_event(&mut self, event: RequestObservabilityEvent) {
+        self.summary.add_event(&event);
+        if self.recent.len() >= RECENT_OBSERVABILITY_LIMIT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(event);
+    }
+
+    fn snapshot(&self) -> RequestObservabilitySnapshot {
+        let mut summary = self.summary.clone();
+        summary.finalize();
+        RequestObservabilitySnapshot {
+            summary,
+            recent: self.recent.iter().cloned().collect(),
+            stored: None,
+        }
+    }
+}
 
 /// Token usage breakdown for a single request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -90,6 +197,7 @@ pub struct Metrics {
     pub latency_count: AtomicU64,
     /// Token usage metrics for the current session.
     pub usage_metrics: Mutex<MetricsDimensions>,
+    pub observability_metrics: Mutex<RequestObservabilityMetrics>,
     /// Persistent store for all-time metrics.
     store: Option<Arc<MetricsStore>>,
     /// All-time totals loaded from store at startup.
@@ -104,6 +212,7 @@ impl Metrics {
             latency_sum_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             usage_metrics: Mutex::new(MetricsDimensions::default()),
+            observability_metrics: Mutex::new(RequestObservabilityMetrics::default()),
             store,
             stored_totals: Mutex::new(StoredTotals::default()),
         }
@@ -170,6 +279,23 @@ impl Metrics {
         }
     }
 
+    pub async fn record_observability(&self, event: RequestObservabilityEvent, persist: bool) {
+        self.observability_metrics
+            .lock()
+            .await
+            .add_event(event.clone());
+        if persist && let Some(ref store) = self.store {
+            store.record_observability(event);
+        }
+    }
+
+    pub async fn load_stored_observability(&self) -> Option<RequestObservabilityStored> {
+        match &self.store {
+            Some(store) => Some(store.load_observability().await),
+            None => None,
+        }
+    }
+
     pub async fn to_json(&self) -> serde_json::Value {
         let requests = self.requests_total.load(Ordering::Relaxed);
         let errors = self.errors_total.load(Ordering::Relaxed);
@@ -187,12 +313,22 @@ impl Metrics {
         drop(usage_metrics);
 
         let stored = self.stored_totals.lock().await;
+        let stored_requests_total = stored.requests_total;
+        let stored_errors_total = stored.errors_total;
+        let stored_avg_latency_ms = stored
+            .latency_sum_ms
+            .checked_div(stored.latency_count)
+            .unwrap_or(0);
         let stored_models: serde_json::Value =
             serde_json::to_value(&stored.model_metrics).unwrap_or_default();
         let stored_providers: serde_json::Value =
             serde_json::to_value(&stored.provider_metrics).unwrap_or_default();
         let stored_initiators: serde_json::Value =
             serde_json::to_value(&stored.initiator_metrics).unwrap_or_default();
+        drop(stored);
+
+        let mut observability = self.observability_metrics.lock().await.snapshot();
+        observability.stored = self.load_stored_observability().await;
 
         json!({
             "requests_total": requests,
@@ -201,10 +337,11 @@ impl Metrics {
             "models": models,
             "providers": providers,
             "initiators": initiators,
+            "observability": serde_json::to_value(observability).unwrap_or_default(),
             "stored": {
-                "requests_total": stored.requests_total,
-                "errors_total": stored.errors_total,
-                "avg_latency_ms": stored.latency_sum_ms.checked_div(stored.latency_count).unwrap_or(0),
+                "requests_total": stored_requests_total,
+                "errors_total": stored_errors_total,
+                "avg_latency_ms": stored_avg_latency_ms,
                 "models": stored_models,
                 "providers": stored_providers,
                 "initiators": stored_initiators,
@@ -253,8 +390,8 @@ impl ProviderHealth {
 mod tests {
     use super::*;
     use claude_proxy_config::settings::{
-        AdminConfig, HttpConfig, LogConfig, ModelAliasConfig, ModelConfig, ProviderConfig,
-        ProviderType, ServerConfig,
+        AdminConfig, HttpConfig, LogConfig, ModelAliasConfig, ModelConfig, ObservabilityConfig,
+        ProviderConfig, ProviderType, ServerConfig,
     };
 
     fn settings_with_limits(
@@ -300,6 +437,7 @@ mod tests {
             },
             http: HttpConfig::default(),
             log: LogConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 
@@ -376,6 +514,95 @@ mod tests {
         assert_eq!(data["models"]["gpt-4.1"]["requests"], 32);
         assert_eq!(data["providers"]["openai"]["input_tokens"], 64);
         assert_eq!(data["initiators"]["user"]["output_tokens"], 96);
+    }
+
+    #[tokio::test]
+    async fn observability_summary_and_recent_are_reported() {
+        let metrics = Metrics::default();
+
+        metrics
+            .record_observability(
+                RequestObservabilityEvent {
+                    request_id: "first".to_string(),
+                    provider: "chatgpt".to_string(),
+                    initiator: "user".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    stream: true,
+                    is_error: false,
+                    terminal_reason: "completed".to_string(),
+                    total_latency_ms: 100,
+                    provider_setup_ms: 10,
+                    upstream_connect_ms: 20,
+                    stream_duration_ms: 70,
+                    first_event_ms: Some(30),
+                    last_event_gap_ms: 5,
+                    max_event_gap_ms: 15,
+                    idle_gap_count: 0,
+                    event_count: 3,
+                    prompt_too_long_retries: 1,
+                    prompt_too_long_original_body_bytes: 200,
+                    prompt_too_long_shrunk_body_bytes: 120,
+                    prompt_too_long_dropped_items: 2,
+                    request_messages: 2,
+                    request_content_blocks: 3,
+                    request_tool_results: 1,
+                    request_text_bytes: 42,
+                },
+                false,
+            )
+            .await;
+        metrics
+            .record_observability(
+                RequestObservabilityEvent {
+                    request_id: "second".to_string(),
+                    provider: "chatgpt".to_string(),
+                    initiator: "agent".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    stream: false,
+                    is_error: true,
+                    terminal_reason: "provider_error".to_string(),
+                    total_latency_ms: 300,
+                    provider_setup_ms: 10,
+                    upstream_connect_ms: 40,
+                    stream_duration_ms: 0,
+                    first_event_ms: None,
+                    last_event_gap_ms: 0,
+                    max_event_gap_ms: 0,
+                    idle_gap_count: 1,
+                    event_count: 0,
+                    prompt_too_long_retries: 0,
+                    prompt_too_long_original_body_bytes: 0,
+                    prompt_too_long_shrunk_body_bytes: 0,
+                    prompt_too_long_dropped_items: 0,
+                    request_messages: 1,
+                    request_content_blocks: 1,
+                    request_tool_results: 0,
+                    request_text_bytes: 10,
+                },
+                false,
+            )
+            .await;
+
+        let data = metrics.to_json().await;
+
+        assert_eq!(data["observability"]["summary"]["requests"], 2);
+        assert_eq!(data["observability"]["summary"]["errors"], 1);
+        assert_eq!(
+            data["observability"]["summary"]["avg_total_latency_ms"],
+            200
+        );
+        assert_eq!(
+            data["observability"]["summary"]["avg_upstream_connect_ms"],
+            30
+        );
+        assert_eq!(data["observability"]["summary"]["max_event_gap_ms"], 15);
+        assert_eq!(data["observability"]["summary"]["idle_gap_count"], 1);
+        assert_eq!(
+            data["observability"]["summary"]["prompt_too_long_retries"],
+            1
+        );
+        assert_eq!(data["observability"]["recent"].as_array().unwrap().len(), 2);
+        assert!(data["observability"]["stored"].is_null());
     }
 
     #[tokio::test]

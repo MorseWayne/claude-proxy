@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::hash::Hasher;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::Json;
 use axum::body::Body;
@@ -11,7 +11,10 @@ use axum::response::{IntoResponse, Response};
 use claude_proxy_config::settings::{ModelReasoningEffort, ProviderType};
 use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
-use claude_proxy_providers::provider::{Provider, ProviderError};
+use claude_proxy_providers::provider::{
+    Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind,
+};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
@@ -20,7 +23,9 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tracing::{debug, error, info, warn};
 
-use crate::app::{AppState, InflightEvent, TokenUsage};
+use crate::app::{
+    AppState, InflightEvent, RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
+};
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -62,6 +67,13 @@ pub async fn messages(
     Json(request): Json<MessagesRequest>,
 ) -> Response {
     let start = std::time::Instant::now();
+    let (observability_enabled, observability_idle_gap_ms) = {
+        let settings = state.settings.read().await;
+        (
+            settings.observability.enabled,
+            settings.observability.idle_gap_ms,
+        )
+    };
     state.metrics.record_request();
 
     // Auth check
@@ -139,46 +151,89 @@ pub async fn messages(
         }
     };
 
+    let provider_setup_ms = start.elapsed().as_millis() as u64;
     let metrics_context = RequestMetricsContext {
         provider_id: resolved.provider_id.clone(),
         model: resolved.request.model.clone(),
         initiator: resolved.initiator,
     };
+    let payload_stats = request_payload_stats(&resolved.request);
+    let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
+    let provider_observer =
+        observability_enabled.then(|| provider_request_observer(observer_state.clone()));
+    let upstream_connect_start = std::time::Instant::now();
 
     // Call provider (registry lock is no longer held)
-    match provider.chat(resolved.request).await {
+    match provider
+        .chat_with_observer(resolved.request, provider_observer)
+        .await
+    {
         Ok(stream) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: format!("{request_hash:016x}"),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: request.stream,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state,
+            });
             if request.stream {
                 stream_leader_response(
                     &state,
                     &metrics_context,
-                    request_hash,
-                    broadcast_tx,
                     stream,
-                    StreamPermits {
-                        _request: request_permit,
-                        _provider: Some(provider_permit),
+                    LeaderResponseContext {
+                        request_hash,
+                        broadcast_tx,
+                        permits: StreamPermits {
+                            _request: request_permit,
+                            _provider: Some(provider_permit),
+                        },
+                        start,
+                        observability,
                     },
-                    start,
                 )
                 .await
             } else {
                 collect_leader_response(
                     &state,
                     &metrics_context,
-                    request_hash,
-                    broadcast_tx,
                     stream,
-                    StreamPermits {
-                        _request: request_permit,
-                        _provider: Some(provider_permit),
+                    LeaderResponseContext {
+                        request_hash,
+                        broadcast_tx,
+                        permits: StreamPermits {
+                            _request: request_permit,
+                            _provider: Some(provider_permit),
+                        },
+                        start,
+                        observability,
                     },
-                    start,
                 )
                 .await
             }
         }
         Err(e) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: format!("{request_hash:016x}"),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: request.stream,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state,
+            });
             handle_provider_error(
                 &state,
                 &metrics_context,
@@ -186,6 +241,7 @@ pub async fn messages(
                 broadcast_tx,
                 e,
                 start,
+                observability,
             )
             .await
         }
@@ -205,6 +261,202 @@ struct RequestMetricsContext {
     provider_id: String,
     model: String,
     initiator: &'static str,
+}
+
+#[derive(Clone)]
+struct ObservabilityContext {
+    request_id: String,
+    provider_id: String,
+    initiator: &'static str,
+    model: String,
+    stream: bool,
+    start: std::time::Instant,
+    provider_setup_ms: u64,
+    upstream_connect_ms: u64,
+    idle_gap_ms: u64,
+    payload_stats: RequestPayloadStats,
+    observer_state: Arc<StdMutex<RequestObserverState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RequestObserverState {
+    prompt_too_long_retries: u64,
+    prompt_too_long_original_body_bytes: u64,
+    prompt_too_long_shrunk_body_bytes: u64,
+    prompt_too_long_dropped_items: u64,
+}
+
+impl RequestObserverState {
+    fn record(&mut self, event: &ProviderRequestObserverEvent) {
+        match event.event {
+            ProviderRequestObserverEventKind::PromptTooLongRetry
+            | ProviderRequestObserverEventKind::PromptTooLongRetryExhausted
+            | ProviderRequestObserverEventKind::PromptTooLongRetryUnshrinkable => {
+                self.prompt_too_long_retries = self
+                    .prompt_too_long_retries
+                    .max(event.prompt_too_long_retries);
+                self.prompt_too_long_original_body_bytes = self
+                    .prompt_too_long_original_body_bytes
+                    .max(event.original_body_bytes);
+                self.prompt_too_long_shrunk_body_bytes = self
+                    .prompt_too_long_shrunk_body_bytes
+                    .max(event.shrunk_body_bytes);
+                self.prompt_too_long_dropped_items =
+                    self.prompt_too_long_dropped_items.max(event.dropped_items);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservabilityTiming {
+    stream_duration_ms: u64,
+    first_event_ms: Option<u64>,
+    last_event_gap_ms: u64,
+    max_event_gap_ms: u64,
+    idle_gap_count: u64,
+    event_count: u64,
+    last_event_at: Option<std::time::Instant>,
+}
+
+impl ObservabilityTiming {
+    fn record_event(
+        &mut self,
+        request_start: std::time::Instant,
+        event_at: std::time::Instant,
+        idle_gap_ms: u64,
+    ) {
+        self.event_count += 1;
+        self.first_event_ms
+            .get_or_insert_with(|| event_at.duration_since(request_start).as_millis() as u64);
+        if let Some(last_event_at) = self.last_event_at {
+            let gap_ms = event_at.duration_since(last_event_at).as_millis() as u64;
+            self.last_event_gap_ms = gap_ms;
+            self.max_event_gap_ms = self.max_event_gap_ms.max(gap_ms);
+            if idle_gap_ms > 0 && gap_ms >= idle_gap_ms {
+                self.idle_gap_count += 1;
+            }
+        }
+        self.last_event_at = Some(event_at);
+    }
+}
+
+fn provider_request_observer(
+    state: Arc<StdMutex<RequestObserverState>>,
+) -> ProviderRequestObserver {
+    Arc::new(move |event| {
+        if let Ok(mut state) = state.lock() {
+            state.record(&event);
+        }
+    })
+}
+
+fn build_observability_event(
+    context: ObservabilityContext,
+    timing: ObservabilityTiming,
+    is_error: bool,
+    terminal_reason: &str,
+) -> RequestObservabilityEvent {
+    let observer_state = context
+        .observer_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    RequestObservabilityEvent {
+        request_id: context.request_id,
+        provider: context.provider_id,
+        initiator: context.initiator.to_string(),
+        model: context.model,
+        stream: context.stream,
+        is_error,
+        terminal_reason: terminal_reason.to_string(),
+        total_latency_ms: context.start.elapsed().as_millis() as u64,
+        provider_setup_ms: context.provider_setup_ms,
+        upstream_connect_ms: context.upstream_connect_ms,
+        stream_duration_ms: timing.stream_duration_ms,
+        first_event_ms: timing.first_event_ms,
+        last_event_gap_ms: timing.last_event_gap_ms,
+        max_event_gap_ms: timing.max_event_gap_ms,
+        idle_gap_count: timing.idle_gap_count,
+        event_count: timing.event_count,
+        prompt_too_long_retries: observer_state.prompt_too_long_retries,
+        prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
+        prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,
+        prompt_too_long_dropped_items: observer_state.prompt_too_long_dropped_items,
+        request_messages: context.payload_stats.messages,
+        request_content_blocks: context.payload_stats.content_blocks,
+        request_tool_results: context.payload_stats.tool_results,
+        request_text_bytes: context.payload_stats.text_bytes,
+    }
+}
+
+fn request_payload_stats(request: &MessagesRequest) -> RequestPayloadStats {
+    let mut stats = RequestPayloadStats {
+        messages: request.messages.len() as u64,
+        ..RequestPayloadStats::default()
+    };
+    if let Some(system) = &request.system {
+        match system {
+            SystemPrompt::Text(text) => {
+                stats.content_blocks += 1;
+                stats.text_bytes += text.len() as u64;
+            }
+            SystemPrompt::Blocks(blocks) => {
+                for block in blocks {
+                    add_content_stats(block, &mut stats);
+                }
+            }
+        }
+    }
+    for message in &request.messages {
+        match &message.content {
+            MessageContent::Text(text) => {
+                stats.content_blocks += 1;
+                stats.text_bytes += text.len() as u64;
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    add_content_stats(block, &mut stats);
+                }
+            }
+        }
+    }
+    stats
+}
+
+fn add_content_stats(content: &Content, stats: &mut RequestPayloadStats) {
+    stats.content_blocks += 1;
+    match content {
+        Content::Text { text } => {
+            stats.text_bytes += text.len() as u64;
+        }
+        Content::Thinking { thinking, .. } => {
+            stats.text_bytes += thinking.len() as u64;
+        }
+        Content::ToolResult { content, .. } => {
+            stats.tool_results += 1;
+            if let Some(content) = content {
+                stats.text_bytes += json_text_bytes(content);
+            }
+        }
+        Content::Unknown(value) => {
+            stats.text_bytes += json_text_bytes(value);
+        }
+        Content::ToolUse { .. } | Content::ServerToolUse { .. } => {}
+    }
+}
+
+fn json_text_bytes(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => text.len() as u64,
+        Value::Array(values) => values.iter().map(json_text_bytes).sum(),
+        Value::Object(object) => object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "type")
+            .map(|(_, value)| json_text_bytes(value))
+            .sum(),
+        _ => 0,
+    }
 }
 
 fn log_resolved_request(original_request: &MessagesRequest, resolved: &ResolvedUpstreamRequest) {
@@ -361,6 +613,14 @@ struct StreamPermits {
     _provider: Option<OwnedSemaphorePermit>,
 }
 
+struct LeaderResponseContext {
+    request_hash: u64,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
+    permits: StreamPermits,
+    start: std::time::Instant,
+    observability: Option<ObservabilityContext>,
+}
+
 async fn acquire_request_permit(
     state: &AppState,
     start: std::time::Instant,
@@ -515,12 +775,16 @@ async fn join_inflight_non_stream(
 async fn stream_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
-    request_hash: u64,
-    broadcast_tx: broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
-    permits: StreamPermits,
-    start: std::time::Instant,
+    context: LeaderResponseContext,
 ) -> Response {
+    let LeaderResponseContext {
+        request_hash,
+        broadcast_tx,
+        permits,
+        start,
+        observability,
+    } = context;
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
     let metrics = state.metrics.clone();
@@ -532,13 +796,19 @@ async fn stream_leader_response(
     tokio::spawn(async move {
         let _permits = permits;
         let task_start = std::time::Instant::now();
+        let mut timing = ObservabilityTiming::default();
         let mut usage = TokenUsage::default();
         let mut had_error = false;
+        let mut terminal_reason = "completed";
         let mut last_error = None;
         let mut leader_tx_open = true;
         while let Some(event_result) = stream.next().await {
             match event_result {
                 Ok(event) => {
+                    let now = std::time::Instant::now();
+                    if let Some(context) = &observability {
+                        timing.record_event(context.start, now, context.idle_gap_ms);
+                    }
                     extract_usage_from_event(&event.data, &mut usage);
                     let sse_text = leader_tx_open.then(|| format_sse_event(&event));
                     let _ = broadcast_tx.send(InflightEvent::Event(event));
@@ -548,6 +818,7 @@ async fn stream_leader_response(
                         leader_tx_open = false;
                     }
                     if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
+                        terminal_reason = "client_disconnected";
                         break;
                     }
                 }
@@ -560,6 +831,7 @@ async fn stream_leader_response(
                         "stream error from provider"
                     );
                     had_error = true;
+                    terminal_reason = "stream_error";
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     let error_event = stream_api_error_event(error_message);
@@ -574,6 +846,7 @@ async fn stream_leader_response(
         let _ = broadcast_tx.send(InflightEvent::Done);
         inflight_map.lock().await.remove(&request_hash);
         let latency_ms = task_start.elapsed().as_millis() as u64;
+        timing.stream_duration_ms = latency_ms;
         if let Some(error) = last_error {
             health_state
                 .record_provider_error(&provider_id, &error)
@@ -591,6 +864,14 @@ async fn stream_leader_response(
                 latency_ms,
             )
             .await;
+        if let Some(context) = observability {
+            metrics
+                .record_observability(
+                    build_observability_event(context, timing, had_error, terminal_reason),
+                    true,
+                )
+                .await;
+        }
     });
 
     state
@@ -602,17 +883,30 @@ async fn stream_leader_response(
 async fn collect_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
-    request_hash: u64,
-    broadcast_tx: broadcast::Sender<InflightEvent>,
     mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
-    _permits: StreamPermits,
-    start: std::time::Instant,
+    context: LeaderResponseContext,
 ) -> Response {
+    let LeaderResponseContext {
+        request_hash,
+        broadcast_tx,
+        permits: _permits,
+        start,
+        observability,
+    } = context;
+    let stream_start = std::time::Instant::now();
+    let mut timing = ObservabilityTiming::default();
     let mut events = Vec::new();
     let mut usage = TokenUsage::default();
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => {
+                if let Some(context) = &observability {
+                    timing.record_event(
+                        context.start,
+                        std::time::Instant::now(),
+                        context.idle_gap_ms,
+                    );
+                }
                 extract_usage_from_event(&event.data, &mut usage);
                 let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
                 events.push(event);
@@ -625,6 +919,30 @@ async fn collect_leader_response(
                 state
                     .record_provider_error(&request.provider_id, &error_message)
                     .await;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                state.metrics.record_error();
+                state.metrics.record_latency(latency_ms);
+                state
+                    .metrics
+                    .record_completed_request(
+                        &request.provider_id,
+                        request.initiator,
+                        &request.model,
+                        &usage,
+                        true,
+                        latency_ms,
+                    )
+                    .await;
+                if let Some(context) = observability {
+                    timing.stream_duration_ms = stream_start.elapsed().as_millis() as u64;
+                    state
+                        .metrics
+                        .record_observability(
+                            build_observability_event(context, timing, true, "stream_error"),
+                            true,
+                        )
+                        .await;
+                }
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     &ErrorResponse::api_error(&error_message),
@@ -654,6 +972,16 @@ async fn collect_leader_response(
 
     state.record_provider_success(&request.provider_id).await;
     state.metrics.record_latency(latency_ms);
+    if let Some(context) = observability {
+        timing.stream_duration_ms = stream_start.elapsed().as_millis() as u64;
+        state
+            .metrics
+            .record_observability(
+                build_observability_event(context, timing, false, "completed"),
+                true,
+            )
+            .await;
+    }
     Json(response_data).into_response()
 }
 
@@ -664,6 +992,7 @@ async fn handle_provider_error(
     broadcast_tx: broadcast::Sender<InflightEvent>,
     error: ProviderError,
     start: std::time::Instant,
+    observability: Option<ObservabilityContext>,
 ) -> Response {
     let _ = broadcast_tx.send(InflightEvent::Error(error.to_string()));
     let _ = broadcast_tx.send(InflightEvent::Done);
@@ -687,6 +1016,20 @@ async fn handle_provider_error(
             latency_ms,
         )
         .await;
+    if let Some(context) = observability {
+        state
+            .metrics
+            .record_observability(
+                build_observability_event(
+                    context,
+                    ObservabilityTiming::default(),
+                    true,
+                    "provider_error",
+                ),
+                true,
+            )
+            .await;
+    }
     provider_error_to_response(&error)
 }
 
@@ -1140,7 +1483,7 @@ mod tests {
     use axum::body::to_bytes;
     use claude_proxy_config::settings::{
         AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelAliasConfig, ModelConfig,
-        ProviderConfig, ProviderType, ServerConfig,
+        ObservabilityConfig, ProviderConfig, ProviderType, ServerConfig,
     };
 
     use super::*;
@@ -1177,6 +1520,7 @@ mod tests {
             limits: LimitsConfig::default(),
             http: HttpConfig::default(),
             log: LogConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 
@@ -1358,14 +1702,17 @@ mod tests {
         let response = stream_leader_response(
             &state,
             &request,
-            0xdead_beef,
-            broadcast_tx,
             tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
-            StreamPermits {
-                _request: request_permit,
-                _provider: None,
+            LeaderResponseContext {
+                request_hash: 0xdead_beef,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observability: None,
             },
-            std::time::Instant::now(),
         )
         .await;
         drop(response);
@@ -1528,6 +1875,63 @@ mod tests {
             assert_eq!(body["error"]["type"], "overloaded_error");
             assert_eq!(body["error"]["message"], "temporary upstream failure");
         }
+    }
+
+    #[test]
+    fn request_payload_stats_counts_blocks_without_storing_content() {
+        let mut request = request_with_system(Some(SystemPrompt::Blocks(vec![Content::Text {
+            text: "system".to_string(),
+        }])));
+        request.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                Content::Text {
+                    text: "hello".to_string(),
+                },
+                Content::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: Some(json!([{"type": "text", "text": "tool output"}])),
+                    is_error: None,
+                },
+            ]),
+        }];
+
+        let stats = request_payload_stats(&request);
+
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.content_blocks, 3);
+        assert_eq!(stats.tool_results, 1);
+        assert_eq!(
+            stats.text_bytes,
+            "system".len() as u64 + "hello".len() as u64 + "tool output".len() as u64
+        );
+    }
+
+    #[test]
+    fn provider_request_observer_keeps_prompt_too_long_max_stats() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::PromptTooLongRetry,
+            prompt_too_long_retries: 1,
+            original_body_bytes: 300,
+            shrunk_body_bytes: 200,
+            dropped_items: 1,
+        });
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::PromptTooLongRetry,
+            prompt_too_long_retries: 2,
+            original_body_bytes: 280,
+            shrunk_body_bytes: 150,
+            dropped_items: 3,
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.prompt_too_long_retries, 2);
+        assert_eq!(state.prompt_too_long_original_body_bytes, 300);
+        assert_eq!(state.prompt_too_long_shrunk_body_bytes, 200);
+        assert_eq!(state.prompt_too_long_dropped_items, 3);
     }
 
     #[test]

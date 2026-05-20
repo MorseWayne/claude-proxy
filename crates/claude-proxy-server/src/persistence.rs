@@ -5,12 +5,17 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::app::{TokenUsage, UsageMetrics};
+use crate::app::{RequestObservabilityEvent, RequestObservabilityStored, TokenUsage, UsageMetrics};
 
 const METRICS_RETENTION_DAYS: i64 = 90;
 const METRICS_WRITE_QUEUE_CAPACITY: usize = 4096;
 const METRICS_MAINTENANCE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
+
+enum MetricsWriteEvent {
+    Usage(UsageEvent),
+    Observability(RequestObservabilityEvent),
+}
 
 /// A single write event to be persisted.
 struct UsageEvent {
@@ -55,8 +60,51 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS request_observability_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            initiator TEXT NOT NULL,
+            model TEXT NOT NULL,
+            stream INTEGER NOT NULL DEFAULT 0,
+            is_error INTEGER NOT NULL DEFAULT 0,
+            terminal_reason TEXT NOT NULL,
+            total_latency_ms INTEGER NOT NULL DEFAULT 0,
+            provider_setup_ms INTEGER NOT NULL DEFAULT 0,
+            upstream_connect_ms INTEGER NOT NULL DEFAULT 0,
+            stream_duration_ms INTEGER NOT NULL DEFAULT 0,
+            first_event_ms INTEGER,
+            last_event_gap_ms INTEGER NOT NULL DEFAULT 0,
+            max_event_gap_ms INTEGER NOT NULL DEFAULT 0,
+            idle_gap_count INTEGER NOT NULL DEFAULT 0,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
+            prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
+            prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
+            prompt_too_long_dropped_items INTEGER NOT NULL DEFAULT 0,
+            request_messages INTEGER NOT NULL DEFAULT 0,
+            request_content_blocks INTEGER NOT NULL DEFAULT 0,
+            request_tool_results INTEGER NOT NULL DEFAULT 0,
+            request_text_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_request_observability_events_provider ON request_observability_events(provider);
+        CREATE INDEX IF NOT EXISTS idx_request_observability_events_model ON request_observability_events(model);
+        CREATE INDEX IF NOT EXISTS idx_request_observability_events_created ON request_observability_events(created_at);",
+    )
+}
+
+fn initialize_metrics_schema(conn: &Connection) -> rusqlite::Result<()> {
+    rebuild_usage_events_schema(conn)?;
+    rebuild_request_observability_schema(conn)?;
+    Ok(())
+}
+
 fn run_metrics_maintenance(conn: &Connection) -> rusqlite::Result<()> {
     prune_old_usage_events(conn, METRICS_RETENTION_DAYS)?;
+    prune_old_request_observability_events(conn, METRICS_RETENTION_DAYS)?;
     checkpoint_metrics_wal(conn)?;
     Ok(())
 }
@@ -64,6 +112,16 @@ fn run_metrics_maintenance(conn: &Connection) -> rusqlite::Result<()> {
 fn prune_old_usage_events(conn: &Connection, retention_days: i64) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM usage_events WHERE created_at < datetime('now', ?1)",
+        [format!("-{retention_days} days")],
+    )
+}
+
+fn prune_old_request_observability_events(
+    conn: &Connection,
+    retention_days: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM request_observability_events WHERE created_at < datetime('now', ?1)",
         [format!("-{retention_days} days")],
     )
 }
@@ -96,7 +154,7 @@ fn spawn_metrics_maintenance(conn: Arc<std::sync::Mutex<Connection>>) {
 /// Persisted metrics store backed by SQLite with a background writer task.
 pub struct MetricsStore {
     /// Channel to send writes to the background task.
-    write_tx: mpsc::Sender<UsageEvent>,
+    write_tx: mpsc::Sender<MetricsWriteEvent>,
     /// Shared connection for reads (load_totals).
     conn: Arc<std::sync::Mutex<Connection>>,
 }
@@ -120,7 +178,7 @@ impl MetricsStore {
         )
         .map_err(|e| format!("failed to set WAL mode: {e}"))?;
 
-        rebuild_usage_events_schema(&conn)
+        initialize_metrics_schema(&conn)
             .map_err(|e| format!("failed to initialize metrics schema: {e}"))?;
         if let Err(e) = run_metrics_maintenance(&conn) {
             warn!("Metrics maintenance skipped: {e}");
@@ -137,7 +195,7 @@ impl MetricsStore {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| format!("failed to set WAL on writer: {e}"))?;
 
-        let (write_tx, write_rx) = mpsc::channel::<UsageEvent>(METRICS_WRITE_QUEUE_CAPACITY);
+        let (write_tx, write_rx) = mpsc::channel::<MetricsWriteEvent>(METRICS_WRITE_QUEUE_CAPACITY);
 
         // Spawn the background writer task
         tokio::spawn(Self::writer_loop(write_conn, write_rx));
@@ -150,7 +208,7 @@ impl MetricsStore {
     }
 
     /// Background task that drains the write channel and batches inserts.
-    async fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<UsageEvent>) {
+    async fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<MetricsWriteEvent>) {
         let mut conn = Some(conn);
         while let Some(event) = rx.recv().await {
             // Drain any additional buffered events for batching
@@ -172,22 +230,8 @@ impl MetricsStore {
             let result = tokio::task::spawn_blocking(move || {
                 if let Ok(tx) = c.unchecked_transaction() {
                     for ev in &batch {
-                        if let Err(e) = tx.execute(
-                            "INSERT INTO usage_events (provider, initiator, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                            rusqlite::params![
-                                ev.provider,
-                                ev.initiator,
-                                ev.model,
-                                ev.input_tokens,
-                                ev.output_tokens,
-                                ev.cache_creation_input_tokens,
-                                ev.cache_read_input_tokens,
-                                ev.is_error,
-                                ev.latency_ms,
-                            ],
-                        ) {
-                            error!("Failed to insert usage event: {e}");
+                        if let Err(e) = Self::insert_metrics_write_event(&tx, ev) {
+                            error!("Failed to insert metrics event: {e}");
                         }
                     }
                     if let Err(e) = tx.commit() {
@@ -213,6 +257,65 @@ impl MetricsStore {
         info!("Metrics writer task shutting down");
     }
 
+    fn insert_metrics_write_event(
+        tx: &rusqlite::Transaction<'_>,
+        event: &MetricsWriteEvent,
+    ) -> rusqlite::Result<usize> {
+        match event {
+        MetricsWriteEvent::Usage(ev) => tx.execute(
+            "INSERT INTO usage_events (provider, initiator, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                ev.provider,
+                ev.initiator,
+                ev.model,
+                ev.input_tokens,
+                ev.output_tokens,
+                ev.cache_creation_input_tokens,
+                ev.cache_read_input_tokens,
+                ev.is_error,
+                ev.latency_ms,
+            ],
+        ),
+        MetricsWriteEvent::Observability(ev) => tx.execute(
+            "INSERT INTO request_observability_events (
+                request_id, provider, initiator, model, stream, is_error, terminal_reason,
+                total_latency_ms, provider_setup_ms, upstream_connect_ms, stream_duration_ms,
+                first_event_ms, last_event_gap_ms, max_event_gap_ms, idle_gap_count, event_count,
+                prompt_too_long_retries, prompt_too_long_original_body_bytes,
+                prompt_too_long_shrunk_body_bytes, prompt_too_long_dropped_items,
+                request_messages, request_content_blocks, request_tool_results, request_text_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            rusqlite::params![
+                ev.request_id,
+                ev.provider,
+                ev.initiator,
+                ev.model,
+                ev.stream as i64,
+                ev.is_error as i64,
+                ev.terminal_reason,
+                ev.total_latency_ms as i64,
+                ev.provider_setup_ms as i64,
+                ev.upstream_connect_ms as i64,
+                ev.stream_duration_ms as i64,
+                ev.first_event_ms.map(|value| value as i64),
+                ev.last_event_gap_ms as i64,
+                ev.max_event_gap_ms as i64,
+                ev.idle_gap_count as i64,
+                ev.event_count as i64,
+                ev.prompt_too_long_retries as i64,
+                ev.prompt_too_long_original_body_bytes as i64,
+                ev.prompt_too_long_shrunk_body_bytes as i64,
+                ev.prompt_too_long_dropped_items as i64,
+                ev.request_messages as i64,
+                ev.request_content_blocks as i64,
+                ev.request_tool_results as i64,
+                ev.request_text_bytes as i64,
+            ],
+        ),
+    }
+    }
+
     /// Record a completed request with its token usage (non-blocking).
     pub fn record_usage(
         &self,
@@ -234,13 +337,28 @@ impl MetricsStore {
             is_error: is_error as i64,
             latency_ms: latency_ms as i64,
         };
-        match self.write_tx.try_send(event) {
+        match self.write_tx.try_send(MetricsWriteEvent::Usage(event)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!("Metrics writer channel full, dropping usage event");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!("Metrics writer channel closed, dropping usage event");
+            }
+        }
+    }
+
+    pub fn record_observability(&self, event: RequestObservabilityEvent) {
+        match self
+            .write_tx
+            .try_send(MetricsWriteEvent::Observability(event))
+        {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Metrics writer channel full, dropping observability event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Metrics writer channel closed, dropping observability event");
             }
         }
     }
@@ -284,6 +402,100 @@ impl MetricsStore {
         .await
         .unwrap_or_default()
     }
+
+    pub async fn load_observability(&self) -> RequestObservabilityStored {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            load_request_observability(&conn)
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
+fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
+    let mut stored = RequestObservabilityStored::default();
+    if let Ok(row) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(total_latency_ms), 0),
+                COALESCE(SUM(upstream_connect_ms), 0),
+                COALESCE(MAX(max_event_gap_ms), 0),
+                COALESCE(SUM(idle_gap_count), 0),
+                COALESCE(SUM(prompt_too_long_retries), 0)
+         FROM request_observability_events",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    ) {
+        stored.summary.requests = row.0 as u64;
+        stored.summary.errors = row.1 as u64;
+        stored.summary.avg_total_latency_ms = row.2 as u64;
+        stored.summary.avg_upstream_connect_ms = row.3 as u64;
+        stored.summary.max_event_gap_ms = row.4 as u64;
+        stored.summary.idle_gap_count = row.5 as u64;
+        stored.summary.prompt_too_long_retries = row.6 as u64;
+        stored.summary.finalize();
+    }
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT request_id, provider, initiator, model, stream, is_error, terminal_reason,
+                total_latency_ms, provider_setup_ms, upstream_connect_ms, stream_duration_ms,
+                first_event_ms, last_event_gap_ms, max_event_gap_ms, idle_gap_count, event_count,
+                prompt_too_long_retries, prompt_too_long_original_body_bytes,
+                prompt_too_long_shrunk_body_bytes, prompt_too_long_dropped_items,
+                request_messages, request_content_blocks, request_tool_results, request_text_bytes
+         FROM request_observability_events
+         ORDER BY id DESC
+         LIMIT 20",
+    ) && let Ok(rows) = stmt.query_map([], request_observability_from_row)
+    {
+        stored.recent = rows.flatten().collect();
+        stored.recent.reverse();
+    }
+
+    stored
+}
+
+fn request_observability_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RequestObservabilityEvent> {
+    Ok(RequestObservabilityEvent {
+        request_id: row.get(0)?,
+        provider: row.get(1)?,
+        initiator: row.get(2)?,
+        model: row.get(3)?,
+        stream: row.get::<_, i64>(4)? != 0,
+        is_error: row.get::<_, i64>(5)? != 0,
+        terminal_reason: row.get(6)?,
+        total_latency_ms: row.get::<_, i64>(7)? as u64,
+        provider_setup_ms: row.get::<_, i64>(8)? as u64,
+        upstream_connect_ms: row.get::<_, i64>(9)? as u64,
+        stream_duration_ms: row.get::<_, i64>(10)? as u64,
+        first_event_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+        last_event_gap_ms: row.get::<_, i64>(12)? as u64,
+        max_event_gap_ms: row.get::<_, i64>(13)? as u64,
+        idle_gap_count: row.get::<_, i64>(14)? as u64,
+        event_count: row.get::<_, i64>(15)? as u64,
+        prompt_too_long_retries: row.get::<_, i64>(16)? as u64,
+        prompt_too_long_original_body_bytes: row.get::<_, i64>(17)? as u64,
+        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(18)? as u64,
+        prompt_too_long_dropped_items: row.get::<_, i64>(19)? as u64,
+        request_messages: row.get::<_, i64>(20)? as u64,
+        request_content_blocks: row.get::<_, i64>(21)? as u64,
+        request_tool_results: row.get::<_, i64>(22)? as u64,
+        request_text_bytes: row.get::<_, i64>(23)? as u64,
+    })
 }
 
 fn load_usage_metrics(
@@ -453,6 +665,98 @@ mod tests {
         assert_eq!(totals.initiator_metrics["agent"].requests, 1);
         assert_eq!(totals.initiator_metrics["user"].output_tokens, 13);
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn test_observability_event(
+        request_id: &str,
+        is_error: bool,
+        total_latency_ms: u64,
+        upstream_connect_ms: u64,
+    ) -> RequestObservabilityEvent {
+        RequestObservabilityEvent {
+            request_id: request_id.to_string(),
+            provider: "chatgpt".to_string(),
+            initiator: "user".to_string(),
+            model: "gpt-5.5".to_string(),
+            stream: true,
+            is_error,
+            terminal_reason: if is_error {
+                "stream_error"
+            } else {
+                "completed"
+            }
+            .to_string(),
+            total_latency_ms,
+            provider_setup_ms: 10,
+            upstream_connect_ms,
+            stream_duration_ms: total_latency_ms.saturating_sub(upstream_connect_ms),
+            first_event_ms: Some(25),
+            last_event_gap_ms: 7,
+            max_event_gap_ms: 45,
+            idle_gap_count: 1,
+            event_count: 4,
+            prompt_too_long_retries: 1,
+            prompt_too_long_original_body_bytes: 200,
+            prompt_too_long_shrunk_body_bytes: 120,
+            prompt_too_long_dropped_items: 2,
+            request_messages: 3,
+            request_content_blocks: 5,
+            request_tool_results: 1,
+            request_text_bytes: 80,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_observability_returns_summary_and_recent_rows() {
+        let path = temp_db_path("observability-totals");
+        let store = MetricsStore::open(path.clone()).unwrap();
+        store.record_observability(test_observability_event("first", false, 100, 20));
+        store.record_observability(test_observability_event("second", true, 300, 40));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stored = store.load_observability().await;
+
+        assert_eq!(stored.summary.requests, 2);
+        assert_eq!(stored.summary.errors, 1);
+        assert_eq!(stored.summary.avg_total_latency_ms, 200);
+        assert_eq!(stored.summary.avg_upstream_connect_ms, 30);
+        assert_eq!(stored.summary.max_event_gap_ms, 45);
+        assert_eq!(stored.summary.idle_gap_count, 2);
+        assert_eq!(stored.summary.prompt_too_long_retries, 2);
+        assert_eq!(stored.recent.len(), 2);
+        assert_eq!(stored.recent[0].request_id, "first");
+        assert_eq!(stored.recent[1].request_id, "second");
+        assert_eq!(stored.recent[1].terminal_reason, "stream_error");
+        assert_eq!(stored.recent[1].request_tool_results, 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prunes_request_observability_events_older_than_retention_window() {
+        let path = temp_db_path("observability-retention");
+        let conn = Connection::open(&path).unwrap();
+        rebuild_request_observability_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO request_observability_events (request_id, provider, initiator, model, terminal_reason, created_at)
+             VALUES ('old', 'chatgpt', 'user', 'gpt-5.5', 'completed', datetime('now', '-91 days'));
+             INSERT INTO request_observability_events (request_id, provider, initiator, model, terminal_reason, created_at)
+             VALUES ('new', 'chatgpt', 'user', 'gpt-5.5', 'completed', datetime('now', '-89 days'));",
+        )
+        .unwrap();
+
+        let deleted = prune_old_request_observability_events(&conn, 90).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_observability_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(count, 1);
         let _ = std::fs::remove_file(path);
     }
 }
