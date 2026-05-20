@@ -49,6 +49,28 @@ Close summary:
 - GitNexus: 修改前已对核心符号做 impact analysis；提交前 `detect_changes` 为 CRITICAL，影响集中在计划内配置、Provider trait、ChatGPT retry、server metrics/persistence/routes/admin metrics 流程。
 - Gaps: 未做真实 Claude Code 长会话端到端观测验证；当前实现覆盖本地单元/集成验证和持久化路径。
 
+### WF-2026-05-20-005 — 安装后启动交互提示
+
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+
+- Outcome: 安装器每次安装前都询问是否继续；如已有服务/进程运行则提示继续会停止它；安装完成后询问是否启动，并在选择启动时追加询问是否后台运行。已有运行状态不再自动恢复。
+- Validation: `bash -n install.sh`、`git diff --check -- install.sh install.ps1` 通过；本机无 PowerShell，未执行 `install.ps1` 解析检查；GitNexus 文件级 impact 为 LOW；已提交 `85e7f7d` 并运行 `npx gitnexus analyze`。
+- Gaps: 未做真实跨平台安装升级端到端验证；GitNexus compare 受当前 observability 未提交改动影响，不能作为 installer-only 风险读数。
+
+### WF-2026-05-20-004 — 安装脚本升级时恢复已有服务
+
+Completed: 2026-05-20
+Level: 2
+
+Close summary:
+
+- Outcome: Unix 安装脚本在已有 daemon 运行时提示确认、停止后覆盖安装并恢复 `server start --daemon`；Windows 安装脚本在已有 claude-proxy 进程时提示确认、停止后覆盖 exe 并重新启动。
+- Validation: `bash -n install.sh`、`git diff --check -- install.sh install.ps1` 通过；本机无 PowerShell，未执行 `install.ps1` 解析检查；GitNexus detect_changes 为 low、0 个受影响流程；已提交 `1a13b58` 并运行 `npx gitnexus analyze`。
+- Gaps: 未做真实跨平台安装升级端到端验证。
+
 ### WF-2026-05-20-002 — 性能热点优化
 Completed: 2026-05-20
 Level: 3
