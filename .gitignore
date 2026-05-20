@@ -1,3 +1,13 @@
 /target
 Cargo.lock
+
+# Local tool state
 .antigravitycli/
+.gitnexus/
+
+# Local environment and editor files
+.env
+.env.*
+.DS_Store
+*.swp
+*.swo
