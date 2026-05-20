@@ -9,6 +9,7 @@ mod responses;
 use std::collections::BTreeSet;
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ use claude_proxy_config::{
     },
 };
 use claude_proxy_core::*;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use reqwest::{
     Client, Response, StatusCode,
     header::{HeaderMap, HeaderValue},
@@ -171,7 +172,21 @@ impl ChatGptProvider {
         &self,
         body: &Value,
         token: &ChatGptToken,
+        compact_request: bool,
+        request_id: u64,
+        prompt_too_long_attempt: usize,
     ) -> Result<Response, ProviderError> {
+        let body_bytes = json_len(body);
+        let started_at = Instant::now();
+        info!(
+            request_id,
+            compact_request,
+            prompt_too_long_attempt,
+            body_bytes,
+            endpoint = %self.endpoint,
+            "ChatGPT upstream request started"
+        );
+
         let mut request_builder = self
             .http_client
             .post(&self.endpoint)
@@ -184,11 +199,36 @@ impl ChatGptProvider {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
 
-        send_upstream_request_with_policy(
+        let result = send_upstream_request_with_policy(
             request_builder.json(body),
             chatgpt_upstream_request_policy(),
         )
-        .await
+        .await;
+
+        match &result {
+            Ok(response) => {
+                info!(
+                    request_id,
+                    compact_request,
+                    prompt_too_long_attempt,
+                    status = response.status().as_u16(),
+                    elapsed_ms = elapsed_millis(started_at),
+                    "ChatGPT upstream response headers received"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    request_id,
+                    compact_request,
+                    prompt_too_long_attempt,
+                    elapsed_ms = elapsed_millis(started_at),
+                    error = %error,
+                    "ChatGPT upstream request failed before response headers"
+                );
+            }
+        }
+
+        result
     }
 
     async fn send_responses_request_with_prompt_too_long_retry(
@@ -196,16 +236,26 @@ impl ChatGptProvider {
         body: &mut Value,
         token: &ChatGptToken,
         compact_request: bool,
+        request_id: u64,
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         let mut prompt_too_long_attempts = 0;
 
         loop {
-            let response = self.send_responses_request(body, token).await?;
+            let response = self
+                .send_responses_request(
+                    body,
+                    token,
+                    compact_request,
+                    request_id,
+                    prompt_too_long_attempts,
+                )
+                .await?;
             let status = response.status();
             if status.is_success() || status == StatusCode::UNAUTHORIZED {
                 if compact_request {
                     info!(
+                        request_id,
                         status = status.as_u16(),
                         prompt_too_long_retry_triggered = prompt_too_long_attempts > 0,
                         prompt_too_long_retries = prompt_too_long_attempts,
@@ -233,6 +283,7 @@ impl ChatGptProvider {
                 );
                 if compact_request {
                     info!(
+                        request_id,
                         status = status.as_u16(),
                         prompt_too_long_retry_triggered = true,
                         prompt_too_long_retries = prompt_too_long_attempts,
@@ -254,6 +305,7 @@ impl ChatGptProvider {
                 );
                 if compact_request {
                     info!(
+                        request_id,
                         status = status.as_u16(),
                         prompt_too_long_retry_triggered = true,
                         prompt_too_long_retries = prompt_too_long_attempts,
@@ -271,6 +323,7 @@ impl ChatGptProvider {
                 Some(&stats),
             );
             warn!(
+                request_id,
                 attempt = prompt_too_long_attempts,
                 compact_request,
                 dropped_groups = stats.dropped_groups,
@@ -407,6 +460,7 @@ impl Provider for ChatGptProvider {
         let marker_mode = marker_mode_from_request(&request);
         let mut body =
             build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
+        let request_id = next_chatgpt_request_id();
         log_request_observability("chatgpt", "/responses", &body);
         let compact_request = is_compact_request_body(&body);
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
@@ -416,6 +470,7 @@ impl Provider for ChatGptProvider {
                 &mut body,
                 &token,
                 compact_request,
+                request_id,
                 observer.as_ref(),
             )
             .await?;
@@ -434,6 +489,7 @@ impl Provider for ChatGptProvider {
                     &mut body,
                     &refreshed,
                     compact_request,
+                    request_id,
                     observer.as_ref(),
                 )
                 .await?;
@@ -452,10 +508,24 @@ impl Provider for ChatGptProvider {
 
         let cache = Arc::clone(&self.cached_rate_limits);
         let provider_id = self.id.clone();
-        Ok(responses::stream_response_with_marker_mode(
-            response,
-            marker_mode,
-            move |event| {
+        let first_sse_seen = Arc::new(AtomicBool::new(false));
+        let first_sse_seen_for_event = Arc::clone(&first_sse_seen);
+        let stream_started_at = Instant::now();
+        let stream =
+            responses::stream_response_with_marker_mode(response, marker_mode, move |event| {
+                if !first_sse_seen_for_event.swap(true, Ordering::Relaxed) {
+                    let event_type = event
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    info!(
+                        request_id,
+                        compact_request,
+                        elapsed_ms = elapsed_millis(stream_started_at),
+                        event_type,
+                        "ChatGPT upstream first SSE event received"
+                    );
+                }
                 if let Some(snapshot) =
                     rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
                 {
@@ -464,8 +534,35 @@ impl Provider for ChatGptProvider {
                         cache_rate_limits_into(&cache, vec![snapshot]).await;
                     });
                 }
-            },
-        ))
+            });
+        let first_stream_item_seen = Arc::new(AtomicBool::new(false));
+        let first_stream_item_seen_for_map = Arc::clone(&first_stream_item_seen);
+        Ok(Box::pin(stream.map(move |result| {
+            if !first_stream_item_seen_for_map.swap(true, Ordering::Relaxed) {
+                match &result {
+                    Ok(event) => {
+                        info!(
+                            request_id,
+                            compact_request,
+                            elapsed_ms = elapsed_millis(stream_started_at),
+                            event = %event.event,
+                            "ChatGPT first downstream stream item emitted"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id,
+                            compact_request,
+                            elapsed_ms = elapsed_millis(stream_started_at),
+                            error = %error,
+                            first_sse_seen = first_sse_seen.load(Ordering::Relaxed),
+                            "ChatGPT stream failed before first downstream item"
+                        );
+                    }
+                }
+            }
+            result
+        })))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -889,6 +986,15 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn next_chatgpt_request_id() -> u64 {
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn window_minutes_from_seconds(seconds: u64) -> u64 {
@@ -1903,7 +2009,7 @@ mod tests {
         });
 
         let response = provider
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false, None)
+            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false, 1, None)
             .await
             .expect("retry should succeed");
 
@@ -1944,6 +2050,7 @@ mod tests {
                 &mut body,
                 &token,
                 false,
+                1,
                 Some(&observer),
             )
             .await
