@@ -27,7 +27,6 @@ pub(super) fn build_body(
 ) -> Value {
     let mut body = crate::responses::convert_to_responses(request);
     if let Some(object) = body.as_object_mut() {
-        object.remove("max_output_tokens");
         object.remove("stop");
         object.insert("stream".to_string(), json!(true));
         let missing_instructions = object

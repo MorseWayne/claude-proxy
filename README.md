@@ -324,7 +324,8 @@ haiku = "chatgpt/gpt-5.3-codex"
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "chatgpt/gpt-5.3-codex",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "chatgpt/gpt-5.3-codex",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "chatgpt/gpt-5.3-codex",
-    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000"
   }
 }
 ```

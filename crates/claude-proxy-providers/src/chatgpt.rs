@@ -1773,7 +1773,7 @@ mod tests {
 
         assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
         assert_eq!(body["stream"], true);
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 4096);
     }
 
     #[test]
@@ -1949,7 +1949,7 @@ mod tests {
         let body = build_chatgpt_responses_body(&req);
 
         assert_eq!(body["stream"], true);
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 4096);
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][0]["call_id"], "call_1");
         assert_eq!(body["input"][1]["type"], "function_call_output");
@@ -1986,7 +1986,7 @@ mod tests {
         assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
         assert_eq!(body["reasoning"]["effort"], "none");
         assert!(body["reasoning"].get("summary").is_none());
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 4096);
     }
 
     #[tokio::test]

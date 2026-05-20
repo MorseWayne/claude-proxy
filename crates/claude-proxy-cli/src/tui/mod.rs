@@ -1850,6 +1850,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
+    set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
     env.remove("ANTHROPIC_AUTH_TOKEN");
     set_env(env, "ANTHROPIC_MODEL", &settings.model.default.name);
     set_optional_env(
@@ -2224,6 +2225,11 @@ mod tests {
             Some("0")
         );
         assert_eq!(
+            env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                .and_then(|v| v.as_str()),
+            Some("128000")
+        );
+        assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
             Some("copilot/claude-sonnet-4")
         );
@@ -2285,7 +2291,8 @@ mod tests {
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "old-opus",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "old-sonnet",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "old-haiku",
-                "ANTHROPIC_REASONING_MODEL": "old-reasoning"
+                "ANTHROPIC_REASONING_MODEL": "old-reasoning",
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"
             }
         });
 
@@ -2295,6 +2302,11 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
             Some("openai/gpt-5")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                .and_then(|v| v.as_str()),
+            Some("128000")
         );
         assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
