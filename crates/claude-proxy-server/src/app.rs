@@ -410,6 +410,7 @@ mod tests {
                 provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
                 chatgpt: None,
+                reasoning_markers: Default::default(),
             },
         );
 
@@ -823,6 +824,7 @@ mod tests {
                 provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
                 chatgpt: None,
+                reasoning_markers: Default::default(),
             },
         );
         let state = AppState::new(settings, None);

@@ -1,17 +1,23 @@
+use claude_proxy_config::settings::ReasoningMarkerMode;
 use claude_proxy_core::{MessagesRequest, SseEvent};
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
 use crate::provider::ProviderError;
 
-pub(super) fn stream_response<F>(
+pub(super) fn stream_response_with_marker_mode<F>(
     response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
     on_event: F,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
-    crate::responses::stream_responses_response_with_observer(response, on_event)
+    crate::responses::stream_responses_response_with_marker_mode_and_observer(
+        response,
+        marker_mode,
+        on_event,
+    )
 }
 
 pub(super) fn build_body(

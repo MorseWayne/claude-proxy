@@ -350,6 +350,7 @@ async fn handle_provider(action: ProviderAction) {
                     provider_type: Some(provider_type.clone()),
                     copilot,
                     chatgpt: None,
+                    reasoning_markers: Default::default(),
                 },
             );
 

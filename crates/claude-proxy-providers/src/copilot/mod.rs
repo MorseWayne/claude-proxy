@@ -27,6 +27,7 @@ use crate::http::{
     read_upstream_response_text, send_upstream_request,
 };
 use crate::provider::{Provider, ProviderError};
+use crate::reasoning_markers::marker_mode_from_request;
 
 use self::auth::CopilotAuth;
 use self::headers::HeaderBuilder;
@@ -245,11 +246,19 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(crate::chat_completions::stream_openai_response(response))
+            Ok(
+                crate::chat_completions::stream_openai_response_with_marker_mode(
+                    response,
+                    marker_mode_from_request(&request),
+                ),
+            )
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::chat_completions::convert_non_streaming_response(&data);
+            let events = crate::chat_completions::convert_non_streaming_response_with_marker_mode(
+                &data,
+                marker_mode_from_request(&request),
+            );
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
         }
@@ -276,11 +285,19 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(crate::responses::stream_responses_response(response))
+            Ok(
+                crate::responses::stream_responses_response_with_marker_mode(
+                    response,
+                    marker_mode_from_request(&request),
+                ),
+            )
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::responses::convert_non_streaming_response(&data);
+            let events = crate::responses::convert_non_streaming_response_with_marker_mode(
+                &data,
+                marker_mode_from_request(&request),
+            );
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
         }

@@ -8,7 +8,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use claude_proxy_config::settings::{ModelReasoningEffort, ProviderType};
+use claude_proxy_config::settings::{
+    ModelReasoningEffort, ProviderType, REASONING_MARKER_MODE_EXTRA_KEY, ReasoningMarkerMode,
+};
 use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
@@ -518,16 +520,20 @@ async fn resolve_upstream_request(
     let resolved_model = settings.resolve_model_with_intent(&request.model, intent);
     let provider_id = resolved_model.provider_id.clone();
     let upstream_model = resolved_model.upstream_model.clone();
-    let provider_type = settings
-        .providers
-        .get(&provider_id)
+    let provider_config = settings.providers.get(&provider_id);
+    let provider_type = provider_config
         .map(|config| config.resolve_type(&provider_id))
         .unwrap_or_else(|| ProviderType::parse(&provider_id));
+    let reasoning_marker_mode = resolved_model
+        .reasoning_marker_mode
+        .or_else(|| provider_config.map(|config| config.reasoning_markers))
+        .unwrap_or_default();
     let initiator = resolve_request_initiator(&settings, &provider_id, request);
 
     let mut request = request.clone();
     request.model = upstream_model.clone();
     apply_alias_reasoning_effort(&mut request, resolved_model.reasoning_effort);
+    apply_reasoning_marker_mode(&mut request, &provider_type, reasoning_marker_mode);
 
     ResolvedUpstreamRequest {
         provider_id,
@@ -557,6 +563,32 @@ fn apply_alias_reasoning_effort(
             .insert("reasoning_effort".to_string(), json!(value));
         request.thinking = None;
     }
+}
+
+fn apply_reasoning_marker_mode(
+    request: &mut MessagesRequest,
+    provider_type: &ProviderType,
+    mode: ReasoningMarkerMode,
+) {
+    if !openai_compatible_marker_mode(provider_type) {
+        return;
+    }
+    request.extra.insert(
+        REASONING_MARKER_MODE_EXTRA_KEY.to_string(),
+        json!(mode.as_config_value()),
+    );
+}
+
+fn openai_compatible_marker_mode(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::OpenAI
+            | ProviderType::Copilot
+            | ProviderType::ChatGPT
+            | ProviderType::OpenRouter
+            | ProviderType::Google
+            | ProviderType::Custom(_)
+    )
 }
 
 fn resolve_request_initiator(
@@ -1499,6 +1531,7 @@ mod tests {
                 provider_type: Some(provider_type),
                 copilot: None,
                 chatgpt: None,
+                reasoning_markers: Default::default(),
             },
         );
 
@@ -1605,6 +1638,37 @@ mod tests {
         );
         assert!(!request.extra.contains_key("reasoning"));
         assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn reasoning_marker_mode_is_internal_to_openai_compatible_providers() {
+        let mut request = request_with_system(None);
+
+        apply_reasoning_marker_mode(
+            &mut request,
+            &ProviderType::OpenAI,
+            ReasoningMarkerMode::LegacyTags,
+        );
+
+        assert_eq!(
+            request
+                .extra
+                .get(REASONING_MARKER_MODE_EXTRA_KEY)
+                .and_then(Value::as_str),
+            Some("legacy_tags")
+        );
+
+        let mut anthropic_request = request_with_system(None);
+        apply_reasoning_marker_mode(
+            &mut anthropic_request,
+            &ProviderType::Anthropic,
+            ReasoningMarkerMode::LegacyTags,
+        );
+        assert!(
+            !anthropic_request
+                .extra
+                .contains_key(REASONING_MARKER_MODE_EXTRA_KEY)
+        );
     }
 
     #[test]

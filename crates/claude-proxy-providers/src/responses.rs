@@ -1,3 +1,4 @@
+use claude_proxy_config::settings::ReasoningMarkerMode;
 use claude_proxy_core::*;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -13,9 +14,8 @@ use crate::openai_compat::{
     thinking_budget_to_reasoning_effort,
 };
 use crate::provider::ProviderError;
-use crate::sse::{SseDecoder, parse_sse_json_value};
-use crate::tagged_thinking::{TaggedThinkingSplitter, TextSegment, split_tagged_thinking};
-use crate::thinking_sanitizer::{ThinkingSanitizer, sanitize_thinking_markers};
+use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
+use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
 
@@ -833,14 +833,38 @@ fn reasoning_for_model(req: &MessagesRequest, mut reasoning: Value) -> Value {
     reasoning
 }
 
+#[cfg(test)]
 pub fn stream_responses_response(
     response: reqwest::Response,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     stream_responses_response_with_observer(response, |_| {})
 }
 
+pub fn stream_responses_response_with_marker_mode(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    stream_responses_response_with_marker_mode_and_observer(response, marker_mode, |_| {})
+}
+
+#[cfg(test)]
 pub fn stream_responses_response_with_observer<F>(
     response: reqwest::Response,
+    on_event: F,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    stream_responses_response_with_marker_mode_and_observer(
+        response,
+        ReasoningMarkerMode::Strict,
+        on_event,
+    )
+}
+
+pub fn stream_responses_response_with_marker_mode_and_observer<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
     on_event: F,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>>
 where
@@ -857,10 +881,11 @@ where
     let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
-        let mut converter = ResponsesStreamConverter::new();
+        let mut converter = ResponsesStreamConverter::with_marker_mode(marker_mode);
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
         let mut preview = Vec::new();
+        let mut saw_done = false;
 
         loop {
             let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
@@ -877,6 +902,10 @@ where
                     append_stream_preview(&mut preview, &chunk);
                     decoder.push(&chunk);
                     while let Some(event) = decoder.next_frame() {
+                        if is_sse_done(&event) {
+                            saw_done = true;
+                            continue;
+                        }
                         if let Some(value) = parse_sse_json(&event) {
                             on_event(&value);
                             for event in converter.process_event(&value) {
@@ -888,7 +917,22 @@ where
                     }
                 }
                 Err(e) => {
-                    if converter.stopped {
+                    if converter.stopped || saw_done {
+                        break;
+                    }
+                    if let Some(event) = decoder.finish() {
+                        if is_sse_done(&event) {
+                            saw_done = true;
+                        } else if let Some(value) = parse_sse_json(&event) {
+                            on_event(&value);
+                            for event in converter.process_event(&value) {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if converter.stopped || saw_done {
                         break;
                     }
                     let _ = tx
@@ -900,6 +944,7 @@ where
         }
 
         if let Some(event) = decoder.finish()
+            && !is_sse_done(&event)
             && let Some(value) = parse_sse_json(&event)
         {
             on_event(&value);
@@ -979,10 +1024,9 @@ struct ResponsesStreamConverter {
     started: bool,
     next_block_index: u32,
     open_block: Option<OpenBlock>,
-    text_sanitizers: HashMap<(u64, u64), ThinkingSanitizer>,
     output_blocks: HashMap<(u64, u64), u32>,
-    tagged_text: TaggedThinkingSplitter,
-    tagged_text_key: Option<(u64, u64)>,
+    reasoning_text: ReasoningTextSplitter,
+    reasoning_text_key: Option<(u64, u64)>,
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
@@ -995,9 +1039,15 @@ struct ResponsesStreamConverter {
 }
 
 impl ResponsesStreamConverter {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_marker_mode(ReasoningMarkerMode::Strict)
+    }
+
+    fn with_marker_mode(marker_mode: ReasoningMarkerMode) -> Self {
         Self {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+            reasoning_text: ReasoningTextSplitter::new(marker_mode),
             ..Default::default()
         }
     }
@@ -1026,7 +1076,7 @@ impl ResponsesStreamConverter {
                 let content_index = event["content_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    self.emit_tagged_text(output_index, content_index, delta, &mut events);
+                    self.emit_text_stream(output_index, content_index, delta, &mut events);
                 }
             }
             "response.refusal.delta" => {
@@ -1035,12 +1085,12 @@ impl ResponsesStreamConverter {
                 let content_index = event["content_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    self.emit_tagged_text(output_index, content_index, delta, &mut events);
+                    self.emit_text_stream(output_index, content_index, delta, &mut events);
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
                     let idx = self.ensure_thinking_block(&mut events);
@@ -1049,7 +1099,7 @@ impl ResponsesStreamConverter {
             }
             "response.function_call_arguments.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 let output_index = event["output_index"].as_u64().unwrap_or(0);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
@@ -1063,18 +1113,18 @@ impl ResponsesStreamConverter {
             }
             "response.function_call_arguments.done" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 self.handle_function_call_arguments_done(event, &mut events);
             }
             "response.output_item.done" => {
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 self.handle_output_item_done(event, &mut events);
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
                 if let Some(response) = event.get("response") {
                     self.ensure_started(response, &mut events);
                     self.set_usage(response);
-                    self.flush_tagged_text(&mut events);
+                    self.flush_reasoning_text(&mut events);
                     self.stop_response(response, &mut events);
                 }
             }
@@ -1087,8 +1137,7 @@ impl ResponsesStreamConverter {
     fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if self.started && !self.stopped {
-            self.flush_tagged_text(&mut events);
-            self.flush_text_sanitizers(&mut events);
+            self.flush_reasoning_text(&mut events);
             self.close_open_block(&mut events);
             self.stop_with_reason("end_turn", &mut events);
         }
@@ -1129,7 +1178,7 @@ impl ResponsesStreamConverter {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
         if item["type"].as_str() == Some("function_call") {
-            self.flush_tagged_text(events);
+            self.flush_reasoning_text(events);
             self.saw_function_call = true;
             if let Some(name) = item["name"].as_str() {
                 self.function_names.insert(output_index, name.to_string());
@@ -1151,14 +1200,14 @@ impl ResponsesStreamConverter {
                 if let Some(text) = part["text"].as_str()
                     && !text.is_empty()
                 {
-                    self.emit_tagged_text(output_index, content_index, text, events);
+                    self.emit_text_stream(output_index, content_index, text, events);
                 }
             }
             Some("refusal") => {
                 if let Some(text) = part["refusal"].as_str()
                     && !text.is_empty()
                 {
-                    self.emit_tagged_text(output_index, content_index, text, events);
+                    self.emit_text_stream(output_index, content_index, text, events);
                 }
             }
             _ => {}
@@ -1172,33 +1221,12 @@ impl ResponsesStreamConverter {
         text: &str,
         events: &mut Vec<SseEvent>,
     ) {
-        let visible = self
-            .text_sanitizers
-            .entry((output_index, content_index))
-            .or_default()
-            .push(text);
-        if visible.is_empty() {
+        if text.is_empty() {
             return;
         }
 
         let idx = self.ensure_text_block(output_index, content_index, events);
-        events.push(content_delta(idx, "text_delta", "text", &visible));
-    }
-
-    fn flush_text_sanitizers(&mut self, events: &mut Vec<SseEvent>) {
-        let mut sanitizers = std::mem::take(&mut self.text_sanitizers)
-            .into_iter()
-            .collect::<Vec<_>>();
-        sanitizers.sort_by_key(|(key, _)| *key);
-
-        for ((output_index, content_index), mut sanitizer) in sanitizers {
-            let visible = sanitizer.finish();
-            if visible.is_empty() {
-                continue;
-            }
-            let idx = self.ensure_text_block(output_index, content_index, events);
-            events.push(content_delta(idx, "text_delta", "text", &visible));
-        }
+        events.push(content_delta(idx, "text_delta", "text", text));
     }
 
     fn handle_output_item_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
@@ -1318,7 +1346,7 @@ impl ResponsesStreamConverter {
         });
     }
 
-    fn emit_tagged_text(
+    fn emit_text_stream(
         &mut self,
         output_index: u64,
         content_index: u64,
@@ -1326,25 +1354,24 @@ impl ResponsesStreamConverter {
         events: &mut Vec<SseEvent>,
     ) {
         let key = (output_index, content_index);
-        if self.tagged_text_key != Some(key) {
-            self.flush_tagged_text(events);
-            self.tagged_text_key = Some(key);
+        if self.reasoning_text_key != Some(key) {
+            self.flush_reasoning_text(events);
+            self.reasoning_text_key = Some(key);
         }
-        for segment in self.tagged_text.push(text) {
+        for segment in self.reasoning_text.push(text) {
             self.emit_text_segment(key, segment, events);
         }
     }
 
-    fn flush_tagged_text(&mut self, events: &mut Vec<SseEvent>) {
-        let key = self.tagged_text_key.take();
-        for segment in self.tagged_text.finish() {
+    fn flush_reasoning_text(&mut self, events: &mut Vec<SseEvent>) {
+        let key = self.reasoning_text_key.take();
+        for segment in self.reasoning_text.finish() {
             if let Some(key) = key {
                 self.emit_text_segment(key, segment, events);
-            } else if let TextSegment::Thinking(thinking) = segment {
+            } else if let TextSegment::Reasoning(thinking) = segment {
                 self.emit_thinking_content(&thinking, events);
             }
         }
-        self.flush_text_sanitizers(events);
     }
 
     fn emit_text_segment(
@@ -1357,8 +1384,7 @@ impl ResponsesStreamConverter {
             TextSegment::Text(text) => {
                 self.emit_text_delta(output_index, content_index, &text, events);
             }
-            TextSegment::Thinking(thinking) => {
-                self.flush_text_sanitizers(events);
+            TextSegment::Reasoning(thinking) => {
                 self.emit_thinking_content(&thinking, events);
             }
         }
@@ -1433,7 +1459,7 @@ impl ResponsesStreamConverter {
             return idx;
         }
 
-        self.flush_text_sanitizers(events);
+        self.flush_reasoning_text(events);
         self.close_open_block(events);
         let item = &event["item"];
         let idx = self.next_block_index;
@@ -1486,7 +1512,7 @@ impl ResponsesStreamConverter {
         if self.stopped {
             return;
         }
-        self.flush_text_sanitizers(events);
+        self.flush_reasoning_text(events);
         self.close_open_block(events);
         self.close_function_blocks(events);
         let reason = response_stop_reason(response, self.saw_function_call);
@@ -1574,8 +1600,16 @@ fn block_stop(index: u32) -> SseEvent {
     }
 }
 
+#[cfg(test)]
 pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
-    let mut converter = NonStreamingResponsesConverter::new(data);
+    convert_non_streaming_response_with_marker_mode(data, ReasoningMarkerMode::Strict)
+}
+
+pub fn convert_non_streaming_response_with_marker_mode(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+) -> Vec<SseEvent> {
+    let mut converter = NonStreamingResponsesConverter::new(data, marker_mode);
     converter.convert()
 }
 
@@ -1585,10 +1619,11 @@ struct NonStreamingResponsesConverter<'a> {
     next_block_index: u32,
     input_tokens: u32,
     output_tokens: u32,
+    marker_mode: ReasoningMarkerMode,
 }
 
 impl<'a> NonStreamingResponsesConverter<'a> {
-    fn new(data: &'a Value) -> Self {
+    fn new(data: &'a Value, marker_mode: ReasoningMarkerMode) -> Self {
         let usage = &data["usage"];
         Self {
             data,
@@ -1596,6 +1631,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             next_block_index: 0,
             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
+            marker_mode,
         }
     }
 
@@ -1712,12 +1748,10 @@ impl<'a> NonStreamingResponsesConverter<'a> {
     }
 
     fn add_text_block(&mut self, text: &str) {
-        for segment in split_tagged_thinking(text) {
+        for segment in split_text(text, self.marker_mode) {
             match segment {
-                TextSegment::Text(text) => {
-                    self.add_plain_text_block(&sanitize_thinking_markers(&text))
-                }
-                TextSegment::Thinking(thinking) => self.add_thinking_block(&thinking),
+                TextSegment::Text(text) => self.add_plain_text_block(&text),
+                TextSegment::Reasoning(thinking) => self.add_thinking_block(&thinking),
             }
         }
     }
@@ -1896,6 +1930,47 @@ mod tests {
                 .iter()
                 .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_chunk_eof_after_undelimited_completed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("terminal frame should be flushed before chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_chunk_eof_after_done_marker() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("done marker should make chunk EOF terminal"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[tokio::test]
@@ -2864,7 +2939,8 @@ mod tests {
 
     #[test]
     fn test_stream_converter_maps_tagged_output_text_to_thinking() {
-        let mut converter = ResponsesStreamConverter::new();
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         let mut events = Vec::new();
 
         events.extend(converter.process_event(&json!({
@@ -2899,8 +2975,36 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_converter_maps_split_tagged_output_text_to_thinking() {
+    fn test_stream_converter_preserves_tagged_output_text_by_default() {
         let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "use `<analysis>...</analysis>` here"
+        })));
+
+        assert_eq!(
+            text_deltas(&events),
+            vec!["use `<analysis>...</analysis>` here"]
+        );
+        assert!(
+            text_and_thinking_deltas(&events)
+                .iter()
+                .all(|(kind, _)| kind == "text_delta")
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_maps_split_tagged_output_text_to_thinking() {
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         let mut events = Vec::new();
 
         events.extend(converter.process_event(&json!({
@@ -2939,7 +3043,8 @@ mod tests {
 
     #[test]
     fn test_stream_converter_drops_unclosed_thinking_marker_in_output_text() {
-        let mut converter = ResponsesStreamConverter::new();
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         let mut events = Vec::new();
 
         events.extend(converter.process_event(&json!({
@@ -3279,7 +3384,8 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
 
-        let events = convert_non_streaming_response(&data);
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
 
         assert_eq!(
             events.first().map(|event| event.event.as_str()),
@@ -3314,7 +3420,8 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
 
-        let events = convert_non_streaming_response(&data);
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
 
         assert_eq!(
             text_and_thinking_deltas(&events),
@@ -3340,7 +3447,8 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
 
-        let events = convert_non_streaming_response(&data);
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
 
         assert_eq!(text_deltas(&events), vec!["visible "]);
         assert!(!text_deltas(&events).join("").contains("secret"));

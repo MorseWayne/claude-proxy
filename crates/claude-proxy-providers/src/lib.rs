@@ -8,10 +8,9 @@ pub mod http;
 pub mod openai;
 mod openai_compat;
 pub mod provider;
+mod reasoning_markers;
 pub(crate) mod responses;
 mod sse;
-mod tagged_thinking;
-mod thinking_sanitizer;
 mod tool_args;
 mod tool_choice;
 

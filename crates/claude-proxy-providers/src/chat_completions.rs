@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use claude_proxy_config::settings::ReasoningMarkerMode;
 use claude_proxy_core::SseEvent;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -13,9 +14,8 @@ use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::provider::ProviderError;
-use crate::sse::{SseDecoder, parse_sse_json_value};
-use crate::tagged_thinking::{TaggedThinkingSplitter, TextSegment, split_tagged_thinking};
-use crate::thinking_sanitizer::{ThinkingSanitizer, sanitize_thinking_markers};
+use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
+use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
 
 // --- SSE Conversion ---
@@ -68,15 +68,24 @@ struct OpenAiFunction {
 
 /// Spawn a task that parses an OpenAI-format SSE byte stream and converts to Anthropic SSE events.
 /// Returns a pinned BoxStream. Used by both OpenAI and Copilot providers.
+#[cfg(test)]
 pub(crate) fn stream_openai_response(
     response: reqwest::Response,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    stream_openai_response_with_marker_mode(response, ReasoningMarkerMode::Strict)
+}
+
+pub(crate) fn stream_openai_response_with_marker_mode(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
 
     tokio::spawn(async move {
-        let mut converter = StreamConverter::new();
+        let mut converter = StreamConverter::with_marker_mode(marker_mode);
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
+        let mut saw_done = false;
 
         loop {
             let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
@@ -92,6 +101,10 @@ pub(crate) fn stream_openai_response(
                 Ok(chunk) => {
                     decoder.push(&chunk);
                     while let Some(event_str) = decoder.next_frame() {
+                        if is_sse_done(&event_str) {
+                            saw_done = true;
+                            continue;
+                        }
                         if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
                             let events = converter.process_chunk(&openai_chunk);
                             for event in events {
@@ -103,7 +116,22 @@ pub(crate) fn stream_openai_response(
                     }
                 }
                 Err(e) => {
-                    if converter.stopped {
+                    if converter.stopped || saw_done {
+                        break;
+                    }
+                    if let Some(event_str) = decoder.finish() {
+                        if is_sse_done(&event_str) {
+                            saw_done = true;
+                        } else if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
+                            let events = converter.process_chunk(&openai_chunk);
+                            for event in events {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if converter.stopped || saw_done {
                         break;
                     }
                     let _ = tx
@@ -115,6 +143,7 @@ pub(crate) fn stream_openai_response(
         }
 
         if let Some(event_str) = decoder.finish()
+            && !is_sse_done(&event_str)
             && let Some(openai_chunk) = parse_openai_chunk(&event_str)
         {
             for event in converter.process_chunk(&openai_chunk) {
@@ -141,13 +170,12 @@ struct StreamConverter {
     model: String,
     content_blocks: Vec<ContentBlockState>,
     current_text_index: Option<u32>,
-    text_sanitizer: ThinkingSanitizer,
     current_thinking_index: Option<u32>,
     tool_call_indices: HashMap<u32, u32>, // tool_call.index -> content_block index
     tool_call_names: HashMap<u32, String>,
     tool_argument_buffers: HashMap<u32, String>,
     tool_argument_emitted: HashMap<u32, String>,
-    tagged_text: TaggedThinkingSplitter,
+    reasoning_text: ReasoningTextSplitter,
     started: bool,
     stopped: bool,
     input_tokens: u32,
@@ -217,18 +245,21 @@ impl Default for StreamConverter {
 
 impl StreamConverter {
     pub fn new() -> Self {
+        Self::with_marker_mode(ReasoningMarkerMode::Strict)
+    }
+
+    pub fn with_marker_mode(marker_mode: ReasoningMarkerMode) -> Self {
         Self {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
             model: String::new(),
             content_blocks: Vec::new(),
             current_text_index: None,
-            text_sanitizer: ThinkingSanitizer::new(),
             current_thinking_index: None,
             tool_call_indices: HashMap::new(),
             tool_call_names: HashMap::new(),
             tool_argument_buffers: HashMap::new(),
             tool_argument_emitted: HashMap::new(),
-            tagged_text: TaggedThinkingSplitter::default(),
+            reasoning_text: ReasoningTextSplitter::new(marker_mode),
             started: false,
             stopped: false,
             input_tokens: 0,
@@ -271,7 +302,7 @@ impl StreamConverter {
             if let Some(ref reasoning) = choice.delta.reasoning_content
                 && !reasoning.is_empty()
             {
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 self.emit_thinking_content(reasoning, &mut events);
             }
 
@@ -279,19 +310,18 @@ impl StreamConverter {
             if let Some(ref content) = choice.delta.content
                 && !content.is_empty()
             {
-                self.emit_tagged_text_content(content, &mut events);
+                self.emit_text_stream_content(content, &mut events);
             }
 
             // Handle tool calls
             if let Some(ref tool_calls) = choice.delta.tool_calls {
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 for tc in tool_calls {
                     if let Some(tool_name) = tc.function.name.as_ref() {
                         self.tool_call_names.insert(tc.index, tool_name.clone());
                     }
 
                     // Close text/thinking blocks if open
-                    self.flush_text_content(&mut events);
                     if self.current_text_index.is_some() {
                         let idx = self.current_text_index.take().unwrap();
                         events.push(SseEvent {
@@ -356,9 +386,8 @@ impl StreamConverter {
 
             // Handle finish_reason
             if let Some(ref reason) = choice.finish_reason {
-                self.flush_tagged_text(&mut events);
+                self.flush_reasoning_text(&mut events);
                 // Close any open blocks
-                self.flush_text_content(&mut events);
                 if self.current_text_index.is_some() {
                     let idx = self.current_text_index.take().unwrap();
                     events.push(SseEvent {
@@ -422,24 +451,22 @@ impl StreamConverter {
         events
     }
 
-    fn emit_tagged_text_content(&mut self, content: &str, events: &mut Vec<SseEvent>) {
-        for segment in self.tagged_text.push(content) {
+    fn emit_text_stream_content(&mut self, content: &str, events: &mut Vec<SseEvent>) {
+        for segment in self.reasoning_text.push(content) {
             self.emit_text_segment(segment, events);
         }
     }
 
-    fn flush_tagged_text(&mut self, events: &mut Vec<SseEvent>) {
-        for segment in self.tagged_text.finish() {
+    fn flush_reasoning_text(&mut self, events: &mut Vec<SseEvent>) {
+        for segment in self.reasoning_text.finish() {
             self.emit_text_segment(segment, events);
         }
-        self.flush_text_content(events);
     }
 
     fn emit_text_segment(&mut self, segment: TextSegment, events: &mut Vec<SseEvent>) {
         match segment {
             TextSegment::Text(text) => self.emit_text_content(&text, events),
-            TextSegment::Thinking(thinking) => {
-                self.flush_text_content(events);
+            TextSegment::Reasoning(thinking) => {
                 self.emit_thinking_content(&thinking, events);
             }
         }
@@ -451,8 +478,7 @@ impl StreamConverter {
             events.push(block_stop(idx));
         }
 
-        let visible = self.text_sanitizer.push(content);
-        if visible.is_empty() {
+        if content.is_empty() {
             return;
         }
         let idx = self.ensure_text_block(events);
@@ -461,23 +487,7 @@ impl StreamConverter {
             data: json!({
                 "type": "content_block_delta",
                 "index": idx,
-                "delta": {"type": "text_delta", "text": visible}
-            }),
-        });
-    }
-
-    fn flush_text_content(&mut self, events: &mut Vec<SseEvent>) {
-        let visible = self.text_sanitizer.finish();
-        if visible.is_empty() {
-            return;
-        }
-        let idx = self.ensure_text_block(events);
-        events.push(SseEvent {
-            event: "content_block_delta".to_string(),
-            data: json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {"type": "text_delta", "text": visible}
+                "delta": {"type": "text_delta", "text": content}
             }),
         });
     }
@@ -609,10 +619,9 @@ impl StreamConverter {
             return events;
         }
 
-        self.flush_tagged_text(&mut events);
+        self.flush_reasoning_text(&mut events);
 
         // Close any remaining open blocks
-        self.flush_text_content(&mut events);
         if self.current_text_index.is_some() {
             let idx = self.current_text_index.take().unwrap();
             events.push(SseEvent {
@@ -736,7 +745,15 @@ fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
 }
 
 /// Convert a non-streaming OpenAI response to Anthropic format.
+#[cfg(test)]
 pub(crate) fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
+    convert_non_streaming_response_with_marker_mode(data, ReasoningMarkerMode::Strict)
+}
+
+pub(crate) fn convert_non_streaming_response_with_marker_mode(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+) -> Vec<SseEvent> {
     let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
     let model = data["model"].as_str().unwrap_or("unknown").to_string();
 
@@ -800,16 +817,15 @@ pub(crate) fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
         if let Some(content) = message["content"].as_str()
             && !content.is_empty()
         {
-            for segment in split_tagged_thinking(content) {
+            for segment in split_text(content, marker_mode) {
                 match segment {
                     TextSegment::Text(text) => {
-                        let text = sanitize_thinking_markers(&text);
                         if !text.is_empty() {
                             push_non_streaming_text_block(&mut events, block_index, &text);
                             block_index += 1;
                         }
                     }
-                    TextSegment::Thinking(thinking) => {
+                    TextSegment::Reasoning(thinking) => {
                         push_non_streaming_thinking_block(&mut events, block_index, &thinking);
                         block_index += 1;
                     }
@@ -935,6 +951,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_openai_ignores_chunk_eof_after_undelimited_finish_reason() {
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_openai_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("terminal frame should be flushed before chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_ignores_chunk_eof_after_done_marker() {
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_openai_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("done marker should make chunk EOF terminal"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[tokio::test]
     async fn test_stream_openai_errors_on_midstream_chunk_eof() {
         let body = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
         let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
@@ -1000,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_stream_converter_maps_tagged_thinking_content() {
-        let mut converter = StreamConverter::new();
+        let mut converter = StreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         converter.process_chunk(&OpenAiChunk {
             id: "test".to_string(),
             model: "gpt-4".to_string(),
@@ -1045,8 +1095,54 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_converter_drops_unclosed_thinking_marker_in_text() {
+    fn test_stream_converter_preserves_tagged_text_by_default() {
         let mut converter = StreamConverter::new();
+        converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+
+        let events = converter.process_chunk(&OpenAiChunk {
+            id: "test".to_string(),
+            model: "gpt-4".to_string(),
+            choices: vec![OpenAiChoice {
+                index: 0,
+                delta: OpenAiDelta {
+                    role: None,
+                    content: Some("use `<thinking>...</thinking>` here".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+
+        assert_eq!(
+            text_deltas(&events),
+            vec!["use `<thinking>...</thinking>` here"]
+        );
+        assert!(
+            text_and_thinking_deltas(&events)
+                .iter()
+                .all(|(kind, _)| kind == "text_delta")
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_drops_unclosed_thinking_marker_in_text() {
+        let mut converter = StreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         converter.process_chunk(&OpenAiChunk {
             id: "test".to_string(),
             model: "gpt-4".to_string(),
@@ -1086,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_stream_converter_sanitizes_split_thinking_markers_in_text() {
-        let mut converter = StreamConverter::new();
+        let mut converter = StreamConverter::with_marker_mode(ReasoningMarkerMode::SanitizeOnly);
         converter.process_chunk(&OpenAiChunk {
             id: "test".to_string(),
             model: "gpt-4".to_string(),
@@ -1170,7 +1266,7 @@ mod tests {
 
     #[test]
     fn test_stream_converter_maps_split_tagged_thinking_content() {
-        let mut converter = StreamConverter::new();
+        let mut converter = StreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
         converter.process_chunk(&OpenAiChunk {
             id: "test".to_string(),
             model: "gpt-4".to_string(),
@@ -1349,16 +1445,19 @@ mod tests {
 
     #[test]
     fn test_non_streaming_response_maps_tagged_thinking_content() {
-        let events = convert_non_streaming_response(&json!({
-            "model": "gpt-4.1",
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {
-                    "content": "hello [thinking]plan[/thinking] world"
-                }
-            }]
-        }));
+        let events = convert_non_streaming_response_with_marker_mode(
+            &json!({
+                "model": "gpt-4.1",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "hello [thinking]plan[/thinking] world"
+                    }
+                }]
+            }),
+            ReasoningMarkerMode::LegacyTags,
+        );
 
         assert_eq!(
             text_and_thinking_deltas(&events),
@@ -1373,16 +1472,19 @@ mod tests {
 
     #[test]
     fn test_non_streaming_response_drops_unclosed_thinking_marker_in_text() {
-        let events = convert_non_streaming_response(&json!({
-            "model": "gpt-4.1",
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {
-                    "content": "visible [thinking]secret"
-                }
-            }]
-        }));
+        let events = convert_non_streaming_response_with_marker_mode(
+            &json!({
+                "model": "gpt-4.1",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "visible [thinking]secret"
+                    }
+                }]
+            }),
+            ReasoningMarkerMode::LegacyTags,
+        );
 
         assert_eq!(text_deltas(&events), vec!["visible "]);
         assert!(!text_deltas(&events).join("").contains("secret"));

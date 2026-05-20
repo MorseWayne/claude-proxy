@@ -29,6 +29,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             provider_type: Some(ProviderType::OpenAI),
             copilot: None,
             chatgpt: None,
+            reasoning_markers: Default::default(),
         },
     );
 

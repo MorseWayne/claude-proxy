@@ -116,6 +116,12 @@ pub(crate) fn parse_sse_json_value(text: &str) -> Option<Value> {
     serde_json::from_str(data).ok()
 }
 
+pub(crate) fn is_sse_done(text: &str) -> bool {
+    parse_sse_frame(text)
+        .map(|frame| frame.data.trim() == "[DONE]")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,7 @@ use crate::provider::{
     ProviderRequestObserverEventKind, RateLimitCredits, RateLimitSnapshot, RateLimitSource,
     RateLimitWindow,
 };
+use crate::reasoning_markers::marker_mode_from_request;
 use tracing::{info, warn};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -403,6 +404,7 @@ impl Provider for ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
+        let marker_mode = marker_mode_from_request(&request);
         let mut body =
             build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
         log_request_observability("chatgpt", "/responses", &body);
@@ -450,16 +452,20 @@ impl Provider for ChatGptProvider {
 
         let cache = Arc::clone(&self.cached_rate_limits);
         let provider_id = self.id.clone();
-        Ok(responses::stream_response(response, move |event| {
-            if let Some(snapshot) =
-                rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
-            {
-                let cache = Arc::clone(&cache);
-                tokio::spawn(async move {
-                    cache_rate_limits_into(&cache, vec![snapshot]).await;
-                });
-            }
-        }))
+        Ok(responses::stream_response_with_marker_mode(
+            response,
+            marker_mode,
+            move |event| {
+                if let Some(snapshot) =
+                    rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
+                {
+                    let cache = Arc::clone(&cache);
+                    tokio::spawn(async move {
+                        cache_rate_limits_into(&cache, vec![snapshot]).await;
+                    });
+                }
+            },
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

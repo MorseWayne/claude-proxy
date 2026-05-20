@@ -5,6 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::ConfigError;
 
+pub const REASONING_MARKER_MODE_EXTRA_KEY: &str = "__claude_proxy_reasoning_marker_mode";
+
 /// Top-level configuration loaded from TOML.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
@@ -50,6 +52,9 @@ pub struct ProviderConfig {
     /// ChatGPT-specific Codex request configuration.
     #[serde(default)]
     pub chatgpt: Option<ChatGptProviderConfig>,
+    /// How plain text marker tags such as [thinking] are handled for this provider.
+    #[serde(default)]
+    pub reasoning_markers: ReasoningMarkerMode,
 }
 
 impl ProviderConfig {
@@ -297,6 +302,8 @@ pub struct ModelAliasConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ModelReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_markers: Option<ReasoningMarkerMode>,
 }
 
 impl ModelAliasConfig {
@@ -304,6 +311,28 @@ impl ModelAliasConfig {
         Self {
             name: name.into(),
             reasoning_effort: None,
+            reasoning_markers: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningMarkerMode {
+    #[default]
+    Strict,
+    LegacyTags,
+    SanitizeOnly,
+    Disabled,
+}
+
+impl ReasoningMarkerMode {
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            ReasoningMarkerMode::Strict => "strict",
+            ReasoningMarkerMode::LegacyTags => "legacy_tags",
+            ReasoningMarkerMode::SanitizeOnly => "sanitize_only",
+            ReasoningMarkerMode::Disabled => "disabled",
         }
     }
 }
@@ -371,6 +400,7 @@ pub struct ResolvedModel {
     pub upstream_model: String,
     pub source: ModelResolutionSource,
     pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_marker_mode: Option<ReasoningMarkerMode>,
 }
 
 impl ResolvedModel {
@@ -648,6 +678,7 @@ fn resolved_model(
     upstream_model: &str,
     source: ModelResolutionSource,
     reasoning_effort: Option<ModelReasoningEffort>,
+    reasoning_marker_mode: Option<ReasoningMarkerMode>,
 ) -> ResolvedModel {
     ResolvedModel {
         requested_model: requested_model.to_string(),
@@ -655,6 +686,7 @@ fn resolved_model(
         upstream_model: upstream_model.to_string(),
         source,
         reasoning_effort,
+        reasoning_marker_mode,
     }
 }
 
@@ -710,6 +742,7 @@ impl Settings {
                 Self::parse_model_name(claude_model),
                 ModelResolutionSource::DirectProviderModel,
                 self.reasoning_effort_for_model_ref(claude_model),
+                self.reasoning_markers_for_model_ref(claude_model),
             );
         }
 
@@ -744,6 +777,7 @@ impl Settings {
             claude_model,
             ModelResolutionSource::DefaultProviderFallback,
             None,
+            None,
         )
     }
 
@@ -763,6 +797,7 @@ impl Settings {
             Self::parse_model_name(&alias.name),
             ModelResolutionSource::Alias(kind),
             alias.reasoning_effort,
+            alias.reasoning_markers,
         )
     }
 
@@ -778,6 +813,20 @@ impl Settings {
         .flatten()
         .find(|alias| alias.name == model_ref)
         .and_then(|alias| alias.reasoning_effort)
+    }
+
+    fn reasoning_markers_for_model_ref(&self, model_ref: &str) -> Option<ReasoningMarkerMode> {
+        [
+            self.model.reasoning.as_ref(),
+            self.model.opus.as_ref(),
+            self.model.sonnet.as_ref(),
+            self.model.haiku.as_ref(),
+            Some(&self.model.default),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|alias| alias.name == model_ref)
+        .and_then(|alias| alias.reasoning_markers)
     }
 
     /// Extract the provider ID from a `provider_id/model` string (first `/` only).
@@ -946,6 +995,7 @@ mod tests {
     fn resolve_model_reports_alias_source_and_reasoning_effort() {
         let mut reasoning = ModelAliasConfig::new("openai/gpt-5");
         reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        reasoning.reasoning_markers = Some(ReasoningMarkerMode::LegacyTags);
         let settings = Settings {
             model: ModelConfig {
                 default: ModelAliasConfig::new("openai/gpt-4.1"),
@@ -966,6 +1016,10 @@ mod tests {
             ModelResolutionSource::Alias(ModelAliasKind::Reasoning)
         );
         assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(
+            resolved.reasoning_marker_mode,
+            Some(ReasoningMarkerMode::LegacyTags)
+        );
     }
 
     #[test]
@@ -1001,6 +1055,7 @@ mod tests {
         default.reasoning_effort = Some(ModelReasoningEffort::Low);
         let mut reasoning = ModelAliasConfig::new("chatgpt/gpt-5.5");
         reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        reasoning.reasoning_markers = Some(ReasoningMarkerMode::SanitizeOnly);
         let settings = Settings {
             model: ModelConfig {
                 default,
@@ -1018,6 +1073,44 @@ mod tests {
         assert_eq!(resolved.provider_id, "chatgpt");
         assert_eq!(resolved.upstream_model, "gpt-5.5");
         assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(
+            resolved.reasoning_marker_mode,
+            Some(ReasoningMarkerMode::SanitizeOnly)
+        );
+    }
+
+    #[test]
+    fn reasoning_marker_mode_defaults_and_parses_overrides() {
+        let toml = r#"
+[providers.openai]
+reasoning_markers = "legacy_tags"
+
+[model]
+reasoning = { name = "openai/gpt-5", reasoning_markers = "sanitize_only" }
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(
+            settings.providers["openai"].reasoning_markers,
+            ReasoningMarkerMode::LegacyTags
+        );
+        assert_eq!(
+            settings
+                .model
+                .reasoning
+                .as_ref()
+                .and_then(|alias| alias.reasoning_markers),
+            Some(ReasoningMarkerMode::SanitizeOnly)
+        );
+        assert_eq!(
+            Settings::from_toml("", Path::new("test.toml"))
+                .unwrap()
+                .providers
+                .get("openai")
+                .map(|provider| provider.reasoning_markers)
+                .unwrap_or_default(),
+            ReasoningMarkerMode::Strict
+        );
     }
 
     #[test]

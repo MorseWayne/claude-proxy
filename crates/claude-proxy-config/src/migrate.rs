@@ -136,6 +136,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
                 chatgpt: None,
+                reasoning_markers: Default::default(),
             },
         );
     }
@@ -149,6 +150,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
                 provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
                 chatgpt: None,
+                reasoning_markers: Default::default(),
             },
         );
     }
