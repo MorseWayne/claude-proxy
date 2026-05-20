@@ -32,6 +32,14 @@ Resume next:
 
 ## Backlog / Future（待办 / 未来）
 
+- [ ] WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
+  - Baseline completed in `73648f4`: ChatGPT `/responses` now sends Codex-style request defaults, stable runtime metadata, and session/thread/window headers.
+  - [ ] Output budget governance: compress/truncate oversized tool output and history more aggressively, clamp requested output budgets to client/model limits, and return clearer Anthropic-compatible errors when output would exceed Claude Code limits.
+  - [ ] Codex SSE parity: add coverage for `response.custom_tool_call_input.delta` and any custom/freeform tool output shapes if Claude Code starts exposing those tools through this bridge.
+  - [ ] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
+  - [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
+  - [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
+  - [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 - [ ] 如果 OpenAI/Copilot Responses 上游开始强制要求 `instructions`，再评估是否需要 provider-specific 处理。
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
