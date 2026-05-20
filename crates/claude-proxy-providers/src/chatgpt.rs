@@ -138,6 +138,9 @@ pub struct ChatGptProvider {
     endpoint: String,
     usage_endpoint: String,
     installation_id: String,
+    session_id: String,
+    thread_id: String,
+    window_id: String,
     request_headers: ChatGptRequestHeaders,
     auth: Arc<ChatGptAuth>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
@@ -159,6 +162,9 @@ impl ChatGptProvider {
             endpoint: codex_responses_endpoint(&config.base_url),
             usage_endpoint: codex_usage_endpoint(&config.base_url),
             installation_id: chatgpt_installation_id(),
+            session_id: chatgpt_runtime_id(),
+            thread_id: chatgpt_runtime_id(),
+            window_id: chatgpt_runtime_id(),
             request_headers: chatgpt_request_headers(&chatgpt_config)?,
             auth,
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
@@ -192,8 +198,13 @@ impl ChatGptProvider {
             .post(&self.endpoint)
             .bearer_auth(&token.access_token)
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .header("originator", self.request_headers.originator.clone())
-            .header("User-Agent", self.request_headers.user_agent.clone());
+            .header("User-Agent", self.request_headers.user_agent.clone())
+            .header("x-client-request-id", self.thread_id.as_str())
+            .header("session-id", self.session_id.as_str())
+            .header("thread-id", self.thread_id.as_str())
+            .header("x-codex-window-id", self.window_id.as_str());
 
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
@@ -458,8 +469,15 @@ impl Provider for ChatGptProvider {
         let token = self.auth.get_token().await?;
         let request = apply_openai_intent(request);
         let marker_mode = marker_mode_from_request(&request);
-        let mut body =
-            build_chatgpt_responses_body_with_context(&request, Some(&self.installation_id));
+        let mut body = responses::build_body_with_context(
+            &request,
+            DEFAULT_CHATGPT_INSTRUCTIONS,
+            responses::CodexRequestContext {
+                installation_id: Some(&self.installation_id),
+                prompt_cache_key: Some(&self.thread_id),
+                window_id: Some(&self.window_id),
+            },
+        );
         let request_id = next_chatgpt_request_id();
         log_request_observability("chatgpt", "/responses", &body);
         let compact_request = is_compact_request_body(&body);
@@ -702,7 +720,7 @@ fn normalized_codex_base_url(base_url: &str) -> String {
 }
 
 fn chatgpt_installation_id() -> String {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = chatgpt_runtime_id();
     let Some(path) = Settings::config_dir().map(|dir| dir.join("chatgpt").join("installation_id"))
     else {
         return id;
@@ -720,6 +738,10 @@ fn chatgpt_installation_id() -> String {
     }
     let _ = fs::write(path, &id);
     id
+}
+
+fn chatgpt_runtime_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn rate_limit_snapshots_from_usage_payload(
@@ -1018,11 +1040,20 @@ fn build_chatgpt_responses_body(request: &MessagesRequest) -> Value {
     build_chatgpt_responses_body_with_context(request, None)
 }
 
+#[cfg(test)]
 fn build_chatgpt_responses_body_with_context(
     request: &MessagesRequest,
     installation_id: Option<&str>,
 ) -> Value {
     responses::build_body(request, DEFAULT_CHATGPT_INSTRUCTIONS, installation_id)
+}
+
+#[cfg(test)]
+fn build_chatgpt_responses_body_with_codex_context(
+    request: &MessagesRequest,
+    context: responses::CodexRequestContext<'_>,
+) -> Value {
+    responses::build_body_with_context(request, DEFAULT_CHATGPT_INSTRUCTIONS, context)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1777,6 +1808,36 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_adds_codex_request_defaults() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["include"], json!([]));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn chatgpt_responses_body_omits_unsupported_stop_parameter() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
@@ -1831,6 +1892,45 @@ mod tests {
         };
 
         let body = build_chatgpt_responses_body_with_context(&req, Some("install-123"));
+
+        assert_eq!(body["prompt_cache_key"], "thread-123");
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "install-123"
+        );
+        assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-123");
+    }
+
+    #[test]
+    fn chatgpt_responses_body_adds_codex_runtime_context() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                installation_id: Some("install-123"),
+                prompt_cache_key: Some("thread-123"),
+                window_id: Some("window-123"),
+            },
+        );
 
         assert_eq!(body["prompt_cache_key"], "thread-123");
         assert_eq!(
@@ -1901,6 +2001,7 @@ mod tests {
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "Read");
+        assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(
             body["tools"][0]["parameters"],
             json!({
@@ -2019,6 +2120,41 @@ mod tests {
         assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
         assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
         assert_eq!(requests[1]["input"][0]["content"], "current");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_send_responses_request_adds_codex_session_headers() {
+        let (endpoint, requests) = capture_once_server().await;
+        let provider = test_chatgpt_provider(endpoint).await;
+        let token = ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account".to_string()),
+        };
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+
+        let response = provider
+            .send_responses_request(&body, &token, false, 1, 0)
+            .await
+            .expect("request should succeed");
+
+        assert!(response.status().is_success());
+        let requests = requests.lock().await;
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(headers.contains("accept: text/event-stream"));
+        assert!(headers.contains("authorization: bearer access"));
+        assert!(headers.contains("chatgpt-account-id: account"));
+        assert!(headers.contains("x-client-request-id: thread-test"));
+        assert!(headers.contains("session-id: session-test"));
+        assert!(headers.contains("thread-id: thread-test"));
+        assert!(headers.contains("x-codex-window-id: window-test"));
+        let request_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request_body["model"], "gpt-5.3-codex");
     }
 
     #[tokio::test]
@@ -2208,6 +2344,9 @@ mod tests {
             endpoint,
             usage_endpoint: "http://127.0.0.1/usage".to_string(),
             installation_id: "install-test".to_string(),
+            session_id: "session-test".to_string(),
+            thread_id: "thread-test".to_string(),
+            window_id: "window-test".to_string(),
             request_headers: ChatGptRequestHeaders {
                 originator: HeaderValue::from_static("opencode"),
                 user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
@@ -2218,6 +2357,34 @@ mod tests {
                 fetched_at: None,
             })),
         }
+    }
+
+    #[derive(Debug)]
+    struct CapturedHttpRequest {
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    async fn capture_once_server() -> (String, Arc<Mutex<Vec<CapturedHttpRequest>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            captured_requests.lock().await.push(request);
+
+            let response_body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (format!("http://{addr}/responses"), requests)
     }
 
     async fn prompt_too_long_retry_server() -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -2270,6 +2437,30 @@ mod tests {
             }
         }
         Vec::new()
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> CapturedHttpRequest {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some((body_start, content_length)) = http_body_start_and_len(&buffer)
+                && buffer.len() >= body_start + content_length
+            {
+                return CapturedHttpRequest {
+                    headers: String::from_utf8_lossy(&buffer[..body_start]).to_string(),
+                    body: buffer[body_start..body_start + content_length].to_vec(),
+                };
+            }
+        }
+        CapturedHttpRequest {
+            headers: String::new(),
+            body: Vec::new(),
+        }
     }
 
     fn http_body_start_and_len(buffer: &[u8]) -> Option<(usize, usize)> {
