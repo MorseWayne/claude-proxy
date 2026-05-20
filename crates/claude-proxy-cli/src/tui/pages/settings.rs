@@ -66,7 +66,11 @@ fn render_server_page(f: &mut Frame, app: &App, area: Rect) {
         true,
     );
 
-    render_hint(f, rows[4], "Admin token: empty = admin API disabled");
+    render_hint(
+        f,
+        rows[4],
+        "Admin token: empty = reuse server auth token for admin API",
+    );
 }
 
 fn render_limits_page(f: &mut Frame, app: &App, area: Rect) {

@@ -4,6 +4,36 @@
 
 ## Active（进行中）
 
+### WF-2026-05-20-006 — Core metrics optimization
+Status: In Progress
+Level: 3
+Priority: Current
+Started: 2026-05-20
+Last updated: 2026-05-20
+Current phase: 实现与验证
+
+Intent:
+- 优化 claude-proxy core metrics：修正/澄清 streaming latency 口径，增强 observability 汇总展示，补充 metrics 错误诊断字段，并明确 admin token fallback。
+
+Current todo:
+- [x] 采集本地 `/admin/metrics` 与 SQLite 指标，确认问题。
+- [x] 用户选择范围：Core metrics only，不做上下文裁剪/请求体优化。
+- [x] 修正 streaming leader 完成时延计入口径，并为完成请求补充诊断字段。
+- [x] 在 `/admin/metrics`、SQLite totals 和 TUI Dashboard 暴露 diagnostics/observability 汇总。
+- [x] 澄清 admin token 留空时复用 server auth token。
+- [x] 运行格式化、测试、clippy 和 GitNexus detect_changes。
+- [ ] 提交代码并在提交后刷新 GitNexus 索引。
+
+Changes:
+- GitNexus 索引已刷新，当前未改业务代码；刷新索引只更新了 `AGENTS.md` 和 `CLAUDE.md` 的统计数字。
+- 初步风险点：server streaming metrics、SQLite schema/load totals、TUI Dashboard parsing/rendering、admin token 配置展示/文档会跨模块联动。
+
+Prerequisites:
+- 用户批准设计方案后才能开始实现。
+
+Resume next:
+- 向用户呈现 2-3 个方案和推荐设计，等待批准。
+
 ### WF-2026-05-20-001 — 解决 main 分支推送冲突
 Status: In Progress
 Level: 2

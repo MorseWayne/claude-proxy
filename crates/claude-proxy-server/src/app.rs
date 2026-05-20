@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::middleware::{RateLimitConfig, RateLimitRuntime};
-use crate::persistence::{MetricsStore, StoredTotals};
+use crate::persistence::{CompletedUsageRecord, MetricsStore, StoredTotals};
 
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_PROVIDER_HEALTH_ERROR_LEN: usize = 2048;
@@ -189,6 +189,31 @@ impl MetricsDimensions {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ErrorDiagnostics {
+    pub errors: u64,
+    pub terminal_reasons: HashMap<String, u64>,
+    pub error_kinds: HashMap<String, u64>,
+}
+
+impl ErrorDiagnostics {
+    pub fn record(&mut self, is_error: bool, terminal_reason: &str, error_kind: &str) {
+        if !is_error {
+            return;
+        }
+        self.errors += 1;
+        if !terminal_reason.is_empty() {
+            *self
+                .terminal_reasons
+                .entry(terminal_reason.to_string())
+                .or_default() += 1;
+        }
+        if !error_kind.is_empty() {
+            *self.error_kinds.entry(error_kind.to_string()).or_default() += 1;
+        }
+    }
+}
+
 /// Request metrics counters.
 pub struct Metrics {
     pub requests_total: AtomicU64,
@@ -198,6 +223,7 @@ pub struct Metrics {
     /// Token usage metrics for the current session.
     pub usage_metrics: Mutex<MetricsDimensions>,
     pub observability_metrics: Mutex<RequestObservabilityMetrics>,
+    pub error_diagnostics: Mutex<ErrorDiagnostics>,
     /// Persistent store for all-time metrics.
     store: Option<Arc<MetricsStore>>,
     /// All-time totals loaded from store at startup.
@@ -213,6 +239,7 @@ impl Metrics {
             latency_count: AtomicU64::new(0),
             usage_metrics: Mutex::new(MetricsDimensions::default()),
             observability_metrics: Mutex::new(RequestObservabilityMetrics::default()),
+            error_diagnostics: Mutex::new(ErrorDiagnostics::default()),
             store,
             stored_totals: Mutex::new(StoredTotals::default()),
         }
@@ -255,19 +282,21 @@ impl Metrics {
     }
 
     /// Record a completed request with usage, persisting to store if available.
-    pub async fn record_completed_request(
-        &self,
-        provider: &str,
-        initiator: &str,
-        model: &str,
-        usage: &TokenUsage,
-        is_error: bool,
-        latency_ms: u64,
-    ) {
-        self.record_usage_dimensions(provider, initiator, model, usage)
-            .await;
+    pub async fn record_completed_request(&self, record: CompletedUsageRecord<'_>) {
+        self.record_usage_dimensions(
+            record.provider,
+            record.initiator,
+            record.model,
+            record.usage,
+        )
+        .await;
+        self.error_diagnostics.lock().await.record(
+            record.is_error,
+            record.terminal_reason,
+            record.error_kind,
+        );
         if let Some(ref store) = self.store {
-            store.record_usage(provider, initiator, model, usage, is_error, latency_ms);
+            store.record_usage(record);
         }
     }
 
@@ -312,6 +341,9 @@ impl Metrics {
             serde_json::to_value(&usage_metrics.initiators).unwrap_or_default();
         drop(usage_metrics);
 
+        let diagnostics: serde_json::Value =
+            serde_json::to_value(self.error_diagnostics.lock().await.clone()).unwrap_or_default();
+
         let stored = self.stored_totals.lock().await;
         let stored_requests_total = stored.requests_total;
         let stored_errors_total = stored.errors_total;
@@ -325,6 +357,8 @@ impl Metrics {
             serde_json::to_value(&stored.provider_metrics).unwrap_or_default();
         let stored_initiators: serde_json::Value =
             serde_json::to_value(&stored.initiator_metrics).unwrap_or_default();
+        let stored_diagnostics: serde_json::Value =
+            serde_json::to_value(&stored.error_diagnostics).unwrap_or_default();
         drop(stored);
 
         let mut observability = self.observability_metrics.lock().await.snapshot();
@@ -337,6 +371,7 @@ impl Metrics {
             "models": models,
             "providers": providers,
             "initiators": initiators,
+            "diagnostics": diagnostics,
             "observability": serde_json::to_value(observability).unwrap_or_default(),
             "stored": {
                 "requests_total": stored_requests_total,
@@ -345,6 +380,7 @@ impl Metrics {
                 "models": stored_models,
                 "providers": stored_providers,
                 "initiators": stored_initiators,
+                "diagnostics": stored_diagnostics,
             },
         })
     }
@@ -466,7 +502,16 @@ mod tests {
         };
 
         metrics
-            .record_completed_request("chatgpt", "agent", "gpt-5.5", &usage, false, 123)
+            .record_completed_request(CompletedUsageRecord {
+                provider: "chatgpt",
+                initiator: "agent",
+                model: "gpt-5.5",
+                usage: &usage,
+                is_error: true,
+                latency_ms: 123,
+                terminal_reason: "stream_error",
+                error_kind: "stream",
+            })
             .await;
         let data = metrics.to_json().await;
 
@@ -478,6 +523,9 @@ mod tests {
             3
         );
         assert_eq!(data["stored"]["providers"].as_object().unwrap().len(), 0);
+        assert_eq!(data["diagnostics"]["errors"], 1);
+        assert_eq!(data["diagnostics"]["terminal_reasons"]["stream_error"], 1);
+        assert_eq!(data["diagnostics"]["error_kinds"]["stream"], 1);
     }
 
     #[tokio::test]
@@ -496,7 +544,16 @@ mod tests {
             let usage = usage.clone();
             tasks.push(tokio::spawn(async move {
                 metrics
-                    .record_completed_request("openai", "user", "gpt-4.1", &usage, false, 10)
+                    .record_completed_request(CompletedUsageRecord {
+                        provider: "openai",
+                        initiator: "user",
+                        model: "gpt-4.1",
+                        usage: &usage,
+                        is_error: false,
+                        latency_ms: 10,
+                        terminal_reason: "completed",
+                        error_kind: "",
+                    })
                     .await;
             }));
         }

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -7,8 +9,10 @@ use ratatui::{
 };
 
 use super::super::app::App;
+use super::super::app::ErrorDiagnostics;
 use super::super::app::LiveModelMetrics;
 use super::super::app::ModelCapability;
+use super::super::app::ObservabilitySummary;
 use super::super::{theme, widgets};
 use claude_proxy_providers::provider::{RateLimitSnapshot, RateLimitSource, RateLimitWindow};
 
@@ -54,6 +58,11 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let metrics_area = widgets::render_content_frame(f, top_cols[1], app, "Live Metrics");
     if let Some(ref metrics) = app.live_metrics {
         let avg_lat = format!("{}ms", metrics.avg_latency_ms);
+        let observability = observability_status(&metrics.observability.summary);
+        let errors = combined_error_status(
+            &metrics.diagnostics,
+            metrics.stored.as_ref().map(|stored| &stored.diagnostics),
+        );
         if let Some(ref stored) = metrics.stored {
             let total_reqs = metrics.requests_total + stored.requests_total;
             let total_errs = metrics.errors_total + stored.errors_total;
@@ -70,6 +79,8 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                         &format!("{total_errs} (session: {})", metrics.errors_total),
                     ),
                     ("Avg Latency", &avg_lat),
+                    ("Observe", &observability),
+                    ("Top Error", &errors),
                 ],
             );
         } else {
@@ -80,6 +91,8 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     ("Requests", &format!("{}", metrics.requests_total)),
                     ("Errors", &format!("{}", metrics.errors_total)),
                     ("Avg Latency", &avg_lat),
+                    ("Observe", &observability),
+                    ("Top Error", &errors),
                 ],
             );
         }
@@ -112,7 +125,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     .auth_token
                     .as_deref()
                     .map(|_| "set")
-                    .unwrap_or("(none)"),
+                    .unwrap_or("fallback to auth"),
             ),
         ],
     );
@@ -230,6 +243,51 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
     push_capability_rows(&mut lines, &metrics.model_capabilities, available);
 
     f.render_widget(Paragraph::new(lines), content_area);
+}
+
+fn observability_status(summary: &ObservabilitySummary) -> String {
+    if summary.requests == 0 {
+        return "no samples".to_string();
+    }
+    format!(
+        "e2e {}ms · up {}ms · gap {}ms",
+        summary.avg_total_latency_ms, summary.avg_upstream_connect_ms, summary.max_event_gap_ms
+    )
+}
+
+fn combined_error_status(session: &ErrorDiagnostics, stored: Option<&ErrorDiagnostics>) -> String {
+    let total_errors = session.errors + stored.map(|diagnostics| diagnostics.errors).unwrap_or(0);
+    if total_errors == 0 {
+        return "none".to_string();
+    }
+
+    let mut error_kinds = session.error_kinds.clone();
+    let mut terminal_reasons = session.terminal_reasons.clone();
+    if let Some(stored) = stored {
+        add_counts(&mut error_kinds, &stored.error_kinds);
+        add_counts(&mut terminal_reasons, &stored.terminal_reasons);
+    }
+
+    if let Some((kind, count)) = top_count(&error_kinds) {
+        return format!("kind {kind} ({count})");
+    }
+    if let Some((reason, count)) = top_count(&terminal_reasons) {
+        return format!("reason {reason} ({count})");
+    }
+    format!("{total_errors} errors")
+}
+
+fn add_counts(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, u64>) {
+    for (key, value) in source {
+        *target.entry(key.clone()).or_default() += value;
+    }
+}
+
+fn top_count(items: &BTreeMap<String, u64>) -> Option<(&str, u64)> {
+    items
+        .iter()
+        .max_by_key(|(key, value)| (*value, std::cmp::Reverse((*key).as_str())))
+        .map(|(key, value)| (key.as_str(), *value))
 }
 
 fn combine_usage_metrics(
@@ -558,5 +616,40 @@ mod tests {
         };
 
         assert_eq!(format_rate_limit_extra(&snapshot), "stream");
+    }
+
+    #[test]
+    fn combined_error_status_prefers_top_error_kind() {
+        let session = ErrorDiagnostics {
+            errors: 2,
+            error_kinds: BTreeMap::from([("stream".to_string(), 2)]),
+            ..Default::default()
+        };
+        let stored = ErrorDiagnostics {
+            errors: 3,
+            error_kinds: BTreeMap::from([("rate_limited".to_string(), 3)]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            combined_error_status(&session, Some(&stored)),
+            "kind rate_limited (3)"
+        );
+    }
+
+    #[test]
+    fn observability_status_formats_latency_summary() {
+        let summary = ObservabilitySummary {
+            requests: 1,
+            avg_total_latency_ms: 1200,
+            avg_upstream_connect_ms: 300,
+            max_event_gap_ms: 450,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            observability_status(&summary),
+            "e2e 1200ms · up 300ms · gap 450ms"
+        );
     }
 }

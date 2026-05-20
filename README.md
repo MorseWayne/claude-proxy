@@ -484,16 +484,40 @@ raw_sse_events = false
       "cache_read_input_tokens": 2000
     }
   },
+  "diagnostics": {
+    "errors": 1,
+    "terminal_reasons": {
+      "provider_error": 1
+    },
+    "error_kinds": {
+      "rate_limited": 1
+    }
+  },
+  "observability": {
+    "summary": {
+      "requests": 42,
+      "errors": 1,
+      "avg_total_latency_ms": 320,
+      "avg_upstream_connect_ms": 80,
+      "max_event_gap_ms": 120,
+      "idle_gap_count": 0,
+      "prompt_too_long_retries": 0
+    }
+  },
   "stored": {
     "requests_total": 1500,
     "errors_total": 12,
     "avg_latency_ms": 305,
-    "models": {}
+    "models": {},
+    "diagnostics": {}
   }
 }
 ```
 
 - 顶层字段是当前进程会话内的统计。
+- `avg_latency_ms` 表示已完成请求的端到端耗时；流式请求会在 stream 结束后计入。
+- `diagnostics` 按结束原因和错误类型聚合错误请求，方便定位 auth、rate limit、stream 等问题。
+- `observability.summary` 汇总请求阶段耗时、上游连接耗时、最大事件间隔和 prompt-too-long retry 次数。
 - `stored` 是 SQLite 持久化的历史累计，跨重启保留。
 - TUI Dashboard 会合并实时数据和历史数据展示总计。
 

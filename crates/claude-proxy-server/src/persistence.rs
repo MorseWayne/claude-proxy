@@ -5,7 +5,10 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::app::{RequestObservabilityEvent, RequestObservabilityStored, TokenUsage, UsageMetrics};
+use crate::app::{
+    ErrorDiagnostics, RequestObservabilityEvent, RequestObservabilityStored, TokenUsage,
+    UsageMetrics,
+};
 
 const METRICS_RETENTION_DAYS: i64 = 90;
 const METRICS_WRITE_QUEUE_CAPACITY: usize = 4096;
@@ -28,6 +31,47 @@ struct UsageEvent {
     cache_read_input_tokens: i64,
     is_error: i64,
     latency_ms: i64,
+    terminal_reason: String,
+    error_kind: String,
+}
+
+/// A completed request usage record to be persisted and aggregated.
+pub struct CompletedUsageRecord<'a> {
+    pub provider: &'a str,
+    pub initiator: &'a str,
+    pub model: &'a str,
+    pub usage: &'a TokenUsage,
+    pub is_error: bool,
+    pub latency_ms: u64,
+    pub terminal_reason: &'a str,
+    pub error_kind: &'a str,
+}
+
+fn ensure_usage_events_diagnostic_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if !usage_events_has_column(conn, "terminal_reason")? {
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN terminal_reason TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !usage_events_has_column(conn, "error_kind")? {
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn usage_events_has_column(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(usage_events)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows.flatten() {
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -51,13 +95,16 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
             cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
             is_error INTEGER NOT NULL DEFAULT 0,
             latency_ms INTEGER NOT NULL DEFAULT 0,
+            terminal_reason TEXT NOT NULL DEFAULT '',
+            error_kind TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_usage_events_provider ON usage_events(provider);
         CREATE INDEX IF NOT EXISTS idx_usage_events_initiator ON usage_events(initiator);
         CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model);
         CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);",
-    )
+    )?;
+    ensure_usage_events_diagnostic_columns(conn)
 }
 
 fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -262,22 +309,27 @@ impl MetricsStore {
         event: &MetricsWriteEvent,
     ) -> rusqlite::Result<usize> {
         match event {
-        MetricsWriteEvent::Usage(ev) => tx.execute(
-            "INSERT INTO usage_events (provider, initiator, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                ev.provider,
-                ev.initiator,
-                ev.model,
-                ev.input_tokens,
-                ev.output_tokens,
-                ev.cache_creation_input_tokens,
-                ev.cache_read_input_tokens,
-                ev.is_error,
-                ev.latency_ms,
-            ],
-        ),
-        MetricsWriteEvent::Observability(ev) => tx.execute(
+            MetricsWriteEvent::Usage(ev) => tx.execute(
+                "INSERT INTO usage_events (
+                    provider, initiator, model, input_tokens, output_tokens,
+                    cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms,
+                    terminal_reason, error_kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    ev.provider,
+                    ev.initiator,
+                    ev.model,
+                    ev.input_tokens,
+                    ev.output_tokens,
+                    ev.cache_creation_input_tokens,
+                    ev.cache_read_input_tokens,
+                    ev.is_error,
+                    ev.latency_ms,
+                    ev.terminal_reason,
+                    ev.error_kind,
+                ],
+            ),
+            MetricsWriteEvent::Observability(ev) => tx.execute(
             "INSERT INTO request_observability_events (
                 request_id, provider, initiator, model, stream, is_error, terminal_reason,
                 total_latency_ms, provider_setup_ms, upstream_connect_ms, stream_duration_ms,
@@ -317,25 +369,19 @@ impl MetricsStore {
     }
 
     /// Record a completed request with its token usage (non-blocking).
-    pub fn record_usage(
-        &self,
-        provider: &str,
-        initiator: &str,
-        model: &str,
-        usage: &TokenUsage,
-        is_error: bool,
-        latency_ms: u64,
-    ) {
+    pub fn record_usage(&self, record: CompletedUsageRecord<'_>) {
         let event = UsageEvent {
-            provider: provider.to_string(),
-            initiator: initiator.to_string(),
-            model: model.to_string(),
-            input_tokens: usage.input_tokens as i64,
-            output_tokens: usage.output_tokens as i64,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens as i64,
-            cache_read_input_tokens: usage.cache_read_input_tokens as i64,
-            is_error: is_error as i64,
-            latency_ms: latency_ms as i64,
+            provider: record.provider.to_string(),
+            initiator: record.initiator.to_string(),
+            model: record.model.to_string(),
+            input_tokens: record.usage.input_tokens as i64,
+            output_tokens: record.usage.output_tokens as i64,
+            cache_creation_input_tokens: record.usage.cache_creation_input_tokens as i64,
+            cache_read_input_tokens: record.usage.cache_read_input_tokens as i64,
+            is_error: record.is_error as i64,
+            latency_ms: record.latency_ms as i64,
+            terminal_reason: record.terminal_reason.to_string(),
+            error_kind: record.error_kind.to_string(),
         };
         match self.write_tx.try_send(MetricsWriteEvent::Usage(event)) {
             Ok(()) => {}
@@ -396,6 +442,7 @@ impl MetricsStore {
             load_usage_metrics(&conn, "model", &mut totals.model_metrics);
             load_usage_metrics(&conn, "provider", &mut totals.provider_metrics);
             load_usage_metrics(&conn, "initiator", &mut totals.initiator_metrics);
+            totals.error_diagnostics = load_error_diagnostics(&conn);
 
             totals
         })
@@ -540,6 +587,43 @@ fn load_usage_metrics(
     }
 }
 
+fn load_error_diagnostics(conn: &Connection) -> ErrorDiagnostics {
+    let mut diagnostics = ErrorDiagnostics::default();
+    if let Ok(errors) = conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END), 0) FROM usage_events",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        diagnostics.errors = errors as u64;
+    }
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT terminal_reason, COUNT(*) FROM usage_events
+         WHERE is_error = 1 AND terminal_reason != ''
+         GROUP BY terminal_reason",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            diagnostics.terminal_reasons.insert(row.0, row.1 as u64);
+        }
+    }
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT error_kind, COUNT(*) FROM usage_events
+         WHERE is_error = 1 AND error_kind != ''
+         GROUP BY error_kind",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            diagnostics.error_kinds.insert(row.0, row.1 as u64);
+        }
+    }
+
+    diagnostics
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StoredTotals {
     pub requests_total: u64,
@@ -549,6 +633,7 @@ pub struct StoredTotals {
     pub model_metrics: std::collections::HashMap<String, UsageMetrics>,
     pub provider_metrics: std::collections::HashMap<String, UsageMetrics>,
     pub initiator_metrics: std::collections::HashMap<String, UsageMetrics>,
+    pub error_diagnostics: ErrorDiagnostics,
 }
 
 #[cfg(test)]
@@ -597,6 +682,40 @@ mod tests {
     }
 
     #[test]
+    fn schema_adds_diagnostic_columns_to_existing_usage_events_table() {
+        let path = temp_db_path("diagnostic-columns");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                initiator TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO usage_events (provider, initiator, model, input_tokens)
+            VALUES ('chatgpt', 'user', 'gpt-5.5', 10);",
+        )
+        .unwrap();
+
+        rebuild_usage_events_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        conn.prepare("SELECT terminal_reason, error_kind FROM usage_events LIMIT 0")
+            .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn prunes_usage_events_older_than_retention_window() {
         let path = temp_db_path("retention");
         let conn = Connection::open(&path).unwrap();
@@ -623,32 +742,36 @@ mod tests {
     async fn load_totals_groups_usage_by_model_provider_and_initiator() {
         let path = temp_db_path("usage-totals");
         let store = MetricsStore::open(path.clone()).unwrap();
-        store.record_usage(
-            "chatgpt",
-            "agent",
-            "gpt-5.5",
-            &TokenUsage {
+        store.record_usage(CompletedUsageRecord {
+            provider: "chatgpt",
+            initiator: "agent",
+            model: "gpt-5.5",
+            usage: &TokenUsage {
                 input_tokens: 11,
                 output_tokens: 7,
                 cache_creation_input_tokens: 3,
                 cache_read_input_tokens: 2,
             },
-            false,
-            123,
-        );
-        store.record_usage(
-            "openai",
-            "user",
-            "gpt-4.1",
-            &TokenUsage {
+            is_error: false,
+            latency_ms: 123,
+            terminal_reason: "completed",
+            error_kind: "",
+        });
+        store.record_usage(CompletedUsageRecord {
+            provider: "openai",
+            initiator: "user",
+            model: "gpt-4.1",
+            usage: &TokenUsage {
                 input_tokens: 5,
                 output_tokens: 13,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 1,
             },
-            true,
-            77,
-        );
+            is_error: true,
+            latency_ms: 77,
+            terminal_reason: "provider_error",
+            error_kind: "rate_limited",
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let totals = store.load_totals().await;
@@ -664,6 +787,12 @@ mod tests {
         assert_eq!(totals.provider_metrics["openai"].cache_read_input_tokens, 1);
         assert_eq!(totals.initiator_metrics["agent"].requests, 1);
         assert_eq!(totals.initiator_metrics["user"].output_tokens, 13);
+        assert_eq!(totals.error_diagnostics.errors, 1);
+        assert_eq!(
+            totals.error_diagnostics.terminal_reasons["provider_error"],
+            1
+        );
+        assert_eq!(totals.error_diagnostics.error_kinds["rate_limited"], 1);
         drop(store);
         let _ = std::fs::remove_file(path);
     }

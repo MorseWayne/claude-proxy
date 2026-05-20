@@ -22,11 +22,11 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use serde_json::{Map, Value};
 
 use app::{
-    App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, FetchResult, Focus,
-    InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay, ModelCapability,
-    NavItem, OAuthOverlay, OAuthResult, OAuthStep, Overlay, PickerAction, PickerOverlay,
-    ProviderCheckOk, ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus,
-    StoredMetrics, Toast,
+    App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, ErrorDiagnostics,
+    FetchResult, Focus, InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay,
+    ModelCapability, NavItem, OAuthOverlay, OAuthResult, OAuthStep, ObservabilityMetrics,
+    ObservabilitySummary, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
+    ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus, StoredMetrics, Toast,
 };
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
@@ -2098,6 +2098,72 @@ fn parse_provider_rate_limits(
     items
 }
 
+fn parse_count_map(value: Option<&Value>) -> std::collections::BTreeMap<String, u64> {
+    value
+        .and_then(|v| v.as_object())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|(key, value)| value.as_u64().map(|count| (key.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_error_diagnostics(value: Option<&Value>) -> ErrorDiagnostics {
+    let Some(value) = value else {
+        return ErrorDiagnostics::default();
+    };
+    ErrorDiagnostics {
+        errors: value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
+        terminal_reasons: parse_count_map(value.get("terminal_reasons")),
+        error_kinds: parse_count_map(value.get("error_kinds")),
+    }
+}
+
+fn parse_observability_summary(value: Option<&Value>) -> ObservabilitySummary {
+    let Some(value) = value else {
+        return ObservabilitySummary::default();
+    };
+    ObservabilitySummary {
+        requests: value.get("requests").and_then(|v| v.as_u64()).unwrap_or(0),
+        errors: value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
+        avg_total_latency_ms: value
+            .get("avg_total_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        avg_upstream_connect_ms: value
+            .get("avg_upstream_connect_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        max_event_gap_ms: value
+            .get("max_event_gap_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        idle_gap_count: value
+            .get("idle_gap_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_too_long_retries: value
+            .get("prompt_too_long_retries")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    }
+}
+
+fn parse_observability(value: Option<&Value>) -> ObservabilityMetrics {
+    let Some(value) = value else {
+        return ObservabilityMetrics::default();
+    };
+    ObservabilityMetrics {
+        summary: parse_observability_summary(value.get("summary")),
+        stored_summary: value
+            .get("stored")
+            .and_then(|stored| stored.get("summary"))
+            .map(|summary| parse_observability_summary(Some(summary))),
+    }
+}
+
 /// Poll for completed metrics fetch results (called every tick).
 fn poll_metrics(app: &mut App) {
     let data = if let Some(ref rx) = app.metrics_rx {
@@ -2134,6 +2200,8 @@ fn poll_metrics(app: &mut App) {
         initiators: parse_usage_metrics(data.get("initiators")),
         model_capabilities: parse_model_capabilities(data.get("model_capabilities")),
         provider_rate_limits: parse_provider_rate_limits(data.get("provider_rate_limits")),
+        diagnostics: parse_error_diagnostics(data.get("diagnostics")),
+        observability: parse_observability(data.get("observability")),
         stored: None,
     };
 
@@ -2155,6 +2223,7 @@ fn poll_metrics(app: &mut App) {
             models: parse_usage_metrics(stored.get("models")),
             providers: parse_usage_metrics(stored.get("providers")),
             initiators: parse_usage_metrics(stored.get("initiators")),
+            diagnostics: parse_error_diagnostics(stored.get("diagnostics")),
         };
         live.stored = Some(stored_metrics);
     }
@@ -2527,6 +2596,55 @@ mod tests {
             limits[0].1[0].credits.as_ref().unwrap().balance.as_deref(),
             Some("5")
         );
+    }
+
+    #[test]
+    fn parse_metrics_contract_reads_error_diagnostics_and_observability() {
+        let diagnostics = parse_error_diagnostics(Some(&json!({
+            "errors": 3,
+            "terminal_reasons": {
+                "provider_error": 2,
+                "stream_error": 1
+            },
+            "error_kinds": {
+                "rate_limited": 2,
+                "stream": 1
+            }
+        })));
+        let observability = parse_observability(Some(&json!({
+            "summary": {
+                "requests": 10,
+                "errors": 1,
+                "avg_total_latency_ms": 1234,
+                "avg_upstream_connect_ms": 456,
+                "max_event_gap_ms": 789,
+                "idle_gap_count": 2,
+                "prompt_too_long_retries": 1
+            },
+            "stored": {
+                "summary": {
+                    "requests": 100,
+                    "errors": 4,
+                    "avg_total_latency_ms": 2345,
+                    "avg_upstream_connect_ms": 567,
+                    "max_event_gap_ms": 890,
+                    "idle_gap_count": 3,
+                    "prompt_too_long_retries": 2
+                }
+            }
+        })));
+
+        assert_eq!(diagnostics.errors, 3);
+        assert_eq!(diagnostics.terminal_reasons["provider_error"], 2);
+        assert_eq!(diagnostics.error_kinds["rate_limited"], 2);
+        assert_eq!(observability.summary.avg_total_latency_ms, 1234);
+        assert_eq!(observability.summary.avg_upstream_connect_ms, 456);
+        assert_eq!(observability.summary.max_event_gap_ms, 789);
+        assert_eq!(observability.summary.idle_gap_count, 2);
+        assert_eq!(observability.summary.prompt_too_long_retries, 1);
+        let stored = observability.stored_summary.expect("stored summary");
+        assert_eq!(stored.requests, 100);
+        assert_eq!(stored.avg_total_latency_ms, 2345);
     }
 
     #[test]

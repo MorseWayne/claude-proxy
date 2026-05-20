@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use claude_proxy_config::Settings;
@@ -351,6 +351,8 @@ pub struct LiveMetrics {
     pub initiators: Vec<(String, LiveModelMetrics)>,
     pub model_capabilities: Vec<(String, ModelCapability)>,
     pub provider_rate_limits: Vec<(String, Vec<RateLimitSnapshot>)>,
+    pub diagnostics: ErrorDiagnostics,
+    pub observability: ObservabilityMetrics,
     /// All-time stored totals (persisted across restarts).
     pub stored: Option<StoredMetrics>,
 }
@@ -363,6 +365,31 @@ pub struct StoredMetrics {
     pub models: Vec<(String, LiveModelMetrics)>,
     pub providers: Vec<(String, LiveModelMetrics)>,
     pub initiators: Vec<(String, LiveModelMetrics)>,
+    pub diagnostics: ErrorDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ErrorDiagnostics {
+    pub errors: u64,
+    pub terminal_reasons: BTreeMap<String, u64>,
+    pub error_kinds: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityMetrics {
+    pub summary: ObservabilitySummary,
+    pub stored_summary: Option<ObservabilitySummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilitySummary {
+    pub requests: u64,
+    pub errors: u64,
+    pub avg_total_latency_ms: u64,
+    pub avg_upstream_connect_ms: u64,
+    pub max_event_gap_ms: u64,
+    pub idle_gap_count: u64,
+    pub prompt_too_long_retries: u64,
 }
 
 #[derive(Debug, Clone, Default)]

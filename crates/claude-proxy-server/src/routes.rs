@@ -28,6 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::app::{
     AppState, InflightEvent, RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
 };
+use crate::persistence::CompletedUsageRecord;
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -814,7 +815,7 @@ async fn stream_leader_response(
         request_hash,
         broadcast_tx,
         permits,
-        start,
+        start: _,
         observability,
     } = context;
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
@@ -886,15 +887,18 @@ async fn stream_leader_response(
         } else {
             health_state.record_provider_success(&provider_id).await;
         }
+        metrics.record_latency(latency_ms);
         metrics
-            .record_completed_request(
-                &provider_id,
+            .record_completed_request(CompletedUsageRecord {
+                provider: &provider_id,
                 initiator,
-                &model_name,
-                &usage,
-                had_error,
+                model: &model_name,
+                usage: &usage,
+                is_error: had_error,
                 latency_ms,
-            )
+                terminal_reason,
+                error_kind: if had_error { "stream" } else { "" },
+            })
             .await;
         if let Some(context) = observability {
             metrics
@@ -906,9 +910,6 @@ async fn stream_leader_response(
         }
     });
 
-    state
-        .metrics
-        .record_latency(start.elapsed().as_millis() as u64);
     sse_body_response(body)
 }
 
@@ -956,14 +957,16 @@ async fn collect_leader_response(
                 state.metrics.record_latency(latency_ms);
                 state
                     .metrics
-                    .record_completed_request(
-                        &request.provider_id,
-                        request.initiator,
-                        &request.model,
-                        &usage,
-                        true,
+                    .record_completed_request(CompletedUsageRecord {
+                        provider: &request.provider_id,
+                        initiator: request.initiator,
+                        model: &request.model,
+                        usage: &usage,
+                        is_error: true,
                         latency_ms,
-                    )
+                        terminal_reason: "stream_error",
+                        error_kind: "stream",
+                    })
                     .await;
                 if let Some(context) = observability {
                     timing.stream_duration_ms = stream_start.elapsed().as_millis() as u64;
@@ -992,14 +995,16 @@ async fn collect_leader_response(
     let latency_ms = start.elapsed().as_millis() as u64;
     state
         .metrics
-        .record_completed_request(
-            &request.provider_id,
-            request.initiator,
-            &request.model,
-            &usage,
-            false,
+        .record_completed_request(CompletedUsageRecord {
+            provider: &request.provider_id,
+            initiator: request.initiator,
+            model: &request.model,
+            usage: &usage,
+            is_error: false,
             latency_ms,
-        )
+            terminal_reason: "completed",
+            error_kind: "",
+        })
         .await;
 
     state.record_provider_success(&request.provider_id).await;
@@ -1039,14 +1044,16 @@ async fn handle_provider_error(
     state.metrics.record_latency(latency_ms);
     state
         .metrics
-        .record_completed_request(
-            &request.provider_id,
-            request.initiator,
-            &request.model,
-            &TokenUsage::default(),
-            true,
+        .record_completed_request(CompletedUsageRecord {
+            provider: &request.provider_id,
+            initiator: request.initiator,
+            model: &request.model,
+            usage: &TokenUsage::default(),
+            is_error: true,
             latency_ms,
-        )
+            terminal_reason: "provider_error",
+            error_kind: provider_error_kind(&error),
+        })
         .await;
     if let Some(context) = observability {
         state
@@ -1336,6 +1343,21 @@ fn overloaded_response(message: &str, retry_after: Option<u64>) -> Response {
 
 fn is_retryable_upstream_error_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 500..=599)
+}
+
+fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Authentication(_) => "authentication",
+        ProviderError::RateLimited { .. } => "rate_limited",
+        ProviderError::InvalidRequest(_) => "invalid_request",
+        ProviderError::RequestTooLarge(_) => "request_too_large",
+        ProviderError::Overloaded { .. } => "overloaded",
+        ProviderError::ModelNotFound(_) => "model_not_found",
+        ProviderError::Timeout => "timeout",
+        ProviderError::UpstreamError { .. } => "upstream",
+        ProviderError::ServiceUnavailable(_) => "service_unavailable",
+        ProviderError::Network(_) => "network",
+    }
 }
 
 fn provider_error_to_response(error: &ProviderError) -> Response {
