@@ -1311,7 +1311,7 @@ fn is_prompt_too_long_candidate_status(status: StatusCode) -> bool {
 }
 
 fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderError {
-    let message = serde_json::from_str::<Value>(&body)
+    let mut message = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|value| {
             value
@@ -1320,6 +1320,9 @@ fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderEr
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| body.clone());
+    if let Some(output_limit_message) = chatgpt_output_limit_error_message(status, &message) {
+        message = output_limit_message;
+    }
 
     match status {
         StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
@@ -1336,6 +1339,49 @@ fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderEr
             body,
         },
     }
+}
+
+fn chatgpt_output_limit_error_message(status: StatusCode, message: &str) -> Option<String> {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    ) || !looks_like_output_limit_error(message)
+    {
+        return None;
+    }
+
+    Some(
+        "requested max_tokens exceeds the upstream model output limit; lower max_tokens or choose a model with a larger output budget".to_string(),
+    )
+}
+
+fn looks_like_output_limit_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase().replace(['-', '_'], " ");
+    let mentions_output_budget = [
+        "max output tokens",
+        "max tokens",
+        "output tokens",
+        "output token",
+        "output limit",
+        "maximum output",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    let mentions_limit = [
+        "limit",
+        "maximum",
+        "exceed",
+        "exceeds",
+        "too high",
+        "too large",
+        "greater than",
+        "less than or equal",
+        "at most",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+
+    mentions_output_budget && mentions_limit
 }
 
 fn notify_prompt_too_long_observer(
@@ -2688,6 +2734,54 @@ mod tests {
             StatusCode::BAD_REQUEST,
             r#"{"error":{"code":"invalid_request","message":"bad tool schema"}}"#
         ));
+    }
+
+    #[test]
+    fn output_limit_errors_map_to_clear_anthropic_invalid_request() {
+        let error = map_chatgpt_error_status_body(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"max_output_tokens is too high. Maximum supported value is 16384"}}"#.to_string(),
+        );
+
+        match error {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(
+                    message,
+                    "requested max_tokens exceeds the upstream model output limit; lower max_tokens or choose a model with a larger output budget"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn output_limit_errors_preserve_payload_too_large_status() {
+        let error = map_chatgpt_error_status_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "requested output tokens exceed the model limit".to_string(),
+        );
+
+        match error {
+            ProviderError::RequestTooLarge(message) => {
+                assert!(message.contains("max_tokens exceeds"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn output_limit_error_detection_ignores_unrelated_bad_requests() {
+        let error = map_chatgpt_error_status_body(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"bad tool schema"}}"#.to_string(),
+        );
+
+        match error {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "bad tool schema");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

@@ -10,14 +10,14 @@ Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Output limit errors
+Current phase: Advanced Codex parity
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
 
 Current todo:
 - [x] Output budget guardrails: truncate oversized current tool output with head/tail retention, keep historical tool-output compression, and clamp ChatGPT Responses `max_output_tokens` to known model limits.
-- [ ] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
+- [x] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
 - [x] Codex SSE parity: map `response.custom_tool_call_input.delta` / `.done` and `custom_tool_call` output items into Anthropic `tool_use` events with fixture coverage.
 - [x] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
 - [x] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
@@ -43,12 +43,15 @@ Changes:
 - Added prompt-content-free ChatGPT structured logs for request identity, upstream request/response ids, upstream model header, terminal SSE stop reason, response header / stream rate-limit summaries, body bytes, and requested/effective output token budgets.
 - Validation: `cargo fmt --check`, ChatGPT observability target tests, output-token clamp budget test, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-providers -- -D warnings` passed.
 - GitNexus: `send_responses_request`, `ChatGptProvider::chat_with_observer`, `rate_limit_snapshots_from_headers`, and `rate_limit_snapshot_from_sse_event` impact LOW.
+- Added ChatGPT provider-side output-limit error normalization: upstream `max_output_tokens` / `max_tokens` limit failures now surface as clear Anthropic-compatible `max_tokens` guidance while preserving 400 vs 413 response classes.
+- Validation: `cargo fmt --check`, output-limit target tests, prompt-too-long detection regression, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-providers -- -D warnings` passed.
+- GitNexus: `map_chatgpt_error_status_body` impact LOW; generic server error response functions were HIGH, so this phase avoided changing the `/v1/messages` response shell.
 
 Prerequisites:
 - None
 
 Resume next:
-- Evaluate output-limit error mapping if upstream/client output-limit failures still surface after truncation and token budget clamps.
+- Evaluate Advanced Codex parity items: turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing.
 
 ## Backlog / Future（待办 / 未来）
 
