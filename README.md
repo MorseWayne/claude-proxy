@@ -263,12 +263,13 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 
 如果需要修改 `Base URL` 或 `Proxy`：在 Providers 详情页按 `→` / `Enter` 进入详情，移动到字段后按 `e` 编辑，确认后按 `Ctrl+S` 保存。
 
-高级场景可以在 TOML 里覆盖 ChatGPT Codex 请求头，默认值通常不需要修改：
+高级场景可以在 TOML 里选择 ChatGPT Codex 请求身份 preset，或继续覆盖请求头；默认值通常不需要修改。可选 preset 为 `opencode`、`codex`、`anthropic-bridge`：
 
 ```toml
 [providers.chatgpt.chatgpt]
-originator = "opencode"
-user_agent = "opencode/claude-proxy"
+identity_preset = "opencode"
+# originator = "opencode"
+# user_agent = "opencode/claude-proxy"
 ```
 
 #### 3. 设置默认模型和 Claude 模型别名
@@ -408,8 +409,9 @@ base_url = "https://chatgpt.com/backend-api/codex"
 provider_type = "chatgpt"
 
 [providers.chatgpt.chatgpt]
-originator = "opencode"
-user_agent = "opencode/claude-proxy"
+identity_preset = "opencode"
+# originator = "opencode"
+# user_agent = "opencode/claude-proxy"
 
 [model]
 default = "openai/gpt-4.1"

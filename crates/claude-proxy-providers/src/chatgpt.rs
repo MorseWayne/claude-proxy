@@ -15,10 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use claude_proxy_config::{
     Settings,
-    settings::{
-        ChatGptProviderConfig, DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT,
-        ProviderConfig,
-    },
+    settings::{ChatGptIdentityPreset, ChatGptProviderConfig, ProviderConfig},
 };
 use claude_proxy_core::*;
 use futures::{StreamExt, stream::BoxStream};
@@ -126,6 +123,7 @@ struct CachedRateLimits {
 
 #[derive(Debug, Clone)]
 struct ChatGptRequestHeaders {
+    identity_preset: ChatGptIdentityPreset,
     originator: HeaderValue,
     user_agent: HeaderValue,
 }
@@ -476,6 +474,7 @@ impl Provider for ChatGptProvider {
                 installation_id: Some(&self.installation_id),
                 prompt_cache_key: Some(&self.thread_id),
                 window_id: Some(&self.window_id),
+                identity_preset: Some(self.request_headers.identity_preset.as_str()),
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -613,16 +612,18 @@ impl Provider for ChatGptProvider {
 fn chatgpt_request_headers(
     config: &ChatGptProviderConfig,
 ) -> Result<ChatGptRequestHeaders, ProviderError> {
+    let identity_preset = config.identity_preset;
     Ok(ChatGptRequestHeaders {
+        identity_preset,
         originator: chatgpt_header_value(
             "originator",
             &config.originator,
-            DEFAULT_CHATGPT_ORIGINATOR,
+            identity_preset.originator(),
         )?,
         user_agent: chatgpt_header_value(
             "User-Agent",
             &config.user_agent,
-            DEFAULT_CHATGPT_USER_AGENT,
+            identity_preset.user_agent(),
         )?,
     })
 }
@@ -1759,15 +1760,18 @@ mod tests {
         let config = claude_proxy_config::settings::ChatGptProviderConfig {
             originator: "codex_cli".to_string(),
             user_agent: "CodexCLI/1.2.3".to_string(),
+            ..Default::default()
         };
 
         let headers = chatgpt_request_headers(&config).unwrap();
+        assert_eq!(headers.identity_preset, ChatGptIdentityPreset::Opencode);
         assert_eq!(headers.originator.to_str().unwrap(), "codex_cli");
         assert_eq!(headers.user_agent.to_str().unwrap(), "CodexCLI/1.2.3");
 
         let config = claude_proxy_config::settings::ChatGptProviderConfig {
             originator: "  ".to_string(),
             user_agent: "\t".to_string(),
+            ..Default::default()
         };
 
         let headers = chatgpt_request_headers(&config).unwrap();
@@ -1775,6 +1779,32 @@ mod tests {
         assert_eq!(
             headers.user_agent.to_str().unwrap(),
             "opencode/claude-proxy"
+        );
+    }
+
+    #[test]
+    fn chatgpt_request_headers_use_identity_presets() {
+        let config = claude_proxy_config::settings::ChatGptProviderConfig {
+            identity_preset: ChatGptIdentityPreset::Codex,
+            ..Default::default()
+        };
+        let headers = chatgpt_request_headers(&config).unwrap();
+        assert_eq!(headers.identity_preset, ChatGptIdentityPreset::Codex);
+        assert_eq!(headers.originator.to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(
+            headers.user_agent.to_str().unwrap(),
+            "codex_cli_rs/0.0.0 (claude-proxy)"
+        );
+
+        let config = claude_proxy_config::settings::ChatGptProviderConfig {
+            identity_preset: ChatGptIdentityPreset::AnthropicBridge,
+            ..Default::default()
+        };
+        let headers = chatgpt_request_headers(&config).unwrap();
+        assert_eq!(headers.originator.to_str().unwrap(), "anthropic-bridge");
+        assert_eq!(
+            headers.user_agent.to_str().unwrap(),
+            "anthropic-bridge/claude-proxy"
         );
     }
 
@@ -1929,6 +1959,7 @@ mod tests {
                 installation_id: Some("install-123"),
                 prompt_cache_key: Some("thread-123"),
                 window_id: Some("window-123"),
+                identity_preset: Some("codex"),
             },
         );
 
@@ -1938,6 +1969,10 @@ mod tests {
             "install-123"
         );
         assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-123");
+        assert_eq!(
+            body["client_metadata"]["x-claude-proxy-identity-preset"],
+            "codex"
+        );
     }
 
     #[test]
@@ -2375,6 +2410,7 @@ mod tests {
             thread_id: "thread-test".to_string(),
             window_id: "window-test".to_string(),
             request_headers: ChatGptRequestHeaders {
+                identity_preset: ChatGptIdentityPreset::Opencode,
                 originator: HeaderValue::from_static("opencode"),
                 user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
             },

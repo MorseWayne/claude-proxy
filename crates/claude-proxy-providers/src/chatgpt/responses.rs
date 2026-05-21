@@ -11,6 +11,7 @@ pub(super) struct CodexRequestContext<'a> {
     pub installation_id: Option<&'a str>,
     pub prompt_cache_key: Option<&'a str>,
     pub window_id: Option<&'a str>,
+    pub identity_preset: Option<&'a str>,
 }
 
 pub(super) fn stream_response_with_marker_mode<F>(
@@ -140,6 +141,16 @@ fn apply_codex_metadata(
         client_metadata
             .entry("x-codex-window-id".to_string())
             .or_insert_with(|| json!(window_id));
+    }
+
+    if let Some(identity_preset) = context
+        .identity_preset
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        client_metadata
+            .entry("x-claude-proxy-identity-preset".to_string())
+            .or_insert_with(|| json!(identity_preset));
     }
 
     if !client_metadata.is_empty() {

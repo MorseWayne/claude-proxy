@@ -10,7 +10,7 @@ Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Codex SSE parity
+Current phase: Compatibility presets
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
@@ -19,7 +19,7 @@ Current todo:
 - [x] Output budget guardrails: truncate oversized current tool output with head/tail retention, keep historical tool-output compression, and clamp ChatGPT Responses `max_output_tokens` to known model limits.
 - [ ] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
 - [x] Codex SSE parity: map `response.custom_tool_call_input.delta` / `.done` and `custom_tool_call` output items into Anthropic `tool_use` events with fixture coverage.
-- [ ] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
+- [x] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
 - [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
 - [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
 - [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
@@ -33,12 +33,16 @@ Changes:
 - Added Responses custom tool-call parity based on OpenAI's current `custom_tool_call` item and `response.custom_tool_call_input.delta` / `.done` streaming events: streaming deltas are escaped into an Anthropic-compatible `tool_use` input object as `{"input": "<freeform text>"}`.
 - Validation: `cargo fmt --check`, `git diff --check`, custom-tool stream/non-stream target tests, Responses stream converter tests, non-streaming response tests, and full `cargo test -p claude-proxy-providers` passed.
 - GitNexus: `ResponsesStreamConverter::process_event` impact CRITICAL because it is the streaming conversion entrypoint; related custom handling helpers and non-stream converter changes were LOW, and the edit was scoped to new `custom_tool_call` event/item branches.
+- Added ChatGPT request identity presets: `opencode` preserves existing defaults; `codex` uses OpenAI Codex source's current `codex_cli_rs` originator; `anthropic-bridge` marks bridge traffic explicitly. Explicit `originator` / `user_agent` overrides still win.
+- ChatGPT Responses body metadata now records `x-claude-proxy-identity-preset` in `client_metadata` when the provider path supplies a preset.
+- Validation: `cargo fmt --check`, config ChatGPT preset tests, ChatGPT provider header/body tests, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt`, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings` passed.
+- GitNexus: `ChatGptProviderConfig`, `chatgpt_request_headers`, `build_body_with_context`, `apply_codex_metadata`, `ChatGptProvider::new`, and `ChatGptProvider::chat_with_observer` impact LOW.
 
 Prerequisites:
 - None
 
 Resume next:
-- Continue with compatibility presets, or add broader real/native Codex fixture snapshots.
+- Add broader real/native Codex fixture snapshots, or continue with observability fields for effective request identity and output budgets.
 
 ## Backlog / Future（待办 / 未来）
 
