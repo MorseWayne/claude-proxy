@@ -10,7 +10,7 @@ Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Output budget governance guardrails
+Current phase: Codex SSE parity
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
@@ -18,7 +18,7 @@ Intent:
 Current todo:
 - [x] Output budget guardrails: truncate oversized current tool output with head/tail retention, keep historical tool-output compression, and clamp ChatGPT Responses `max_output_tokens` to known model limits.
 - [ ] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
-- [ ] Codex SSE parity: add coverage for `response.custom_tool_call_input.delta` and any custom/freeform tool output shapes if Claude Code starts exposing those tools through this bridge.
+- [x] Codex SSE parity: map `response.custom_tool_call_input.delta` / `.done` and `custom_tool_call` output items into Anthropic `tool_use` events with fixture coverage.
 - [ ] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
 - [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
 - [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
@@ -30,12 +30,15 @@ Changes:
 - Added ChatGPT Responses `max_output_tokens` clamping against known OpenAI model metadata, covering the common `gpt-5.4-mini` 16,384-token ceiling case.
 - Validation: `cargo fmt --check`, targeted ChatGPT clamp test, targeted current tool-output truncation test, `cargo test -p claude-proxy-providers chatgpt`, `cargo test -p claude-proxy-providers responses::tests::test_convert_to_responses`, and full `cargo test -p claude-proxy-providers` passed.
 - GitNexus: `build_body_with_context` / `build_body` impact LOW; generic `tool_result_output` and `convert_to_responses` impact CRITICAL, so the edit was kept to bounded truncation behavior with focused and provider-wide tests.
+- Added Responses custom tool-call parity based on OpenAI's current `custom_tool_call` item and `response.custom_tool_call_input.delta` / `.done` streaming events: streaming deltas are escaped into an Anthropic-compatible `tool_use` input object as `{"input": "<freeform text>"}`.
+- Validation: `cargo fmt --check`, `git diff --check`, custom-tool stream/non-stream target tests, Responses stream converter tests, non-streaming response tests, and full `cargo test -p claude-proxy-providers` passed.
+- GitNexus: `ResponsesStreamConverter::process_event` impact CRITICAL because it is the streaming conversion entrypoint; related custom handling helpers and non-stream converter changes were LOW, and the edit was scoped to new `custom_tool_call` event/item branches.
 
 Prerequisites:
 - None
 
 Resume next:
-- Continue with output-limit error mapping if real failures still surface, otherwise move to Codex SSE parity fixtures.
+- Continue with compatibility presets, or add broader real/native Codex fixture snapshots.
 
 ## Backlog / Future（待办 / 未来）
 

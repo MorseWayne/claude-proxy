@@ -4,7 +4,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -1079,6 +1079,8 @@ struct ResponsesStreamConverter {
     function_call_ids: HashMap<u64, String>,
     function_argument_buffers: HashMap<u64, String>,
     function_argument_emitted: HashMap<u64, String>,
+    custom_tool_input_open: HashSet<u64>,
+    custom_tool_input_emitted: HashSet<u64>,
     saw_function_call: bool,
     input_tokens: u32,
     output_tokens: u32,
@@ -1163,6 +1165,16 @@ impl ResponsesStreamConverter {
                 self.flush_reasoning_text(&mut events);
                 self.handle_function_call_arguments_done(event, &mut events);
             }
+            "response.custom_tool_call_input.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                self.handle_custom_tool_call_input_delta(event, &mut events);
+            }
+            "response.custom_tool_call_input.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                self.handle_custom_tool_call_input_done(event, &mut events);
+            }
             "response.output_item.done" => {
                 self.flush_reasoning_text(&mut events);
                 self.handle_output_item_done(event, &mut events);
@@ -1224,16 +1236,10 @@ impl ResponsesStreamConverter {
     fn handle_output_item_added(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
-        if item["type"].as_str() == Some("function_call") {
+        if is_responses_tool_call_type(item["type"].as_str()) {
             self.flush_reasoning_text(events);
             self.saw_function_call = true;
-            if let Some(name) = item["name"].as_str() {
-                self.function_names.insert(output_index, name.to_string());
-            }
-            if let Some(call_id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
-                self.function_call_ids
-                    .insert(output_index, call_id.to_string());
-            }
+            self.remember_tool_call_metadata(output_index, event);
             self.ensure_function_block(output_index, event, events);
         }
     }
@@ -1279,31 +1285,30 @@ impl ResponsesStreamConverter {
     fn handle_output_item_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         let item = &event["item"];
-        if item["type"].as_str() == Some("function_call") {
-            self.saw_function_call = true;
-            let idx = self.ensure_function_block(output_index, event, events);
-            let arguments = item["arguments"].as_str();
-            self.emit_function_arguments(output_index, idx, arguments, false, events);
-            events.push(block_stop(idx));
-            self.function_blocks.remove(&output_index);
-            self.function_argument_buffers.remove(&output_index);
-            self.function_argument_emitted.remove(&output_index);
+        match item["type"].as_str() {
+            Some("function_call") => {
+                self.saw_function_call = true;
+                self.remember_tool_call_metadata(output_index, event);
+                let idx = self.ensure_function_block(output_index, event, events);
+                let arguments = item["arguments"].as_str();
+                self.emit_function_arguments(output_index, idx, arguments, false, events);
+                self.close_function_block(output_index, idx, events);
+            }
+            Some("custom_tool_call") => {
+                self.saw_function_call = true;
+                self.remember_tool_call_metadata(output_index, event);
+                let idx = self.ensure_function_block(output_index, event, events);
+                self.emit_custom_tool_input_done(output_index, idx, item["input"].as_str(), events);
+                self.close_function_block(output_index, idx, events);
+            }
+            _ => {}
         }
     }
 
     fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
         let output_index = event["output_index"].as_u64().unwrap_or(0);
         self.saw_function_call = true;
-        if let Some(name) = event["name"].as_str() {
-            self.function_names.insert(output_index, name.to_string());
-        }
-        if let Some(call_id) = event["call_id"]
-            .as_str()
-            .or_else(|| event["item_id"].as_str())
-        {
-            self.function_call_ids
-                .insert(output_index, call_id.to_string());
-        }
+        self.remember_tool_call_metadata(output_index, event);
 
         let idx = self.ensure_function_block(output_index, event, events);
         self.emit_function_arguments(
@@ -1313,6 +1318,43 @@ impl ResponsesStreamConverter {
             false,
             events,
         );
+    }
+
+    fn handle_custom_tool_call_input_delta(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let delta = event["delta"].as_str().unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+
+        self.saw_function_call = true;
+        self.remember_tool_call_metadata(output_index, event);
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.emit_custom_tool_input_delta(output_index, idx, delta, events);
+    }
+
+    fn handle_custom_tool_call_input_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        self.saw_function_call = true;
+        self.remember_tool_call_metadata(output_index, event);
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.emit_custom_tool_input_done(output_index, idx, event["input"].as_str(), events);
+    }
+
+    fn remember_tool_call_metadata(&mut self, output_index: u64, event: &Value) {
+        let item = &event["item"];
+        if let Some(name) = item["name"].as_str().or_else(|| event["name"].as_str()) {
+            self.function_names.insert(output_index, name.to_string());
+        }
+        if let Some(call_id) = item["call_id"]
+            .as_str()
+            .or_else(|| event["call_id"].as_str())
+            .or_else(|| item["id"].as_str())
+            .or_else(|| event["item_id"].as_str())
+        {
+            self.function_call_ids
+                .insert(output_index, call_id.to_string());
+        }
     }
 
     fn emit_parseable_function_arguments(
@@ -1329,6 +1371,55 @@ impl ResponsesStreamConverter {
         }
         let idx = self.ensure_function_block(output_index, event, events);
         self.emit_function_arguments(output_index, idx, None, true, events);
+    }
+
+    fn emit_custom_tool_input_delta(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        delta: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.custom_tool_input_open.insert(output_index) {
+            Self::push_function_arguments_delta(idx, "{\"input\":\"", events);
+        }
+        self.custom_tool_input_emitted.insert(output_index);
+        Self::push_function_arguments_delta(idx, &json_string_fragment(delta), events);
+    }
+
+    fn emit_custom_tool_input_done(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        input: Option<&str>,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.close_custom_tool_input_if_open(output_index, idx, events) {
+            return;
+        }
+        if self.custom_tool_input_emitted.contains(&output_index) {
+            return;
+        }
+        let Some(input) = input else {
+            return;
+        };
+        let encoded = serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string());
+        Self::push_function_arguments_delta(idx, &format!("{{\"input\":{encoded}}}"), events);
+        self.custom_tool_input_emitted.insert(output_index);
+    }
+
+    fn close_custom_tool_input_if_open(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        events: &mut Vec<SseEvent>,
+    ) -> bool {
+        if !self.custom_tool_input_open.remove(&output_index) {
+            return false;
+        }
+        Self::push_function_arguments_delta(idx, "\"}", events);
+        self.custom_tool_input_emitted.insert(output_index);
+        true
     }
 
     fn emit_function_arguments(
@@ -1569,11 +1660,24 @@ impl ResponsesStreamConverter {
     fn close_function_blocks(&mut self, events: &mut Vec<SseEvent>) {
         let blocks = std::mem::take(&mut self.function_blocks);
         for (output_index, idx) in blocks {
+            self.close_custom_tool_input_if_open(output_index, idx, events);
             self.emit_function_arguments(output_index, idx, None, false, events);
             events.push(block_stop(idx));
         }
         self.function_argument_buffers.clear();
         self.function_argument_emitted.clear();
+        self.custom_tool_input_open.clear();
+        self.custom_tool_input_emitted.clear();
+    }
+
+    fn close_function_block(&mut self, output_index: u64, idx: u32, events: &mut Vec<SseEvent>) {
+        self.close_custom_tool_input_if_open(output_index, idx, events);
+        events.push(block_stop(idx));
+        self.function_blocks.remove(&output_index);
+        self.function_argument_buffers.remove(&output_index);
+        self.function_argument_emitted.remove(&output_index);
+        self.custom_tool_input_open.remove(&output_index);
+        self.custom_tool_input_emitted.remove(&output_index);
     }
 
     fn stop_with_reason(&mut self, reason: &str, events: &mut Vec<SseEvent>) {
@@ -1620,13 +1724,26 @@ fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static s
         || response["output"].as_array().is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item["type"].as_str() == Some("function_call"))
+                .any(|item| is_responses_tool_call_type(item["type"].as_str()))
         })
     {
         "tool_use"
     } else {
         "end_turn"
     }
+}
+
+fn is_responses_tool_call_type(item_type: Option<&str>) -> bool {
+    matches!(item_type, Some("function_call") | Some("custom_tool_call"))
+}
+
+fn json_string_fragment(text: &str) -> String {
+    let encoded = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    encoded
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn content_delta(index: u32, delta_type: &str, key: &str, value: &str) -> SseEvent {
@@ -1705,6 +1822,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                 match item["type"].as_str() {
                     Some("message") => self.convert_message(item),
                     Some("function_call") => self.convert_function_call(item),
+                    Some("custom_tool_call") => self.convert_custom_tool_call(item),
                     Some("reasoning") => self.convert_reasoning_item(item),
                     _ => {}
                 }
@@ -1763,6 +1881,29 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                     .unwrap_or_else(|| args.to_string());
                 serde_json::from_str::<Value>(&arguments).ok()
             })
+            .unwrap_or_else(|| json!({}));
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown"),
+                    "name": item["name"].as_str().unwrap_or(""),
+                    "input": input
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+    }
+
+    fn convert_custom_tool_call(&mut self, item: &Value) {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        let input = item["input"]
+            .as_str()
+            .map(|input| json!({ "input": input }))
             .unwrap_or_else(|| json!({}));
         self.events.push(SseEvent {
             event: "content_block_start".to_string(),
@@ -3453,6 +3594,88 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_converter_maps_custom_tool_call_input_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_custom_1", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_custom_1",
+                    "name": "python"
+                }
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "delta": "print(\""
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "delta": "hi\")\n"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "input": "print(\"hi\")\n"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_custom_1",
+                    "model": "gpt-5.3-codex",
+                    "status": "completed",
+                    "output": [{"type": "custom_tool_call"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_custom_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
     fn test_non_streaming_response_maps_text_and_function() {
         let data = json!({
             "id": "resp_1",
@@ -3492,6 +3715,45 @@ mod tests {
                 .data["delta"]["stop_reason"],
             "tool_use"
         );
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_custom_tool_call() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom_1",
+                    "name": "python",
+                    "input": "print(\"hi\")\n"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_custom_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            tool_block.data["content_block"]["input"],
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
