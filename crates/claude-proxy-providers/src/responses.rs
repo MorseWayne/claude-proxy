@@ -21,6 +21,7 @@ use crate::tool_choice::normalize_for_responses;
 
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
+const MAX_CURRENT_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const RECENT_TEXT_ITEMS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TEXT_BYTES: usize = 32 * 1024;
 const SMALL_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 256 * 1024;
@@ -651,11 +652,9 @@ fn tool_result_text(
         }
     };
     let text = if truncate_if_large && text.len() > MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
-        format!(
-            "[tool output truncated: original_bytes={}, max_historical_tool_output_bytes={}]",
-            text.len(),
-            MAX_HISTORICAL_TOOL_OUTPUT_BYTES
-        )
+        historical_tool_result_truncation_marker(text.len())
+    } else if text.len() > MAX_CURRENT_TOOL_OUTPUT_BYTES {
+        truncated_current_tool_result_text(&text)
     } else {
         text
     };
@@ -677,6 +676,52 @@ fn tool_result_error_text(content: &Option<Value>) -> String {
         Some(value) => value.to_string(),
         None => String::new(),
     }
+}
+
+fn historical_tool_result_truncation_marker(original_bytes: usize) -> String {
+    format!(
+        "[tool output truncated: original_bytes={original_bytes}, max_historical_tool_output_bytes={MAX_HISTORICAL_TOOL_OUTPUT_BYTES}]"
+    )
+}
+
+fn truncated_current_tool_result_text(text: &str) -> String {
+    let marker = format!(
+        "[tool output truncated: original_bytes={}, max_current_tool_output_bytes={}]\n",
+        text.len(),
+        MAX_CURRENT_TOOL_OUTPUT_BYTES
+    );
+    let omitted_marker = "\n[... middle of tool output omitted ...]\n";
+    let visible_budget = MAX_CURRENT_TOOL_OUTPUT_BYTES
+        .saturating_sub(marker.len())
+        .saturating_sub(omitted_marker.len());
+    let head_budget = visible_budget * 3 / 4;
+    let tail_budget = visible_budget.saturating_sub(head_budget);
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+
+    format!(
+        "{}{}{}{}",
+        marker,
+        &text[..head_end],
+        omitted_marker,
+        &text[tail_start..]
+    )
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn tool_result_error_text_item(value: &Value) -> Option<String> {
@@ -701,7 +746,9 @@ fn tool_result_output(
     is_error: Option<bool>,
     truncate_if_large: bool,
 ) -> Value {
-    if is_error == Some(true) || truncate_if_large {
+    let should_truncate_current =
+        !truncate_if_large && raw_tool_result_text_len(content) > MAX_CURRENT_TOOL_OUTPUT_BYTES;
+    if is_error == Some(true) || truncate_if_large || should_truncate_current {
         return json!(tool_result_text(content, is_error, truncate_if_large));
     }
 
@@ -2745,6 +2792,48 @@ mod tests {
         );
         assert_eq!(input[2]["output"], large_output);
         assert_eq!(input.last().unwrap()["output"], large_output);
+    }
+
+    #[test]
+    fn test_convert_to_responses_truncates_current_oversized_tool_output_with_head_and_tail() {
+        let large_output = format!(
+            "{}TAIL_SENTINEL",
+            "x".repeat(MAX_CURRENT_TOOL_OUTPUT_BYTES * 2)
+        );
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "current_call".to_string(),
+                    content: Some(Value::String(large_output)),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+        let output = body["input"][0]["output"]
+            .as_str()
+            .expect("tool output string");
+
+        assert!(output.starts_with("[tool output truncated:"));
+        assert!(output.contains("max_current_tool_output_bytes="));
+        assert!(output.contains("[... middle of tool output omitted ...]"));
+        assert!(output.ends_with("TAIL_SENTINEL"));
+        assert!(output.len() <= MAX_CURRENT_TOOL_OUTPUT_BYTES);
     }
 
     #[test]

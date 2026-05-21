@@ -3,6 +3,7 @@ use claude_proxy_core::{MessagesRequest, SseEvent};
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
+use crate::openai_compat::openai_model_info;
 use crate::provider::ProviderError;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,6 +54,7 @@ pub(super) fn build_body_with_context(
         object.remove("stop");
         object.insert("stream".to_string(), json!(true));
         apply_codex_defaults(object);
+        clamp_max_output_tokens(object);
         let missing_instructions = object
             .get("instructions")
             .and_then(Value::as_str)
@@ -78,6 +80,22 @@ fn apply_codex_defaults(body: &mut Map<String, Value>) {
         .is_some_and(|tools| !tools.is_empty());
     body.entry("parallel_tool_calls".to_string())
         .or_insert_with(|| json!(has_tools));
+}
+
+fn clamp_max_output_tokens(body: &mut Map<String, Value>) {
+    let Some(requested) = body.get("max_output_tokens").and_then(Value::as_u64) else {
+        return;
+    };
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(limit) = openai_model_info(model).max_output_tokens.map(u64::from) else {
+        return;
+    };
+
+    if requested > limit {
+        body.insert("max_output_tokens".to_string(), json!(limit));
+    }
 }
 
 fn apply_codex_metadata(

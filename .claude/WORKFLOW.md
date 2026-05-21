@@ -4,46 +4,56 @@
 
 ## Active（进行中）
 
-### WF-2026-05-20-001 — 解决 main 分支推送冲突
+### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: In Progress
-Level: 2
-Priority: Paused while performance optimization commit/index refresh finishes
-Started: 2026-05-20
-Last updated: 2026-05-20
-Current phase: 冲突解决与验证
+Level: 3
+Priority: Continue from Backlog after Codex request metadata baseline
+Started: 2026-05-21
+Last updated: 2026-05-21
+Current phase: Output budget governance guardrails
 
 Intent:
-- 解决本地 `main` 与 `origin/main` 分叉导致的推送冲突，并保持现有工作不丢失。
+- Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
 
 Current todo:
-- [x] 检查本地/远端提交差异和未提交 `.claude/WORKFLOW.md` 改动。
-- [x] 确认合并语义：同时保留远端 tagged thinking 转换和本地 sanitizer 防泄漏。
-- [ ] 运行格式化、provider 测试、GitNexus detect_changes，提交并刷新索引。
+- [x] Output budget guardrails: truncate oversized current tool output with head/tail retention, keep historical tool-output compression, and clamp ChatGPT Responses `max_output_tokens` to known model limits.
+- [ ] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
+- [ ] Codex SSE parity: add coverage for `response.custom_tool_call_input.delta` and any custom/freeform tool output shapes if Claude Code starts exposing those tools through this bridge.
+- [ ] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
+- [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
+- [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
+- [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 
 Changes:
-- 初始状态：`main...origin/main [ahead 2, behind 2]`，未展开 merge conflict，工作区仅 `.claude/WORKFLOW.md` 有本地改动。
-- 合并 `origin/main` 后冲突集中在 `.claude/WORKFLOW.md`、`chat_completions.rs`、`responses.rs`、`lib.rs`；用户确认完整 tagged thinking 应转为 `thinking_delta`，未闭合或残留 marker 不应泄漏到普通 text。
+- Baseline completed in `73648f4`: ChatGPT `/responses` now sends Codex-style request defaults, stable runtime metadata, and session/thread/window headers.
+- Added provider-neutral current tool-output head/tail truncation at 128 KiB so a fresh oversized Claude Code tool result does not get forwarded to Responses verbatim.
+- Added ChatGPT Responses `max_output_tokens` clamping against known OpenAI model metadata, covering the common `gpt-5.4-mini` 16,384-token ceiling case.
+- Validation: `cargo fmt --check`, targeted ChatGPT clamp test, targeted current tool-output truncation test, `cargo test -p claude-proxy-providers chatgpt`, `cargo test -p claude-proxy-providers responses::tests::test_convert_to_responses`, and full `cargo test -p claude-proxy-providers` passed.
+- GitNexus: `build_body_with_context` / `build_body` impact LOW; generic `tool_result_output` and `convert_to_responses` impact CRITICAL, so the edit was kept to bounded truncation behavior with focused and provider-wide tests.
 
 Prerequisites:
 - None
 
 Resume next:
-- 运行格式化和 provider 级测试，修正失败后完成 merge commit。
+- Continue with output-limit error mapping if real failures still surface, otherwise move to Codex SSE parity fixtures.
 
 ## Backlog / Future（待办 / 未来）
 
-- [ ] WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
-  - Baseline completed in `73648f4`: ChatGPT `/responses` now sends Codex-style request defaults, stable runtime metadata, and session/thread/window headers.
-  - [ ] Output budget governance: compress/truncate oversized tool output and history more aggressively, clamp requested output budgets to client/model limits, and return clearer Anthropic-compatible errors when output would exceed Claude Code limits.
-  - [ ] Codex SSE parity: add coverage for `response.custom_tool_call_input.delta` and any custom/freeform tool output shapes if Claude Code starts exposing those tools through this bridge.
-  - [ ] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
-  - [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
-  - [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
-  - [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 - [ ] 如果 OpenAI/Copilot Responses 上游开始强制要求 `instructions`，再评估是否需要 provider-specific 处理。
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-20-001 — 解决 main 分支推送冲突
+
+Completed: 2026-05-21
+Level: 2
+
+Close summary:
+
+- Outcome: `main` 已完成推送冲突后的收尾，最近两次提交 `73648f4` 与 `3662dae` 已推送，当前 `main...origin/main` 对齐且工作树干净。
+- Validation: ChatGPT/Codex metadata baseline 提交前已运行 `cargo fmt --check`、`cargo test -p claude-proxy-providers`、`git diff --check` 和 GitNexus staged `detect_changes`；workflow 提交 detect 为 LOW。
+- Gaps: None。
 
 ### WF-2026-05-20-006 — Core metrics optimization
 

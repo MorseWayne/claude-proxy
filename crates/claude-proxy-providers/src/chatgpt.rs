@@ -2090,6 +2090,33 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 4096);
     }
 
+    #[test]
+    fn chatgpt_responses_body_clamps_max_output_tokens_to_model_limit() {
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(128_000),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["max_output_tokens"], 16_384);
+    }
+
     #[tokio::test]
     async fn chatgpt_retries_prompt_too_long_with_shrunk_body() {
         let (endpoint, requests) = prompt_too_long_retry_server().await;
