@@ -2015,6 +2015,40 @@ mod tests {
             .collect()
     }
 
+    fn fixture_sse_values(fixture: &str) -> Vec<Value> {
+        fixture.split("\n\n").filter_map(parse_sse_json).collect()
+    }
+
+    fn convert_fixture_sse(fixture: &str) -> Vec<SseEvent> {
+        let mut converter = ResponsesStreamConverter::new();
+        fixture_sse_values(fixture)
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect()
+    }
+
+    fn stop_reason(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .and_then(|event| event.data["delta"]["stop_reason"].as_str())
+            .expect("message_delta stop reason")
+            .to_string()
+    }
+
+    fn tool_input_delta_json(events: &[SseEvent]) -> Value {
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        serde_json::from_str(&arguments).expect("valid input_json_delta payload")
+    }
+
     async fn response_from_body(content_type: &str, body: &str) -> reqwest::Response {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2184,6 +2218,99 @@ mod tests {
 
         let observed = observed.lock().unwrap();
         assert!(observed.iter().any(|kind| kind == "codex.rate_limits"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_success_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_success.sse"
+        ));
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(text_deltas(&events), vec!["done"]);
+        assert_eq!(stop.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(stop.data["usage"]["input_tokens"], 12);
+        assert_eq!(stop.data["usage"]["output_tokens"], 3);
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_incomplete_and_failed_fixtures() {
+        let incomplete = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_incomplete.sse"
+        ));
+        let failed = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_failed.sse"
+        ));
+
+        assert_eq!(text_deltas(&incomplete), vec!["partial"]);
+        assert_eq!(stop_reason(&incomplete), "max_tokens");
+        assert_eq!(stop_reason(&failed), "error");
+        assert!(failed.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_rate_limit_fixture() {
+        let fixture = include_str!("../tests/fixtures/chatgpt_codex/stream_rate_limit.sse");
+        let raw_types = fixture_sse_values(fixture)
+            .iter()
+            .filter_map(|event| event["type"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        let events = convert_fixture_sse(fixture);
+
+        assert!(raw_types.iter().any(|kind| kind == "codex.rate_limits"));
+        assert_eq!(stop_reason(&events), "end_turn");
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_function_tool_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_function_tool.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_fixture_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "Bash");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"command": "git status --short", "description": ""})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_custom_tool_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_custom_tool.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(
+            tool_block.data["content_block"]["id"],
+            "call_custom_fixture_1"
+        );
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
     }
 
     #[test]

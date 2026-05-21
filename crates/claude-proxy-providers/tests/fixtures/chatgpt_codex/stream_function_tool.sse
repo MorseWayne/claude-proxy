@@ -1,0 +1,13 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_tool","model":"gpt-5.3-codex","usage":{"input_tokens":10,"output_tokens":0}}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_fixture_1","call_id":"call_fixture_1","name":"Bash","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_fixture_1","delta":"{\"command\":\"git"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_fixture_1","delta":" status --short\",\"description\":\"\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_fixture_1","name":"Bash","arguments":"{\"command\":\"git status --short\",\"description\":\"\"}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_fixture_1","call_id":"call_fixture_1","name":"Bash","arguments":"{\"command\":\"git status --short\",\"description\":\"\"}"}}
+
+data: {"type":"response.completed","response":{"id":"resp_fixture_tool","model":"gpt-5.3-codex","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}

@@ -1,0 +1,3 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_failed","model":"gpt-5.3-codex","usage":{"input_tokens":8,"output_tokens":0}}}
+
+data: {"type":"response.failed","response":{"id":"resp_fixture_failed","model":"gpt-5.3-codex","status":"failed","error":{"code":"server_error","message":"upstream failed"},"output":[],"usage":{"input_tokens":8,"output_tokens":0}}}

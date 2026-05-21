@@ -1,0 +1,43 @@
+{
+  "client_metadata": {
+    "x-claude-proxy-identity-preset": "codex",
+    "x-codex-installation-id": "install-fixture",
+    "x-codex-window-id": "window-from-request"
+  },
+  "include": [],
+  "input": [
+    {
+      "content": "List changed files.",
+      "role": "user"
+    }
+  ],
+  "instructions": "Follow the user's instructions.",
+  "max_output_tokens": 4096,
+  "model": "gpt-5.3-codex",
+  "parallel_tool_calls": true,
+  "prompt_cache_key": "thread-fixture",
+  "store": false,
+  "stream": true,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "Run a shell command",
+      "name": "Bash",
+      "parameters": {
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -10,7 +10,7 @@ Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Compatibility presets
+Current phase: Fixture tests
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
@@ -20,7 +20,7 @@ Current todo:
 - [ ] Output limit errors: add clearer Anthropic-compatible errors if upstream/client output-limit failures still surface after truncation.
 - [x] Codex SSE parity: map `response.custom_tool_call_input.delta` / `.done` and `custom_tool_call` output items into Anthropic `tool_use` events with fixture coverage.
 - [x] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
-- [ ] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
+- [x] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
 - [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
 - [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 
@@ -37,12 +37,15 @@ Changes:
 - ChatGPT Responses body metadata now records `x-claude-proxy-identity-preset` in `client_metadata` when the provider path supplies a preset.
 - Validation: `cargo fmt --check`, config ChatGPT preset tests, ChatGPT provider header/body tests, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt`, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings` passed.
 - GitNexus: `ChatGptProviderConfig`, `chatgpt_request_headers`, `build_body_with_context`, `apply_codex_metadata`, `ChatGptProvider::new`, and `ChatGptProvider::chat_with_observer` impact LOW.
+- Added sanitized native-shape ChatGPT/Codex fixtures for request body, request identity headers, successful SSE, incomplete SSE, failed SSE, rate-limit SSE, function tool-call SSE, and custom tool-call SSE.
+- Validation: `cargo fmt --check`, native Codex fixture target tests, existing ChatGPT Codex tool fixture test, and full `cargo test -p claude-proxy-providers` passed.
+- GitNexus: fixture-covered request body/header symbols were LOW; `ResponsesStreamConverter::process_event` impact is CRITICAL as the central Responses streaming conversion entrypoint, so this phase only added fixture coverage and did not change streaming conversion behavior.
 
 Prerequisites:
 - None
 
 Resume next:
-- Add broader real/native Codex fixture snapshots, or continue with observability fields for effective request identity and output budgets.
+- Continue with observability fields for effective request identity and output budgets, then evaluate output-limit error mapping if upstream failures still surface.
 
 ## Backlog / Future（待办 / 未来）
 

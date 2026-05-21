@@ -1,0 +1,11 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_custom_tool","model":"gpt-5.3-codex","usage":{"input_tokens":10,"output_tokens":0}}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_fixture_1","call_id":"call_custom_fixture_1","name":"python"}}
+
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_fixture_1","delta":"print(\""}
+
+data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_fixture_1","delta":"hi\")\n"}
+
+data: {"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_fixture_1","input":"print(\"hi\")\n"}
+
+data: {"type":"response.completed","response":{"id":"resp_fixture_custom_tool","model":"gpt-5.3-codex","status":"completed","output":[{"type":"custom_tool_call"}],"usage":{"input_tokens":10,"output_tokens":5}}}

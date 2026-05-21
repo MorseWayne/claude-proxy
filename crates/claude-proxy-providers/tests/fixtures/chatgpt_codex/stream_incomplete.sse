@@ -1,0 +1,5 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_incomplete","model":"gpt-5.3-codex","usage":{"input_tokens":20,"output_tokens":0}}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}
+
+data: {"type":"response.incomplete","response":{"id":"resp_fixture_incomplete","model":"gpt-5.3-codex","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":20,"output_tokens":7}}}

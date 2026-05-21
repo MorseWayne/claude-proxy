@@ -1,0 +1,5 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_success","model":"gpt-5.3-codex","usage":{"input_tokens":12,"output_tokens":0}}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"done"}
+
+data: {"type":"response.completed","response":{"id":"resp_fixture_success","model":"gpt-5.3-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":12,"output_tokens":3}}}

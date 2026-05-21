@@ -1726,6 +1726,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_native_codex_rate_limit_sse_fixture() {
+        let fixture = include_str!("../tests/fixtures/chatgpt_codex/stream_rate_limit.sse");
+        let event = chatgpt_codex_fixture_sse_events(fixture)
+            .into_iter()
+            .find(|event| event["type"] == "codex.rate_limits")
+            .expect("codex.rate_limits fixture event");
+
+        let snapshot =
+            rate_limit_snapshot_from_sse_event("chatgpt", &event, 999).expect("snapshot");
+
+        assert_eq!(snapshot.provider_id, "chatgpt");
+        assert_eq!(snapshot.feature.as_deref(), Some("codex"));
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        assert_eq!(snapshot.primary.as_ref().unwrap().used_percent, 55.5);
+        assert_eq!(snapshot.primary.as_ref().unwrap().window_minutes, Some(300));
+        assert_eq!(
+            snapshot.secondary.as_ref().unwrap().window_minutes,
+            Some(10080)
+        );
+        assert_eq!(
+            snapshot.credits.as_ref().unwrap().balance.as_deref(),
+            Some("3.25")
+        );
+        assert_eq!(snapshot.source, RateLimitSource::StreamEvent);
+    }
+
+    #[test]
     fn chatgpt_models_include_reasoning_capabilities() {
         let models = chatgpt_models();
         let gpt55 = models
@@ -1806,6 +1833,27 @@ mod tests {
             headers.user_agent.to_str().unwrap(),
             "anthropic-bridge/claude-proxy"
         );
+    }
+
+    #[test]
+    fn chatgpt_request_headers_match_native_codex_fixture() {
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/chatgpt_codex/native_request_headers.json"
+        ))
+        .expect("valid native headers fixture");
+        let config = claude_proxy_config::settings::ChatGptProviderConfig {
+            identity_preset: ChatGptIdentityPreset::Codex,
+            ..Default::default()
+        };
+
+        let headers = chatgpt_request_headers(&config).unwrap();
+        let actual = json!({
+            "identity_preset": headers.identity_preset.as_str(),
+            "originator": headers.originator.to_str().unwrap(),
+            "user_agent": headers.user_agent.to_str().unwrap(),
+        });
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1973,6 +2021,61 @@ mod tests {
             body["client_metadata"]["x-claude-proxy-identity-preset"],
             "codex"
         );
+    }
+
+    #[test]
+    fn chatgpt_responses_body_matches_native_codex_fixture_shape() {
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/chatgpt_codex/native_request_body.json"
+        ))
+        .expect("valid native body fixture");
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("List changed files.".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            tools: Some(vec![Tool {
+                name: "Bash".to_string(),
+                description: Some("Run a shell command".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["command"]
+                }),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({
+                "prompt_cache_key": "thread-fixture",
+                "client_metadata": {
+                    "x-codex-window-id": "window-from-request"
+                }
+            })),
+            extra: Default::default(),
+        };
+
+        let actual = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                installation_id: Some("install-fixture"),
+                prompt_cache_key: Some("thread-fallback"),
+                window_id: Some("window-runtime"),
+                identity_preset: Some("codex"),
+            },
+        );
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2397,6 +2500,24 @@ mod tests {
 
         assert_eq!(body["instructions"].as_str().unwrap().len(), 250_000);
         assert!(body["input"][0]["content"].as_str().unwrap().len() < 200_000);
+    }
+
+    fn chatgpt_codex_fixture_sse_events(fixture: &str) -> Vec<Value> {
+        fixture
+            .split("\n\n")
+            .filter_map(|frame| {
+                let data = frame
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if data.is_empty() || data == "[DONE]" {
+                    return None;
+                }
+                Some(serde_json::from_str(&data).expect("valid SSE fixture JSON"))
+            })
+            .collect()
     }
 
     async fn test_chatgpt_provider(endpoint: String) -> ChatGptProvider {
