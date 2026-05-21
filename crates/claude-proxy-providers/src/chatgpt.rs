@@ -275,8 +275,13 @@ impl ChatGptProvider {
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         let mut prompt_too_long_attempts = 0;
+        let mut retried_without_max_output_tokens = false;
 
         loop {
+            let current_budget = ChatGptOutputTokenBudget {
+                requested: budget.requested,
+                effective: body.get("max_output_tokens").and_then(Value::as_u64),
+            };
             let response = self
                 .send_responses_request(
                     body,
@@ -284,7 +289,7 @@ impl ChatGptProvider {
                     compact_request,
                     request_id,
                     prompt_too_long_attempts,
-                    budget,
+                    current_budget,
                 )
                 .await?;
             let status = response.status();
@@ -306,6 +311,24 @@ impl ChatGptProvider {
             }
 
             let error_body = read_upstream_response_text(response).await?;
+            if !retried_without_max_output_tokens
+                && body.get("max_output_tokens").is_some()
+                && is_unsupported_parameter_error(status, &error_body, "max_output_tokens")
+            {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("max_output_tokens");
+                }
+                retried_without_max_output_tokens = true;
+                warn!(
+                    request_id,
+                    compact_request,
+                    prompt_too_long_attempt = prompt_too_long_attempts,
+                    parameter = "max_output_tokens",
+                    "Retrying ChatGPT request without unsupported upstream parameter"
+                );
+                continue;
+            }
+
             if !is_prompt_too_long_error(status, &error_body) {
                 return Err(map_chatgpt_error_status_body(status, error_body));
             }
@@ -1310,16 +1333,31 @@ fn is_prompt_too_long_candidate_status(status: StatusCode) -> bool {
     )
 }
 
+fn is_unsupported_parameter_error(status: StatusCode, body: &str, parameter: &str) -> bool {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let normalized = chatgpt_error_message_from_body(body)
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ");
+    let parameter = parameter.to_ascii_lowercase().replace(['-', '_'], " ");
+    normalized.contains(&parameter)
+        && [
+            "unsupported parameter",
+            "unknown parameter",
+            "unrecognized parameter",
+            "unrecognized request argument",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
 fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderError {
-    let mut message = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| body.clone());
+    let mut message = chatgpt_error_message_from_body(&body);
     if let Some(output_limit_message) = chatgpt_output_limit_error_message(status, &message) {
         message = output_limit_message;
     }
@@ -1339,6 +1377,25 @@ fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderEr
             body,
         },
     }
+}
+
+fn chatgpt_error_message_from_body(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            ["/error/message", "/detail", "/message"]
+                .iter()
+                .find_map(|pointer| value.pointer(pointer).and_then(chatgpt_error_message_value))
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
+fn chatgpt_error_message_value(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.is_null().then(String::new))
+        .filter(|message| !message.is_empty())
 }
 
 fn chatgpt_output_limit_error_message(status: StatusCode, message: &str) -> Option<String> {
@@ -2629,6 +2686,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_retries_without_unsupported_max_output_tokens() {
+        let (endpoint, requests) = unsupported_max_output_tokens_retry_server().await;
+        let provider = test_chatgpt_provider(endpoint).await;
+        let token = ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account".to_string()),
+        };
+        let mut body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [{"role": "user", "content": "hi"}],
+            "max_output_tokens": 4096,
+            "stream": true
+        });
+
+        let response = provider
+            .send_responses_request_with_prompt_too_long_retry(
+                &mut body,
+                &token,
+                false,
+                1,
+                ChatGptOutputTokenBudget {
+                    requested: Some(4096),
+                    effective: Some(4096),
+                },
+                None,
+            )
+            .await
+            .expect("unsupported parameter retry should succeed");
+
+        assert!(response.status().is_success());
+        assert!(body.get("max_output_tokens").is_none());
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["max_output_tokens"], 4096);
+        assert!(requests[1].get("max_output_tokens").is_none());
+    }
+
+    #[tokio::test]
     async fn chatgpt_send_responses_request_adds_codex_session_headers() {
         let (endpoint, requests) = capture_once_server().await;
         let provider = test_chatgpt_provider(endpoint).await;
@@ -2779,6 +2876,24 @@ mod tests {
         match error {
             ProviderError::InvalidRequest(message) => {
                 assert_eq!(message, "bad tool schema");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_parameter_detection_reads_detail_body() {
+        let body = r#"{"detail":"Unsupported parameter: max_output_tokens"}"#;
+        assert!(is_unsupported_parameter_error(
+            StatusCode::BAD_REQUEST,
+            body,
+            "max_output_tokens"
+        ));
+
+        let error = map_chatgpt_error_status_body(StatusCode::BAD_REQUEST, body.to_string());
+        match error {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "Unsupported parameter: max_output_tokens");
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -2990,6 +3105,40 @@ mod tests {
                     (
                         "400 Bad Request",
                         r#"{"error":{"message":"Prompt is too long: 20 tokens > 10 maximum"}}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"ok":true}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{addr}/responses"), requests)
+    }
+
+    async fn unsupported_max_output_tokens_retry_server() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_http_request_body(&mut socket).await;
+                captured_requests
+                    .lock()
+                    .await
+                    .push(serde_json::from_slice(&body).unwrap());
+
+                let (status, response_body) = if attempt == 0 {
+                    (
+                        "400 Bad Request",
+                        r#"{"detail":"Unsupported parameter: max_output_tokens"}"#,
                     )
                 } else {
                     ("200 OK", r#"{"ok":true}"#)

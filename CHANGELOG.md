@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.1 - 2026-05-21
+
+### Fixed
+
+- ChatGPT/Codex requests now retry once without `max_output_tokens` when the upstream backend responds with `Unsupported parameter: max_output_tokens`. Backends that support the field still receive it on the first request, preserving output-budget control where available.
+- ChatGPT upstream error mapping now reads top-level `detail` messages in addition to OpenAI-style `error.message`, so unsupported-parameter failures surface as clearer client errors if retry fallback cannot recover.
+
 ## v1.1.0 - 2026-05-21
 
 This release focuses on ChatGPT/Codex compatibility, output-budget resilience, and safer production diagnostics. It is backward compatible with v1.0.5.
