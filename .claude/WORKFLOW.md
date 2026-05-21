@@ -5,12 +5,12 @@
 ## Active（进行中）
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
-Status: In Progress
+Status: Completed
 Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Advanced Codex parity
+Current phase: Closed
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
@@ -22,7 +22,7 @@ Current todo:
 - [x] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
 - [x] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
 - [x] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
-- [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
+- [x] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 
 Changes:
 - Baseline completed in `73648f4`: ChatGPT `/responses` now sends Codex-style request defaults, stable runtime metadata, and session/thread/window headers.
@@ -46,12 +46,14 @@ Changes:
 - Added ChatGPT provider-side output-limit error normalization: upstream `max_output_tokens` / `max_tokens` limit failures now surface as clear Anthropic-compatible `max_tokens` guidance while preserving 400 vs 413 response classes.
 - Validation: `cargo fmt --check`, output-limit target tests, prompt-too-long detection regression, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-providers -- -D warnings` passed.
 - GitNexus: `map_chatgpt_error_status_body` impact LOW; generic server error response functions were HIGH, so this phase avoided changing the `/v1/messages` response shell.
+- Added Advanced Codex parity decision record in [2026-05-21-chatgpt-advanced-codex-parity.md](../docs/superpowers/plans/2026-05-21-chatgpt-advanced-codex-parity.md): keep HTTP SSE stable; defer Codex App Server turn replay, Responses WebSocket transport, and residency routing until upstream/client requirements are concrete; retain existing automatic `ChatGPT-Account-Id` forwarding.
+- Validation: `git diff --check` passed; Rust tests were not run because this closeout only changes docs/workflow notes.
 
 Prerequisites:
 - None
 
 Resume next:
-- Evaluate Advanced Codex parity items: turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing.
+- None. Workflow is closed; reopen only if a new upstream Codex transport or lifecycle requirement appears.
 
 ## Backlog / Future（待办 / 未来）
 
