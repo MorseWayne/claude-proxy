@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.2 - 2026-05-21
+
+### Changed
+
+- ChatGPT/Codex and Copilot `/responses` requests now omit `max_output_tokens` by default so only public OpenAI Responses requests keep that field.
+- Removed the ChatGPT/Codex retry fallback for upstream `Unsupported parameter: max_output_tokens` responses; output limits are now handled by not sending that unsupported field on backends that do not use it.
+
 ## v1.1.1 - 2026-05-21
 
 ### Fixed

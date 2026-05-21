@@ -273,7 +273,10 @@ impl CopilotProvider {
         let url = format!("{}/responses", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
         let headers = self.build_headers(token, vision, initiator);
-        let body = crate::responses::convert_to_responses(&request);
+        let mut body = crate::responses::convert_to_responses(&request);
+        if let Some(object) = body.as_object_mut() {
+            object.remove("max_output_tokens");
+        }
 
         debug!("Copilot responses API request to {url}");
 

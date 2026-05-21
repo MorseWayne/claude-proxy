@@ -12,7 +12,6 @@
     }
   ],
   "instructions": "Follow the user's instructions.",
-  "max_output_tokens": 4096,
   "model": "gpt-5.3-codex",
   "parallel_tool_calls": true,
   "prompt_cache_key": "thread-fixture",
