@@ -10,7 +10,7 @@ Level: 3
 Priority: Continue from Backlog after Codex request metadata baseline
 Started: 2026-05-21
 Last updated: 2026-05-21
-Current phase: Fixture tests
+Current phase: Output limit errors
 
 Intent:
 - Improve ChatGPT/Codex compatibility beyond the baseline in `73648f4`, starting with output budget governance for oversized Claude Code responses.
@@ -21,7 +21,7 @@ Current todo:
 - [x] Codex SSE parity: map `response.custom_tool_call_input.delta` / `.done` and `custom_tool_call` output items into Anthropic `tool_use` events with fixture coverage.
 - [x] Compatibility presets: make `codex`, `opencode`, and `anthropic-bridge` request identity defaults explicit for originator, user agent, headers, and body metadata behavior.
 - [x] Fixture tests: add snapshot fixtures from real/native Codex request body, headers, successful SSE, incomplete, failed, rate-limit, and tool-call streams.
-- [ ] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
+- [x] Observability: expose upstream request id, model header, stop reason, rate-limit summary, body bytes, and requested/effective output token budget in structured logs or admin metrics without prompt content.
 - [ ] Advanced Codex parity: evaluate turn-state replay, WebSocket Responses transport, FedRAMP/residency routing headers, and account-specific routing only after the HTTP SSE path is stable.
 
 Changes:
@@ -40,12 +40,15 @@ Changes:
 - Added sanitized native-shape ChatGPT/Codex fixtures for request body, request identity headers, successful SSE, incomplete SSE, failed SSE, rate-limit SSE, function tool-call SSE, and custom tool-call SSE.
 - Validation: `cargo fmt --check`, native Codex fixture target tests, existing ChatGPT Codex tool fixture test, and full `cargo test -p claude-proxy-providers` passed.
 - GitNexus: fixture-covered request body/header symbols were LOW; `ResponsesStreamConverter::process_event` impact is CRITICAL as the central Responses streaming conversion entrypoint, so this phase only added fixture coverage and did not change streaming conversion behavior.
+- Added prompt-content-free ChatGPT structured logs for request identity, upstream request/response ids, upstream model header, terminal SSE stop reason, response header / stream rate-limit summaries, body bytes, and requested/effective output token budgets.
+- Validation: `cargo fmt --check`, ChatGPT observability target tests, output-token clamp budget test, full `cargo test -p claude-proxy-providers`, and `cargo clippy -p claude-proxy-providers -- -D warnings` passed.
+- GitNexus: `send_responses_request`, `ChatGptProvider::chat_with_observer`, `rate_limit_snapshots_from_headers`, and `rate_limit_snapshot_from_sse_event` impact LOW.
 
 Prerequisites:
 - None
 
 Resume next:
-- Continue with observability fields for effective request identity and output budgets, then evaluate output-limit error mapping if upstream failures still surface.
+- Evaluate output-limit error mapping if upstream/client output-limit failures still surface after truncation and token budget clamps.
 
 ## Backlog / Future（待办 / 未来）
 

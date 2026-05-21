@@ -121,6 +121,12 @@ struct CachedRateLimits {
     fetched_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChatGptOutputTokenBudget {
+    requested: Option<u64>,
+    effective: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct ChatGptRequestHeaders {
     identity_preset: ChatGptIdentityPreset,
@@ -179,14 +185,29 @@ impl ChatGptProvider {
         compact_request: bool,
         request_id: u64,
         prompt_too_long_attempt: usize,
+        budget: ChatGptOutputTokenBudget,
     ) -> Result<Response, ProviderError> {
         let body_bytes = json_len(body);
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
         let started_at = Instant::now();
         info!(
             request_id,
             compact_request,
             prompt_too_long_attempt,
+            model,
             body_bytes,
+            upstream_request_id = %self.thread_id,
+            session_id = %self.session_id,
+            thread_id = %self.thread_id,
+            window_id = %self.window_id,
+            identity_preset = self.request_headers.identity_preset.as_str(),
+            requested_output_tokens = budget.requested.unwrap_or(0),
+            requested_output_tokens_present = budget.requested.is_some(),
+            effective_output_tokens = budget.effective.unwrap_or(0),
+            effective_output_tokens_present = budget.effective.is_some(),
             endpoint = %self.endpoint,
             "ChatGPT upstream request started"
         );
@@ -216,11 +237,15 @@ impl ChatGptProvider {
 
         match &result {
             Ok(response) => {
+                let upstream_response_id = upstream_request_id_from_headers(response.headers());
+                let upstream_model_header = upstream_model_from_headers(response.headers());
                 info!(
                     request_id,
                     compact_request,
                     prompt_too_long_attempt,
                     status = response.status().as_u16(),
+                    upstream_request_id = upstream_response_id.as_deref().unwrap_or(""),
+                    upstream_model_header = upstream_model_header.as_deref().unwrap_or(""),
                     elapsed_ms = elapsed_millis(started_at),
                     "ChatGPT upstream response headers received"
                 );
@@ -246,6 +271,7 @@ impl ChatGptProvider {
         token: &ChatGptToken,
         compact_request: bool,
         request_id: u64,
+        budget: ChatGptOutputTokenBudget,
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         let mut prompt_too_long_attempts = 0;
@@ -258,6 +284,7 @@ impl ChatGptProvider {
                     compact_request,
                     request_id,
                     prompt_too_long_attempts,
+                    budget,
                 )
                 .await?;
             let status = response.status();
@@ -446,6 +473,160 @@ fn merge_rate_limit_snapshot(
     }
 }
 
+fn header_value_from_any(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_value_from_any(
+        headers,
+        &[
+            "x-request-id",
+            "x-openai-request-id",
+            "openai-request-id",
+            "cf-ray",
+        ],
+    )
+}
+
+fn upstream_model_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_value_from_any(
+        headers,
+        &["openai-model", "x-openai-model", "x-model", "model"],
+    )
+}
+
+fn chatgpt_output_token_budget(
+    request: &MessagesRequest,
+    body: &Value,
+) -> ChatGptOutputTokenBudget {
+    ChatGptOutputTokenBudget {
+        requested: request.max_tokens.map(u64::from),
+        effective: body.get("max_output_tokens").and_then(Value::as_u64),
+    }
+}
+
+fn log_rate_limit_summary(
+    request_id: u64,
+    compact_request: bool,
+    source: &str,
+    snapshots: &[RateLimitSnapshot],
+) {
+    if snapshots.is_empty() {
+        return;
+    }
+    let summary = rate_limit_summary(snapshots);
+    info!(
+        request_id,
+        compact_request,
+        source,
+        rate_limit_summary = %summary,
+        "ChatGPT upstream rate-limit summary observed"
+    );
+}
+
+fn rate_limit_summary(snapshots: &[RateLimitSnapshot]) -> String {
+    snapshots
+        .iter()
+        .map(rate_limit_snapshot_summary)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn rate_limit_snapshot_summary(snapshot: &RateLimitSnapshot) -> String {
+    let label = snapshot
+        .limit_name
+        .as_deref()
+        .or(snapshot.feature.as_deref())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("codex");
+    let mut parts = Vec::new();
+    if let Some(plan_type) = snapshot.plan_type.as_deref() {
+        parts.push(format!("plan={plan_type}"));
+    }
+    if let Some(primary) = snapshot.primary.as_ref() {
+        parts.push(format_rate_limit_window_summary("primary", primary));
+    }
+    if let Some(secondary) = snapshot.secondary.as_ref() {
+        parts.push(format_rate_limit_window_summary("secondary", secondary));
+    }
+    if let Some(credits) = snapshot.credits.as_ref()
+        && let Some(balance) = credits.balance.as_deref()
+    {
+        parts.push(format!("credits={balance}"));
+    }
+    if let Some(kind) = snapshot.rate_limit_reached_type.as_deref() {
+        parts.push(format!("reached={kind}"));
+    }
+
+    if parts.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}:{}", parts.join(","))
+    }
+}
+
+fn format_rate_limit_window_summary(label: &str, window: &RateLimitWindow) -> String {
+    let mut summary = format!("{label}={:.1}%", window.used_percent);
+    if let Some(minutes) = window.window_minutes {
+        summary.push_str(&format!("/{minutes}m"));
+    }
+    summary
+}
+
+fn chatgpt_sse_stop_reason(event: &Value) -> Option<&'static str> {
+    match event.get("type").and_then(Value::as_str)? {
+        "response.completed" | "response.incomplete" | "response.failed" => {}
+        _ => return None,
+    }
+    let response = event.get("response").unwrap_or(event);
+    if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
+        return Some(match reason {
+            "max_output_tokens" => "max_tokens",
+            "content_filter" | "content_policy_violation" => "refusal",
+            _ => "end_turn",
+        });
+    }
+    if response["status"].as_str() == Some("failed") {
+        return Some("error");
+    }
+    if response["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("function_call" | "custom_tool_call")
+            )
+        })
+    }) {
+        Some("tool_use")
+    } else {
+        Some("end_turn")
+    }
+}
+
+fn chatgpt_sse_model(event: &Value) -> Option<&str> {
+    event
+        .get("response")
+        .unwrap_or(event)
+        .get("model")
+        .and_then(Value::as_str)
+}
+
+fn chatgpt_sse_response_id(event: &Value) -> Option<&str> {
+    event
+        .get("response")
+        .unwrap_or(event)
+        .get("id")
+        .and_then(Value::as_str)
+}
+
 #[async_trait]
 impl Provider for ChatGptProvider {
     fn id(&self) -> &str {
@@ -477,6 +658,7 @@ impl Provider for ChatGptProvider {
                 identity_preset: Some(self.request_headers.identity_preset.as_str()),
             },
         );
+        let output_token_budget = chatgpt_output_token_budget(&request, &body);
         let request_id = next_chatgpt_request_id();
         log_request_observability("chatgpt", "/responses", &body);
         let compact_request = is_compact_request_body(&body);
@@ -488,6 +670,7 @@ impl Provider for ChatGptProvider {
                 &token,
                 compact_request,
                 request_id,
+                output_token_budget,
                 observer.as_ref(),
             )
             .await?;
@@ -507,6 +690,7 @@ impl Provider for ChatGptProvider {
                     &refreshed,
                     compact_request,
                     request_id,
+                    output_token_budget,
                     observer.as_ref(),
                 )
                 .await?;
@@ -521,6 +705,12 @@ impl Provider for ChatGptProvider {
 
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
+        log_rate_limit_summary(
+            request_id,
+            compact_request,
+            "response_headers",
+            &header_snapshots,
+        );
         self.cache_rate_limits(header_snapshots).await;
 
         let cache = Arc::clone(&self.cached_rate_limits);
@@ -546,10 +736,26 @@ impl Provider for ChatGptProvider {
                 if let Some(snapshot) =
                     rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
                 {
+                    log_rate_limit_summary(
+                        request_id,
+                        compact_request,
+                        "stream_event",
+                        std::slice::from_ref(&snapshot),
+                    );
                     let cache = Arc::clone(&cache);
                     tokio::spawn(async move {
                         cache_rate_limits_into(&cache, vec![snapshot]).await;
                     });
+                }
+                if let Some(stop_reason) = chatgpt_sse_stop_reason(event) {
+                    info!(
+                        request_id,
+                        compact_request,
+                        upstream_stop_reason = stop_reason,
+                        upstream_model = chatgpt_sse_model(event).unwrap_or("unknown"),
+                        upstream_response_id = chatgpt_sse_response_id(event).unwrap_or(""),
+                        "ChatGPT upstream terminal SSE event received"
+                    );
                 }
             });
         let first_stream_item_seen = Arc::new(AtomicBool::new(false));
@@ -1690,6 +1896,38 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_observability_extracts_upstream_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "req_123".parse().unwrap());
+        headers.insert("openai-model", "gpt-5.3-codex".parse().unwrap());
+
+        assert_eq!(
+            upstream_request_id_from_headers(&headers).as_deref(),
+            Some("req_123")
+        );
+        assert_eq!(
+            upstream_model_from_headers(&headers).as_deref(),
+            Some("gpt-5.3-codex")
+        );
+    }
+
+    #[test]
+    fn chatgpt_observability_formats_rate_limit_summary() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "40".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert("x-codex-credits-balance", "7.50".parse().unwrap());
+        headers.insert("x-agent-primary-used-percent", "9.5".parse().unwrap());
+        headers.insert("x-agent-limit-name", "Agent".parse().unwrap());
+
+        let snapshots = rate_limit_snapshots_from_headers("chatgpt", &headers, 456);
+        let summary = rate_limit_summary(&snapshots);
+
+        assert!(summary.contains("Agent:primary=9.5%"));
+        assert!(summary.contains("codex:primary=40.0%/300m,credits=7.50"));
+    }
+
+    #[test]
     fn parses_codex_rate_limit_sse_event() {
         let snapshot = rate_limit_snapshot_from_sse_event(
             "chatgpt",
@@ -1750,6 +1988,49 @@ mod tests {
             Some("3.25")
         );
         assert_eq!(snapshot.source, RateLimitSource::StreamEvent);
+    }
+
+    #[test]
+    fn chatgpt_observability_derives_terminal_sse_stop_reason() {
+        assert_eq!(
+            chatgpt_sse_stop_reason(&json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "gpt-5.3-codex",
+                    "status": "completed",
+                    "output": [{"type": "message"}]
+                }
+            })),
+            Some("end_turn")
+        );
+        assert_eq!(
+            chatgpt_sse_stop_reason(&json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [{"type": "custom_tool_call"}]
+                }
+            })),
+            Some("tool_use")
+        );
+        assert_eq!(
+            chatgpt_sse_stop_reason(&json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            })),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            chatgpt_sse_stop_reason(&json!({
+                "type": "response.failed",
+                "response": {"status": "failed"}
+            })),
+            Some("error")
+        );
     }
 
     #[test]
@@ -2253,6 +2534,13 @@ mod tests {
         let body = build_chatgpt_responses_body(&req);
 
         assert_eq!(body["max_output_tokens"], 16_384);
+        assert_eq!(
+            chatgpt_output_token_budget(&req, &body),
+            ChatGptOutputTokenBudget {
+                requested: Some(128_000),
+                effective: Some(16_384)
+            }
+        );
     }
 
     #[tokio::test]
@@ -2275,7 +2563,14 @@ mod tests {
         });
 
         let response = provider
-            .send_responses_request_with_prompt_too_long_retry(&mut body, &token, false, 1, None)
+            .send_responses_request_with_prompt_too_long_retry(
+                &mut body,
+                &token,
+                false,
+                1,
+                ChatGptOutputTokenBudget::default(),
+                None,
+            )
             .await
             .expect("retry should succeed");
 
@@ -2304,7 +2599,17 @@ mod tests {
         });
 
         let response = provider
-            .send_responses_request(&body, &token, false, 1, 0)
+            .send_responses_request(
+                &body,
+                &token,
+                false,
+                1,
+                0,
+                ChatGptOutputTokenBudget {
+                    requested: Some(4096),
+                    effective: body.get("max_output_tokens").and_then(Value::as_u64),
+                },
+            )
             .await
             .expect("request should succeed");
 
@@ -2352,6 +2657,7 @@ mod tests {
                 &token,
                 false,
                 1,
+                ChatGptOutputTokenBudget::default(),
                 Some(&observer),
             )
             .await
