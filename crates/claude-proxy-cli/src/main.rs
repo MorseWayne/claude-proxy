@@ -92,6 +92,11 @@ enum ProviderAction {
         /// Provider ID to fetch models for
         id: String,
     },
+    /// Run an explicit OAuth login flow for ChatGPT or Copilot
+    Login {
+        /// Provider ID to authenticate
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -371,65 +376,17 @@ async fn handle_provider(action: ProviderAction) {
                     "{}",
                     format!("Authenticating with {}...", provider_type.display_name()).bold()
                 );
-                let provider_proxy = settings
-                    .providers
-                    .get(&provider_id)
-                    .map(|cfg| cfg.proxy.as_str())
-                    .unwrap_or("");
-                let client = match build_oauth_http_client(&settings, provider_proxy) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("{} Failed to build HTTP client: {e}", "✗".red().bold());
-                        if !settings.http.extra_ca_certs.is_empty() {
-                            eprintln!(
-                                "  hint: check that http.extra_ca_certs entries are readable PEM files"
-                            );
-                        }
-                        return;
-                    }
-                };
-                let auth_result = match &provider_type {
-                    ProviderType::Copilot => {
-                        match claude_proxy_providers::copilot::auth::CopilotAuth::new(
-                            client, "vscode",
-                        )
-                        .await
-                        {
-                            Ok(auth) => match auth.run_device_flow().await {
-                                Ok(_) => {
-                                    let _ = auth.refresh_copilot_token().await;
-                                    Ok(())
-                                }
-                                Err(e) => Err(e),
-                            },
-                            Err(e) => Err(e),
-                        }
-                    }
-                    ProviderType::ChatGPT => {
-                        match claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await {
-                            Ok(auth) => auth.run_device_flow().await.map(|_| ()),
-                            Err(e) => Err(e),
-                        }
-                    }
-                    _ => Ok(()),
-                };
+                let auth_result = login_oauth_provider(
+                    &settings,
+                    settings.providers.get(&provider_id).unwrap(),
+                    &provider_type,
+                )
+                .await;
 
                 if let Err(e) = auth_result {
                     eprintln!("{} Authentication failed: {e}", "✗".red().bold());
                     if matches!(e, claude_proxy_providers::ProviderError::Network(_)) {
-                        let cfg_path = claude_proxy_config::Settings::config_file_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
-                        let err_text = e.to_string();
-                        if err_text.contains("dns error") || err_text.contains("lookup address") {
-                            eprintln!(
-                                "  hint: DNS lookup failed before TLS. Check your DNS/network,\n        or set this provider's proxy in {cfg_path}\n        example: proxy = \"http://127.0.0.1:7890\""
-                            );
-                        } else {
-                            eprintln!(
-                                "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
-                            );
-                        }
+                        print_oauth_failure_hint(&settings, &e);
                     }
                     return;
                 }
@@ -669,6 +626,40 @@ async fn handle_provider(action: ProviderAction) {
                 }
             }
         }
+        ProviderAction::Login { id } => {
+            let settings = load_settings_or_exit();
+            let Some(provider_config) = settings.providers.get(&id) else {
+                eprintln!("{} Provider \"{}\" not found.", "Error:".red().bold(), id);
+                process::exit(1);
+            };
+            let provider_type = provider_config.resolve_type(&id);
+            if provider_type != ProviderType::ChatGPT && provider_type != ProviderType::Copilot {
+                eprintln!(
+                    "{} Provider \"{}\" uses {} auth and does not support OAuth login.",
+                    "Error:".red().bold(),
+                    id,
+                    provider_type.display_name()
+                );
+                process::exit(1);
+            }
+
+            println!(
+                "{}",
+                format!("Authenticating with {}...", provider_type.display_name()).bold()
+            );
+            match login_oauth_provider(&settings, provider_config, &provider_type).await {
+                Ok(()) => println!(
+                    "{} {} authentication successful!",
+                    "✓".green().bold(),
+                    provider_type.display_name()
+                ),
+                Err(e) => {
+                    eprintln!("{} Authentication failed: {e}", "✗".red().bold());
+                    print_oauth_failure_hint(&settings, &e);
+                    process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -866,10 +857,61 @@ async fn handle_server(action: ServerAction) {
     }
 }
 
-/// Build the reqwest client used by the interactive Copilot OAuth device
-/// flow. Honours `http.connect_timeout`, `http.read_timeout`, and
-/// provider proxy, `http.extra_ca_certs`, and HTTP timeouts so the CLI behaves
-/// the same as the server-side providers.
+async fn login_oauth_provider(
+    settings: &claude_proxy_config::Settings,
+    provider_config: &ProviderConfig,
+    provider_type: &ProviderType,
+) -> Result<(), claude_proxy_providers::ProviderError> {
+    let client = build_oauth_http_client(settings, &provider_config.proxy)
+        .map_err(claude_proxy_providers::ProviderError::Network)?;
+    match provider_type {
+        ProviderType::Copilot => {
+            let auth =
+                claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await?;
+            auth.run_device_flow().await?;
+            let _ = auth.refresh_copilot_token().await;
+            Ok(())
+        }
+        ProviderType::ChatGPT => {
+            let auth = claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await?;
+            auth.run_device_flow().await.map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn print_oauth_failure_hint(
+    settings: &claude_proxy_config::Settings,
+    error: &claude_proxy_providers::ProviderError,
+) {
+    if !matches!(error, claude_proxy_providers::ProviderError::Network(_)) {
+        return;
+    }
+    if error
+        .to_string()
+        .starts_with("network error: invalid proxy")
+    {
+        eprintln!("  hint: check this provider's proxy setting in config.toml");
+        return;
+    }
+    let cfg_path = claude_proxy_config::Settings::config_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/claude-proxy/config.toml".into());
+    let err_text = error.to_string();
+    if err_text.contains("dns error") || err_text.contains("lookup address") {
+        eprintln!(
+            "  hint: DNS lookup failed before TLS. Check your DNS/network,\n        or set this provider's proxy in {cfg_path}\n        example: proxy = \"http://127.0.0.1:7890\""
+        );
+    } else if !settings.http.extra_ca_certs.is_empty() {
+        eprintln!("  hint: check that http.extra_ca_certs entries are readable PEM files");
+    } else {
+        eprintln!(
+            "  hint: if your network performs TLS interception (Fortinet,\n        Zscaler, ...), add the corporate root CA path to\n        http.extra_ca_certs in {cfg_path}\n        example: extra_ca_certs = [\"/etc/ssl/certs/ca-certificates.crt\"]"
+        );
+    }
+}
+
+/// Build the reqwest client used by the interactive OAuth device flows.
 fn build_oauth_http_client(
     settings: &claude_proxy_config::Settings,
     proxy: &str,

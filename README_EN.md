@@ -129,8 +129,9 @@ enable_agent_marking = true             # Enable sub-agent traffic marking
 base_url = "https://chatgpt.com/backend-api/codex"
 
 [providers.chatgpt.chatgpt]
-originator = "opencode"
-user_agent = "opencode/claude-proxy"
+# Default User-Agent uses local `codex --version` when available, then this fallback.
+# originator = "codex_cli_rs"
+# user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
 
 [model]
 default = "openai/gpt-4.1"

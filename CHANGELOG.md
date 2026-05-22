@@ -20,12 +20,8 @@ This release focuses on ChatGPT/Codex compatibility, output-budget resilience, a
 
 ### Added
 
-- ChatGPT/Codex request metadata parity for `/responses` requests: Codex-style `originator`, `User-Agent`, `session-id`, `thread-id`, `x-codex-window-id`, optional `ChatGPT-Account-Id`, and matching `client_metadata`.
-- ChatGPT identity presets under `[providers.<name>.chatgpt]`:
-  - `identity_preset = "opencode"` keeps the existing default behavior.
-  - `identity_preset = "codex"` uses Codex-style request identity.
-  - `identity_preset = "anthropic-bridge"` explicitly marks Anthropic bridge traffic.
-  - `originator` and `user_agent` remain available as explicit overrides.
+- ChatGPT/Codex request metadata parity for `/responses` requests: Codex-style `originator`, `User-Agent`, `session-id`, `thread-id`, `x-codex-window-id`, optional `ChatGPT-Account-Id`, and native `client_metadata`.
+- ChatGPT requests now default to Codex-style `originator` and `User-Agent`, using local `codex --version` when available and a nonzero fallback otherwise; `originator` and `user_agent` remain available as explicit overrides under `[providers.<name>.chatgpt]`.
 - Responses custom tool-call parity: `custom_tool_call` output items and `response.custom_tool_call_input.delta` / `.done` stream events are converted into Anthropic-compatible `tool_use` events.
 - Native-shape ChatGPT/Codex fixtures for request bodies, headers, successful SSE, incomplete SSE, failed SSE, rate-limit SSE, function tool-call SSE, and custom tool-call SSE.
 - Prompt-content-free ChatGPT upstream observability logs for request identity, upstream request/response ids, upstream model headers, terminal SSE stop reasons, rate-limit summaries, request body size, and requested/effective output-token budgets.

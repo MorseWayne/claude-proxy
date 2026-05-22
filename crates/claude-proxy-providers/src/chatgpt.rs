@@ -8,15 +8,18 @@ mod responses;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::sync::Arc;
+#[cfg(not(test))]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use claude_proxy_config::{
     Settings,
     settings::{
-        ChatGptIdentityPreset, ChatGptProviderConfig, ProviderConfig, ProviderRuntimeConfig,
+        ChatGptProviderConfig, DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT,
+        ProviderConfig, ProviderRuntimeConfig,
     },
 };
 use claude_proxy_core::*;
@@ -55,6 +58,8 @@ const CHATGPT_PTL_RETRY_MARKER: &str =
     "[earlier conversation truncated for ChatGPT prompt-too-long retry]";
 const CHATGPT_PTL_MAX_RETRIES: usize = 3;
 const CHATGPT_PTL_FALLBACK_DROP_DIVISOR: usize = 5;
+const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
+const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -132,7 +137,6 @@ struct ChatGptOutputTokenBudget {
 
 #[derive(Debug, Clone)]
 struct ChatGptRequestHeaders {
-    identity_preset: ChatGptIdentityPreset,
     originator: HeaderValue,
     user_agent: HeaderValue,
 }
@@ -199,6 +203,13 @@ impl ChatGptProvider {
             .get("model")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
+        warn_if_request_nears_context_window(
+            request_id,
+            compact_request,
+            prompt_too_long_attempt,
+            model,
+            body_bytes,
+        );
         let started_at = Instant::now();
         info!(
             request_id,
@@ -210,7 +221,6 @@ impl ChatGptProvider {
             session_id = %self.session_id,
             thread_id = %self.thread_id,
             window_id = %self.window_id,
-            identity_preset = self.request_headers.identity_preset.as_str(),
             requested_output_tokens = budget.requested.unwrap_or(0),
             requested_output_tokens_present = budget.requested.is_some(),
             effective_output_tokens = budget.effective.unwrap_or(0),
@@ -662,7 +672,7 @@ impl Provider for ChatGptProvider {
         request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
-        let token = self.auth.get_token().await?;
+        let token = self.auth.get_existing_token().await?;
         let request = apply_openai_intent(request);
         let marker_mode = marker_mode_from_request(&request);
         let mut body = responses::build_body_with_context(
@@ -671,8 +681,6 @@ impl Provider for ChatGptProvider {
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
                 prompt_cache_key: Some(&self.thread_id),
-                window_id: Some(&self.window_id),
-                identity_preset: Some(self.request_headers.identity_preset.as_str()),
             },
         );
         let output_token_budget = chatgpt_output_token_budget(&request, &body);
@@ -838,18 +846,16 @@ impl Provider for ChatGptProvider {
 fn chatgpt_request_headers(
     config: &ChatGptProviderConfig,
 ) -> Result<ChatGptRequestHeaders, ProviderError> {
-    let identity_preset = config.identity_preset;
     Ok(ChatGptRequestHeaders {
-        identity_preset,
         originator: chatgpt_header_value(
             "originator",
             &config.originator,
-            identity_preset.originator(),
+            DEFAULT_CHATGPT_ORIGINATOR,
         )?,
         user_agent: chatgpt_header_value(
             "User-Agent",
             &config.user_agent,
-            identity_preset.user_agent(),
+            default_chatgpt_user_agent(),
         )?,
     })
 }
@@ -857,7 +863,7 @@ fn chatgpt_request_headers(
 fn chatgpt_header_value(
     header_name: &str,
     configured_value: &str,
-    default_value: &'static str,
+    default_value: &str,
 ) -> Result<HeaderValue, ProviderError> {
     let value = configured_value.trim();
     let value = if value.is_empty() {
@@ -871,6 +877,52 @@ fn chatgpt_header_value(
             "invalid ChatGPT {header_name} header value: {error}"
         ))
     })
+}
+
+fn default_chatgpt_user_agent() -> &'static str {
+    static DEFAULT_USER_AGENT: OnceLock<String> = OnceLock::new();
+    DEFAULT_USER_AGENT
+        .get_or_init(resolve_default_chatgpt_user_agent)
+        .as_str()
+}
+
+fn resolve_default_chatgpt_user_agent() -> String {
+    local_codex_cli_version()
+        .map(|version| format!("codex_cli_rs/{version} (claude-proxy)"))
+        .unwrap_or_else(|| DEFAULT_CHATGPT_USER_AGENT.to_string())
+}
+
+#[cfg(not(test))]
+fn local_codex_cli_version() -> Option<String> {
+    let output = Command::new("codex").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_codex_cli_version(stdout.as_ref()).or_else(|| parse_codex_cli_version(stderr.as_ref()))
+}
+
+#[cfg(test)]
+fn local_codex_cli_version() -> Option<String> {
+    None
+}
+
+fn parse_codex_cli_version(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|ch: char| matches!(ch, '(' | ')' | ',' | ';'));
+        let token = token.strip_prefix('v').unwrap_or(token);
+        is_version_token(token).then(|| token.to_string())
+    })
+}
+
+fn is_version_token(token: &str) -> bool {
+    token.contains('.')
+        && token.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
 }
 
 fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, ProviderError> {
@@ -1763,6 +1815,47 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
+fn chatgpt_request_warning_threshold(model: &str) -> Option<usize> {
+    let context_window = openai_model_info(model).context_window? as usize;
+    Some(
+        context_window
+            .saturating_mul(CHATGPT_REQUEST_WARNING_RATIO)
+            .saturating_div(100)
+            .saturating_mul(CHATGPT_BYTES_PER_ESTIMATED_TOKEN),
+    )
+}
+
+fn request_size_warning(model: &str, body_bytes: usize) -> Option<(usize, usize)> {
+    let threshold_bytes = chatgpt_request_warning_threshold(model)?;
+    (body_bytes >= threshold_bytes).then_some((
+        threshold_bytes,
+        body_bytes / CHATGPT_BYTES_PER_ESTIMATED_TOKEN,
+    ))
+}
+
+fn warn_if_request_nears_context_window(
+    request_id: u64,
+    compact_request: bool,
+    prompt_too_long_attempt: usize,
+    model: &str,
+    body_bytes: usize,
+) {
+    let Some((threshold_bytes, estimated_tokens)) = request_size_warning(model, body_bytes) else {
+        return;
+    };
+    warn!(
+        request_id,
+        compact_request,
+        prompt_too_long_attempt,
+        model,
+        body_bytes,
+        threshold_bytes,
+        estimated_tokens,
+        warning_ratio = CHATGPT_REQUEST_WARNING_RATIO,
+        "ChatGPT request is approaching the model context window"
+    );
+}
+
 fn chatgpt_models() -> Vec<ModelInfo> {
     [
         "gpt-5.5",
@@ -2128,6 +2221,22 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_request_size_warning_uses_model_context_metadata() {
+        let threshold = chatgpt_request_warning_threshold("gpt-5.3-codex").unwrap();
+
+        assert_eq!(
+            threshold,
+            400_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
+        );
+        assert!(request_size_warning("gpt-5.3-codex", threshold - 1).is_none());
+        assert_eq!(
+            request_size_warning("gpt-5.3-codex", threshold),
+            Some((threshold, threshold / CHATGPT_BYTES_PER_ESTIMATED_TOKEN))
+        );
+        assert!(request_size_warning("unknown-model", threshold).is_none());
+    }
+
+    #[test]
     fn chatgpt_models_include_reasoning_capabilities() {
         let models = chatgpt_models();
         let gpt55 = models
@@ -2185,7 +2294,6 @@ mod tests {
         };
 
         let headers = chatgpt_request_headers(&config).unwrap();
-        assert_eq!(headers.identity_preset, ChatGptIdentityPreset::Opencode);
         assert_eq!(headers.originator.to_str().unwrap(), "codex_cli");
         assert_eq!(headers.user_agent.to_str().unwrap(), "CodexCLI/1.2.3");
 
@@ -2196,37 +2304,24 @@ mod tests {
         };
 
         let headers = chatgpt_request_headers(&config).unwrap();
-        assert_eq!(headers.originator.to_str().unwrap(), "opencode");
+        assert_eq!(headers.originator.to_str().unwrap(), "codex_cli_rs");
         assert_eq!(
             headers.user_agent.to_str().unwrap(),
-            "opencode/claude-proxy"
+            "codex_cli_rs/1.0.0 (claude-proxy)"
         );
     }
 
     #[test]
-    fn chatgpt_request_headers_use_identity_presets() {
-        let config = claude_proxy_config::settings::ChatGptProviderConfig {
-            identity_preset: ChatGptIdentityPreset::Codex,
-            ..Default::default()
-        };
-        let headers = chatgpt_request_headers(&config).unwrap();
-        assert_eq!(headers.identity_preset, ChatGptIdentityPreset::Codex);
-        assert_eq!(headers.originator.to_str().unwrap(), "codex_cli_rs");
+    fn parses_local_codex_cli_version_output() {
         assert_eq!(
-            headers.user_agent.to_str().unwrap(),
-            "codex_cli_rs/0.0.0 (claude-proxy)"
+            parse_codex_cli_version("codex-cli 0.130.0"),
+            Some("0.130.0".to_string())
         );
-
-        let config = claude_proxy_config::settings::ChatGptProviderConfig {
-            identity_preset: ChatGptIdentityPreset::AnthropicBridge,
-            ..Default::default()
-        };
-        let headers = chatgpt_request_headers(&config).unwrap();
-        assert_eq!(headers.originator.to_str().unwrap(), "anthropic-bridge");
         assert_eq!(
-            headers.user_agent.to_str().unwrap(),
-            "anthropic-bridge/claude-proxy"
+            parse_codex_cli_version("codex v0.130.0"),
+            Some("0.130.0".to_string())
         );
+        assert_eq!(parse_codex_cli_version("codex-cli dev"), None);
     }
 
     #[test]
@@ -2235,14 +2330,10 @@ mod tests {
             "../tests/fixtures/chatgpt_codex/native_request_headers.json"
         ))
         .expect("valid native headers fixture");
-        let config = claude_proxy_config::settings::ChatGptProviderConfig {
-            identity_preset: ChatGptIdentityPreset::Codex,
-            ..Default::default()
-        };
+        let config = claude_proxy_config::settings::ChatGptProviderConfig::default();
 
         let headers = chatgpt_request_headers(&config).unwrap();
         let actual = json!({
-            "identity_preset": headers.identity_preset.as_str(),
             "originator": headers.originator.to_str().unwrap(),
             "user_agent": headers.user_agent.to_str().unwrap(),
         });
@@ -2357,7 +2448,8 @@ mod tests {
             metadata: Some(json!({
                 "prompt_cache_key": "thread-123",
                 "client_metadata": {
-                    "x-codex-window-id": "window-123"
+                    "x-codex-window-id": "window-123",
+                    "x-client-only": "ignored"
                 }
             })),
             extra: Default::default(),
@@ -2366,11 +2458,12 @@ mod tests {
         let body = build_chatgpt_responses_body_with_context(&req, Some("install-123"));
 
         assert_eq!(body["prompt_cache_key"], "thread-123");
+        let client_metadata = body["client_metadata"].as_object().unwrap();
         assert_eq!(
-            body["client_metadata"]["x-codex-installation-id"],
-            "install-123"
+            client_metadata.get("x-codex-installation-id"),
+            Some(&json!("install-123"))
         );
-        assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-123");
+        assert_eq!(client_metadata.len(), 1);
     }
 
     #[test]
@@ -2400,21 +2493,16 @@ mod tests {
             responses::CodexRequestContext {
                 installation_id: Some("install-123"),
                 prompt_cache_key: Some("thread-123"),
-                window_id: Some("window-123"),
-                identity_preset: Some("codex"),
             },
         );
 
         assert_eq!(body["prompt_cache_key"], "thread-123");
+        let client_metadata = body["client_metadata"].as_object().unwrap();
         assert_eq!(
-            body["client_metadata"]["x-codex-installation-id"],
-            "install-123"
+            client_metadata.get("x-codex-installation-id"),
+            Some(&json!("install-123"))
         );
-        assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-123");
-        assert_eq!(
-            body["client_metadata"]["x-claude-proxy-identity-preset"],
-            "codex"
-        );
+        assert_eq!(client_metadata.len(), 1);
     }
 
     #[test]
@@ -2464,8 +2552,6 @@ mod tests {
             responses::CodexRequestContext {
                 installation_id: Some("install-fixture"),
                 prompt_cache_key: Some("thread-fallback"),
-                window_id: Some("window-runtime"),
-                identity_preset: Some("codex"),
             },
         );
 
@@ -3010,7 +3096,6 @@ mod tests {
             thread_id: "thread-test".to_string(),
             window_id: "window-test".to_string(),
             request_headers: ChatGptRequestHeaders {
-                identity_preset: ChatGptIdentityPreset::Opencode,
                 originator: HeaderValue::from_static("opencode"),
                 user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
             },

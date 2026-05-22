@@ -148,55 +148,13 @@ pub struct CopilotProviderConfig {
 }
 
 pub const CHATGPT_CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub const CHATGPT_CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (claude-proxy)";
-pub const CHATGPT_OPENCODE_ORIGINATOR: &str = "opencode";
-pub const CHATGPT_OPENCODE_USER_AGENT: &str = "opencode/claude-proxy";
-pub const CHATGPT_ANTHROPIC_BRIDGE_ORIGINATOR: &str = "anthropic-bridge";
-pub const CHATGPT_ANTHROPIC_BRIDGE_USER_AGENT: &str = "anthropic-bridge/claude-proxy";
-pub const DEFAULT_CHATGPT_ORIGINATOR: &str = CHATGPT_OPENCODE_ORIGINATOR;
-pub const DEFAULT_CHATGPT_USER_AGENT: &str = CHATGPT_OPENCODE_USER_AGENT;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ChatGptIdentityPreset {
-    Codex,
-    #[default]
-    Opencode,
-    AnthropicBridge,
-}
-
-impl ChatGptIdentityPreset {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Opencode => "opencode",
-            Self::AnthropicBridge => "anthropic-bridge",
-        }
-    }
-
-    pub fn originator(self) -> &'static str {
-        match self {
-            Self::Codex => CHATGPT_CODEX_ORIGINATOR,
-            Self::Opencode => CHATGPT_OPENCODE_ORIGINATOR,
-            Self::AnthropicBridge => CHATGPT_ANTHROPIC_BRIDGE_ORIGINATOR,
-        }
-    }
-
-    pub fn user_agent(self) -> &'static str {
-        match self {
-            Self::Codex => CHATGPT_CODEX_USER_AGENT,
-            Self::Opencode => CHATGPT_OPENCODE_USER_AGENT,
-            Self::AnthropicBridge => CHATGPT_ANTHROPIC_BRIDGE_USER_AGENT,
-        }
-    }
-}
+pub const CHATGPT_CODEX_USER_AGENT: &str = "codex_cli_rs/1.0.0 (claude-proxy)";
+pub const DEFAULT_CHATGPT_ORIGINATOR: &str = CHATGPT_CODEX_ORIGINATOR;
+pub const DEFAULT_CHATGPT_USER_AGENT: &str = CHATGPT_CODEX_USER_AGENT;
 
 /// ChatGPT provider configuration (OAuth + Codex backend request metadata).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptProviderConfig {
-    /// Request identity preset used for ChatGPT Codex headers and body metadata.
-    #[serde(default)]
-    pub identity_preset: ChatGptIdentityPreset,
     /// Optional originator header override sent to ChatGPT Codex requests.
     #[serde(default = "default_empty", skip_serializing_if = "String::is_empty")]
     pub originator: String,
@@ -208,7 +166,6 @@ pub struct ChatGptProviderConfig {
 impl Default for ChatGptProviderConfig {
     fn default() -> Self {
         Self {
-            identity_preset: ChatGptIdentityPreset::default(),
             originator: default_empty(),
             user_agent: default_empty(),
         }
@@ -1339,14 +1296,13 @@ service_tier = "flex"
     }
 
     #[test]
-    fn chatgpt_provider_config_parses_codex_header_overrides() {
+    fn chatgpt_provider_config_parses_header_overrides() {
         let toml = r#"
 [providers.chatgpt]
 provider_type = "chatgpt"
 base_url = "https://chatgpt.com/backend-api/codex"
 
 [providers.chatgpt.chatgpt]
-identity_preset = "codex"
 originator = "codex_cli"
 user_agent = "CodexCLI/1.2.3"
 "#;
@@ -1355,34 +1311,8 @@ user_agent = "CodexCLI/1.2.3"
         let provider = settings.providers.get("chatgpt").unwrap();
         let chatgpt = provider.chatgpt.as_ref().unwrap();
 
-        assert_eq!(chatgpt.identity_preset, ChatGptIdentityPreset::Codex);
         assert_eq!(chatgpt.originator, "codex_cli");
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
-    }
-
-    #[test]
-    fn chatgpt_provider_config_parses_identity_presets() {
-        let toml = r#"
-[providers.chatgpt]
-provider_type = "chatgpt"
-
-[providers.chatgpt.chatgpt]
-identity_preset = "anthropic-bridge"
-"#;
-
-        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
-        let chatgpt = settings
-            .providers
-            .get("chatgpt")
-            .and_then(|provider| provider.chatgpt.as_ref())
-            .unwrap();
-
-        assert_eq!(
-            chatgpt.identity_preset,
-            ChatGptIdentityPreset::AnthropicBridge
-        );
-        assert!(chatgpt.originator.is_empty());
-        assert!(chatgpt.user_agent.is_empty());
     }
 
     #[test]

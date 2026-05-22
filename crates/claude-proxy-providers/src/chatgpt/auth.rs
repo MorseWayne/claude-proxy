@@ -25,6 +25,7 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_EXPIRES_IN: i64 = 3600;
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 const MAX_DEVICE_POLL_ATTEMPTS: u32 = 60;
+const CHATGPT_AUTH_NEEDED_MESSAGE: &str = "ChatGPT authentication required; run `claude-proxy provider login chatgpt` in an interactive terminal";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGptToken {
@@ -253,9 +254,7 @@ impl ChatGptAuth {
 
         let _refresh_guard = self.token_refresh_lock.lock().await;
         if self.token.read().await.is_none() {
-            return Err(ProviderError::Authentication(
-                "no ChatGPT token".to_string(),
-            ));
+            return Err(chatgpt_auth_needed_error());
         }
         if self.token_needs_refresh().await {
             self.refresh_access_token().await?;
@@ -292,7 +291,7 @@ impl ChatGptAuth {
             .read()
             .await
             .clone()
-            .ok_or_else(|| ProviderError::Authentication("no ChatGPT token".to_string()))
+            .ok_or_else(chatgpt_auth_needed_error)
     }
 
     async fn refresh_access_token(&self) -> Result<(), ProviderError> {
@@ -371,6 +370,10 @@ impl ChatGptAuth {
         let mut current = self.token.write().await;
         *current = Some(token);
     }
+}
+
+fn chatgpt_auth_needed_error() -> ProviderError {
+    ProviderError::Authentication(CHATGPT_AUTH_NEEDED_MESSAGE.to_string())
 }
 
 fn write_token_file(path: &Path, body: &str) -> io::Result<()> {
@@ -496,6 +499,20 @@ mod tests {
         assert!(!fresh.token_needs_refresh().await);
         assert!(stale.token_needs_refresh().await);
         assert!(missing.token_needs_refresh().await);
+    }
+
+    #[tokio::test]
+    async fn existing_token_reports_actionable_auth_needed_without_device_flow() {
+        let auth = auth_with_token(None);
+
+        let error = auth.get_existing_token().await.unwrap_err();
+
+        match error {
+            ProviderError::Authentication(message) => {
+                assert_eq!(message, CHATGPT_AUTH_NEEDED_MESSAGE);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

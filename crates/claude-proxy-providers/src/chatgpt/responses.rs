@@ -8,8 +8,6 @@ use serde_json::{Map, Value, json};
 pub(super) struct CodexRequestContext<'a> {
     pub installation_id: Option<&'a str>,
     pub prompt_cache_key: Option<&'a str>,
-    pub window_id: Option<&'a str>,
-    pub identity_preset: Option<&'a str>,
 }
 
 pub(super) fn stream_response_with_marker_mode<F>(
@@ -98,11 +96,7 @@ fn apply_codex_metadata(
             .or_insert_with(|| json!(prompt_cache_key));
     }
 
-    let mut client_metadata = metadata
-        .and_then(|metadata| metadata.get("client_metadata"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut client_metadata = Map::new();
 
     if let Some(installation_id) = context
         .installation_id
@@ -113,26 +107,6 @@ fn apply_codex_metadata(
             "x-codex-installation-id".to_string(),
             json!(installation_id),
         );
-    }
-
-    if let Some(window_id) = context
-        .window_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        client_metadata
-            .entry("x-codex-window-id".to_string())
-            .or_insert_with(|| json!(window_id));
-    }
-
-    if let Some(identity_preset) = context
-        .identity_preset
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        client_metadata
-            .entry("x-claude-proxy-identity-preset".to_string())
-            .or_insert_with(|| json!(identity_preset));
     }
 
     if !client_metadata.is_empty() {
