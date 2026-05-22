@@ -1777,7 +1777,7 @@ impl ResponsesStreamConverter {
 fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static str {
     if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
         return match reason {
-            "max_output_tokens" => "max_tokens",
+            "max_output_tokens" | "max_tokens" => "max_tokens",
             "content_filter" | "content_policy_violation" => "refusal",
             _ => "end_turn",
         };
@@ -3998,6 +3998,37 @@ mod tests {
         assert_eq!(text_deltas(&events), vec!["visible "]);
         assert!(!text_deltas(&events).join("").contains("secret"));
         assert!(thinking_deltas(&events).is_empty());
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_refusal_reasoning_and_incomplete() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_tokens"},
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "checked constraints"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I can’t help with that."}]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
+        assert_eq!(text_deltas(&events), vec!["I can’t help with that."]);
+        assert_eq!(stop.data["delta"]["stop_reason"], "max_tokens");
     }
 
     #[test]

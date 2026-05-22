@@ -12,7 +12,7 @@ use claude_proxy_config::settings::ProviderRuntimeConfig;
 use claude_proxy_core::*;
 use futures::stream::BoxStream;
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
@@ -55,6 +55,77 @@ fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
         upstream.reasoning_effort_levels = known.reasoning_effort_levels;
     }
     upstream
+}
+
+fn apply_openai_responses_options(
+    body: &mut Value,
+    request: &MessagesRequest,
+    runtime: &ProviderRuntimeConfig,
+) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    insert_trimmed_string(
+        object,
+        "service_tier",
+        request
+            .extra
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .or(runtime.openai.service_tier.as_deref()),
+    );
+    insert_trimmed_string(
+        object,
+        "prompt_cache_key",
+        request
+            .extra
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                request
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("prompt_cache_key"))
+                    .and_then(Value::as_str)
+            }),
+    );
+    if let Some(value) = request.extra.get("parallel_tool_calls")
+        && value.is_boolean()
+    {
+        object.insert("parallel_tool_calls".to_string(), value.clone());
+    }
+    if let Some(verbosity) = openai_responses_verbosity(request) {
+        object.insert("text".to_string(), json!({ "verbosity": verbosity }));
+    }
+}
+
+fn openai_responses_verbosity(request: &MessagesRequest) -> Option<&str> {
+    if !request.model.starts_with("gpt-5") {
+        return None;
+    }
+
+    request
+        .extra
+        .get("verbosity")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            request
+                .extra
+                .get("text")
+                .and_then(|value| value.get("verbosity"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| matches!(*value, "low" | "medium" | "high"))
+}
+
+fn insert_trimmed_string(object: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        object
+            .entry(key.to_string())
+            .or_insert_with(|| value.into());
+    }
 }
 
 impl OpenAiProvider {
@@ -148,25 +219,18 @@ impl OpenAiProvider {
         }
     }
 
+    fn responses_request_body(&self, request: &MessagesRequest) -> Value {
+        let mut body = crate::responses::convert_to_responses(request);
+        apply_openai_responses_options(&mut body, request, &self.runtime);
+        body
+    }
+
     async fn chat_via_responses(
         &self,
         request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
-        let mut body = crate::responses::convert_to_responses(&request);
-        if let Some(service_tier) = self
-            .runtime
-            .openai
-            .service_tier
-            .as_deref()
-            .map(str::trim)
-            .filter(|service_tier| !service_tier.is_empty())
-            && let Some(object) = body.as_object_mut()
-        {
-            object
-                .entry("service_tier".to_string())
-                .or_insert_with(|| service_tier.into());
-        }
+        let body = self.responses_request_body(&request);
         let url = format!("{}/responses", self.base_url);
 
         log_request_observability("openai", "/responses", &body);
@@ -295,5 +359,106 @@ mod tests {
             info.supported_endpoints,
             vec!["/chat/completions", "/responses"]
         );
+    }
+
+    #[test]
+    fn openai_responses_body_applies_runtime_and_request_options() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("parallel_tool_calls".to_string(), json!(false));
+        extra.insert("verbosity".to_string(), json!("high"));
+        extra.insert("service_tier".to_string(), json!("priority"));
+        extra.insert("prompt_cache_key".to_string(), json!("request-thread"));
+        let runtime = ProviderRuntimeConfig {
+            openai: claude_proxy_config::settings::OpenAiRuntimeConfig {
+                service_tier: Some("flex".to_string()),
+            },
+            ..Default::default()
+        };
+        let provider = OpenAiProvider::new(
+            "openai",
+            "test-key",
+            "http://127.0.0.1:1",
+            "",
+            1,
+            1,
+            &[],
+            UpstreamRequestPolicy::default(),
+            runtime,
+        )
+        .unwrap();
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "search".to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"prompt_cache_key": "thread-123"})),
+            extra,
+        };
+
+        let body = provider.responses_request_body(&req);
+
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["prompt_cache_key"], "request-thread");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["text"], json!({"verbosity": "high"}));
+    }
+
+    #[test]
+    fn openai_responses_body_omits_unknown_request_options() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("parallel_tool_calls".to_string(), json!("false"));
+        extra.insert("verbosity".to_string(), json!("verbose"));
+        let provider = OpenAiProvider::new(
+            "openai",
+            "test-key",
+            "http://127.0.0.1:1",
+            "",
+            1,
+            1,
+            &[],
+            UpstreamRequestPolicy::default(),
+            ProviderRuntimeConfig::default(),
+        )
+        .unwrap();
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"prompt_cache_key": "   "})),
+            extra,
+        };
+
+        let body = provider.responses_request_body(&req);
+
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("text").is_none());
     }
 }
