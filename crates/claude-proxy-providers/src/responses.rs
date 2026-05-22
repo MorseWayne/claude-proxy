@@ -2185,9 +2185,9 @@ mod tests {
             .expect("malformed stream error")
             .expect_err("malformed HTTP 200 body should not finish empty");
 
-        match error {
+        match error.without_upstream_metadata() {
             ProviderError::UpstreamError { status, body } => {
-                assert_eq!(status, 200);
+                assert_eq!(*status, 200);
                 assert!(body.contains("empty or malformed Responses API stream"));
                 assert!(body.contains("content-type: text/html"));
                 assert!(body.contains("login required"));

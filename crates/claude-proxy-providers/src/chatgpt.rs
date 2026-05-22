@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
     map_upstream_response, read_upstream_response_text, send_upstream_request_with_policy,
+    upstream_error_metadata_from_parts,
 };
 use crate::openai_compat::{
     apply_openai_intent, is_compact_request_body, log_compact_request_observability,
@@ -314,9 +315,12 @@ impl ChatGptProvider {
                 return Err(map_upstream_response(response).await);
             }
 
+            let headers = response.headers().clone();
             let error_body = read_upstream_response_text(response).await?;
             if !is_prompt_too_long_error(status, &error_body) {
-                return Err(map_chatgpt_error_status_body(status, error_body));
+                return Err(map_chatgpt_error_status_body_with_headers(
+                    status, &headers, error_body,
+                ));
             }
 
             if prompt_too_long_attempts >= CHATGPT_PTL_MAX_RETRIES {
@@ -336,7 +340,9 @@ impl ChatGptProvider {
                         "Compact request prompt-too-long retry result"
                     );
                 }
-                return Err(map_chatgpt_error_status_body(status, error_body));
+                return Err(map_chatgpt_error_status_body_with_headers(
+                    status, &headers, error_body,
+                ));
             }
 
             let Some(stats) =
@@ -358,7 +364,9 @@ impl ChatGptProvider {
                         "Compact request prompt-too-long retry result"
                     );
                 }
-                return Err(map_chatgpt_error_status_body(status, error_body));
+                return Err(map_chatgpt_error_status_body_with_headers(
+                    status, &headers, error_body,
+                ));
             };
             prompt_too_long_attempts += 1;
             notify_prompt_too_long_observer(
@@ -687,7 +695,7 @@ impl Provider for ChatGptProvider {
             let refreshed = match self.auth.force_refresh_token().await {
                 Ok(token) => token,
                 Err(error) => {
-                    if matches!(error, ProviderError::Authentication(_)) {
+                    if error.is_authentication() {
                         self.auth.clear_token().await;
                     }
                     return Err(error);
@@ -814,7 +822,7 @@ impl Provider for ChatGptProvider {
                 self.cache_rate_limits(snapshots.clone()).await;
                 Ok(snapshots)
             }
-            Err(ProviderError::Authentication(_)) => Ok(self.cached_rate_limits().await),
+            Err(error) if error.is_authentication() => Ok(self.cached_rate_limits().await),
             Err(error) => {
                 let cached = self.cached_rate_limits().await;
                 if cached.is_empty() {
@@ -1324,27 +1332,41 @@ fn is_prompt_too_long_candidate_status(status: StatusCode) -> bool {
     )
 }
 
+#[cfg(test)]
 fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderError {
+    map_chatgpt_error_status_body_with_headers(status, &HeaderMap::new(), body)
+}
+
+fn map_chatgpt_error_status_body_with_headers(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: String,
+) -> ProviderError {
     let mut message = chatgpt_error_message_from_body(&body);
     if let Some(output_limit_message) = chatgpt_output_limit_error_message(status, &message) {
         message = output_limit_message;
     }
 
-    match status {
+    let metadata =
+        upstream_error_metadata_from_parts(status.as_u16(), headers, &body, message.clone());
+    let error = match status {
         StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
         StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
         StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
         StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
-        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited { retry_after: None },
+        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited {
+            retry_after: metadata.retry_after,
+        },
         status if status.is_server_error() => ProviderError::Overloaded {
             message,
-            retry_after: None,
+            retry_after: metadata.retry_after,
         },
         status => ProviderError::UpstreamError {
             status: status.as_u16(),
             body,
         },
-    }
+    };
+    error.with_upstream_metadata(metadata)
 }
 
 fn chatgpt_error_message_from_body(body: &str) -> String {
@@ -2788,7 +2810,7 @@ mod tests {
             r#"{"error":{"message":"max_output_tokens is too high. Maximum supported value is 16384"}}"#.to_string(),
         );
 
-        match error {
+        match error.without_upstream_metadata() {
             ProviderError::InvalidRequest(message) => {
                 assert_eq!(
                     message,
@@ -2806,7 +2828,7 @@ mod tests {
             "requested output tokens exceed the model limit".to_string(),
         );
 
-        match error {
+        match error.without_upstream_metadata() {
             ProviderError::RequestTooLarge(message) => {
                 assert!(message.contains("max_tokens exceeds"));
             }
@@ -2821,7 +2843,7 @@ mod tests {
             r#"{"error":{"message":"bad tool schema"}}"#.to_string(),
         );
 
-        match error {
+        match error.without_upstream_metadata() {
             ProviderError::InvalidRequest(message) => {
                 assert_eq!(message, "bad tool schema");
             }
@@ -2833,7 +2855,7 @@ mod tests {
     fn chatgpt_error_mapping_reads_detail_body() {
         let body = r#"{"detail":"Unsupported parameter: max_output_tokens"}"#;
         let error = map_chatgpt_error_status_body(StatusCode::BAD_REQUEST, body.to_string());
-        match error {
+        match error.without_upstream_metadata() {
             ProviderError::InvalidRequest(message) => {
                 assert_eq!(message, "Unsupported parameter: max_output_tokens");
             }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
 use claude_proxy_core::ModelInfo;
-use claude_proxy_providers::provider::Provider;
+use claude_proxy_providers::provider::{Provider, UpstreamErrorMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -407,6 +407,8 @@ pub struct ProviderHealth {
     pub last_ok_unix_secs: Option<u64>,
     pub last_error_unix_secs: Option<u64>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_metadata: Option<UpstreamErrorMetadata>,
 }
 
 impl ProviderHealth {
@@ -415,10 +417,11 @@ impl ProviderHealth {
         self.last_ok_unix_secs = Some(timestamp);
     }
 
-    fn mark_error(&mut self, timestamp: u64, error: &str) {
+    fn mark_error(&mut self, timestamp: u64, error: &str, metadata: Option<UpstreamErrorMetadata>) {
         self.status = ProviderHealthStatus::Unhealthy;
         self.last_error_unix_secs = Some(timestamp);
         self.last_error = Some(truncate_provider_error(error));
+        self.last_error_metadata = metadata;
     }
 }
 
@@ -684,6 +687,29 @@ mod tests {
             snapshot["openai"].last_error.as_deref(),
             Some("upstream timeout")
         );
+        assert!(snapshot["openai"].last_error_metadata.is_none());
+
+        state
+            .record_provider_error_with_metadata(
+                "openai",
+                "rate limited",
+                Some(UpstreamErrorMetadata {
+                    status: 429,
+                    retry_after: Some(5),
+                    request_id: Some("req_123".to_string()),
+                    message: Some("slow down".to_string()),
+                    body_preview: None,
+                    headers: Vec::new(),
+                }),
+            )
+            .await;
+        let snapshot = state
+            .provider_health_snapshot(vec!["openai".to_string()])
+            .await;
+        let metadata = snapshot["openai"].last_error_metadata.as_ref().unwrap();
+        assert_eq!(metadata.status, 429);
+        assert_eq!(metadata.retry_after, Some(5));
+        assert_eq!(metadata.request_id.as_deref(), Some("req_123"));
 
         state.record_provider_success("openai").await;
         let snapshot = state
@@ -692,7 +718,7 @@ mod tests {
         assert_eq!(snapshot["openai"].status, ProviderHealthStatus::Healthy);
         assert_eq!(
             snapshot["openai"].last_error.as_deref(),
-            Some("upstream timeout")
+            Some("rate limited")
         );
         assert!(snapshot["openai"].last_ok_unix_secs.is_some());
     }
@@ -1256,13 +1282,23 @@ impl AppState {
     }
 
     pub async fn record_provider_error(&self, provider_id: &str, error: &str) {
+        self.record_provider_error_with_metadata(provider_id, error, None)
+            .await;
+    }
+
+    pub async fn record_provider_error_with_metadata(
+        &self,
+        provider_id: &str,
+        error: &str,
+        metadata: Option<UpstreamErrorMetadata>,
+    ) {
         let now = unix_timestamp_secs();
         self.provider_health
             .lock()
             .await
             .entry(provider_id.to_string())
             .or_default()
-            .mark_error(now, error);
+            .mark_error(now, error, metadata);
     }
 
     pub async fn provider_health_snapshot(

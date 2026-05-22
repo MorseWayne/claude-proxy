@@ -15,7 +15,7 @@ use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
     Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
-    ProviderRequestObserverEventKind, ProviderUsageMetadata,
+    ProviderRequestObserverEventKind, ProviderUsageMetadata, UpstreamErrorMetadata,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -965,7 +965,11 @@ async fn collect_leader_response(
                 let _ = broadcast_tx.send(InflightEvent::Done);
                 state.inflight.lock().await.remove(&request_hash);
                 state
-                    .record_provider_error(&request.provider_id, &error_message)
+                    .record_provider_error_with_metadata(
+                        &request.provider_id,
+                        &error_message,
+                        e.upstream_metadata().cloned(),
+                    )
                     .await;
                 let latency_ms = start.elapsed().as_millis() as u64;
                 state.metrics.record_error();
@@ -1054,7 +1058,11 @@ async fn handle_provider_error(
 
     error!("Provider error: {error}");
     state
-        .record_provider_error(&request.provider_id, &error.to_string())
+        .record_provider_error_with_metadata(
+            &request.provider_id,
+            &error.to_string(),
+            error.upstream_metadata().cloned(),
+        )
         .await;
     state.metrics.record_error();
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -1363,7 +1371,7 @@ fn is_retryable_upstream_error_status(status: u16) -> bool {
 }
 
 fn provider_error_kind(error: &ProviderError) -> &'static str {
-    match error {
+    match error.without_upstream_metadata() {
         ProviderError::Authentication(_) => "authentication",
         ProviderError::RateLimited { .. } => "rate_limited",
         ProviderError::InvalidRequest(_) => "invalid_request",
@@ -1374,11 +1382,13 @@ fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::UpstreamError { .. } => "upstream",
         ProviderError::ServiceUnavailable(_) => "service_unavailable",
         ProviderError::Network(_) => "network",
+        ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
     }
 }
 
 fn provider_error_to_response(error: &ProviderError) -> Response {
-    match error {
+    let metadata = error.upstream_metadata();
+    let mut response = match error.without_upstream_metadata() {
         ProviderError::Authentication(msg) => error_response(
             StatusCode::UNAUTHORIZED,
             &ErrorResponse::authentication(msg),
@@ -1426,7 +1436,10 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
             StatusCode::BAD_GATEWAY,
             &ErrorResponse::api_error(&format!("network error: {msg}")),
         ),
-    }
+        ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
+    };
+    attach_upstream_error_headers(&mut response, metadata);
+    response
 }
 
 fn upstream_error_to_response(status: u16, body: &str) -> Response {
@@ -1442,6 +1455,33 @@ fn upstream_error_to_response(status: u16, body: &str) -> Response {
         ),
         status if is_retryable_upstream_error_status(status) => overloaded_response(&message, None),
         _ => error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&message)),
+    }
+}
+
+fn attach_upstream_error_headers(
+    response: &mut Response,
+    metadata: Option<&UpstreamErrorMetadata>,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    if let Ok(header_value) = HeaderValue::from_str(&metadata.status.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-upstream-status", header_value);
+    }
+    if let Some(request_id) = metadata.request_id.as_deref()
+        && let Ok(header_value) = HeaderValue::from_str(request_id)
+    {
+        response
+            .headers_mut()
+            .insert("x-upstream-request-id", header_value);
+    }
+    if let Some(secs) = metadata.retry_after
+        && !response.headers().contains_key("retry-after")
+        && let Ok(header_value) = HeaderValue::from_str(&secs.to_string())
+    {
+        response.headers_mut().insert("retry-after", header_value);
     }
 }
 
@@ -1968,6 +2008,42 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "overloaded_error");
         assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[tokio::test]
+    async fn provider_error_response_exposes_safe_upstream_headers() {
+        let response = provider_error_to_response(
+            &ProviderError::RateLimited {
+                retry_after: Some(5),
+            }
+            .with_upstream_metadata(UpstreamErrorMetadata {
+                status: 429,
+                retry_after: Some(5),
+                request_id: Some("req_abc".to_string()),
+                message: Some("slow down".to_string()),
+                body_preview: None,
+                headers: Vec::new(),
+            }),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            HeaderValue::from_static("5")
+        );
+        assert_eq!(
+            response.headers().get("x-upstream-status").unwrap(),
+            HeaderValue::from_static("429")
+        );
+        assert_eq!(
+            response.headers().get("x-upstream-request-id").unwrap(),
+            HeaderValue::from_static("req_abc")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "rate limited by upstream");
     }
 
     #[tokio::test]

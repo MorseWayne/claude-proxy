@@ -17,7 +17,7 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use crate::provider::ProviderError;
+use crate::provider::{ProviderError, UpstreamErrorHeader, UpstreamErrorMetadata};
 use chrono::DateTime;
 use claude_proxy_config::settings::{
     ProviderRequestConfig, ProviderRetryConfig, ProviderRuntimeConfig,
@@ -33,6 +33,8 @@ use tokio::time::{sleep, timeout};
 use tracing::warn;
 
 const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_UPSTREAM_ERROR_PREVIEW_BYTES: usize = 2048;
+const MAX_SAFE_UPSTREAM_HEADER_VALUE_BYTES: usize = 512;
 const MAX_SEND_ATTEMPTS: usize = 3;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
@@ -371,10 +373,20 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(retry_after_seconds);
+    let request_id = upstream_request_id_from_headers(response.headers());
+    let safe_headers = safe_upstream_error_headers(response.headers());
     let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let message = extract_upstream_error_message(&body);
+    let metadata = UpstreamErrorMetadata {
+        status,
+        retry_after,
+        request_id,
+        message: Some(message.clone()),
+        body_preview: upstream_error_body_preview(&body),
+        headers: safe_headers,
+    };
 
-    match status {
+    let error = match status {
         400 => ProviderError::InvalidRequest(message),
         401 => ProviderError::Authentication(message),
         404 => ProviderError::ModelNotFound(message),
@@ -385,7 +397,110 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
             retry_after,
         },
         _ => ProviderError::UpstreamError { status, body },
+    };
+    error.with_upstream_metadata(metadata)
+}
+
+pub fn upstream_error_metadata_from_parts(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    message: String,
+) -> UpstreamErrorMetadata {
+    UpstreamErrorMetadata {
+        status,
+        retry_after: headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(retry_after_seconds),
+        request_id: upstream_request_id_from_headers(headers),
+        message: Some(message),
+        body_preview: upstream_error_body_preview(body),
+        headers: safe_upstream_error_headers(headers),
     }
+}
+
+fn upstream_request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    header_value_from_any(
+        headers,
+        &[
+            "request-id",
+            "x-request-id",
+            "x-openai-request-id",
+            "openai-request-id",
+            "x-ms-request-id",
+            "cf-ray",
+        ],
+    )
+}
+
+fn safe_upstream_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<UpstreamErrorHeader> {
+    [
+        "request-id",
+        "x-request-id",
+        "x-openai-request-id",
+        "openai-request-id",
+        "x-ms-request-id",
+        "cf-ray",
+        "retry-after",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        header_value(headers, name).map(|value| UpstreamErrorHeader {
+            name: name.to_string(),
+            value,
+        })
+    })
+    .collect()
+}
+
+fn header_value_from_any(headers: &reqwest::header::HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| header_value(headers, name))
+}
+
+fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(truncate_safe_header_value)
+}
+
+fn truncate_safe_header_value(value: &str) -> String {
+    if value.len() <= MAX_SAFE_UPSTREAM_HEADER_VALUE_BYTES {
+        return value.to_string();
+    }
+
+    let mut truncated = value
+        .chars()
+        .take(MAX_SAFE_UPSTREAM_HEADER_VALUE_BYTES)
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn upstream_error_body_preview(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MAX_UPSTREAM_ERROR_PREVIEW_BYTES {
+        return Some(trimmed.to_string());
+    }
+
+    let mut preview = trimmed
+        .chars()
+        .take(MAX_UPSTREAM_ERROR_PREVIEW_BYTES)
+        .collect::<String>();
+    preview.push_str("...");
+    Some(preview)
 }
 
 async fn read_limited_response_text(response: reqwest::Response, limit: usize) -> String {
@@ -518,6 +633,43 @@ mod tests {
             .unwrap()
     }
 
+    async fn response_with_status_headers_and_body(
+        status_line: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let mut response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            response.push_str(&body);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn retryable_statuses_include_transient_failures() {
         assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
@@ -595,6 +747,64 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ProviderError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_metadata_keeps_safe_headers_only() {
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[
+                ("retry-after", "4"),
+                ("x-openai-request-id", "req_123"),
+                ("authorization", "Bearer secret"),
+            ],
+            r#"{"error":{"message":"slow down"}}"#,
+        )
+        .await;
+
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::RateLimited {
+                retry_after: Some(4)
+            }
+        ));
+        let metadata = error.upstream_metadata().unwrap();
+        assert_eq!(metadata.status, 429);
+        assert_eq!(metadata.retry_after, Some(4));
+        assert_eq!(metadata.request_id.as_deref(), Some("req_123"));
+        assert_eq!(metadata.message.as_deref(), Some("slow down"));
+        assert!(
+            metadata
+                .headers
+                .iter()
+                .any(|header| header.name == "x-openai-request-id" && header.value == "req_123")
+        );
+        assert!(
+            !metadata
+                .headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_metadata_truncates_body_preview() {
+        let body = "x".repeat(MAX_UPSTREAM_ERROR_PREVIEW_BYTES + 128);
+        let response =
+            response_with_status_headers_and_body("500 Internal Server Error", &[], &body).await;
+
+        let error = map_upstream_response(response).await;
+        let metadata = error.upstream_metadata().unwrap();
+
+        assert_eq!(metadata.status, 500);
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::Overloaded { .. }
+        ));
+        let preview = metadata.body_preview.as_deref().unwrap();
+        assert!(preview.len() < body.len());
+        assert!(preview.ends_with("..."));
     }
 
     #[tokio::test]

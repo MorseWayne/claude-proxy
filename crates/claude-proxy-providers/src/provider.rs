@@ -39,6 +39,74 @@ pub enum ProviderError {
 
     #[error("network error: {0}")]
     Network(String),
+
+    #[error("{source}")]
+    WithUpstreamMetadata {
+        #[source]
+        source: Box<ProviderError>,
+        metadata: Box<UpstreamErrorMetadata>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamErrorMetadata {
+    pub status: u16,
+    #[serde(default)]
+    pub retry_after: Option<u64>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub body_preview: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<UpstreamErrorHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamErrorHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl ProviderError {
+    pub fn with_upstream_metadata(self, metadata: UpstreamErrorMetadata) -> Self {
+        match self {
+            ProviderError::WithUpstreamMetadata { source, .. } => {
+                ProviderError::WithUpstreamMetadata {
+                    source,
+                    metadata: Box::new(metadata),
+                }
+            }
+            source => ProviderError::WithUpstreamMetadata {
+                source: Box::new(source),
+                metadata: Box::new(metadata),
+            },
+        }
+    }
+
+    pub fn upstream_metadata(&self) -> Option<&UpstreamErrorMetadata> {
+        match self {
+            ProviderError::WithUpstreamMetadata { metadata, .. } => Some(metadata),
+            _ => None,
+        }
+    }
+
+    pub fn without_upstream_metadata(&self) -> &ProviderError {
+        match self {
+            ProviderError::WithUpstreamMetadata { source, .. } => {
+                source.without_upstream_metadata()
+            }
+            _ => self,
+        }
+    }
+
+    pub fn is_authentication(&self) -> bool {
+        matches!(
+            self.without_upstream_metadata(),
+            ProviderError::Authentication(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
