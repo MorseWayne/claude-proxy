@@ -8,26 +8,30 @@ mod request;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use claude_proxy_config::settings::ProviderRuntimeConfig;
 use claude_proxy_core::*;
 use futures::stream::BoxStream;
 use reqwest::Client;
 use serde_json::Value;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, read_upstream_response_json,
-    read_upstream_response_text, send_upstream_request,
+    UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
+    map_upstream_response, read_upstream_response_json, read_upstream_response_text,
+    send_upstream_request_with_policy,
 };
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
     supports_responses,
 };
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, ProviderRequestObserver};
 use crate::reasoning_markers::marker_mode_from_request;
 
 pub struct OpenAiProvider {
     id: String,
     client: Client,
     base_url: String,
+    request_policy: UpstreamRequestPolicy,
+    runtime: ProviderRuntimeConfig,
 }
 
 fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
@@ -63,6 +67,8 @@ impl OpenAiProvider {
         connect_timeout: u64,
         read_timeout: u64,
         extra_ca_certs: &[String],
+        request_policy: UpstreamRequestPolicy,
+        runtime: ProviderRuntimeConfig,
     ) -> Result<Self, ProviderError> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout))
@@ -98,19 +104,25 @@ impl OpenAiProvider {
             id: id.to_string(),
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            request_policy,
+            runtime,
         })
     }
 
     async fn chat_via_completions(
         &self,
         request: MessagesRequest,
+        observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let body = request::convert_request(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
         log_request_observability("openai", "/chat/completions", &body);
 
-        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
+        let upstream_request =
+            apply_runtime_request_config(self.client.post(&url), &self.runtime)?.json(&body);
+        let response =
+            send_upstream_request_with_policy(upstream_request, self.request_policy).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -118,9 +130,10 @@ impl OpenAiProvider {
 
         if request.stream {
             Ok(
-                crate::chat_completions::stream_openai_response_with_marker_mode(
+                crate::chat_completions::stream_openai_response_with_marker_mode_and_observer(
                     response,
                     marker_mode_from_request(&request),
+                    observer,
                 ),
             )
         } else {
@@ -138,13 +151,30 @@ impl OpenAiProvider {
     async fn chat_via_responses(
         &self,
         request: MessagesRequest,
+        observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
-        let body = crate::responses::convert_to_responses(&request);
+        let mut body = crate::responses::convert_to_responses(&request);
+        if let Some(service_tier) = self
+            .runtime
+            .openai
+            .service_tier
+            .as_deref()
+            .map(str::trim)
+            .filter(|service_tier| !service_tier.is_empty())
+            && let Some(object) = body.as_object_mut()
+        {
+            object
+                .entry("service_tier".to_string())
+                .or_insert_with(|| service_tier.into());
+        }
         let url = format!("{}/responses", self.base_url);
 
         log_request_observability("openai", "/responses", &body);
 
-        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
+        let upstream_request =
+            apply_runtime_request_config(self.client.post(&url), &self.runtime)?.json(&body);
+        let response =
+            send_upstream_request_with_policy(upstream_request, self.request_policy).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
@@ -152,9 +182,10 @@ impl OpenAiProvider {
 
         if request.stream {
             Ok(
-                crate::responses::stream_responses_response_with_marker_mode(
+                crate::responses::stream_responses_response_with_marker_mode_and_provider_observer(
                     response,
                     marker_mode_from_request(&request),
+                    observer,
                 ),
             )
         } else {
@@ -180,17 +211,27 @@ impl Provider for OpenAiProvider {
         &self,
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        self.chat_with_observer(request, None).await
+    }
+
+    async fn chat_with_observer(
+        &self,
+        request: MessagesRequest,
+        observer: Option<ProviderRequestObserver>,
+    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let request = apply_openai_intent(request);
         if prefers_responses(&request.model) {
-            self.chat_via_responses(request).await
+            self.chat_via_responses(request, observer).await
         } else {
-            self.chat_via_completions(request).await
+            self.chat_via_completions(request, observer).await
         }
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let url = format!("{}/models", self.base_url);
-        let response = send_upstream_request(self.client.get(&url)).await?;
+        let upstream_request = apply_runtime_request_config(self.client.get(&url), &self.runtime)?;
+        let response =
+            send_upstream_request_with_policy(upstream_request, self.request_policy).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);

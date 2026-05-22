@@ -574,6 +574,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                     provider_type: Some(provider_type),
                                     copilot,
                                     chatgpt: None,
+                                    runtime: Default::default(),
                                     reasoning_markers: Default::default(),
                                 },
                             );

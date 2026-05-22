@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
-use crate::provider::ProviderError;
+use crate::provider::{
+    ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, ProviderStreamMetadata, ProviderUsageMetadata,
+};
 use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
 use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
@@ -79,10 +82,19 @@ pub(crate) fn stream_openai_response_with_marker_mode(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    stream_openai_response_with_marker_mode_and_observer(response, marker_mode, None)
+}
+
+pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    observer: Option<ProviderRequestObserver>,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
 
     tokio::spawn(async move {
         let mut converter = StreamConverter::with_marker_mode(marker_mode);
+        let observer = observer.as_ref();
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
         let mut saw_done = false;
@@ -107,6 +119,7 @@ pub(crate) fn stream_openai_response_with_marker_mode(
                         }
                         if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
                             let events = converter.process_chunk(&openai_chunk);
+                            notify_stream_metadata(observer, &openai_chunk);
                             for event in events {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -124,6 +137,7 @@ pub(crate) fn stream_openai_response_with_marker_mode(
                             saw_done = true;
                         } else if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
                             let events = converter.process_chunk(&openai_chunk);
+                            notify_stream_metadata(observer, &openai_chunk);
                             for event in events {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -146,6 +160,7 @@ pub(crate) fn stream_openai_response_with_marker_mode(
             && !is_sse_done(&event_str)
             && let Some(openai_chunk) = parse_openai_chunk(&event_str)
         {
+            notify_stream_metadata(observer, &openai_chunk);
             for event in converter.process_chunk(&openai_chunk) {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -744,6 +759,37 @@ fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
     })
 }
 
+fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, chunk: &OpenAiChunk) {
+    let Some(observer) = observer else {
+        return;
+    };
+    if chunk.usage.is_none() && chunk.model.is_empty() && chunk.id.is_empty() {
+        return;
+    }
+
+    let usage = chunk.usage.as_ref().map(|usage| ProviderUsageMetadata {
+        input_tokens: usage.prompt_tokens as u64,
+        output_tokens: usage.completion_tokens as u64,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+    let stop_reason = chunk
+        .choices
+        .iter()
+        .find_map(|choice| choice.finish_reason.clone());
+
+    observer(ProviderRequestObserverEvent {
+        event: ProviderRequestObserverEventKind::StreamMetadata,
+        stream_metadata: Some(ProviderStreamMetadata {
+            usage,
+            model: (!chunk.model.is_empty()).then(|| chunk.model.clone()),
+            request_id: (!chunk.id.is_empty()).then(|| chunk.id.clone()),
+            stop_reason,
+        }),
+        ..ProviderRequestObserverEvent::default()
+    });
+}
+
 /// Convert a non-streaming OpenAI response to Anthropic format.
 #[cfg(test)]
 pub(crate) fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
@@ -895,6 +941,7 @@ pub(crate) fn convert_non_streaming_response_with_marker_mode(
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1002,6 +1049,43 @@ mod tests {
             saw_network_error,
             "mid-stream chunk EOF must produce an error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_observer_sees_late_usage_chunk() {
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_observer = Arc::clone(&observed);
+        let observer: ProviderRequestObserver = Arc::new(move |event| {
+            observed_for_observer.lock().unwrap().push(event);
+        });
+        let mut stream = stream_openai_response_with_marker_mode_and_observer(
+            response,
+            ReasoningMarkerMode::Strict,
+            Some(observer),
+        );
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("stream should complete"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        let observed = observed.lock().unwrap();
+        let usage = observed
+            .iter()
+            .filter_map(|event| event.stream_metadata.as_ref())
+            .filter_map(|metadata| metadata.usage.as_ref())
+            .last()
+            .expect("late usage metadata should be observed");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
     }
 
     #[test]

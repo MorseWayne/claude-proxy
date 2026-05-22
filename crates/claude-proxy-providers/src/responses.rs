@@ -13,7 +13,10 @@ use crate::openai_compat::{
     default_adaptive_reasoning_effort, supports_reasoning_summary, supports_sampling_parameters,
     thinking_budget_to_reasoning_effort,
 };
-use crate::provider::ProviderError;
+use crate::provider::{
+    ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, ProviderStreamMetadata, ProviderUsageMetadata,
+};
 use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
 use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
@@ -894,6 +897,16 @@ pub fn stream_responses_response_with_marker_mode(
     stream_responses_response_with_marker_mode_and_observer(response, marker_mode, |_| {})
 }
 
+pub fn stream_responses_response_with_marker_mode_and_provider_observer(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    observer: Option<ProviderRequestObserver>,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    stream_responses_response_with_marker_mode_and_observer(response, marker_mode, move |event| {
+        notify_stream_metadata(observer.as_ref(), event);
+    })
+}
+
 #[cfg(test)]
 pub fn stream_responses_response_with_observer<F>(
     response: reqwest::Response,
@@ -1025,6 +1038,60 @@ where
 
 fn parse_sse_json(text: &str) -> Option<Value> {
     parse_sse_json_value(text)
+}
+
+pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, event: &Value) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let response = event.get("response").unwrap_or(event);
+    let usage = provider_usage_from_responses_response(response);
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let request_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let stop_reason = response_stop_reason_metadata(response);
+    if usage.is_none() && model.is_none() && request_id.is_none() && stop_reason.is_none() {
+        return;
+    }
+
+    observer(ProviderRequestObserverEvent {
+        event: ProviderRequestObserverEventKind::StreamMetadata,
+        stream_metadata: Some(ProviderStreamMetadata {
+            usage,
+            model,
+            request_id,
+            stop_reason,
+        }),
+        ..ProviderRequestObserverEvent::default()
+    });
+}
+
+fn provider_usage_from_responses_response(response: &Value) -> Option<ProviderUsageMetadata> {
+    let usage = response.get("usage")?;
+    Some(ProviderUsageMetadata {
+        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+    })
+}
+
+fn response_stop_reason_metadata(response: &Value) -> Option<String> {
+    if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
+        return Some(reason.to_string());
+    }
+    response
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "completed" | "incomplete" | "failed"))
+        .map(str::to_string)
 }
 
 fn append_stream_preview(preview: &mut Vec<u8>, chunk: &[u8]) {

@@ -15,7 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use claude_proxy_config::{
     Settings,
-    settings::{ChatGptIdentityPreset, ChatGptProviderConfig, ProviderConfig},
+    settings::{
+        ChatGptIdentityPreset, ChatGptProviderConfig, ProviderConfig, ProviderRuntimeConfig,
+    },
 };
 use claude_proxy_core::*;
 use futures::{StreamExt, stream::BoxStream};
@@ -28,8 +30,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::http::{
-    UpstreamRequestPolicy, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
-    read_upstream_response_text, send_upstream_request_with_policy,
+    UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
+    map_upstream_response, read_upstream_response_text, send_upstream_request_with_policy,
 };
 use crate::openai_compat::{
     apply_openai_intent, is_compact_request_body, log_compact_request_observability,
@@ -146,6 +148,8 @@ pub struct ChatGptProvider {
     thread_id: String,
     window_id: String,
     request_headers: ChatGptRequestHeaders,
+    request_policy: UpstreamRequestPolicy,
+    runtime: ProviderRuntimeConfig,
     auth: Arc<ChatGptAuth>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
 }
@@ -170,6 +174,8 @@ impl ChatGptProvider {
             thread_id: chatgpt_runtime_id(),
             window_id: chatgpt_runtime_id(),
             request_headers: chatgpt_request_headers(&chatgpt_config)?,
+            request_policy: chatgpt_upstream_request_policy(&config.runtime),
+            runtime: config.runtime.clone(),
             auth,
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
@@ -229,11 +235,10 @@ impl ChatGptProvider {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
 
-        let result = send_upstream_request_with_policy(
-            request_builder.json(body),
-            chatgpt_upstream_request_policy(),
-        )
-        .await;
+        let request_builder = apply_runtime_request_config(request_builder, &self.runtime)?;
+        let result =
+            send_upstream_request_with_policy(request_builder.json(body), self.request_policy)
+                .await;
 
         match &result {
             Ok(response) => {
@@ -389,9 +394,9 @@ impl ChatGptProvider {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
 
+        let request_builder = apply_runtime_request_config(request_builder, &self.runtime)?;
         let response =
-            send_upstream_request_with_policy(request_builder, chatgpt_upstream_request_policy())
-                .await?;
+            send_upstream_request_with_policy(request_builder, self.request_policy).await?;
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
         }
@@ -751,6 +756,9 @@ impl Provider for ChatGptProvider {
                         cache_rate_limits_into(&cache, vec![snapshot]).await;
                     });
                 }
+                if let Some(observer) = observer.as_ref() {
+                    crate::responses::notify_stream_metadata(Some(observer), event);
+                }
                 if let Some(stop_reason) = chatgpt_sse_stop_reason(event) {
                     info!(
                         request_id,
@@ -879,11 +887,13 @@ fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, Provide
     })
 }
 
-fn chatgpt_upstream_request_policy() -> UpstreamRequestPolicy {
+fn chatgpt_upstream_request_policy(runtime: &ProviderRuntimeConfig) -> UpstreamRequestPolicy {
     UpstreamRequestPolicy {
         max_attempts: CHATGPT_SEND_MAX_ATTEMPTS,
         attempt_timeout: Some(CHATGPT_SEND_ATTEMPT_TIMEOUT),
+        ..UpstreamRequestPolicy::default()
     }
+    .with_runtime_config(runtime)
 }
 
 fn codex_responses_endpoint(base_url: &str) -> String {
@@ -1414,6 +1424,7 @@ fn notify_prompt_too_long_observer(
         original_body_bytes: stats.map_or(0, |stats| stats.original_body_bytes as u64),
         shrunk_body_bytes: stats.map_or(0, |stats| stats.shrunk_body_bytes as u64),
         dropped_items: stats.map_or(0, |stats| stats.dropped_items as u64),
+        ..ProviderRequestObserverEvent::default()
     });
 }
 
@@ -2118,10 +2129,29 @@ mod tests {
 
     #[test]
     fn chatgpt_request_policy_caps_first_response_wait() {
-        let policy = chatgpt_upstream_request_policy();
+        let policy = chatgpt_upstream_request_policy(&ProviderRuntimeConfig::default());
 
         assert_eq!(policy.max_attempts, 2);
         assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn chatgpt_request_policy_allows_runtime_overrides() {
+        let runtime = ProviderRuntimeConfig {
+            retry: claude_proxy_config::settings::ProviderRetryConfig {
+                max_attempts: Some(4),
+                ..Default::default()
+            },
+            request: claude_proxy_config::settings::ProviderRequestConfig {
+                attempt_timeout_seconds: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policy = chatgpt_upstream_request_policy(&runtime);
+
+        assert_eq!(policy.max_attempts, 4);
+        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(20)));
     }
 
     #[test]
@@ -2962,6 +2992,8 @@ mod tests {
                 originator: HeaderValue::from_static("opencode"),
                 user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
             },
+            request_policy: chatgpt_upstream_request_policy(&ProviderRuntimeConfig::default()),
+            runtime: ProviderRuntimeConfig::default(),
             auth: ChatGptAuth::new(Client::new()).await.unwrap(),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),

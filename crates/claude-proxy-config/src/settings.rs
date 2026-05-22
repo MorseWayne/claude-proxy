@@ -52,9 +52,56 @@ pub struct ProviderConfig {
     /// ChatGPT-specific Codex request configuration.
     #[serde(default)]
     pub chatgpt: Option<ChatGptProviderConfig>,
+    /// Provider-specific upstream runtime policy and request options.
+    #[serde(default)]
+    pub runtime: ProviderRuntimeConfig,
     /// How plain text marker tags such as [thinking] are handled for this provider.
     #[serde(default)]
     pub reasoning_markers: ReasoningMarkerMode,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRuntimeConfig {
+    #[serde(default)]
+    pub retry: ProviderRetryConfig,
+    #[serde(default)]
+    pub request: ProviderRequestConfig,
+    #[serde(default)]
+    pub openai: OpenAiRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRetryConfig {
+    #[serde(default)]
+    pub max_attempts: Option<usize>,
+    #[serde(default)]
+    pub base_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub network_errors: Option<bool>,
+    #[serde(default)]
+    pub timeout_errors: Option<bool>,
+    #[serde(default)]
+    pub rate_limits: Option<bool>,
+    #[serde(default)]
+    pub transient_statuses: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRequestConfig {
+    #[serde(default)]
+    pub attempt_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub stream_idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub query_params: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiRuntimeConfig {
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1235,6 +1282,60 @@ idle_gap_ms = 45000
 
         assert!(!settings.observability.enabled);
         assert_eq!(settings.observability.idle_gap_ms, 45_000);
+    }
+
+    #[test]
+    fn provider_runtime_config_defaults_and_parses_overrides() {
+        let default_settings = Settings::from_toml(
+            r#"
+[providers.openai]
+api_key = "sk-test"
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        let default_runtime = &default_settings.providers["openai"].runtime;
+        assert_eq!(default_runtime.retry.max_attempts, None);
+        assert_eq!(default_runtime.request.attempt_timeout_seconds, None);
+        assert!(default_runtime.request.extra_headers.is_empty());
+        assert!(default_runtime.request.query_params.is_empty());
+        assert_eq!(default_runtime.openai.service_tier, None);
+
+        let toml = r#"
+[providers.openai]
+api_key = "sk-test"
+
+[providers.openai.runtime.retry]
+max_attempts = 5
+base_delay_ms = 150
+network_errors = false
+timeout_errors = true
+rate_limits = false
+transient_statuses = true
+
+[providers.openai.runtime.request]
+attempt_timeout_seconds = 45
+stream_idle_timeout_seconds = 90
+extra_headers = { "x-test" = "enabled" }
+query_params = { "api-version" = "2026-05-22" }
+
+[providers.openai.runtime.openai]
+service_tier = "flex"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let runtime = &settings.providers["openai"].runtime;
+
+        assert_eq!(runtime.retry.max_attempts, Some(5));
+        assert_eq!(runtime.retry.base_delay_ms, Some(150));
+        assert_eq!(runtime.retry.network_errors, Some(false));
+        assert_eq!(runtime.retry.timeout_errors, Some(true));
+        assert_eq!(runtime.retry.rate_limits, Some(false));
+        assert_eq!(runtime.retry.transient_statuses, Some(true));
+        assert_eq!(runtime.request.attempt_timeout_seconds, Some(45));
+        assert_eq!(runtime.request.stream_idle_timeout_seconds, Some(90));
+        assert_eq!(runtime.request.extra_headers["x-test"], "enabled");
+        assert_eq!(runtime.request.query_params["api-version"], "2026-05-22");
+        assert_eq!(runtime.openai.service_tier.as_deref(), Some("flex"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
     Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
-    ProviderRequestObserverEventKind,
+    ProviderRequestObserverEventKind, ProviderUsageMetadata,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -162,8 +162,7 @@ pub async fn messages(
     };
     let payload_stats = request_payload_stats(&resolved.request);
     let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
-    let provider_observer =
-        observability_enabled.then(|| provider_request_observer(observer_state.clone()));
+    let provider_observer = Some(provider_request_observer(observer_state.clone()));
     let upstream_connect_start = std::time::Instant::now();
 
     // Call provider (registry lock is no longer held)
@@ -184,7 +183,7 @@ pub async fn messages(
                 upstream_connect_ms,
                 idle_gap_ms: observability_idle_gap_ms,
                 payload_stats,
-                observer_state,
+                observer_state: observer_state.clone(),
             });
             if request.stream {
                 stream_leader_response(
@@ -199,6 +198,7 @@ pub async fn messages(
                             _provider: Some(provider_permit),
                         },
                         start,
+                        observer_state: observer_state.clone(),
                         observability,
                     },
                 )
@@ -216,6 +216,7 @@ pub async fn messages(
                             _provider: Some(provider_permit),
                         },
                         start,
+                        observer_state: observer_state.clone(),
                         observability,
                     },
                 )
@@ -235,7 +236,7 @@ pub async fn messages(
                 upstream_connect_ms,
                 idle_gap_ms: observability_idle_gap_ms,
                 payload_stats,
-                observer_state,
+                observer_state: observer_state.clone(),
             });
             handle_provider_error(
                 &state,
@@ -287,6 +288,7 @@ struct RequestObserverState {
     prompt_too_long_original_body_bytes: u64,
     prompt_too_long_shrunk_body_bytes: u64,
     prompt_too_long_dropped_items: u64,
+    stream_usage: TokenUsage,
 }
 
 impl RequestObserverState {
@@ -306,6 +308,15 @@ impl RequestObserverState {
                     .max(event.shrunk_body_bytes);
                 self.prompt_too_long_dropped_items =
                     self.prompt_too_long_dropped_items.max(event.dropped_items);
+            }
+            ProviderRequestObserverEventKind::StreamMetadata => {
+                if let Some(usage) = event
+                    .stream_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.usage.as_ref())
+                {
+                    merge_provider_usage_metadata(usage, &mut self.stream_usage);
+                }
             }
         }
     }
@@ -651,6 +662,7 @@ struct LeaderResponseContext {
     broadcast_tx: broadcast::Sender<InflightEvent>,
     permits: StreamPermits,
     start: std::time::Instant,
+    observer_state: Arc<StdMutex<RequestObserverState>>,
     observability: Option<ObservabilityContext>,
 }
 
@@ -816,6 +828,7 @@ async fn stream_leader_response(
         broadcast_tx,
         permits,
         start: _,
+        observer_state,
         observability,
     } = context;
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
@@ -887,6 +900,7 @@ async fn stream_leader_response(
         } else {
             health_state.record_provider_success(&provider_id).await;
         }
+        merge_observer_usage(&observer_state, &mut usage);
         metrics.record_latency(latency_ms);
         metrics
             .record_completed_request(CompletedUsageRecord {
@@ -924,6 +938,7 @@ async fn collect_leader_response(
         broadcast_tx,
         permits: _permits,
         start,
+        observer_state,
         observability,
     } = context;
     let stream_start = std::time::Instant::now();
@@ -955,6 +970,7 @@ async fn collect_leader_response(
                 let latency_ms = start.elapsed().as_millis() as u64;
                 state.metrics.record_error();
                 state.metrics.record_latency(latency_ms);
+                merge_observer_usage(&observer_state, &mut usage);
                 state
                     .metrics
                     .record_completed_request(CompletedUsageRecord {
@@ -993,6 +1009,7 @@ async fn collect_leader_response(
         .unwrap_or(json!({"error": "no response from provider"}));
 
     let latency_ms = start.elapsed().as_millis() as u64;
+    merge_observer_usage(&observer_state, &mut usage);
     state
         .metrics
         .record_completed_request(CompletedUsageRecord {
@@ -1506,6 +1523,34 @@ fn update_usage_snapshot(u: &Value, usage: &mut TokenUsage) {
     }
 }
 
+fn merge_observer_usage(state: &Arc<StdMutex<RequestObserverState>>, usage: &mut TokenUsage) {
+    if let Ok(state) = state.lock() {
+        merge_usage_snapshot(&state.stream_usage, usage);
+    }
+}
+
+fn merge_provider_usage_metadata(provider_usage: &ProviderUsageMetadata, usage: &mut TokenUsage) {
+    usage.input_tokens = usage.input_tokens.max(provider_usage.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(provider_usage.output_tokens);
+    usage.cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .max(provider_usage.cache_creation_input_tokens);
+    usage.cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .max(provider_usage.cache_read_input_tokens);
+}
+
+fn merge_usage_snapshot(snapshot: &TokenUsage, usage: &mut TokenUsage) {
+    usage.input_tokens = usage.input_tokens.max(snapshot.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(snapshot.output_tokens);
+    usage.cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .max(snapshot.cache_creation_input_tokens);
+    usage.cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .max(snapshot.cache_read_input_tokens);
+}
+
 /// Compute a hash of the request for deduplication purposes.
 /// Two requests with the same model, messages, system, tools, and parameters
 /// will produce the same hash.
@@ -1553,6 +1598,7 @@ mod tests {
                 provider_type: Some(provider_type),
                 copilot: None,
                 chatgpt: None,
+                runtime: Default::default(),
                 reasoning_markers: Default::default(),
             },
         );
@@ -1797,6 +1843,7 @@ mod tests {
                     _provider: None,
                 },
                 start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
                 observability: None,
             },
         )
@@ -2004,6 +2051,7 @@ mod tests {
             original_body_bytes: 300,
             shrunk_body_bytes: 200,
             dropped_items: 1,
+            ..ProviderRequestObserverEvent::default()
         });
         observer(ProviderRequestObserverEvent {
             event: ProviderRequestObserverEventKind::PromptTooLongRetry,
@@ -2011,6 +2059,7 @@ mod tests {
             original_body_bytes: 280,
             shrunk_body_bytes: 150,
             dropped_items: 3,
+            ..ProviderRequestObserverEvent::default()
         });
 
         let state = state.lock().unwrap();
@@ -2018,6 +2067,41 @@ mod tests {
         assert_eq!(state.prompt_too_long_original_body_bytes, 300);
         assert_eq!(state.prompt_too_long_shrunk_body_bytes, 200);
         assert_eq!(state.prompt_too_long_dropped_items, 3);
+    }
+
+    #[test]
+    fn provider_request_observer_merges_stream_usage_metadata() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::StreamMetadata,
+            stream_metadata: Some(claude_proxy_providers::provider::ProviderStreamMetadata {
+                usage: Some(ProviderUsageMetadata {
+                    input_tokens: 42,
+                    output_tokens: 9,
+                    cache_creation_input_tokens: 3,
+                    cache_read_input_tokens: 5,
+                }),
+                model: Some("gpt-4".to_string()),
+                request_id: Some("chatcmpl-1".to_string()),
+                stop_reason: Some("stop".to_string()),
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+
+        let mut usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        merge_observer_usage(&state, &mut usage);
+
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, 5);
     }
 
     #[test]

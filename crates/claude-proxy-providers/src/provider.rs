@@ -94,6 +94,26 @@ pub enum RateLimitSource {
     StreamEvent,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsageMetadata {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderStreamMetadata {
+    #[serde(default)]
+    pub usage: Option<ProviderUsageMetadata>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRequestObserverEvent {
     pub event: ProviderRequestObserverEventKind,
@@ -105,6 +125,8 @@ pub struct ProviderRequestObserverEvent {
     pub shrunk_body_bytes: u64,
     #[serde(default)]
     pub dropped_items: u64,
+    #[serde(default)]
+    pub stream_metadata: Option<ProviderStreamMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +136,7 @@ pub enum ProviderRequestObserverEventKind {
     PromptTooLongRetry,
     PromptTooLongRetryExhausted,
     PromptTooLongRetryUnshrinkable,
+    StreamMetadata,
 }
 
 pub type ProviderRequestObserver = Arc<dyn Fn(ProviderRequestObserverEvent) + Send + Sync>;

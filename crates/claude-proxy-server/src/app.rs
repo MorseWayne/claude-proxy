@@ -446,6 +446,7 @@ mod tests {
                 provider_type: Some(ProviderType::OpenAI),
                 copilot: None,
                 chatgpt: None,
+                runtime: Default::default(),
                 reasoning_markers: Default::default(),
             },
         );
@@ -881,6 +882,7 @@ mod tests {
                 provider_type: Some(ProviderType::Anthropic),
                 copilot: None,
                 chatgpt: None,
+                runtime: Default::default(),
                 reasoning_markers: Default::default(),
             },
         );

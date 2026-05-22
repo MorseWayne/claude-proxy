@@ -19,8 +19,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::provider::ProviderError;
 use chrono::DateTime;
+use claude_proxy_config::settings::{
+    ProviderRequestConfig, ProviderRetryConfig, ProviderRuntimeConfig,
+};
 use futures::StreamExt;
-use reqwest::StatusCode;
+use reqwest::{
+    RequestBuilder, StatusCode,
+    header::{HeaderName, HeaderValue},
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
@@ -38,6 +44,11 @@ const UPSTREAM_SUCCESS_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct UpstreamRequestPolicy {
     pub max_attempts: usize,
     pub attempt_timeout: Option<Duration>,
+    pub base_retry_delay: Duration,
+    pub retry_network_errors: bool,
+    pub retry_timeout_errors: bool,
+    pub retry_rate_limits: bool,
+    pub retry_transient_statuses: bool,
 }
 
 impl Default for UpstreamRequestPolicy {
@@ -45,14 +56,81 @@ impl Default for UpstreamRequestPolicy {
         Self {
             max_attempts: MAX_SEND_ATTEMPTS,
             attempt_timeout: None,
+            base_retry_delay: BASE_RETRY_DELAY,
+            retry_network_errors: true,
+            retry_timeout_errors: true,
+            retry_rate_limits: true,
+            retry_transient_statuses: true,
         }
     }
 }
 
 impl UpstreamRequestPolicy {
+    pub fn from_runtime_config(config: &ProviderRuntimeConfig) -> Self {
+        Self::default().with_runtime_config(config)
+    }
+
+    pub fn with_runtime_config(mut self, config: &ProviderRuntimeConfig) -> Self {
+        self.apply_retry_config(&config.retry);
+        self.apply_request_config(&config.request);
+        self
+    }
+
+    fn apply_retry_config(&mut self, retry: &ProviderRetryConfig) {
+        if let Some(max_attempts) = retry.max_attempts {
+            self.max_attempts = max_attempts;
+        }
+        if let Some(base_delay_ms) = retry.base_delay_ms {
+            self.base_retry_delay = Duration::from_millis(base_delay_ms);
+        }
+        if let Some(retry_network_errors) = retry.network_errors {
+            self.retry_network_errors = retry_network_errors;
+        }
+        if let Some(retry_timeout_errors) = retry.timeout_errors {
+            self.retry_timeout_errors = retry_timeout_errors;
+        }
+        if let Some(retry_rate_limits) = retry.rate_limits {
+            self.retry_rate_limits = retry_rate_limits;
+        }
+        if let Some(retry_transient_statuses) = retry.transient_statuses {
+            self.retry_transient_statuses = retry_transient_statuses;
+        }
+    }
+
+    fn apply_request_config(&mut self, request: &ProviderRequestConfig) {
+        if let Some(attempt_timeout_seconds) = request.attempt_timeout_seconds {
+            self.attempt_timeout = Some(Duration::from_secs(attempt_timeout_seconds));
+        }
+    }
+
     fn max_attempts(self) -> usize {
         self.max_attempts.max(1)
     }
+}
+
+pub fn apply_runtime_request_config(
+    mut request: RequestBuilder,
+    config: &ProviderRuntimeConfig,
+) -> Result<RequestBuilder, ProviderError> {
+    for (name, value) in &config.request.extra_headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            ProviderError::InvalidRequest(format!(
+                "invalid provider runtime header {name}: {error}"
+            ))
+        })?;
+        let header_value = HeaderValue::from_str(value).map_err(|error| {
+            ProviderError::InvalidRequest(format!(
+                "invalid provider runtime header {name}: {error}"
+            ))
+        })?;
+        request = request.header(header_name, header_value);
+    }
+
+    if !config.request.query_params.is_empty() {
+        request = request.query(&config.request.query_params);
+    }
+
+    Ok(request)
 }
 
 /// Walk the `source` chain of an error and produce a `: `-separated string so
@@ -117,12 +195,12 @@ pub async fn send_upstream_request_with_policy(
         };
 
         let response = send_once(next_request, policy.attempt_timeout).await;
-        if attempt >= max_attempts || !should_retry_result(&response) {
+        if attempt >= max_attempts || !should_retry_result(&response, policy) {
             return response;
         }
 
         warn_retrying_upstream_request(attempt, max_attempts, &response);
-        sleep(retry_delay(attempt, response.as_ref().ok())).await;
+        sleep(retry_delay(attempt, response.as_ref().ok(), policy)).await;
     }
 }
 
@@ -216,12 +294,23 @@ fn warn_retrying_upstream_request(
     }
 }
 
-fn should_retry_result(response: &Result<reqwest::Response, ProviderError>) -> bool {
+fn should_retry_result(
+    response: &Result<reqwest::Response, ProviderError>,
+    policy: UpstreamRequestPolicy,
+) -> bool {
     match response {
-        Ok(response) => is_retryable_status(response.status()),
-        Err(ProviderError::Timeout) | Err(ProviderError::Network(_)) => true,
+        Ok(response) => should_retry_status(response.status(), policy),
+        Err(ProviderError::Timeout) => policy.retry_timeout_errors,
+        Err(ProviderError::Network(_)) => policy.retry_network_errors,
         Err(_) => false,
     }
+}
+
+fn should_retry_status(status: StatusCode, policy: UpstreamRequestPolicy) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return policy.retry_rate_limits;
+    }
+    policy.retry_transient_statuses && is_retryable_status(status)
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -239,10 +328,14 @@ fn is_retryable_overload_status(status: u16) -> bool {
     })
 }
 
-fn retry_delay(attempt: usize, response: Option<&reqwest::Response>) -> Duration {
+fn retry_delay(
+    attempt: usize,
+    response: Option<&reqwest::Response>,
+    policy: UpstreamRequestPolicy,
+) -> Duration {
     response
         .and_then(retry_after_delay)
-        .unwrap_or_else(|| BASE_RETRY_DELAY * attempt as u32)
+        .unwrap_or_else(|| policy.base_retry_delay * attempt as u32)
 }
 
 fn retry_after_delay_secs(value: &str) -> Option<Duration> {
@@ -395,6 +488,7 @@ pub fn apply_extra_ca_certs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_proxy_config::settings::{ProviderRequestConfig, ProviderRetryConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -480,13 +574,16 @@ mod tests {
 
     #[test]
     fn timeout_and_network_errors_are_retryable() {
-        assert!(should_retry_result(&Err(ProviderError::Timeout)));
-        assert!(should_retry_result(&Err(ProviderError::Network(
-            "connection closed".to_string()
-        ))));
-        assert!(!should_retry_result(&Err(ProviderError::InvalidRequest(
-            "bad request".to_string()
-        ))));
+        let policy = UpstreamRequestPolicy::default();
+        assert!(should_retry_result(&Err(ProviderError::Timeout), policy));
+        assert!(should_retry_result(
+            &Err(ProviderError::Network("connection closed".to_string())),
+            policy
+        ));
+        assert!(!should_retry_result(
+            &Err(ProviderError::InvalidRequest("bad request".to_string())),
+            policy
+        ));
     }
 
     #[tokio::test]
@@ -540,9 +637,60 @@ mod tests {
     fn request_policy_uses_one_attempt_when_configured_zero() {
         let policy = UpstreamRequestPolicy {
             max_attempts: 0,
-            attempt_timeout: None,
+            ..UpstreamRequestPolicy::default()
         };
 
         assert_eq!(policy.max_attempts(), 1);
+    }
+
+    #[test]
+    fn runtime_config_overrides_request_policy() {
+        let runtime = ProviderRuntimeConfig {
+            retry: ProviderRetryConfig {
+                max_attempts: Some(4),
+                base_delay_ms: Some(50),
+                network_errors: Some(false),
+                timeout_errors: Some(false),
+                rate_limits: Some(false),
+                transient_statuses: Some(false),
+            },
+            request: ProviderRequestConfig {
+                attempt_timeout_seconds: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let policy = UpstreamRequestPolicy::from_runtime_config(&runtime);
+
+        assert_eq!(policy.max_attempts, 4);
+        assert_eq!(policy.base_retry_delay, Duration::from_millis(50));
+        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(30)));
+        assert!(!policy.retry_network_errors);
+        assert!(!policy.retry_timeout_errors);
+        assert!(!policy.retry_rate_limits);
+        assert!(!policy.retry_transient_statuses);
+    }
+
+    #[test]
+    fn runtime_config_retry_toggles_control_retryable_results() {
+        let policy = UpstreamRequestPolicy {
+            retry_network_errors: false,
+            retry_timeout_errors: false,
+            retry_rate_limits: false,
+            retry_transient_statuses: false,
+            ..UpstreamRequestPolicy::default()
+        };
+
+        assert!(!should_retry_result(&Err(ProviderError::Timeout), policy));
+        assert!(!should_retry_result(
+            &Err(ProviderError::Network("connection closed".to_string())),
+            policy
+        ));
+        assert!(!should_retry_status(StatusCode::TOO_MANY_REQUESTS, policy));
+        assert!(!should_retry_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            policy
+        ));
     }
 }
