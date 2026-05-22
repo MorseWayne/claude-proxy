@@ -1281,12 +1281,22 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
         .collect::<Vec<_>>();
     drop(settings);
 
-    let model_capabilities = state.provider_registry.read().await.model_capabilities();
+    let (model_capabilities, model_cache) = {
+        let registry = state.provider_registry.read().await;
+        (
+            registry.model_capabilities(),
+            registry.model_cache_status(&provider_ids),
+        )
+    };
     let provider_rate_limits = provider_rate_limit_snapshots(&state, rate_limit_provider_ids).await;
     let provider_health = state.provider_health_snapshot(provider_ids).await;
     let mut metrics = state.metrics.to_json().await;
     if let Some(object) = metrics.as_object_mut() {
         object.insert("model_capabilities".to_string(), model_capabilities);
+        object.insert(
+            "model_cache".to_string(),
+            serde_json::to_value(model_cache).unwrap_or_default(),
+        );
         object.insert(
             "provider_rate_limits".to_string(),
             serde_json::to_value(provider_rate_limits).unwrap_or_default(),
@@ -1297,6 +1307,48 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
         );
     }
     Json(metrics).into_response()
+}
+
+/// POST /admin/models/refresh — force refresh model caches for all configured providers
+pub async fn admin_refresh_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    let provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
+    drop(settings);
+
+    let mut refreshed = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    for provider_id in &provider_ids {
+        match state.refresh_models(provider_id).await {
+            Ok(models) => {
+                refreshed.insert(provider_id.clone(), json!(models.len()));
+            }
+            Err(error) => {
+                warn!("{error}");
+                errors.insert(provider_id.clone(), json!(error));
+            }
+        }
+    }
+
+    let model_cache = state
+        .provider_registry
+        .read()
+        .await
+        .model_cache_status(&provider_ids);
+    let status = if errors.is_empty() { "ok" } else { "partial" };
+
+    Json(json!({
+        "status": status,
+        "refreshed": refreshed,
+        "errors": errors,
+        "model_cache": model_cache,
+    }))
+    .into_response()
 }
 
 async fn provider_rate_limit_snapshots(
@@ -2256,11 +2308,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_refresh_models_requires_admin_auth() {
+        let mut settings = settings_with_provider(ProviderType::OpenAI);
+        settings.admin.auth_token = Some("admin-secret".to_string());
+        let state = AppState::new(settings, None);
+
+        let response = admin_refresh_models(State(state), HeaderMap::new()).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn admin_metrics_includes_model_capabilities() {
         let settings = settings_with_provider(ProviderType::ChatGPT);
         let state = AppState::new(settings, None);
         state.provider_registry.write().await.cache_models(
-            "chatgpt",
+            "test",
             vec![ModelInfo {
                 model_id: "gpt-5.5".to_string(),
                 supports_thinking: Some(true),
@@ -2287,17 +2350,24 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(
-            body["model_capabilities"]["chatgpt/gpt-5.5"]["max_output_tokens"],
+            body["model_capabilities"]["test/gpt-5.5"]["max_output_tokens"],
             128_000
         );
         assert_eq!(
-            body["model_capabilities"]["chatgpt/gpt-5.5"]["context_window"],
+            body["model_capabilities"]["test/gpt-5.5"]["context_window"],
             400_000
         );
         assert_eq!(
-            body["model_capabilities"]["chatgpt/gpt-5.5"]["supported_endpoints"][0],
+            body["model_capabilities"]["test/gpt-5.5"]["supported_endpoints"][0],
             "/responses"
         );
+        assert_eq!(body["model_cache"][0]["provider"], "test");
+        assert_eq!(body["model_cache"][0]["cached"], true);
+        assert_eq!(body["model_cache"][0]["model_count"], 1);
+        assert_eq!(body["model_cache"][0]["fresh"], true);
+        assert!(body["model_cache"][0]["ttl_secs"].as_u64().unwrap() > 0);
+        assert!(body["model_cache"][0]["age_secs"].as_u64().is_some());
+        assert!(body["model_cache"][0]["expires_in_secs"].as_u64().is_some());
         assert_eq!(body["provider_health"]["chatgpt"]["status"], "unhealthy");
         assert_eq!(
             body["provider_health"]["chatgpt"]["last_error"],

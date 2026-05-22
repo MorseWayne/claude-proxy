@@ -302,6 +302,31 @@ async fn test_list_models() {
 }
 
 #[tokio::test]
+async fn test_admin_models_refresh_with_auth() {
+    let mock_url = start_mock_openai().await;
+    let mut settings = test_settings(&mock_url, "test-token");
+    settings.admin.auth_token = Some("admin-secret".to_string());
+    let proxy_url = start_proxy(settings).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/admin/models/refresh", proxy_url))
+        .header("authorization", "Bearer admin-secret")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["refreshed"]["openai"], 2);
+    assert_eq!(body["model_cache"][0]["provider"], "openai");
+    assert_eq!(body["model_cache"][0]["cached"], true);
+    assert_eq!(body["model_cache"][0]["model_count"], 2);
+    assert_eq!(body["model_cache"][0]["fresh"], true);
+}
+
+#[tokio::test]
 async fn test_admin_config_without_auth() {
     let mock_url = start_mock_openai().await;
     let mut settings = test_settings(&mock_url, "test-token");

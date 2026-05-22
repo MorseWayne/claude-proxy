@@ -764,6 +764,109 @@ mod tests {
     }
 
     #[test]
+    fn provider_registry_exports_model_cache_status() {
+        let mut registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(60));
+        let cached_at = Instant::now() - Duration::from_secs(20);
+        registry.cache_models_at(
+            "chatgpt",
+            vec![
+                ModelInfo {
+                    model_id: "gpt-5.5".to_string(),
+                    supports_thinking: None,
+                    vendor: None,
+                    max_output_tokens: None,
+                    context_window: None,
+                    supported_endpoints: Vec::new(),
+                    is_chat_default: None,
+                    supports_vision: None,
+                    supports_adaptive_thinking: None,
+                    min_thinking_budget: None,
+                    max_thinking_budget: None,
+                    reasoning_effort_levels: Vec::new(),
+                },
+                ModelInfo {
+                    model_id: "gpt-5-mini".to_string(),
+                    supports_thinking: None,
+                    vendor: None,
+                    max_output_tokens: None,
+                    context_window: None,
+                    supported_endpoints: Vec::new(),
+                    is_chat_default: None,
+                    supports_vision: None,
+                    supports_adaptive_thinking: None,
+                    min_thinking_budget: None,
+                    max_thinking_budget: None,
+                    reasoning_effort_levels: Vec::new(),
+                },
+            ],
+            cached_at,
+        );
+
+        let statuses = registry.model_cache_status_at(
+            &["chatgpt".to_string()],
+            cached_at + Duration::from_secs(20),
+        );
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].provider, "chatgpt");
+        assert!(statuses[0].cached);
+        assert_eq!(statuses[0].model_count, 2);
+        assert!(statuses[0].fresh);
+        assert_eq!(statuses[0].age_secs, Some(20));
+        assert_eq!(statuses[0].ttl_secs, 60);
+        assert_eq!(statuses[0].expires_in_secs, Some(40));
+    }
+
+    #[test]
+    fn provider_registry_marks_stale_model_cache_status() {
+        let mut registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(60));
+        let cached_at = Instant::now() - Duration::from_secs(90);
+        registry.cache_models_at(
+            "openai",
+            vec![ModelInfo {
+                model_id: "stale-model".to_string(),
+                supports_thinking: None,
+                vendor: None,
+                max_output_tokens: None,
+                context_window: None,
+                supported_endpoints: Vec::new(),
+                is_chat_default: None,
+                supports_vision: None,
+                supports_adaptive_thinking: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: Vec::new(),
+            }],
+            cached_at,
+        );
+
+        let statuses = registry
+            .model_cache_status_at(&["openai".to_string()], cached_at + Duration::from_secs(90));
+
+        assert_eq!(statuses[0].provider, "openai");
+        assert!(statuses[0].cached);
+        assert!(!statuses[0].fresh);
+        assert_eq!(statuses[0].age_secs, Some(90));
+        assert_eq!(statuses[0].ttl_secs, 60);
+        assert_eq!(statuses[0].expires_in_secs, Some(0));
+    }
+
+    #[test]
+    fn provider_registry_reports_uncached_model_cache_status() {
+        let registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(60));
+
+        let statuses = registry.model_cache_status_at(&["openai".to_string()], Instant::now());
+
+        assert_eq!(statuses[0].provider, "openai");
+        assert!(!statuses[0].cached);
+        assert_eq!(statuses[0].model_count, 0);
+        assert!(!statuses[0].fresh);
+        assert_eq!(statuses[0].age_secs, None);
+        assert_eq!(statuses[0].ttl_secs, 60);
+        assert_eq!(statuses[0].expires_in_secs, None);
+    }
+
+    #[test]
     fn provider_registry_treats_expired_models_as_stale() {
         let mut registry = ProviderRegistry::new();
         registry.cache_models_at(
@@ -986,6 +1089,17 @@ pub struct ProviderRegistry {
     model_cache_ttl: Duration,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCacheStatus {
+    pub provider: String,
+    pub cached: bool,
+    pub model_count: usize,
+    pub fresh: bool,
+    pub age_secs: Option<u64>,
+    pub ttl_secs: u64,
+    pub expires_in_secs: Option<u64>,
+}
+
 struct ModelCacheEntry {
     models: Vec<claude_proxy_core::ModelInfo>,
     cached_at: Instant,
@@ -1005,7 +1119,11 @@ impl ModelCacheEntry {
     }
 
     fn is_fresh_at(&self, now: Instant, ttl: Duration) -> bool {
-        now.saturating_duration_since(self.cached_at) < ttl
+        self.age_at(now) < ttl
+    }
+
+    fn age_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.cached_at)
     }
 }
 
@@ -1089,6 +1207,48 @@ impl ProviderRegistry {
             .flat_map(|entry| entry.models.iter())
             .cloned()
             .collect()
+    }
+
+    pub fn model_cache_status(&self, provider_ids: &[String]) -> Vec<ModelCacheStatus> {
+        self.model_cache_status_at(provider_ids, Instant::now())
+    }
+
+    fn model_cache_status_at(
+        &self,
+        provider_ids: &[String],
+        now: Instant,
+    ) -> Vec<ModelCacheStatus> {
+        let ttl = self.model_cache_ttl;
+        let mut statuses = provider_ids
+            .iter()
+            .map(|provider_id| {
+                let Some(entry) = self.model_cache.get(provider_id) else {
+                    return ModelCacheStatus {
+                        provider: provider_id.clone(),
+                        cached: false,
+                        model_count: 0,
+                        fresh: false,
+                        age_secs: None,
+                        ttl_secs: ttl.as_secs(),
+                        expires_in_secs: None,
+                    };
+                };
+
+                let age = entry.age_at(now);
+                let fresh = entry.is_fresh_at(now, ttl);
+                ModelCacheStatus {
+                    provider: provider_id.clone(),
+                    cached: true,
+                    model_count: entry.models.len(),
+                    fresh,
+                    age_secs: Some(age.as_secs()),
+                    ttl_secs: ttl.as_secs(),
+                    expires_in_secs: Some(ttl.saturating_sub(age).as_secs()),
+                }
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|a, b| a.provider.cmp(&b.provider));
+        statuses
     }
 
     pub fn model_capabilities(&self) -> Value {
@@ -1231,6 +1391,17 @@ impl AppState {
             return Ok(models);
         }
 
+        self.fetch_and_cache_models(provider_id).await
+    }
+
+    pub async fn refresh_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>, String> {
+        let refresh_lock = self.model_refresh_lock(provider_id).await;
+        let _refresh_guard = refresh_lock.lock().await;
+
+        self.fetch_and_cache_models(provider_id).await
+    }
+
+    async fn fetch_and_cache_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>, String> {
         let provider = self.get_or_create_provider(provider_id).await?;
         let models = match provider.list_models().await {
             Ok(models) => {

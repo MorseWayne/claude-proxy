@@ -35,6 +35,7 @@ pub fn build_router(state: AppState, _settings: &Settings) -> Router {
         .route("/admin/config", put(routes::admin_update_config))
         .route("/admin/restart", post(routes::admin_restart))
         .route("/admin/metrics", get(routes::admin_metrics))
+        .route("/admin/models/refresh", post(routes::admin_refresh_models))
         .with_state(state)
         .layer(rate_limit_layer)
         .layer(TraceLayer::new_for_http())
