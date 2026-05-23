@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.1 - 2026-05-24
+
+### Added in v1.2.1
+
+- Added canonical model capability contract metadata for internal routing and compatibility validation.
+
+### Changed in v1.2.1
+
+- Updated local tooling ignore rules to keep CI/build outputs out of version control and simplify release preparation.
+
 ## v1.2.0 - 2026-05-22
 
 ### Added in v1.2.0
