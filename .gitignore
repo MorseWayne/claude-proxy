@@ -4,6 +4,8 @@ Cargo.lock
 # Local tool state
 .antigravitycli/
 .gitnexus/
+.codegraph/
+.cursor/
 
 # Local environment and editor files
 .env
