@@ -297,32 +297,206 @@ pub struct SseEvent {
     pub data: Value,
 }
 
-/// Information about an available model.
+/// Capability support state for a model feature or modality.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityState {
+    Supported,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+impl CapabilityState {
+    pub fn from_bool(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Supported,
+            Some(false) => Self::Unsupported,
+            None => Self::Unknown,
+        }
+    }
+
+    pub fn is_supported(self) -> bool {
+        self == Self::Supported
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelInfo {
-    pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_thinking: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vendor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
+pub struct EndpointCapabilities {
+    #[serde(default)]
+    pub anthropic_messages: CapabilityState,
+    #[serde(default)]
+    pub openai_chat_completions: CapabilityState,
+    #[serde(default)]
+    pub openai_responses: CapabilityState,
+}
+
+impl Default for EndpointCapabilities {
+    fn default() -> Self {
+        Self {
+            anthropic_messages: CapabilityState::Unknown,
+            openai_chat_completions: CapabilityState::Unknown,
+            openai_responses: CapabilityState::Unknown,
+        }
+    }
+}
+
+impl EndpointCapabilities {
+    pub fn from_paths(paths: &[String]) -> Self {
+        Self {
+            anthropic_messages: path_state(paths, "/v1/messages"),
+            openai_chat_completions: path_state(paths, "/chat/completions"),
+            openai_responses: path_state(paths, "/responses"),
+        }
+    }
+
+    pub fn supported_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        if self.anthropic_messages.is_supported() {
+            paths.push("/v1/messages".to_string());
+        }
+        if self.openai_chat_completions.is_supported() {
+            paths.push("/chat/completions".to_string());
+        }
+        if self.openai_responses.is_supported() {
+            paths.push("/responses".to_string());
+        }
+        paths
+    }
+}
+
+fn path_state(paths: &[String], path: &str) -> CapabilityState {
+    if paths.iter().any(|candidate| candidate == path) {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unsupported
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModalityCapabilities {
+    #[serde(default)]
+    pub input: InputModalities,
+    #[serde(default)]
+    pub output: OutputModalities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputModalities {
+    #[serde(default = "supported_capability")]
+    pub text: CapabilityState,
+    #[serde(default)]
+    pub image: CapabilityState,
+    #[serde(default)]
+    pub document: CapabilityState,
+    #[serde(default = "unsupported_capability")]
+    pub audio: CapabilityState,
+    #[serde(default = "unsupported_capability")]
+    pub video: CapabilityState,
+}
+
+impl Default for InputModalities {
+    fn default() -> Self {
+        Self {
+            text: CapabilityState::Supported,
+            image: CapabilityState::Unknown,
+            document: CapabilityState::Unknown,
+            audio: CapabilityState::Unsupported,
+            video: CapabilityState::Unsupported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputModalities {
+    #[serde(default = "supported_capability")]
+    pub text: CapabilityState,
+    #[serde(default = "unsupported_capability")]
+    pub image: CapabilityState,
+    #[serde(default = "unsupported_capability")]
+    pub audio: CapabilityState,
+}
+
+impl Default for OutputModalities {
+    fn default() -> Self {
+        Self {
+            text: CapabilityState::Supported,
+            image: CapabilityState::Unsupported,
+            audio: CapabilityState::Unsupported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeatureCapabilities {
+    #[serde(default)]
+    pub streaming: CapabilityState,
+    #[serde(default)]
+    pub system_prompt: CapabilityState,
+    #[serde(default)]
+    pub tools: CapabilityState,
+    #[serde(default)]
+    pub tool_choice: CapabilityState,
+    #[serde(default)]
+    pub thinking: CapabilityState,
+    #[serde(default)]
+    pub adaptive_thinking: CapabilityState,
+    #[serde(default)]
+    pub reasoning_effort: CapabilityState,
+    #[serde(default)]
+    pub prompt_cache: CapabilityState,
+    #[serde(default)]
+    pub sampling: CapabilityState,
+    #[serde(default)]
+    pub stop_sequences: CapabilityState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub supported_endpoints: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_chat_default: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_vision: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_adaptive_thinking: Option<bool>,
+    pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_thinking_budget: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_thinking_budget: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_effort_levels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub endpoints: EndpointCapabilities,
+    #[serde(default)]
+    pub modalities: ModalityCapabilities,
+    #[serde(default)]
+    pub features: FeatureCapabilities,
+    #[serde(default)]
+    pub limits: ModelLimits,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_parameters: Vec<String>,
+}
+
+fn supported_capability() -> CapabilityState {
+    CapabilityState::Supported
+}
+
+fn unsupported_capability() -> CapabilityState {
+    CapabilityState::Unsupported
+}
+
+/// Information about an available model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_chat_default: Option<bool>,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
 }
 
 /// Errors from provider interactions.
@@ -451,6 +625,65 @@ mod tests {
         };
         assert_eq!(preserved, &raw);
         assert_eq!(serde_json::to_value(content).unwrap(), raw);
+    }
+
+    #[test]
+    fn model_capabilities_serialize_canonical_shape() {
+        let info = ModelInfo {
+            model_id: "gpt-5.5".to_string(),
+            vendor: Some("openai".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                endpoints: EndpointCapabilities {
+                    anthropic_messages: CapabilityState::Unsupported,
+                    openai_chat_completions: CapabilityState::Supported,
+                    openai_responses: CapabilityState::Supported,
+                },
+                modalities: ModalityCapabilities {
+                    input: InputModalities {
+                        image: CapabilityState::Unknown,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                features: FeatureCapabilities {
+                    streaming: CapabilityState::Supported,
+                    tools: CapabilityState::Supported,
+                    thinking: CapabilityState::Supported,
+                    reasoning_effort: CapabilityState::Supported,
+                    ..Default::default()
+                },
+                limits: ModelLimits {
+                    context_window: Some(400_000),
+                    max_output_tokens: Some(128_000),
+                    reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+                    ..Default::default()
+                },
+                supported_parameters: vec!["messages".to_string(), "tools".to_string()],
+            },
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["capabilities"]["endpoints"]["openai_responses"],
+            "supported"
+        );
+        assert_eq!(
+            value["capabilities"]["modalities"]["input"]["image"],
+            "unknown"
+        );
+        assert_eq!(value["capabilities"]["limits"]["context_window"], 400_000);
+        assert_eq!(value["capabilities"]["supported_parameters"][1], "tools");
+
+        let parsed: ModelInfo = serde_json::from_value(value).unwrap();
+        assert!(
+            parsed
+                .capabilities
+                .endpoints
+                .openai_responses
+                .is_supported()
+        );
+        assert_eq!(parsed.capabilities.limits.max_output_tokens, Some(128_000));
     }
 
     #[test]

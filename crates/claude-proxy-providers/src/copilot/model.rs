@@ -1,4 +1,7 @@
-use claude_proxy_core::ModelInfo;
+use claude_proxy_core::{
+    CapabilityState, EndpointCapabilities, FeatureCapabilities, InputModalities,
+    ModalityCapabilities, ModelCapabilities, ModelInfo, ModelLimits,
+};
 use serde_json::Value;
 use tracing::warn;
 
@@ -19,65 +22,114 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
     let billing = &model["billing"];
     let supports = &capabilities["supports"];
 
+    let supports_thinking = model["supports_thinking"]
+        .as_bool()
+        .or_else(|| capabilities["supports_thinking"].as_bool())
+        .or_else(|| supports["thinking"].as_bool());
+    let supports_vision = supports["vision"]
+        .as_bool()
+        .or_else(|| capabilities["supports_vision"].as_bool());
+    let supports_adaptive_thinking = model["supports_adaptive_thinking"]
+        .as_bool()
+        .or_else(|| capabilities["supports_adaptive_thinking"].as_bool())
+        .or_else(|| supports["adaptive_thinking"].as_bool());
+    let min_thinking_budget = model["min_thinking_budget"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            supports["min_thinking_budget"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    let max_thinking_budget = model["max_thinking_budget"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            supports["max_thinking_budget"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+        })
+        .or_else(|| {
+            billing["max_thinking_budget"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    let reasoning_effort_levels = supports["reasoning_effort"]
+        .as_array()
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| level.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let supported_endpoints = parse_supported_endpoints(&model["supported_endpoints"]);
+
     Some(ModelInfo {
         model_id: model_id.to_string(),
-        supports_thinking: model["supports_thinking"]
-            .as_bool()
-            .or_else(|| capabilities["supports_thinking"].as_bool())
-            .or_else(|| supports["thinking"].as_bool()),
         vendor: model["vendor"]
             .get("name")
             .and_then(Value::as_str)
             .or_else(|| model["vendor"].as_str())
             .map(|s| s.to_ascii_lowercase()),
-        max_output_tokens: limits["max_output_tokens"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok()),
-        context_window: limits["max_context_window_tokens"]
-            .as_u64()
-            .or_else(|| limits["context_window"].as_u64())
-            .or_else(|| capabilities["context_window"].as_u64())
-            .and_then(|n| u32::try_from(n).ok()),
-        supported_endpoints: parse_supported_endpoints(&model["supported_endpoints"]),
         is_chat_default: model["is_chat_default"].as_bool(),
-        supports_vision: supports["vision"]
-            .as_bool()
-            .or_else(|| capabilities["supports_vision"].as_bool()),
-        supports_adaptive_thinking: model["supports_adaptive_thinking"]
-            .as_bool()
-            .or_else(|| capabilities["supports_adaptive_thinking"].as_bool())
-            .or_else(|| supports["adaptive_thinking"].as_bool()),
-        min_thinking_budget: model["min_thinking_budget"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .or_else(|| {
-                supports["min_thinking_budget"]
+        capabilities: ModelCapabilities {
+            endpoints: EndpointCapabilities::from_paths(&supported_endpoints),
+            modalities: ModalityCapabilities {
+                input: InputModalities {
+                    image: CapabilityState::from_bool(supports_vision),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            features: FeatureCapabilities {
+                streaming: CapabilityState::Supported,
+                system_prompt: CapabilityState::Supported,
+                tools: CapabilityState::Supported,
+                tool_choice: CapabilityState::Supported,
+                thinking: CapabilityState::from_bool(supports_thinking),
+                adaptive_thinking: CapabilityState::from_bool(supports_adaptive_thinking),
+                reasoning_effort: CapabilityState::from_bool(
+                    (!reasoning_effort_levels.is_empty()).then_some(true),
+                ),
+                sampling: CapabilityState::Supported,
+                stop_sequences: CapabilityState::Supported,
+                ..Default::default()
+            },
+            limits: ModelLimits {
+                max_output_tokens: limits["max_output_tokens"]
                     .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-            }),
-        max_thinking_budget: model["max_thinking_budget"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .or_else(|| {
-                supports["max_thinking_budget"]
+                    .and_then(|n| u32::try_from(n).ok()),
+                context_window: limits["max_context_window_tokens"]
                     .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-            })
-            .or_else(|| {
-                billing["max_thinking_budget"]
-                    .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-            }),
-        reasoning_effort_levels: supports["reasoning_effort"]
-            .as_array()
-            .map(|levels| {
-                levels
-                    .iter()
-                    .filter_map(|level| level.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
+                    .or_else(|| limits["context_window"].as_u64())
+                    .or_else(|| capabilities["context_window"].as_u64())
+                    .and_then(|n| u32::try_from(n).ok()),
+                min_thinking_budget,
+                max_thinking_budget,
+                reasoning_effort_levels,
+            },
+            supported_parameters: copilot_supported_parameters(supports_thinking.is_some()),
+        },
     })
+}
+
+fn copilot_supported_parameters(include_thinking: bool) -> Vec<String> {
+    let mut parameters = vec![
+        "system".to_string(),
+        "messages".to_string(),
+        "max_tokens".to_string(),
+        "stream".to_string(),
+        "tools".to_string(),
+        "tool_choice".to_string(),
+        "temperature".to_string(),
+        "top_p".to_string(),
+        "stop_sequences".to_string(),
+    ];
+    if include_thinking {
+        parameters.push("thinking".to_string());
+    }
+    parameters
 }
 
 pub(super) fn supports_responses_only(endpoints: &[String]) -> bool {
@@ -135,20 +187,23 @@ mod tests {
         let model = parse_copilot_model(&raw).expect("valid model");
         assert_eq!(model.model_id, "claude-sonnet-4");
         assert_eq!(model.vendor.as_deref(), Some("anthropic"));
-        assert_eq!(model.max_output_tokens, Some(16384));
-        assert_eq!(model.context_window, Some(200000));
+        assert_eq!(model.capabilities.limits.max_output_tokens, Some(16384));
+        assert_eq!(model.capabilities.limits.context_window, Some(200000));
         assert_eq!(
-            model.supported_endpoints,
+            model.capabilities.endpoints.supported_paths(),
             vec!["/v1/messages", "/chat/completions"]
         );
         assert_eq!(model.is_chat_default, Some(true));
-        assert_eq!(model.supports_vision, Some(true));
-        assert_eq!(model.supports_thinking, Some(true));
-        assert_eq!(model.supports_adaptive_thinking, Some(false));
-        assert_eq!(model.min_thinking_budget, Some(1024));
-        assert_eq!(model.max_thinking_budget, Some(8192));
+        assert!(model.capabilities.modalities.input.image.is_supported());
+        assert!(model.capabilities.features.thinking.is_supported());
         assert_eq!(
-            model.reasoning_effort_levels,
+            model.capabilities.features.adaptive_thinking,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(model.capabilities.limits.min_thinking_budget, Some(1024));
+        assert_eq!(model.capabilities.limits.max_thinking_budget, Some(8192));
+        assert_eq!(
+            model.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
         );
     }

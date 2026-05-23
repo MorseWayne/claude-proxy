@@ -432,6 +432,55 @@ mod tests {
         AdminConfig, HttpConfig, LogConfig, ModelAliasConfig, ModelConfig, ObservabilityConfig,
         ProviderConfig, ProviderType, ServerConfig,
     };
+    use claude_proxy_core::{
+        CapabilityState, EndpointCapabilities, FeatureCapabilities, InputModalities,
+        ModalityCapabilities, ModelCapabilities, ModelLimits,
+    };
+
+    fn model_capability_fixture(model_id: &str) -> ModelInfo {
+        ModelInfo {
+            model_id: model_id.to_string(),
+            vendor: Some("openai".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                endpoints: EndpointCapabilities {
+                    anthropic_messages: CapabilityState::Unsupported,
+                    openai_chat_completions: CapabilityState::Unsupported,
+                    openai_responses: CapabilityState::Supported,
+                },
+                modalities: ModalityCapabilities {
+                    input: InputModalities {
+                        image: CapabilityState::Supported,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                features: FeatureCapabilities {
+                    thinking: CapabilityState::Supported,
+                    adaptive_thinking: CapabilityState::Unsupported,
+                    reasoning_effort: CapabilityState::Supported,
+                    ..Default::default()
+                },
+                limits: ModelLimits {
+                    max_output_tokens: Some(128_000),
+                    context_window: Some(400_000),
+                    min_thinking_budget: Some(1024),
+                    max_thinking_budget: Some(32_000),
+                    reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+                },
+                supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
+            },
+        }
+    }
+
+    fn basic_model(model_id: &str) -> ModelInfo {
+        ModelInfo {
+            model_id: model_id.to_string(),
+            vendor: None,
+            is_chat_default: None,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
 
     fn settings_with_limits(
         max_concurrency: u32,
@@ -726,39 +775,26 @@ mod tests {
     #[test]
     fn provider_registry_exports_model_capabilities() {
         let mut registry = ProviderRegistry::new();
-        registry.cache_models(
-            "chatgpt",
-            vec![claude_proxy_core::ModelInfo {
-                model_id: "gpt-5.5".to_string(),
-                supports_thinking: Some(true),
-                vendor: Some("openai".to_string()),
-                max_output_tokens: Some(128_000),
-                context_window: Some(400_000),
-                supported_endpoints: vec!["/responses".to_string()],
-                is_chat_default: None,
-                supports_vision: Some(true),
-                supports_adaptive_thinking: Some(false),
-                min_thinking_budget: Some(1024),
-                max_thinking_budget: Some(32_000),
-                reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
-            }],
-        );
+        registry.cache_models("chatgpt", vec![model_capability_fixture("gpt-5.5")]);
 
         let capabilities = registry.model_capabilities();
 
         assert_eq!(capabilities["chatgpt/gpt-5.5"]["provider"], "chatgpt");
         assert_eq!(capabilities["chatgpt/gpt-5.5"]["model"], "gpt-5.5");
         assert_eq!(
-            capabilities["chatgpt/gpt-5.5"]["max_output_tokens"],
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["limits"]["max_output_tokens"],
             128_000
         );
-        assert_eq!(capabilities["chatgpt/gpt-5.5"]["context_window"], 400_000);
         assert_eq!(
-            capabilities["chatgpt/gpt-5.5"]["supported_endpoints"][0],
-            "/responses"
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["limits"]["context_window"],
+            400_000
         );
         assert_eq!(
-            capabilities["chatgpt/gpt-5.5"]["reasoning_effort_levels"][1],
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["endpoints"]["openai_responses"],
+            "supported"
+        );
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["limits"]["reasoning_effort_levels"][1],
             "high"
         );
     }
@@ -769,36 +805,7 @@ mod tests {
         let cached_at = Instant::now() - Duration::from_secs(20);
         registry.cache_models_at(
             "chatgpt",
-            vec![
-                ModelInfo {
-                    model_id: "gpt-5.5".to_string(),
-                    supports_thinking: None,
-                    vendor: None,
-                    max_output_tokens: None,
-                    context_window: None,
-                    supported_endpoints: Vec::new(),
-                    is_chat_default: None,
-                    supports_vision: None,
-                    supports_adaptive_thinking: None,
-                    min_thinking_budget: None,
-                    max_thinking_budget: None,
-                    reasoning_effort_levels: Vec::new(),
-                },
-                ModelInfo {
-                    model_id: "gpt-5-mini".to_string(),
-                    supports_thinking: None,
-                    vendor: None,
-                    max_output_tokens: None,
-                    context_window: None,
-                    supported_endpoints: Vec::new(),
-                    is_chat_default: None,
-                    supports_vision: None,
-                    supports_adaptive_thinking: None,
-                    min_thinking_budget: None,
-                    max_thinking_budget: None,
-                    reasoning_effort_levels: Vec::new(),
-                },
-            ],
+            vec![basic_model("gpt-5.5"), basic_model("gpt-5-mini")],
             cached_at,
         );
 
@@ -821,24 +828,7 @@ mod tests {
     fn provider_registry_marks_stale_model_cache_status() {
         let mut registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(60));
         let cached_at = Instant::now() - Duration::from_secs(90);
-        registry.cache_models_at(
-            "openai",
-            vec![ModelInfo {
-                model_id: "stale-model".to_string(),
-                supports_thinking: None,
-                vendor: None,
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: Vec::new(),
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            }],
-            cached_at,
-        );
+        registry.cache_models_at("openai", vec![basic_model("stale-model")], cached_at);
 
         let statuses = registry
             .model_cache_status_at(&["openai".to_string()], cached_at + Duration::from_secs(90));
@@ -871,20 +861,7 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.cache_models_at(
             "openai",
-            vec![ModelInfo {
-                model_id: "stale-model".to_string(),
-                supports_thinking: None,
-                vendor: None,
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: Vec::new(),
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            }],
+            vec![basic_model("stale-model")],
             Instant::now() - DEFAULT_MODEL_CACHE_TTL - Duration::from_secs(1),
         );
 
@@ -897,20 +874,7 @@ mod tests {
         let mut registry = ProviderRegistry::with_model_cache_ttl(Duration::from_secs(10));
         registry.cache_models_at(
             "openai",
-            vec![ModelInfo {
-                model_id: "still-fresh".to_string(),
-                supports_thinking: None,
-                vendor: None,
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: Vec::new(),
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            }],
+            vec![basic_model("still-fresh")],
             Instant::now() - Duration::from_secs(6),
         );
 
@@ -974,23 +938,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_refresh_models_reuses_cached_models() {
         let state = AppState::new(settings_with_limits(1, 1, 10, 60), None);
-        state.provider_registry.write().await.cache_models(
-            "openai",
-            vec![ModelInfo {
-                model_id: "gpt-4.1".to_string(),
-                supports_thinking: None,
-                vendor: None,
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: Vec::new(),
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            }],
-        );
+        state
+            .provider_registry
+            .write()
+            .await
+            .cache_models("openai", vec![basic_model("gpt-4.1")]);
 
         let models = state.get_or_refresh_models("openai").await.unwrap();
 
@@ -1018,20 +970,7 @@ mod tests {
         let state = AppState::new(settings, None);
         state.provider_registry.write().await.cache_models_at(
             "anthropic",
-            vec![ModelInfo {
-                model_id: "stale-model".to_string(),
-                supports_thinking: None,
-                vendor: None,
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: Vec::new(),
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            }],
+            vec![basic_model("stale-model")],
             Instant::now() - DEFAULT_MODEL_CACHE_TTL - Duration::from_secs(1),
         );
 
@@ -1263,16 +1202,9 @@ impl ProviderRegistry {
                             "provider": provider_id,
                             "model": model.model_id,
                             "vendor": model.vendor,
-                            "max_output_tokens": model.max_output_tokens,
-                            "context_window": model.context_window,
-                            "supported_endpoints": model.supported_endpoints,
-                            "supports_thinking": model.supports_thinking,
-                            "supports_vision": model.supports_vision,
-                            "supports_adaptive_thinking": model.supports_adaptive_thinking,
-                            "min_thinking_budget": model.min_thinking_budget,
-                            "max_thinking_budget": model.max_thinking_budget,
-                            "reasoning_effort_levels": model.reasoning_effort_levels,
                             "is_chat_default": model.is_chat_default,
+                            "supported_endpoints": model.capabilities.endpoints.supported_paths(),
+                            "capabilities": model.capabilities,
                         }),
                     )
                 })

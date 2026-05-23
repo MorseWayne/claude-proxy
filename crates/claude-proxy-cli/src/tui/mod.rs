@@ -2030,6 +2030,12 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
     let mut items: Vec<(String, ModelCapability)> = capabilities
         .iter()
         .map(|(name, v)| {
+            let capability = v.get("capabilities");
+            let limits = capability.and_then(|c| c.get("limits"));
+            let features = capability.and_then(|c| c.get("features"));
+            let endpoints = capability.and_then(|c| c.get("endpoints"));
+            let modalities = capability.and_then(|c| c.get("modalities"));
+            let input_modalities = modalities.and_then(|m| m.get("input"));
             (
                 name.clone(),
                 ModelCapability {
@@ -2039,32 +2045,28 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
                         .unwrap_or_default()
                         .to_string(),
                     vendor: v.get("vendor").and_then(|x| x.as_str()).map(str::to_string),
-                    max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
-                    context_window: v.get("context_window").and_then(|x| x.as_u64()),
-                    supported_endpoints: v
-                        .get("supported_endpoints")
+                    max_output_tokens: limits
+                        .and_then(|l| l.get("max_output_tokens"))
+                        .and_then(|x| x.as_u64()),
+                    context_window: limits
+                        .and_then(|l| l.get("context_window"))
+                        .and_then(|x| x.as_u64()),
+                    supported_endpoints: parse_supported_endpoint_paths(endpoints),
+                    supported_parameters: capability
+                        .and_then(|c| c.get("supported_parameters"))
                         .and_then(|x| x.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str().map(str::to_string))
-                                .collect()
-                        })
+                        .map(|items| parse_string_array(items))
                         .unwrap_or_default(),
-                    supports_thinking: v.get("supports_thinking").and_then(|x| x.as_bool()),
-                    supports_vision: v.get("supports_vision").and_then(|x| x.as_bool()),
-                    supports_adaptive_thinking: v
-                        .get("supports_adaptive_thinking")
-                        .and_then(|x| x.as_bool()),
-                    reasoning_effort_levels: v
-                        .get("reasoning_effort_levels")
+                    streaming: feature_supported(features, "streaming"),
+                    tools: feature_supported(features, "tools"),
+                    thinking: feature_supported(features, "thinking"),
+                    vision: feature_supported(input_modalities, "image"),
+                    adaptive_thinking: feature_supported(features, "adaptive_thinking"),
+                    prompt_cache: feature_supported(features, "prompt_cache"),
+                    reasoning_effort_levels: limits
+                        .and_then(|l| l.get("reasoning_effort_levels"))
                         .and_then(|x| x.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str().map(str::to_string))
-                                .collect()
-                        })
+                        .map(|items| parse_string_array(items))
                         .unwrap_or_default(),
                 },
             )
@@ -2072,6 +2074,32 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
     items
+}
+
+fn feature_supported(value: Option<&Value>, key: &str) -> bool {
+    value.and_then(|v| v.get(key)).and_then(Value::as_str) == Some("supported")
+}
+
+fn parse_string_array(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+fn parse_supported_endpoint_paths(endpoints: Option<&Value>) -> Vec<String> {
+    let Some(endpoints) = endpoints.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    [
+        ("anthropic_messages", "/v1/messages"),
+        ("openai_chat_completions", "/chat/completions"),
+        ("openai_responses", "/responses"),
+    ]
+    .into_iter()
+    .filter(|(field, _)| endpoints.get(*field).and_then(Value::as_str) == Some("supported"))
+    .map(|(_, path)| path.to_string())
+    .collect()
 }
 
 fn parse_provider_rate_limits(
@@ -2649,18 +2677,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_capabilities_reads_metadata_fields() {
+    fn parse_model_capabilities_reads_canonical_fields() {
         let capabilities = parse_model_capabilities(Some(&json!({
             "chatgpt/gpt-5.5": {
                 "provider": "chatgpt",
                 "vendor": "openai",
-                "max_output_tokens": 128000,
-                "context_window": 400000,
-                "supported_endpoints": ["/responses"],
-                "supports_thinking": true,
-                "supports_vision": true,
-                "supports_adaptive_thinking": false,
-                "reasoning_effort_levels": ["low", "high"]
+                "capabilities": {
+                    "endpoints": {
+                        "anthropic_messages": "unsupported",
+                        "openai_chat_completions": "unsupported",
+                        "openai_responses": "supported"
+                    },
+                    "modalities": {
+                        "input": {"text": "supported", "image": "supported"},
+                        "output": {"text": "supported"}
+                    },
+                    "features": {
+                        "streaming": "supported",
+                        "tools": "supported",
+                        "thinking": "supported",
+                        "adaptive_thinking": "unsupported",
+                        "prompt_cache": "unknown"
+                    },
+                    "limits": {
+                        "max_output_tokens": 128000,
+                        "context_window": 400000,
+                        "reasoning_effort_levels": ["low", "high"]
+                    },
+                    "supported_parameters": ["messages", "tools", "thinking"]
+                }
             }
         })));
 
@@ -2670,8 +2715,13 @@ mod tests {
         assert_eq!(capabilities[0].1.max_output_tokens, Some(128000));
         assert_eq!(capabilities[0].1.context_window, Some(400000));
         assert_eq!(capabilities[0].1.supported_endpoints[0], "/responses");
-        assert_eq!(capabilities[0].1.supports_thinking, Some(true));
+        assert!(capabilities[0].1.streaming);
+        assert!(capabilities[0].1.tools);
+        assert!(capabilities[0].1.thinking);
+        assert!(capabilities[0].1.vision);
+        assert!(!capabilities[0].1.adaptive_thinking);
         assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");
+        assert_eq!(capabilities[0].1.supported_parameters[1], "tools");
     }
 
     #[test]

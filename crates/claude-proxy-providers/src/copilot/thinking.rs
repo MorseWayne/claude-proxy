@@ -10,7 +10,10 @@ pub(super) fn apply_model_limits(
         return;
     };
 
-    if let Some(model_max) = model_info.max_output_tokens {
+    let limits = &model_info.capabilities.limits;
+    let features = &model_info.capabilities.features;
+
+    if let Some(model_max) = limits.max_output_tokens {
         request.max_tokens = Some(
             request
                 .max_tokens
@@ -21,20 +24,20 @@ pub(super) fn apply_model_limits(
     if request.thinking.is_none() && model_can_think(model_info) {
         request.thinking = Some(ThinkingConfig {
             r#type: Some(
-                if model_info.supports_adaptive_thinking == Some(true) {
+                if features.adaptive_thinking.is_supported() {
                     "adaptive"
                 } else {
                     "enabled"
                 }
                 .to_string(),
             ),
-            budget_tokens: if model_info.supports_adaptive_thinking == Some(true) {
+            budget_tokens: if features.adaptive_thinking.is_supported() {
                 None
             } else {
                 compute_thinking_budget(
-                    model_info.min_thinking_budget,
-                    model_info.max_thinking_budget,
-                    request.max_tokens.or(model_info.max_output_tokens),
+                    limits.min_thinking_budget,
+                    limits.max_thinking_budget,
+                    request.max_tokens.or(limits.max_output_tokens),
                     configured_max_thinking_tokens,
                 )
             },
@@ -44,7 +47,7 @@ pub(super) fn apply_model_limits(
 
 pub(super) fn should_use_interleaved_thinking_beta(model_info: Option<&ModelInfo>) -> bool {
     model_info.is_some_and(|model| {
-        model.supports_adaptive_thinking != Some(true) && model_can_think(model)
+        !model.capabilities.features.adaptive_thinking.is_supported() && model_can_think(model)
     })
 }
 
@@ -109,9 +112,10 @@ fn compute_thinking_budget(
 }
 
 fn model_can_think(model_info: &ModelInfo) -> bool {
-    model_info.supports_thinking == Some(true)
-        || model_info.supports_adaptive_thinking == Some(true)
-        || model_info.max_thinking_budget.is_some()
+    let capabilities = &model_info.capabilities;
+    capabilities.features.thinking.is_supported()
+        || capabilities.features.adaptive_thinking.is_supported()
+        || capabilities.limits.max_thinking_budget.is_some()
 }
 
 fn thinking_budget_to_effort(budget_tokens: u32) -> String {
@@ -131,7 +135,7 @@ fn select_supported_reasoning_effort(
         return requested_effort.to_string();
     };
 
-    let supported = &model_info.reasoning_effort_levels;
+    let supported = &model_info.capabilities.limits.reasoning_effort_levels;
     if supported.is_empty() || supported.iter().any(|level| level == requested_effort) {
         return requested_effort.to_string();
     }
@@ -149,24 +153,58 @@ fn select_supported_reasoning_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claude_proxy_core::Message;
+    use claude_proxy_core::{
+        CapabilityState, EndpointCapabilities, FeatureCapabilities, Message, ModelCapabilities,
+        ModelLimits,
+    };
     use std::collections::HashMap;
 
-    fn model() -> ModelInfo {
+    fn model_with_capabilities(
+        model_id: &str,
+        thinking: CapabilityState,
+        adaptive_thinking: CapabilityState,
+        max_output_tokens: Option<u32>,
+        min_thinking_budget: Option<u32>,
+        max_thinking_budget: Option<u32>,
+        reasoning_effort_levels: Vec<String>,
+    ) -> ModelInfo {
         ModelInfo {
-            model_id: "claude-opus-4.7".to_string(),
-            supports_thinking: Some(true),
+            model_id: model_id.to_string(),
             vendor: Some("anthropic".to_string()),
-            max_output_tokens: Some(8192),
-            context_window: None,
-            supported_endpoints: vec!["/v1/messages".to_string()],
             is_chat_default: None,
-            supports_vision: None,
-            supports_adaptive_thinking: Some(true),
-            min_thinking_budget: Some(1024),
-            max_thinking_budget: Some(4096),
-            reasoning_effort_levels: vec!["low".to_string(), "medium".to_string()],
+            capabilities: ModelCapabilities {
+                endpoints: EndpointCapabilities {
+                    anthropic_messages: CapabilityState::Supported,
+                    openai_chat_completions: CapabilityState::Unsupported,
+                    openai_responses: CapabilityState::Unsupported,
+                },
+                features: FeatureCapabilities {
+                    thinking,
+                    adaptive_thinking,
+                    ..Default::default()
+                },
+                limits: ModelLimits {
+                    max_output_tokens,
+                    min_thinking_budget,
+                    max_thinking_budget,
+                    reasoning_effort_levels,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         }
+    }
+
+    fn model() -> ModelInfo {
+        model_with_capabilities(
+            "claude-opus-4.7",
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+            Some(8192),
+            Some(1024),
+            Some(4096),
+            vec!["low".to_string(), "medium".to_string()],
+        )
     }
 
     fn request(model: &ModelInfo) -> MessagesRequest {
@@ -190,20 +228,15 @@ mod tests {
 
     #[test]
     fn apply_model_limits_clamps_and_adds_thinking() {
-        let model = ModelInfo {
-            model_id: "claude-sonnet-4".to_string(),
-            supports_thinking: Some(true),
-            vendor: Some("anthropic".to_string()),
-            max_output_tokens: Some(4096),
-            context_window: None,
-            supported_endpoints: vec!["/v1/messages".to_string()],
-            is_chat_default: None,
-            supports_vision: None,
-            supports_adaptive_thinking: Some(false),
-            min_thinking_budget: Some(1024),
-            max_thinking_budget: Some(2048),
-            reasoning_effort_levels: Vec::new(),
-        };
+        let model = model_with_capabilities(
+            "claude-sonnet-4",
+            CapabilityState::Supported,
+            CapabilityState::Unsupported,
+            Some(4096),
+            Some(1024),
+            Some(2048),
+            Vec::new(),
+        );
         let mut request = request(&model);
 
         apply_model_limits(&mut request, Some(&model), 16_000);
@@ -230,9 +263,9 @@ mod tests {
     #[test]
     fn messages_effort_clamps_to_supported_model_levels() {
         let mut model = model();
-        model.min_thinking_budget = None;
-        model.max_thinking_budget = None;
-        model.reasoning_effort_levels = vec!["medium".to_string()];
+        model.capabilities.limits.min_thinking_budget = None;
+        model.capabilities.limits.max_thinking_budget = None;
+        model.capabilities.limits.reasoning_effort_levels = vec!["medium".to_string()];
 
         let mut request = request(&model);
         request.thinking = Some(ThinkingConfig {

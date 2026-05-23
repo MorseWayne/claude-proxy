@@ -399,9 +399,13 @@ pub struct ModelCapability {
     pub max_output_tokens: Option<u64>,
     pub context_window: Option<u64>,
     pub supported_endpoints: Vec<String>,
-    pub supports_thinking: Option<bool>,
-    pub supports_vision: Option<bool>,
-    pub supports_adaptive_thinking: Option<bool>,
+    pub supported_parameters: Vec<String>,
+    pub streaming: bool,
+    pub tools: bool,
+    pub thinking: bool,
+    pub vision: bool,
+    pub adaptive_thinking: bool,
+    pub prompt_cache: bool,
     pub reasoning_effort_levels: Vec<String>,
 }
 

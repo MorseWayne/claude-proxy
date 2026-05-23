@@ -1816,7 +1816,10 @@ fn json_len(value: &Value) -> usize {
 }
 
 fn chatgpt_request_warning_threshold(model: &str) -> Option<usize> {
-    let context_window = openai_model_info(model).context_window? as usize;
+    let context_window = openai_model_info(model)
+        .capabilities
+        .limits
+        .context_window? as usize;
     Some(
         context_window
             .saturating_mul(CHATGPT_REQUEST_WARNING_RATIO)
@@ -1868,7 +1871,7 @@ fn chatgpt_models() -> Vec<ModelInfo> {
     .into_iter()
     .map(|model_id| {
         let mut info = openai_model_info(model_id);
-        info.supports_vision = Some(true);
+        info.capabilities.modalities.input.image = CapabilityState::Supported;
         info
     })
     .collect()
@@ -2244,16 +2247,12 @@ mod tests {
             .find(|model| model.model_id == "gpt-5.5")
             .expect("gpt-5.5 model");
 
-        assert_eq!(gpt55.max_output_tokens, Some(128_000));
-        assert_eq!(gpt55.context_window, Some(400_000));
-        assert!(
-            gpt55
-                .supported_endpoints
-                .contains(&"/responses".to_string())
-        );
-        assert_eq!(gpt55.supports_vision, Some(true));
+        assert_eq!(gpt55.capabilities.limits.max_output_tokens, Some(128_000));
+        assert_eq!(gpt55.capabilities.limits.context_window, Some(400_000));
+        assert!(gpt55.capabilities.endpoints.openai_responses.is_supported());
+        assert!(gpt55.capabilities.modalities.input.image.is_supported());
         assert_eq!(
-            gpt55.reasoning_effort_levels,
+            gpt55.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
         );
     }

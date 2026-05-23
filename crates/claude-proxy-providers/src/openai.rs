@@ -21,7 +21,6 @@ use crate::http::{
 };
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
-    supports_responses,
 };
 use crate::provider::{Provider, ProviderError, ProviderRequestObserver};
 use crate::reasoning_markers::marker_mode_from_request;
@@ -36,24 +35,10 @@ pub struct OpenAiProvider {
 
 fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
     let known = openai_model_info(&upstream.model_id);
-    if upstream.supports_thinking.is_none() {
-        upstream.supports_thinking = known.supports_thinking;
-    }
     if upstream.vendor.is_none() {
         upstream.vendor = known.vendor;
     }
-    if upstream.max_output_tokens.is_none() {
-        upstream.max_output_tokens = known.max_output_tokens;
-    }
-    if upstream.context_window.is_none() {
-        upstream.context_window = known.context_window;
-    }
-    if upstream.supported_endpoints.is_empty() || supports_responses(&upstream.model_id) {
-        upstream.supported_endpoints = known.supported_endpoints;
-    }
-    if upstream.reasoning_effort_levels.is_empty() {
-        upstream.reasoning_effort_levels = known.reasoning_effort_levels;
-    }
+    upstream.capabilities = known.capabilities;
     upstream
 }
 
@@ -313,17 +298,9 @@ impl Provider for OpenAiProvider {
                 m["id"].as_str().map(|id| {
                     merge_model_info(ModelInfo {
                         model_id: id.to_string(),
-                        supports_thinking: None,
                         vendor: Some("openai".to_string()),
-                        max_output_tokens: None,
-                        context_window: None,
-                        supported_endpoints: vec!["/chat/completions".to_string()],
                         is_chat_default: None,
-                        supports_vision: None,
-                        supports_adaptive_thinking: None,
-                        min_thinking_budget: None,
-                        max_thinking_budget: None,
-                        reasoning_effort_levels: Vec::new(),
+                        capabilities: ModelCapabilities::default(),
                     })
                 })
             })
@@ -341,22 +318,14 @@ mod tests {
     fn merge_model_info_adds_known_responses_endpoint() {
         let info = merge_model_info(ModelInfo {
             model_id: "gpt-5.5".to_string(),
-            supports_thinking: None,
             vendor: Some("openai".to_string()),
-            max_output_tokens: None,
-            context_window: None,
-            supported_endpoints: vec!["/chat/completions".to_string()],
             is_chat_default: None,
-            supports_vision: None,
-            supports_adaptive_thinking: None,
-            min_thinking_budget: None,
-            max_thinking_budget: None,
-            reasoning_effort_levels: Vec::new(),
+            capabilities: ModelCapabilities::default(),
         });
 
-        assert_eq!(info.context_window, Some(400_000));
+        assert_eq!(info.capabilities.limits.context_window, Some(400_000));
         assert_eq!(
-            info.supported_endpoints,
+            info.capabilities.endpoints.supported_paths(),
             vec!["/chat/completions", "/responses"]
         );
     }

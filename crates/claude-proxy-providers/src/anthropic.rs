@@ -124,49 +124,57 @@ impl Provider for AnthropicProvider {
         // Anthropic doesn't have a standard /models endpoint.
         // Return well-known Claude models.
         Ok(vec![
-            ModelInfo {
-                model_id: "claude-opus-4-20250514".to_string(),
-                supports_thinking: Some(true),
-                vendor: Some("anthropic".to_string()),
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: vec!["/v1/messages".to_string()],
-                is_chat_default: None,
-                supports_vision: Some(true),
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            },
-            ModelInfo {
-                model_id: "claude-sonnet-4-20250514".to_string(),
-                supports_thinking: Some(true),
-                vendor: Some("anthropic".to_string()),
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: vec!["/v1/messages".to_string()],
-                is_chat_default: None,
-                supports_vision: Some(true),
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            },
-            ModelInfo {
-                model_id: "claude-3-5-haiku-20241022".to_string(),
-                supports_thinking: Some(false),
-                vendor: Some("anthropic".to_string()),
-                max_output_tokens: None,
-                context_window: None,
-                supported_endpoints: vec!["/v1/messages".to_string()],
-                is_chat_default: None,
-                supports_vision: Some(true),
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: Vec::new(),
-            },
+            anthropic_model("claude-opus-4-20250514", CapabilityState::Supported),
+            anthropic_model("claude-sonnet-4-20250514", CapabilityState::Supported),
+            anthropic_model("claude-3-5-haiku-20241022", CapabilityState::Unsupported),
         ])
+    }
+}
+
+fn anthropic_model(model_id: &str, thinking: CapabilityState) -> ModelInfo {
+    ModelInfo {
+        model_id: model_id.to_string(),
+        vendor: Some("anthropic".to_string()),
+        is_chat_default: None,
+        capabilities: ModelCapabilities {
+            endpoints: EndpointCapabilities {
+                anthropic_messages: CapabilityState::Supported,
+                openai_chat_completions: CapabilityState::Unsupported,
+                openai_responses: CapabilityState::Unsupported,
+            },
+            modalities: ModalityCapabilities {
+                input: InputModalities {
+                    image: CapabilityState::Supported,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            features: FeatureCapabilities {
+                streaming: CapabilityState::Supported,
+                system_prompt: CapabilityState::Supported,
+                tools: CapabilityState::Supported,
+                tool_choice: CapabilityState::Supported,
+                thinking,
+                prompt_cache: CapabilityState::Supported,
+                sampling: CapabilityState::Supported,
+                stop_sequences: CapabilityState::Supported,
+                ..Default::default()
+            },
+            supported_parameters: vec![
+                "system".to_string(),
+                "messages".to_string(),
+                "max_tokens".to_string(),
+                "stream".to_string(),
+                "tools".to_string(),
+                "tool_choice".to_string(),
+                "thinking".to_string(),
+                "temperature".to_string(),
+                "top_p".to_string(),
+                "top_k".to_string(),
+                "stop_sequences".to_string(),
+            ],
+            ..Default::default()
+        },
     }
 }
 

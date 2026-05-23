@@ -142,6 +142,15 @@ pub async fn messages(
         }
     };
 
+    if let Err(error) = validate_resolved_request_capabilities(&state, &resolved).await {
+        let message = error.error.message.clone();
+        let _ = broadcast_tx.send(InflightEvent::Error(message));
+        let _ = broadcast_tx.send(InflightEvent::Done);
+        state.inflight.lock().await.remove(&request_hash);
+        record_request_error(&state, start);
+        return error_response(StatusCode::BAD_REQUEST, &error);
+    }
+
     let provider_permit = match acquire_provider_permit(&state, &resolved.provider_id, start).await
     {
         Ok(permit) => permit,
@@ -258,6 +267,162 @@ struct ResolvedUpstreamRequest {
     upstream_model: String,
     initiator: &'static str,
     request: MessagesRequest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestFeatures {
+    streaming: bool,
+    system_prompt: bool,
+    tools: bool,
+    tool_choice: bool,
+    thinking: bool,
+    vision: bool,
+    sampling: bool,
+    stop_sequences: bool,
+}
+
+impl RequestFeatures {
+    fn from_request(request: &MessagesRequest) -> Self {
+        Self {
+            streaming: request.stream,
+            system_prompt: request.system.is_some(),
+            tools: request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty()),
+            tool_choice: request.tool_choice.is_some(),
+            thinking: request.thinking.is_some(),
+            vision: request_uses_vision(request),
+            sampling: request.temperature.is_some()
+                || request.top_p.is_some()
+                || request.top_k.is_some(),
+            stop_sequences: request
+                .stop_sequences
+                .as_ref()
+                .is_some_and(|sequences| !sequences.is_empty()),
+        }
+    }
+}
+
+fn request_uses_vision(request: &MessagesRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| match &message.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(content_is_image),
+            MessageContent::Text(_) => false,
+        })
+}
+
+fn content_is_image(content: &Content) -> bool {
+    match content {
+        Content::Unknown(value) => value.get("type").and_then(Value::as_str) == Some("image"),
+        _ => false,
+    }
+}
+
+fn validate_request_capabilities(
+    provider_id: &str,
+    model: &str,
+    capabilities: &ModelCapabilities,
+    features: &RequestFeatures,
+) -> Result<(), ErrorResponse> {
+    reject_unsupported(
+        provider_id,
+        model,
+        "streaming",
+        features.streaming,
+        capabilities.features.streaming,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "system prompt",
+        features.system_prompt,
+        capabilities.features.system_prompt,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "tools",
+        features.tools,
+        capabilities.features.tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "tool_choice",
+        features.tool_choice,
+        capabilities.features.tool_choice,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "thinking",
+        features.thinking,
+        capabilities.features.thinking,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "vision input",
+        features.vision,
+        capabilities.modalities.input.image,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "sampling parameters",
+        features.sampling,
+        capabilities.features.sampling,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "stop_sequences",
+        features.stop_sequences,
+        capabilities.features.stop_sequences,
+    )
+}
+
+fn reject_unsupported(
+    provider_id: &str,
+    model: &str,
+    feature: &str,
+    requested: bool,
+    state: CapabilityState,
+) -> Result<(), ErrorResponse> {
+    if requested && state == CapabilityState::Unsupported {
+        return Err(ErrorResponse::invalid_request(&format!(
+            "model {model} via provider {provider_id} does not support {feature}"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_resolved_request_capabilities(
+    state: &AppState,
+    resolved: &ResolvedUpstreamRequest,
+) -> Result<(), ErrorResponse> {
+    let features = RequestFeatures::from_request(&resolved.request);
+    let registry = state.provider_registry.read().await;
+    let Some(model) = registry
+        .cached_models(&resolved.provider_id)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.model_id == resolved.upstream_model)
+        })
+    else {
+        return Ok(());
+    };
+
+    validate_request_capabilities(
+        &resolved.provider_id,
+        &resolved.upstream_model,
+        &model.capabilities,
+        &features,
+    )
 }
 
 #[derive(Clone)]
@@ -1121,17 +1286,10 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
             json!({
                 "id": m.model_id,
                 "object": "model",
-                "supports_thinking": m.supports_thinking,
                 "vendor": m.vendor,
-                "max_output_tokens": m.max_output_tokens,
-                "context_window": m.context_window,
-                "supported_endpoints": m.supported_endpoints,
                 "is_chat_default": m.is_chat_default,
-                "supports_vision": m.supports_vision,
-                "supports_adaptive_thinking": m.supports_adaptive_thinking,
-                "min_thinking_budget": m.min_thinking_budget,
-                "max_thinking_budget": m.max_thinking_budget,
-                "reasoning_effort_levels": m.reasoning_effort_levels,
+                "supported_endpoints": m.capabilities.endpoints.supported_paths(),
+                "capabilities": m.capabilities,
             })
         })
         .collect();
@@ -1730,6 +1888,34 @@ mod tests {
         );
     }
 
+    fn model_capability_fixture(model_id: &str) -> ModelInfo {
+        ModelInfo {
+            model_id: model_id.to_string(),
+            vendor: Some("openai".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                endpoints: EndpointCapabilities {
+                    anthropic_messages: CapabilityState::Unsupported,
+                    openai_chat_completions: CapabilityState::Unsupported,
+                    openai_responses: CapabilityState::Supported,
+                },
+                features: FeatureCapabilities {
+                    thinking: CapabilityState::Supported,
+                    reasoning_effort: CapabilityState::Supported,
+                    ..Default::default()
+                },
+                limits: ModelLimits {
+                    max_output_tokens: Some(128_000),
+                    context_window: Some(400_000),
+                    reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+                    ..Default::default()
+                },
+                supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
+                ..Default::default()
+            },
+        }
+    }
+
     fn request_with_system(system: Option<SystemPrompt>) -> MessagesRequest {
         MessagesRequest {
             model: "test/model".to_string(),
@@ -2307,6 +2493,76 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 10);
     }
 
+    #[test]
+    fn request_features_detects_used_capabilities() {
+        let mut request = request_with_system(Some(SystemPrompt::Text("system".to_string())));
+        request.stream = true;
+        request.temperature = Some(0.2);
+        request.stop_sequences = Some(vec!["stop".to_string()]);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("enabled".to_string()),
+            budget_tokens: Some(1024),
+        });
+        request.tools = Some(vec![Tool {
+            name: "read".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }]);
+        request.tool_choice = Some(json!({"type": "auto"}));
+        request.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![Content::Unknown(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "..."}
+            }))]),
+        }];
+
+        let features = RequestFeatures::from_request(&request);
+
+        assert!(features.streaming);
+        assert!(features.system_prompt);
+        assert!(features.tools);
+        assert!(features.tool_choice);
+        assert!(features.thinking);
+        assert!(features.vision);
+        assert!(features.sampling);
+        assert!(features.stop_sequences);
+    }
+
+    #[test]
+    fn capability_validation_rejects_explicitly_unsupported_features() {
+        let capabilities = ModelCapabilities {
+            features: FeatureCapabilities {
+                tools: CapabilityState::Unsupported,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let features = RequestFeatures {
+            tools: true,
+            ..Default::default()
+        };
+
+        let error = validate_request_capabilities("openai", "gpt-x", &capabilities, &features)
+            .expect_err("unsupported tools should fail");
+
+        assert_eq!(error.error.error_type, "invalid_request_error");
+        assert!(error.error.message.contains("does not support tools"));
+    }
+
+    #[test]
+    fn capability_validation_allows_unknown_features() {
+        let capabilities = ModelCapabilities::default();
+        let features = RequestFeatures {
+            tools: true,
+            thinking: true,
+            vision: true,
+            ..Default::default()
+        };
+
+        validate_request_capabilities("custom", "model", &capabilities, &features).unwrap();
+    }
+
     #[tokio::test]
     async fn admin_refresh_models_requires_admin_auth() {
         let mut settings = settings_with_provider(ProviderType::OpenAI);
@@ -2322,23 +2578,11 @@ mod tests {
     async fn admin_metrics_includes_model_capabilities() {
         let settings = settings_with_provider(ProviderType::ChatGPT);
         let state = AppState::new(settings, None);
-        state.provider_registry.write().await.cache_models(
-            "test",
-            vec![ModelInfo {
-                model_id: "gpt-5.5".to_string(),
-                supports_thinking: Some(true),
-                vendor: Some("openai".to_string()),
-                max_output_tokens: Some(128_000),
-                context_window: Some(400_000),
-                supported_endpoints: vec!["/responses".to_string()],
-                is_chat_default: None,
-                supports_vision: None,
-                supports_adaptive_thinking: None,
-                min_thinking_budget: None,
-                max_thinking_budget: None,
-                reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
-            }],
-        );
+        state
+            .provider_registry
+            .write()
+            .await
+            .cache_models("test", vec![model_capability_fixture("gpt-5.5")]);
         state
             .record_provider_error("chatgpt", "token refresh failed")
             .await;
@@ -2350,16 +2594,16 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(
-            body["model_capabilities"]["test/gpt-5.5"]["max_output_tokens"],
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["limits"]["max_output_tokens"],
             128_000
         );
         assert_eq!(
-            body["model_capabilities"]["test/gpt-5.5"]["context_window"],
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["limits"]["context_window"],
             400_000
         );
         assert_eq!(
-            body["model_capabilities"]["test/gpt-5.5"]["supported_endpoints"][0],
-            "/responses"
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["endpoints"]["openai_responses"],
+            "supported"
         );
         assert_eq!(body["model_cache"][0]["provider"], "test");
         assert_eq!(body["model_cache"][0]["cached"], true);

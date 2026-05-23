@@ -120,10 +120,11 @@ impl CopilotProvider {
 
     async fn get_model_endpoints(&self, model: &str) -> Vec<String> {
         let models = self.model_cache.read().await;
-        if let Some(model_info) = models.iter().find(|m| m.model_id == model)
-            && !model_info.supported_endpoints.is_empty()
-        {
-            return model_info.supported_endpoints.clone();
+        if let Some(model_info) = models.iter().find(|m| m.model_id == model) {
+            let endpoints = model_info.capabilities.endpoints.supported_paths();
+            if !endpoints.is_empty() {
+                return endpoints;
+            }
         }
         drop(models);
 
@@ -137,7 +138,13 @@ impl CopilotProvider {
         models
             .iter()
             .find(|m| m.model_id == model)
-            .and_then(|m| m.supports_thinking)
+            .and_then(|m| {
+                m.capabilities
+                    .features
+                    .thinking
+                    .is_supported()
+                    .then_some(true)
+            })
             .map_or_else(
                 || vec!["/chat/completions".to_string()],
                 |_| vec!["/v1/messages".to_string(), "/chat/completions".to_string()],

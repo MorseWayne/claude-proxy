@@ -259,31 +259,63 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let supported_endpoints = supported_endpoints_for(model_id);
+    let supports_reasoning = !reasoning_efforts.is_empty();
 
     ModelInfo {
         model_id: model_id.to_string(),
-        supports_thinking: (!reasoning_efforts.is_empty()).then_some(true),
         vendor: Some("openai".to_string()),
-        max_output_tokens: if model_id.starts_with("gpt-5.5") {
-            Some(128_000)
-        } else if model_id.contains("mini") {
-            Some(16_384)
-        } else {
-            None
-        },
-        context_window: if model_id.starts_with("gpt-5") {
-            Some(400_000)
-        } else {
-            None
-        },
-        supported_endpoints,
         is_chat_default: None,
-        supports_vision: None,
-        supports_adaptive_thinking: None,
-        min_thinking_budget: None,
-        max_thinking_budget: None,
-        reasoning_effort_levels: reasoning_efforts,
+        capabilities: ModelCapabilities {
+            endpoints: EndpointCapabilities::from_paths(&supported_endpoints),
+            modalities: ModalityCapabilities::default(),
+            features: FeatureCapabilities {
+                streaming: CapabilityState::Supported,
+                system_prompt: CapabilityState::Supported,
+                tools: CapabilityState::Supported,
+                tool_choice: CapabilityState::Supported,
+                thinking: CapabilityState::from_bool(supports_reasoning.then_some(true)),
+                reasoning_effort: CapabilityState::from_bool(supports_reasoning.then_some(true)),
+                sampling: CapabilityState::Supported,
+                stop_sequences: CapabilityState::Supported,
+                ..Default::default()
+            },
+            limits: ModelLimits {
+                max_output_tokens: if model_id.starts_with("gpt-5.5") {
+                    Some(128_000)
+                } else if model_id.contains("mini") {
+                    Some(16_384)
+                } else {
+                    None
+                },
+                context_window: if model_id.starts_with("gpt-5") {
+                    Some(400_000)
+                } else {
+                    None
+                },
+                reasoning_effort_levels: reasoning_efforts,
+                ..Default::default()
+            },
+            supported_parameters: openai_supported_parameters(supports_reasoning),
+        },
     }
+}
+
+fn openai_supported_parameters(supports_reasoning: bool) -> Vec<String> {
+    let mut parameters = vec![
+        "system".to_string(),
+        "messages".to_string(),
+        "max_tokens".to_string(),
+        "stream".to_string(),
+        "tools".to_string(),
+        "tool_choice".to_string(),
+        "temperature".to_string(),
+        "top_p".to_string(),
+        "stop_sequences".to_string(),
+    ];
+    if supports_reasoning {
+        parameters.push("thinking".to_string());
+    }
+    parameters
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -616,14 +648,14 @@ mod tests {
         let info = openai_model_info("gpt-5.5");
 
         assert!(prefers_responses("gpt-5.5"));
-        assert_eq!(info.max_output_tokens, Some(128_000));
-        assert_eq!(info.context_window, Some(400_000));
+        assert_eq!(info.capabilities.limits.max_output_tokens, Some(128_000));
+        assert_eq!(info.capabilities.limits.context_window, Some(400_000));
         assert_eq!(
-            info.supported_endpoints,
+            info.capabilities.endpoints.supported_paths(),
             vec!["/chat/completions", "/responses"]
         );
         assert_eq!(
-            info.reasoning_effort_levels,
+            info.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
         );
     }
@@ -633,8 +665,11 @@ mod tests {
         let info = openai_model_info("gpt-4.1");
 
         assert!(!prefers_responses("gpt-4.1"));
-        assert_eq!(info.supported_endpoints, vec!["/chat/completions"]);
-        assert!(info.reasoning_effort_levels.is_empty());
+        assert_eq!(
+            info.capabilities.endpoints.supported_paths(),
+            vec!["/chat/completions"]
+        );
+        assert!(info.capabilities.limits.reasoning_effort_levels.is_empty());
     }
 
     #[test]
@@ -642,7 +677,10 @@ mod tests {
         let info = openai_model_info("gpt-5.3-codex");
 
         assert!(prefers_responses("gpt-5.3-codex"));
-        assert_eq!(info.supported_endpoints, vec!["/responses"]);
+        assert_eq!(
+            info.capabilities.endpoints.supported_paths(),
+            vec!["/responses"]
+        );
     }
 
     #[test]

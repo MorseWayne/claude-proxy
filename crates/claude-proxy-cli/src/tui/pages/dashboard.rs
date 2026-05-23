@@ -533,24 +533,33 @@ fn push_capability_rows(
 
 fn capability_flags(capability: &ModelCapability) -> String {
     let mut flags = Vec::new();
-    if capability.supports_vision == Some(true) {
+    if capability.streaming {
+        flags.push("stream");
+    }
+    if capability.tools {
+        flags.push("tools");
+    }
+    if capability.vision {
         flags.push("vision");
     }
-    if capability.supports_thinking == Some(true) {
-        flags.push("thinking");
+    if capability.thinking {
+        flags.push("think");
     }
-    if capability.supports_adaptive_thinking == Some(true) {
+    if capability.adaptive_thinking {
         flags.push("adaptive");
     }
     if !capability.reasoning_effort_levels.is_empty() {
         flags.push("effort");
+    }
+    if capability.prompt_cache {
+        flags.push("cache");
     }
     if capability
         .supported_endpoints
         .iter()
         .any(|e| e == "/responses")
     {
-        flags.push("responses");
+        flags.push("resp");
     }
     flags.join(",")
 }

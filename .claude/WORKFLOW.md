@@ -62,6 +62,16 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-05-23-001 — Capability contract optimization
+Completed: 2026-05-23
+Level: 3
+
+Close summary:
+- Outcome: Replaced flat model capability fields with canonical `ModelCapabilities`; providers, `/v1/models`, `/admin/metrics`, TUI parsing, and conservative `/v1/messages` request validation now use the canonical shape.
+- Validation: `cargo fmt --check`, targeted crate tests, full `cargo test`, `cargo clippy -- -D warnings`, `git diff --check`, and GitNexus `detect_changes` completed.
+- GitNexus: `detect_changes` reported CRITICAL because the change intentionally updates the core `ModelInfo` contract and message validation flow; affected processes matched planned model metadata, admin metrics, TUI, provider metadata, and `/v1/messages` scope.
+- Gaps: Did not run a live TUI visual session or real upstream provider requests; validation is unit/integration/static.
+
 ### WF-2026-05-20-001 — 解决 main 分支推送冲突
 
 Completed: 2026-05-21
