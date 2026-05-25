@@ -1,0 +1,48 @@
+version: '3.9'
+
+services:
+
+  backend:
+    image: ${BACKEND_IMAGE:-lg-director-backend:latest}
+    container_name: director-backend
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-director}:${POSTGRES_PASSWORD:-director}@${POSTGRES_HOST:-postgres}:5432/${POSTGRES_DB:-director_platform}?sslmode=disable
+      MONGO_DEFAULT_URI: mongodb://${MONGO_HOST:-mongodb}:27017
+      JWT_SECRET: ${JWT_SECRET:-changeme-dev}
+      SERVER_PORT: ${SERVER_PORT:-8080}
+      SERVER_MODE: ${SERVER_MODE:-release}
+      LOG_PATH: /app/logs
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:-}
+      SVN_USERNAME: ${SVN_USERNAME:-}
+      SVN_PASSWORD: ${SVN_PASSWORD:-}
+      PROXY_EVENT_URL: ${PROXY_EVENT_URL:-}
+    volumes:
+      - backend-data:/app/data
+      - backend-logs:/app/logs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'cat < /dev/tcp/127.0.0.1/8080'"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-lg-director-frontend:latest}
+    container_name: director-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+
+volumes:
+  backend-data:
+  backend-logs:
