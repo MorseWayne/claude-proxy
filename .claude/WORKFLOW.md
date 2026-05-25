@@ -4,6 +4,30 @@
 
 ## Active（进行中）
 
+### WF-2026-05-25-001 — ChatGPT/Codex provider modernization
+Status: In Progress
+Level: 3
+Started: 2026-05-25
+Last updated: 2026-05-25
+Current phase: Design
+
+Intent:
+- Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
+
+Current todo:
+- [ ] Finalize design scope and implementation sequence before code changes.
+- [ ] Run GitNexus impact analysis before editing each target symbol.
+- [ ] Implement in reviewable phases with provider tests and full validation.
+
+Changes:
+- User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
+
+Prerequisites:
+- Design approval before implementation.
+
+Resume next:
+- Present implementation approaches and recommended design, then wait for approval.
+
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
 Level: 3
