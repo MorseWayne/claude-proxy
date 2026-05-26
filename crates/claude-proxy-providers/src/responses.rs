@@ -1036,6 +1036,54 @@ where
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+pub(crate) fn stream_responses_json_events_with_marker_mode_and_observer<F>(
+    mut events: mpsc::Receiver<Result<Value, ProviderError>>,
+    marker_mode: ReasoningMarkerMode,
+    on_event: F,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+    let on_event = Arc::new(on_event);
+
+    tokio::spawn(async move {
+        let mut converter = ResponsesStreamConverter::with_marker_mode(marker_mode);
+
+        while let Some(event) = events.recv().await {
+            let value = match event {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+
+            on_event(&value);
+            for event in converter.process_event(&value) {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        if !converter.started {
+            let _ = tx
+                .send(Err(malformed_responses_stream_error(200, "websocket", &[])))
+                .await;
+            return;
+        }
+
+        for event in converter.finish() {
+            if tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 fn parse_sse_json(text: &str) -> Option<Value> {
     parse_sse_json_value(text)
 }

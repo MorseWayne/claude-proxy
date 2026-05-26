@@ -161,6 +161,9 @@ pub struct ChatGptProviderConfig {
     /// Optional User-Agent header override sent to ChatGPT Codex requests.
     #[serde(default = "default_empty", skip_serializing_if = "String::is_empty")]
     pub user_agent: String,
+    /// Transport used for ChatGPT Codex Responses streams.
+    #[serde(default)]
+    pub transport: ChatGptTransport,
 }
 
 impl Default for ChatGptProviderConfig {
@@ -168,8 +171,18 @@ impl Default for ChatGptProviderConfig {
         Self {
             originator: default_empty(),
             user_agent: default_empty(),
+            transport: ChatGptTransport::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptTransport {
+    Sse,
+    Websocket,
+    #[default]
+    Auto,
 }
 
 fn default_oauth_app() -> String {
@@ -1305,6 +1318,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 [providers.chatgpt.chatgpt]
 originator = "codex_cli"
 user_agent = "CodexCLI/1.2.3"
+transport = "websocket"
 "#;
 
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
@@ -1313,6 +1327,11 @@ user_agent = "CodexCLI/1.2.3"
 
         assert_eq!(chatgpt.originator, "codex_cli");
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
+        assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
+        assert_eq!(
+            ChatGptProviderConfig::default().transport,
+            ChatGptTransport::Auto
+        );
     }
 
     #[test]

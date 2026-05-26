@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 2 WebSocket transport next
+Current phase: Phase 2 WebSocket transport accepted; commit and GitNexus refresh pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -23,7 +23,10 @@ Current todo:
 - [x] Validate Phase 1 with fmt and targeted provider tests before moving to WebSocket work.
 - [x] Review Phase 1 diff and apply any reviewer fixes before starting WebSocket work.
 - [x] Commit Phase 1 and refresh GitNexus index.
-- [ ] Implement Phase 2 WebSocket transport with SSE fallback.
+- [x] Implement Phase 2 WebSocket transport with SSE fallback.
+- [x] Review Phase 2 diff and address reviewer blockers.
+- [x] Final focused reviewer pass found no remaining blockers.
+- [ ] Commit Phase 2 and refresh GitNexus metadata.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -35,12 +38,18 @@ Changes:
 - Reviewer fanout found no blockers; accepted one small maintainability cleanup to share Responses usage JSON emission.
 - GitNexus detect_changes reports CRITICAL because the diff touches central ChatGPT request and Responses stream conversion paths; affected processes align with Phase 1 scope.
 - Phase 1 foundation committed, and `npx gitnexus analyze` completed successfully.
+- Phase 2 implementation adds configurable ChatGPT transport selection (`sse`/`websocket`/`auto`), a Responses WebSocket transport with `response.create`, OpenAI beta header, account/session headers, startup SSE fallback, post-first-event non-replay behavior, and completed-connection reuse.
+- Phase 2 validation so far: `cargo fmt --check`, `cargo test -p claude-proxy-config`, ChatGPT/Responses provider tests, full `cargo test -p claude-proxy-providers`, full `cargo test`, `cargo clippy -- -D warnings`, and `git diff --check` passed.
+- Phase 2 reviewer found blockers around abort/drop cleanup and honoring proxy/custom CA settings for WebSocket; fixes now add downstream-drop abort signaling, prompt upstream close on abort, proxy/extra-CA-aware WebSocket connection setup, and regression coverage for abort cleanup plus configured HTTP proxy routing.
+- Final focused reviewer pass found no remaining blockers for abort/drop cleanup, proxy/custom-CA support, or connector correctness; noted non-blocking gaps around SOCKS/HTTPS proxy parity, proxy credential coverage, and custom-CA fixture coverage.
+- After blocker fixes, validation passed again: `cargo fmt --check`, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt`, `cargo test -p claude-proxy-providers responses`, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
+- GitNexus detect_changes reports HIGH; affected flows are expected ChatGPT provider/test-helper paths plus Responses stream metadata usage extraction.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Start Phase 2 WebSocket transport planning/implementation from the approved design. Run fresh GitNexus impact analysis before touching transport/session symbols.
+- Commit Phase 2, refresh GitNexus index, then proceed to the next modernization phase (continuation/delta-input support).
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

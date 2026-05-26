@@ -16,6 +16,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
