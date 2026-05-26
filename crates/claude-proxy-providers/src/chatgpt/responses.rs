@@ -168,6 +168,12 @@ pub(super) fn prompt_cache_key_source(request: &MessagesRequest) -> PromptCacheK
         .unwrap_or(PromptCacheKeySource::None)
 }
 
+pub(super) fn stable_client_conversation_id_for_continuation(
+    request: &MessagesRequest,
+) -> Option<String> {
+    stable_client_conversation_id(request).map(ToOwned::to_owned)
+}
+
 fn resolve_prompt_cache_key(request: &MessagesRequest) -> Option<PromptCacheKey> {
     trimmed_string(request.extra.get("prompt_cache_key"))
         .or_else(|| metadata_string(request, "prompt_cache_key"))

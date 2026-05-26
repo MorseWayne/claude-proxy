@@ -149,6 +149,7 @@ struct ChatGptPreparedRequest {
     compact_request: bool,
     request_id: u64,
     output_token_budget: ChatGptOutputTokenBudget,
+    stable_client_conversation_id: Option<String>,
     observer: Option<ProviderRequestObserver>,
 }
 
@@ -477,6 +478,7 @@ impl ChatGptProvider {
             request_id,
             output_token_budget,
             observer,
+            ..
         } = prepared;
         let mut response = self
             .send_responses_request_with_prompt_too_long_retry(
@@ -572,6 +574,7 @@ impl ChatGptProvider {
             compact_request,
             request_id,
             observer,
+            stable_client_conversation_id,
             ..
         } = prepared;
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
@@ -584,8 +587,15 @@ impl ChatGptProvider {
             stream_started_at,
             observer,
         );
-        let (stream, reused) =
-            transport::open_websocket_stream(self, body, token, marker_mode, on_event).await?;
+        let (stream, reused) = transport::open_websocket_stream(
+            self,
+            body,
+            token,
+            marker_mode,
+            stable_client_conversation_id.as_deref(),
+            on_event,
+        )
+        .await?;
         info!(
             request_id,
             compact_request,
@@ -975,6 +985,8 @@ impl Provider for ChatGptProvider {
         let request = apply_openai_intent(request);
         let marker_mode = marker_mode_from_request(&request);
         let prompt_cache_key_source = responses::prompt_cache_key_source(&request);
+        let stable_client_conversation_id =
+            responses::stable_client_conversation_id_for_continuation(&request);
         let body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
@@ -1002,6 +1014,7 @@ impl Provider for ChatGptProvider {
                 compact_request,
                 request_id,
                 output_token_budget,
+                stable_client_conversation_id,
                 observer,
             },
             token,
@@ -2975,6 +2988,44 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_continuation_stable_conversation_id_excludes_explicit_prompt_cache_key() {
+        let mut explicit_extra = std::collections::HashMap::new();
+        explicit_extra.insert("prompt_cache_key".to_string(), json!("cache-only"));
+        let explicit = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: explicit_extra,
+        };
+        assert_eq!(
+            responses::stable_client_conversation_id_for_continuation(&explicit),
+            None
+        );
+
+        let stable = MessagesRequest {
+            metadata: Some(json!({"conversation_id": "conversation-123"})),
+            ..explicit
+        };
+        assert_eq!(
+            responses::stable_client_conversation_id_for_continuation(&stable).as_deref(),
+            Some("conversation-123")
+        );
+    }
+
+    #[test]
     fn chatgpt_responses_body_adds_codex_runtime_context() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
@@ -3375,6 +3426,331 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_continuation_sends_previous_response_id_and_delta_input() {
+        let first_body = chatgpt_websocket_test_body();
+        let second_delta = json!({"role": "user", "content": "next"});
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            second_delta.clone()
+        ]);
+
+        let (endpoint, requests, handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(8, first_body), (9, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some("conversation-continuation"),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        assert_eq!(handshakes.lock().unwrap().len(), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[0]["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(requests[1]["previous_response_id"], "resp-ws-1");
+        assert_eq!(requests[1]["input"], json!([second_delta]));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_requires_stable_conversation_id() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(10, chatgpt_websocket_test_body()), (11, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(request_id, body, None),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_prefix_mismatch_sends_full_input() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "different"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(12, chatgpt_websocket_test_body()), (13, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some("conversation-prefix-mismatch"),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_account_mismatch_sends_full_input() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let first = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    14,
+                    chatgpt_websocket_test_body(),
+                    Some("conversation-account-mismatch"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut second_token = chatgpt_test_token();
+        second_token.account_id = Some("other-account".to_string());
+        let second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    15,
+                    second_body,
+                    Some("conversation-account-mismatch"),
+                ),
+                second_token,
+            )
+            .await
+            .expect("second websocket stream should start");
+        assert!(
+            collect_stream_results(second)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_body_mismatch_sends_full_input() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["service_tier"] = json!("priority");
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(12, chatgpt_websocket_test_body()), (13, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some("conversation-body-mismatch"),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["service_tier"], "priority");
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_terminal_failure_clears_state() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_failed("resp-ws-1"),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(14, chatgpt_websocket_test_body()), (15, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some("conversation-failed"),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
     async fn chatgpt_websocket_uses_configured_http_proxy() {
         let (endpoint, proxy_url, connect_requests) = websocket_proxy_server(vec![
             websocket_response_created("resp-ws-proxy"),
@@ -3399,6 +3775,68 @@ mod tests {
                 .headers
                 .starts_with("CONNECT chatgpt.test:80 HTTP/1.1")
         );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_auto_transport_sse_fallback_preserves_full_body_after_continuation_attempt() {
+        let second_delta = json!({"role": "user", "content": "next"});
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            second_delta.clone()
+        ]);
+        let (endpoint, websocket_requests, sse_requests) =
+            websocket_continuation_then_sse_fallback_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Auto;
+
+        let first = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    20,
+                    chatgpt_websocket_test_body(),
+                    Some("conversation-auto-fallback"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    21,
+                    second_body,
+                    Some("conversation-auto-fallback"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("auto transport should fall back to SSE");
+        assert!(
+            collect_stream_results(second)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let websocket_requests = websocket_requests.lock().unwrap();
+        assert_eq!(websocket_requests.len(), 2);
+        assert_eq!(websocket_requests[1]["previous_response_id"], "resp-ws-1");
+        assert_eq!(websocket_requests[1]["input"], json!([second_delta]));
+        let sse_requests = sse_requests.lock().await;
+        assert_eq!(sse_requests.len(), 1);
+        let sse_body: Value = serde_json::from_slice(&sse_requests[0].body).unwrap();
+        assert!(sse_body.get("previous_response_id").is_none());
+        assert_eq!(sse_body["input"].as_array().map(Vec::len), Some(3));
+        assert!(provider.websocket_disabled.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -3759,12 +4197,25 @@ mod tests {
     }
 
     fn chatgpt_test_prepared_request(request_id: u64) -> ChatGptPreparedRequest {
+        chatgpt_test_prepared_request_with_body(
+            request_id,
+            chatgpt_websocket_test_body(),
+            Some("conversation-test"),
+        )
+    }
+
+    fn chatgpt_test_prepared_request_with_body(
+        request_id: u64,
+        body: Value,
+        stable_client_conversation_id: Option<&str>,
+    ) -> ChatGptPreparedRequest {
         ChatGptPreparedRequest {
-            body: chatgpt_websocket_test_body(),
+            body,
             marker_mode: ReasoningMarkerMode::Strict,
             compact_request: false,
             request_id,
             output_token_budget: ChatGptOutputTokenBudget::default(),
+            stable_client_conversation_id: stable_client_conversation_id.map(ToOwned::to_owned),
             observer: None,
         }
     }
@@ -3782,17 +4233,39 @@ mod tests {
     }
 
     fn websocket_response_completed(id: &str) -> Value {
+        websocket_response_completed_with_output(id, json!([]))
+    }
+
+    fn websocket_response_completed_with_output(id: &str, output: Value) -> Value {
         json!({
             "type": "response.completed",
             "response": {
                 "id": id,
                 "model": "gpt-5.3-codex",
                 "status": "completed",
-                "output": [],
+                "output": output,
                 "usage": {
                     "input_tokens": 1,
                     "output_tokens": 2,
                     "total_tokens": 3
+                }
+            }
+        })
+    }
+
+    fn websocket_response_failed(id: &str) -> Value {
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": id,
+                "model": "gpt-5.3-codex",
+                "status": "failed",
+                "output": [],
+                "error": {"message": "failed"},
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 0,
+                    "total_tokens": 1
                 }
             }
         })
@@ -3888,6 +4361,85 @@ mod tests {
         });
 
         (format!("http://{addr}/responses"), requests, handshakes)
+    }
+
+    async fn websocket_continuation_then_sse_fallback_server() -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        Arc<Mutex<Vec<CapturedHttpRequest>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let websocket_requests = Arc::new(StdMutex::new(Vec::new()));
+        let sse_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_websocket_requests = Arc::clone(&websocket_requests);
+        let captured_sse_requests = Arc::clone(&sse_requests);
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_websocket_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-1").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_completed_with_output(
+                        "resp-ws-1",
+                        json!([{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hello"}]
+                        }]),
+                    )
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_websocket_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            let _ = websocket.close(None).await;
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request_allow_empty_body(&mut socket).await;
+            captured_sse_requests.lock().await.push(request);
+            let response_body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                websocket_response_created("resp-sse-2"),
+                websocket_response_completed("resp-sse-2")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (
+            format!("http://{addr}/responses"),
+            websocket_requests,
+            sse_requests,
+        )
     }
 
     async fn websocket_proxy_server(

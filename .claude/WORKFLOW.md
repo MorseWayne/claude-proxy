@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 2 WebSocket transport complete; next phase pending
+Current phase: Phase 3 continuation/delta-input support reviewed; commit pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -27,7 +27,10 @@ Current todo:
 - [x] Review Phase 2 diff and address reviewer blockers.
 - [x] Final focused reviewer pass found no remaining blockers.
 - [x] Commit Phase 2 and refresh GitNexus metadata.
-- [ ] Plan/implement next modernization phase: continuation/delta-input support.
+- [x] Plan Phase 3 continuation/delta-input support.
+- [x] Implement Phase 3 continuation/delta-input support.
+- [x] Validate/review Phase 3.
+- [ ] Commit Phase 3 and refresh GitNexus metadata.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -46,12 +49,16 @@ Changes:
 - After blocker fixes, validation passed again: `cargo fmt --check`, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt`, `cargo test -p claude-proxy-providers responses`, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
 - GitNexus detect_changes reports HIGH; affected flows are expected ChatGPT provider/test-helper paths plus Responses stream metadata usage extraction.
 - Phase 2 committed in `08cf57a` and GitNexus metadata refreshed afterward.
+- Phase 3 implementation adds WebSocket-only continuation state keyed by provider/account/model/stable client conversation/schema, canonical non-input body comparison, delta input with `previous_response_id` on safe prefix match, and state cleanup on terminal failure, transport errors, and abort/drop.
+- Phase 3 focused/full validation passed so far: `cargo fmt --check`, transport helper tests, ChatGPT WebSocket/auto/chatgpt tests, Responses tests, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
+- GitNexus detect_changes for Phase 3 reports CRITICAL because the diff touches ChatGPT WebSocket transport/session flow and test helpers; affected flows align with planned ChatGPT continuation/WebSocket scope.
+- Phase 3 reviewer found no blockers; non-blocking follow-ups are explicit busy/concurrency coverage, abort-state invalidation coverage, and e2e function-call/tool-result continuation coverage.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Start the next modernization phase: continuation/delta-input support.
+- Commit Phase 3, refresh GitNexus metadata, then decide whether to add the reviewer’s non-blocking continuation hardening tests as a follow-up.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -32,6 +33,7 @@ const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const CHATGPT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
+const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 
 #[derive(Debug)]
@@ -86,11 +88,19 @@ impl Drop for AbortOnDropStream {
 
 pub(super) struct ChatGptWebSocketSession {
     cached: Option<CachedWebSocketConnection>,
+    continuations: HashMap<ContinuationKey, CachedContinuation>,
+    busy: HashSet<ContinuationKey>,
+    generations: HashMap<ContinuationKey, u64>,
 }
 
 impl ChatGptWebSocketSession {
     pub fn new() -> Self {
-        Self { cached: None }
+        Self {
+            cached: None,
+            continuations: HashMap::new(),
+            busy: HashSet::new(),
+            generations: HashMap::new(),
+        }
     }
 
     fn take_fresh(&mut self) -> Option<ChatGptWsStream> {
@@ -98,6 +108,8 @@ impl ChatGptWebSocketSession {
         if cached.last_used.elapsed() <= CHATGPT_WEBSOCKET_SESSION_IDLE_TTL {
             Some(cached.stream)
         } else {
+            self.continuations.clear();
+            self.busy.clear();
             None
         }
     }
@@ -112,6 +124,287 @@ impl ChatGptWebSocketSession {
         });
         true
     }
+
+    fn prepare_continuation(
+        &mut self,
+        provider: &ChatGptProvider,
+        token: &ChatGptToken,
+        body: &Value,
+        stable_client_conversation_id: Option<&str>,
+    ) -> ContinuationAttempt {
+        self.prune_expired_continuations();
+        let Some(key) = continuation_key(provider, token, body, stable_client_conversation_id)
+        else {
+            return ContinuationAttempt::disabled(
+                body.clone(),
+                ContinuationDisabledReason::MissingKey,
+            );
+        };
+        self.clear_conflicting_continuations(&key);
+
+        let Some(full_input) = response_input_items(body) else {
+            self.clear_continuation_for_key(&key);
+            self.bump_generation(&key);
+            return ContinuationAttempt::disabled_with_key(
+                key,
+                body.clone(),
+                ContinuationDisabledReason::InvalidInput,
+            );
+        };
+        let canonical_body = canonical_request_body(body);
+
+        if self.busy.contains(&key) {
+            self.clear_continuation_for_key(&key);
+            self.bump_generation(&key);
+            return ContinuationAttempt::disabled_with_key(
+                key,
+                body.clone(),
+                ContinuationDisabledReason::Busy,
+            );
+        }
+
+        let generation = self.current_generation(&key);
+        let mut send_body = body.clone();
+        let mut used = false;
+        let mut disabled_reason = ContinuationDisabledReason::MissingSession;
+        match self.continuations.get(&key) {
+            Some(cached) if cached.canonical_body != canonical_body => {
+                self.clear_continuation_for_key(&key);
+                disabled_reason = ContinuationDisabledReason::BodyMismatch;
+            }
+            Some(cached) if cached.response_id.is_empty() => {
+                self.clear_continuation_for_key(&key);
+                disabled_reason = ContinuationDisabledReason::MissingResponseId;
+            }
+            Some(cached) => {
+                let mut baseline = cached.full_input.clone();
+                baseline.extend(cached.assistant_output_items.clone());
+                if full_input.starts_with(&baseline) && full_input.len() > baseline.len() {
+                    let delta = full_input[baseline.len()..].to_vec();
+                    if let Some(object) = send_body.as_object_mut() {
+                        object.insert(
+                            "previous_response_id".to_string(),
+                            Value::String(cached.response_id.clone()),
+                        );
+                        object.insert("input".to_string(), Value::Array(delta));
+                        used = true;
+                        disabled_reason = ContinuationDisabledReason::None;
+                    } else {
+                        self.clear_continuation_for_key(&key);
+                        self.bump_generation(&key);
+                        return ContinuationAttempt::disabled_with_key(
+                            key,
+                            body.clone(),
+                            ContinuationDisabledReason::InvalidBody,
+                        );
+                    }
+                } else {
+                    self.clear_continuation_for_key(&key);
+                    disabled_reason = ContinuationDisabledReason::PrefixMismatch;
+                }
+            }
+            None => {}
+        }
+
+        self.busy.insert(key.clone());
+        ContinuationAttempt {
+            key: Some(key),
+            send_body,
+            canonical_body,
+            full_input,
+            used,
+            update_on_success: true,
+            owns_busy: true,
+            generation,
+            disabled_reason,
+        }
+    }
+
+    fn complete_continuation(&mut self, attempt: &ContinuationAttempt, terminal_event: &Value) {
+        let Some(key) = attempt.key.as_ref() else {
+            return;
+        };
+        if attempt.owns_busy {
+            self.busy.remove(key);
+        }
+
+        if !attempt.update_on_success {
+            return;
+        }
+        if self.current_generation(key) != attempt.generation {
+            self.clear_continuation_for_key(key);
+            return;
+        }
+
+        if !is_successful_completed_event(terminal_event) {
+            self.clear_continuation_for_key(key);
+            self.bump_generation(key);
+            return;
+        }
+
+        let Some(response_id) = terminal_response_id(terminal_event) else {
+            self.clear_continuation_for_key(key);
+            self.bump_generation(key);
+            return;
+        };
+        let Some(assistant_output_items) = terminal_assistant_output_items(terminal_event) else {
+            self.clear_continuation_for_key(key);
+            self.bump_generation(key);
+            return;
+        };
+
+        self.continuations.insert(
+            key.clone(),
+            CachedContinuation {
+                canonical_body: attempt.canonical_body.clone(),
+                full_input: attempt.full_input.clone(),
+                assistant_output_items,
+                response_id: response_id.to_string(),
+                updated_at: Instant::now(),
+            },
+        );
+    }
+
+    fn fail_continuation(&mut self, attempt: &ContinuationAttempt) {
+        if let Some(key) = attempt.key.as_ref() {
+            if attempt.owns_busy {
+                self.busy.remove(key);
+            }
+            if attempt.update_on_success || attempt.owns_busy {
+                self.clear_continuation_for_key(key);
+                self.bump_generation(key);
+            }
+        }
+    }
+
+    fn clear_conflicting_continuations(&mut self, key: &ContinuationKey) {
+        let conflicts = self
+            .continuations
+            .keys()
+            .chain(self.busy.iter())
+            .filter(|candidate| {
+                candidate.provider_id == key.provider_id
+                    && candidate.stable_client_conversation_id == key.stable_client_conversation_id
+                    && *candidate != key
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for conflict in conflicts {
+            self.clear_continuation_for_key(&conflict);
+            self.bump_generation(&conflict);
+        }
+    }
+
+    fn clear_continuation_for_key(&mut self, key: &ContinuationKey) {
+        self.continuations.remove(key);
+    }
+
+    fn current_generation(&self, key: &ContinuationKey) -> u64 {
+        self.generations.get(key).copied().unwrap_or(0)
+    }
+
+    fn bump_generation(&mut self, key: &ContinuationKey) {
+        *self.generations.entry(key.clone()).or_insert(0) += 1;
+    }
+
+    fn prune_expired_continuations(&mut self) {
+        self.continuations
+            .retain(|_, cached| cached.updated_at.elapsed() <= CHATGPT_WEBSOCKET_SESSION_IDLE_TTL);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ContinuationKey {
+    provider_id: String,
+    account_id: String,
+    model: String,
+    stable_client_conversation_id: String,
+    schema_version: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CachedContinuation {
+    canonical_body: Value,
+    full_input: Vec<Value>,
+    assistant_output_items: Vec<Value>,
+    response_id: String,
+    updated_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationDisabledReason {
+    None,
+    MissingKey,
+    MissingSession,
+    Busy,
+    InvalidBody,
+    InvalidInput,
+    BodyMismatch,
+    PrefixMismatch,
+    MissingResponseId,
+}
+
+impl ContinuationDisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::MissingKey => "missing_key",
+            Self::MissingSession => "missing_session",
+            Self::Busy => "busy",
+            Self::InvalidBody => "invalid_body",
+            Self::InvalidInput => "invalid_input",
+            Self::BodyMismatch => "body_mismatch",
+            Self::PrefixMismatch => "prefix_mismatch",
+            Self::MissingResponseId => "missing_response_id",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationAttempt {
+    key: Option<ContinuationKey>,
+    send_body: Value,
+    canonical_body: Value,
+    full_input: Vec<Value>,
+    used: bool,
+    update_on_success: bool,
+    owns_busy: bool,
+    generation: u64,
+    disabled_reason: ContinuationDisabledReason,
+}
+
+impl ContinuationAttempt {
+    fn disabled(body: Value, disabled_reason: ContinuationDisabledReason) -> Self {
+        Self {
+            key: None,
+            canonical_body: canonical_request_body(&body),
+            full_input: response_input_items(&body).unwrap_or_default(),
+            send_body: body,
+            used: false,
+            update_on_success: false,
+            owns_busy: false,
+            generation: 0,
+            disabled_reason,
+        }
+    }
+
+    fn disabled_with_key(
+        key: ContinuationKey,
+        body: Value,
+        disabled_reason: ContinuationDisabledReason,
+    ) -> Self {
+        Self {
+            key: Some(key),
+            canonical_body: canonical_request_body(&body),
+            full_input: response_input_items(&body).unwrap_or_default(),
+            send_body: body,
+            used: false,
+            update_on_success: false,
+            owns_busy: false,
+            generation: 0,
+            disabled_reason,
+        }
+    }
 }
 
 struct CachedWebSocketConnection {
@@ -119,36 +412,250 @@ struct CachedWebSocketConnection {
     last_used: Instant,
 }
 
+fn continuation_key(
+    provider: &ChatGptProvider,
+    token: &ChatGptToken,
+    body: &Value,
+    stable_client_conversation_id: Option<&str>,
+) -> Option<ContinuationKey> {
+    Some(ContinuationKey {
+        provider_id: provider.id.clone(),
+        account_id: token.account_id.as_deref()?.trim().to_string(),
+        model: body.get("model")?.as_str()?.trim().to_string(),
+        stable_client_conversation_id: stable_client_conversation_id?.trim().to_string(),
+        schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+    })
+    .filter(|key| {
+        !key.provider_id.is_empty()
+            && !key.account_id.is_empty()
+            && !key.model.is_empty()
+            && !key.stable_client_conversation_id.is_empty()
+    })
+}
+
+fn response_input_items(body: &Value) -> Option<Vec<Value>> {
+    body.get("input").and_then(Value::as_array).cloned()
+}
+
+fn canonical_request_body(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("input");
+        object.remove("previous_response_id");
+        object.remove("type");
+    }
+    canonical_json_value(body)
+}
+
+fn canonical_json_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        Value::Object(object) => {
+            let sorted = object
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            let mut mapped = Map::new();
+            for (key, value) in sorted {
+                mapped.insert(key, value);
+            }
+            Value::Object(mapped)
+        }
+        value => value,
+    }
+}
+
+fn is_successful_completed_event(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("response.completed")
+        && event
+            .get("response")
+            .and_then(|response| response.get("status"))
+            .and_then(Value::as_str)
+            .is_none_or(|status| status == "completed")
+}
+
+fn terminal_response_id(event: &Value) -> Option<&str> {
+    event
+        .get("response")
+        .unwrap_or(event)
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn terminal_assistant_output_items(event: &Value) -> Option<Vec<Value>> {
+    let output = event
+        .get("response")
+        .unwrap_or(event)
+        .get("output")
+        .and_then(Value::as_array)?;
+    output
+        .iter()
+        .map(assistant_output_item_to_input_prefix_item)
+        .collect()
+}
+
+fn assistant_output_item_to_input_prefix_item(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => assistant_message_output_to_input_item(item),
+        Some("function_call") => assistant_function_call_output_to_input_item(item),
+        Some("reasoning" | "custom_tool_call") => None,
+        Some(_) | None => None,
+    }
+}
+
+fn assistant_message_output_to_input_item(item: &Value) -> Option<Value> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    if role != "assistant" {
+        return None;
+    }
+    let content = item.get("content")?.as_array()?;
+    let mut text_parts = Vec::new();
+    for part in content {
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text") => {
+                text_parts.push(part.get("text").and_then(Value::as_str).unwrap_or_default());
+            }
+            Some("refusal") => {
+                text_parts.push(
+                    part.get("refusal")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+            }
+            Some(_) | None => return None,
+        }
+    }
+    Some(Value::Object(Map::from_iter([
+        ("role".to_string(), Value::String("assistant".to_string())),
+        ("content".to_string(), Value::String(text_parts.join("\n"))),
+    ])))
+}
+
+fn assistant_function_call_output_to_input_item(item: &Value) -> Option<Value> {
+    let call_id = item.get("call_id").and_then(Value::as_str)?;
+    let name = item.get("name").and_then(Value::as_str)?;
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(Value::Object(Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("function_call".to_string()),
+        ),
+        ("call_id".to_string(), Value::String(call_id.to_string())),
+        ("name".to_string(), Value::String(name.to_string())),
+        (
+            "arguments".to_string(),
+            Value::String(arguments.to_string()),
+        ),
+    ])))
+}
+
 pub(super) async fn open_websocket_stream<F>(
     provider: &ChatGptProvider,
     body: Value,
     token: &ChatGptToken,
     marker_mode: ReasoningMarkerMode,
+    stable_client_conversation_id: Option<&str>,
     on_event: F,
 ) -> Result<(BoxStream<'static, Result<SseEvent, ProviderError>>, bool), ChatGptWebSocketStartError>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
     let idle_timeout = websocket_idle_timeout(provider);
-    let (mut stream, reused) = checkout_connection(provider, token).await?;
-    let request_text = response_create_request_text(body)?;
-
-    send_websocket_request(&mut stream, request_text, idle_timeout)
+    let continuation = provider
+        .websocket_session
+        .lock()
         .await
-        .map_err(|error| ChatGptWebSocketStartError::new(error, true))?;
+        .prepare_continuation(provider, token, &body, stable_client_conversation_id);
+    info!(
+        transport = "websocket",
+        continuation_key_present = continuation.key.is_some(),
+        continuation_used = continuation.used,
+        continuation_disabled_reason = continuation.disabled_reason.as_str(),
+        continuation_delta_items = continuation
+            .send_body
+            .get("input")
+            .and_then(|value| value.as_array())
+            .map(Vec::len)
+            .unwrap_or(0),
+        continuation_cached_input_items = continuation.full_input.len(),
+        continuation_schema_version = CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        "ChatGPT websocket continuation decision"
+    );
 
-    let first_event = read_next_json_event(&mut stream, idle_timeout, true).await?;
+    let (mut stream, reused) = match checkout_connection(provider, token).await {
+        Ok((stream, reused)) => (stream, reused),
+        Err(error) => {
+            provider
+                .websocket_session
+                .lock()
+                .await
+                .fail_continuation(&continuation);
+            return Err(error);
+        }
+    };
+    let request_text = match response_create_request_text(continuation.send_body.clone()) {
+        Ok(request_text) => request_text,
+        Err(error) => {
+            provider
+                .websocket_session
+                .lock()
+                .await
+                .fail_continuation(&continuation);
+            return Err(error);
+        }
+    };
+    if let Err(error) = send_websocket_request(&mut stream, request_text, idle_timeout).await {
+        provider
+            .websocket_session
+            .lock()
+            .await
+            .fail_continuation(&continuation);
+        return Err(ChatGptWebSocketStartError::new(error, true));
+    }
+
+    let first_event = match read_next_json_event(&mut stream, idle_timeout, true).await {
+        Ok(event) => event,
+        Err(error) => {
+            provider
+                .websocket_session
+                .lock()
+                .await
+                .fail_continuation(&continuation);
+            return Err(error);
+        }
+    };
     let first_event_terminal = is_terminal_response_event(&first_event);
     let (tx_event, rx_event) = mpsc::channel::<Result<Value, ProviderError>>(1600);
-    tx_event
-        .send(Ok(first_event))
-        .await
-        .map_err(|_| ChatGptWebSocketStartError::new(response_consumer_dropped_error(), false))?;
+    if tx_event.send(Ok(first_event.clone())).await.is_err() {
+        provider
+            .websocket_session
+            .lock()
+            .await
+            .fail_continuation(&continuation);
+        return Err(ChatGptWebSocketStartError::new(
+            response_consumer_dropped_error(),
+            false,
+        ));
+    }
 
     let websocket_session = provider.websocket_session.clone();
     let (abort_tx, mut abort_rx) = watch::channel(false);
     tokio::spawn(async move {
         if first_event_terminal {
+            websocket_session
+                .lock()
+                .await
+                .complete_continuation(&continuation, &first_event);
             store_completed_connection(websocket_session, stream).await;
             return;
         }
@@ -156,6 +663,10 @@ where
         loop {
             tokio::select! {
                 _ = abort_rx.changed() => {
+                    websocket_session
+                        .lock()
+                        .await
+                        .fail_continuation(&continuation);
                     close_or_release_websocket(stream).await;
                     return;
                 }
@@ -163,15 +674,28 @@ where
                     match result {
                         Ok(event) => {
                             let terminal = is_terminal_response_event(&event);
-                            if tx_event.send(Ok(event)).await.is_err() {
+                            if tx_event.send(Ok(event.clone())).await.is_err() {
+                                websocket_session
+                                    .lock()
+                                    .await
+                                    .fail_continuation(&continuation);
+                                close_or_release_websocket(stream).await;
                                 return;
                             }
                             if terminal {
+                                websocket_session
+                                    .lock()
+                                    .await
+                                    .complete_continuation(&continuation, &event);
                                 store_completed_connection(websocket_session, stream).await;
                                 return;
                             }
                         }
                         Err(error) => {
+                            websocket_session
+                                .lock()
+                                .await
+                                .fail_continuation(&continuation);
                             let _ = tx_event.send(Err(error.error)).await;
                             return;
                         }
@@ -871,6 +1395,112 @@ mod tests {
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["model"], "gpt-5.3-codex");
         assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn continuation_canonical_body_ignores_only_input_previous_response_and_type() {
+        let first = canonical_request_body(&json!({
+            "type": "response.create",
+            "previous_response_id": "resp-1",
+            "input": [{"role": "user", "content": "hi"}],
+            "model": "gpt-5.3-codex",
+            "text": {"verbosity": "high"},
+            "tools": [{"name": "Read", "type": "function"}]
+        }));
+        let second = canonical_request_body(&json!({
+            "tools": [{"type": "function", "name": "Read"}],
+            "text": {"verbosity": "high"},
+            "model": "gpt-5.3-codex",
+            "input": [{"role": "user", "content": "different"}]
+        }));
+        let changed = canonical_request_body(&json!({
+            "model": "gpt-5.3-codex",
+            "text": {"verbosity": "low"},
+            "tools": [{"name": "Read", "type": "function"}],
+            "input": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(first, second);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn continuation_extracts_supported_assistant_output_prefix_items() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "Read",
+                        "arguments": "{\"file\":\"a\"}"
+                    }
+                ]
+            }
+        });
+
+        let items = terminal_assistant_output_items(&event).expect("supported output items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], json!({"role": "assistant", "content": "hello"}));
+        assert_eq!(
+            items[1],
+            json!({
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "Read",
+                "arguments": "{\"file\":\"a\"}"
+            })
+        );
+    }
+
+    #[test]
+    fn continuation_rejects_unsupported_assistant_output_prefix_items() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "output": [{"type": "custom_tool_call", "call_id": "call-1"}]
+            }
+        });
+
+        assert!(terminal_assistant_output_items(&event).is_none());
+    }
+
+    #[test]
+    fn continuation_prunes_expired_entries() {
+        let mut session = ChatGptWebSocketSession::new();
+        let key = ContinuationKey {
+            provider_id: "chatgpt".to_string(),
+            account_id: "account".to_string(),
+            model: "gpt-5.3-codex".to_string(),
+            stable_client_conversation_id: "conversation".to_string(),
+            schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        };
+        session.continuations.insert(
+            key,
+            CachedContinuation {
+                canonical_body: json!({"model": "gpt-5.3-codex"}),
+                full_input: vec![json!({"role": "user", "content": "hi"})],
+                assistant_output_items: Vec::new(),
+                response_id: "resp-1".to_string(),
+                updated_at: Instant::now()
+                    - CHATGPT_WEBSOCKET_SESSION_IDLE_TTL
+                    - Duration::from_secs(1),
+            },
+        );
+
+        session.prune_expired_continuations();
+
+        assert!(session.continuations.is_empty());
     }
 
     #[test]
