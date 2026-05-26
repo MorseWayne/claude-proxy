@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 3 continuation/delta-input support complete; follow-up hardening pending
+Current phase: Phase 3 continuation hardening tests validated; commit pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -31,7 +31,10 @@ Current todo:
 - [x] Implement Phase 3 continuation/delta-input support.
 - [x] Validate/review Phase 3.
 - [x] Commit Phase 3 and refresh GitNexus metadata.
-- [ ] Decide whether to add non-blocking continuation hardening tests.
+- [x] Decide whether to add non-blocking continuation hardening tests.
+- [x] Implement continuation hardening tests for busy overlap, abort invalidation, and function-call/tool-result delta.
+- [x] Validate continuation hardening tests.
+- [ ] Commit continuation hardening tests and refresh GitNexus metadata.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -55,12 +58,15 @@ Changes:
 - GitNexus detect_changes for Phase 3 reports CRITICAL because the diff touches ChatGPT WebSocket transport/session flow and test helpers; affected flows align with planned ChatGPT continuation/WebSocket scope.
 - Phase 3 reviewer found no blockers; non-blocking follow-ups are explicit busy/concurrency coverage, abort-state invalidation coverage, and e2e function-call/tool-result continuation coverage.
 - Phase 3 committed in `5967589` and GitNexus metadata refreshed afterward.
+- Follow-up hardening tests now cover same-key busy overlap invalidating in-flight continuation state, downstream abort clearing continuation state before the next request, and function-call/tool-result continuation sending only the tool-result delta.
+- Reviewer found the initial busy-overlap test could pass via prefix mismatch; fixed by making the fourth request extend the stale in-flight transcript so a bad late cache update would send `previous_response_id: resp-ws-2` and fail.
+- Hardening validation passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_websocket_continuation`, `cargo test -p claude-proxy-providers chatgpt`, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Decide whether to add the reviewer’s non-blocking continuation hardening tests as a follow-up.
+- Commit the continuation hardening tests and refresh GitNexus metadata.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

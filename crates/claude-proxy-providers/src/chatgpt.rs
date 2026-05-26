@@ -3483,6 +3483,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_continuation_function_call_delta_sends_tool_result_only() {
+        let function_call = json!({
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "Read",
+            "arguments": "{\"file\":\"a.txt\"}"
+        });
+        let tool_result = json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "file contents"
+        });
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            function_call.clone(),
+            tool_result.clone()
+        ]);
+
+        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output("resp-ws-1", json!([function_call])),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        for (request_id, body) in [(30, chatgpt_websocket_test_body()), (31, second_body)] {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some("conversation-function-call"),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            let events = collect_stream_results(stream).await;
+            assert!(events.iter().all(Result::is_ok));
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["previous_response_id"], "resp-ws-1");
+        assert_eq!(requests[1]["input"], json!([tool_result]));
+    }
+
+    #[tokio::test]
     async fn chatgpt_websocket_continuation_requires_stable_conversation_id() {
         let mut second_body = chatgpt_websocket_test_body();
         second_body["input"] = json!([
@@ -3748,6 +3804,197 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].get("previous_response_id").is_none());
         assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_abort_clears_state() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "abort me"}
+        ]);
+        let mut third_body = chatgpt_websocket_test_body();
+        third_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "after abort"}
+        ]);
+        let (endpoint, requests, close_rx) =
+            websocket_abort_continuation_invalidation_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let first = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    40,
+                    chatgpt_websocket_test_body(),
+                    Some("conversation-abort-invalidation"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    41,
+                    second_body,
+                    Some("conversation-abort-invalidation"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("second websocket stream should start");
+        let first_event = second
+            .next()
+            .await
+            .expect("first downstream event")
+            .expect("message_start should be ok");
+        assert_eq!(first_event.event, "message_start");
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(2), close_rx)
+            .await
+            .expect("websocket should close after downstream abort")
+            .expect("close notification should be sent");
+
+        let third = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    42,
+                    third_body,
+                    Some("conversation-abort-invalidation"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("third websocket stream should start");
+        assert!(
+            collect_stream_results(third)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["previous_response_id"], "resp-ws-1");
+        assert!(requests[2].get("previous_response_id").is_none());
+        assert_eq!(requests[2]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_continuation_busy_request_invalidates_in_flight_state() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "busy"}
+        ]);
+        let mut third_body = chatgpt_websocket_test_body();
+        third_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "overlap"}
+        ]);
+        let mut fourth_body = chatgpt_websocket_test_body();
+        fourth_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "busy"},
+            {"role": "user", "content": "after overlap"}
+        ]);
+        let (endpoint, requests, complete_second_tx) =
+            websocket_busy_continuation_invalidation_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let first = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    50,
+                    chatgpt_websocket_test_body(),
+                    Some("conversation-busy"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(51, second_body, Some("conversation-busy")),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("second websocket stream should start");
+        let first_event = second
+            .next()
+            .await
+            .expect("first downstream event")
+            .expect("message_start should be ok");
+        assert_eq!(first_event.event, "message_start");
+
+        let third = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(52, third_body, Some("conversation-busy")),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("third websocket stream should start");
+        assert!(
+            collect_stream_results(third)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        complete_second_tx
+            .send(())
+            .expect("second completion signal should send");
+        assert!(
+            collect_stream_results(second)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let fourth = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(53, fourth_body, Some("conversation-busy")),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("fourth websocket stream should start");
+        assert!(
+            collect_stream_results(fourth)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["previous_response_id"], "resp-ws-1");
+        assert!(requests[2].get("previous_response_id").is_none());
+        assert_eq!(requests[2]["input"].as_array().map(Vec::len), Some(3));
+        assert!(requests[3].get("previous_response_id").is_none());
+        assert_eq!(requests[3]["input"].as_array().map(Vec::len), Some(4));
     }
 
     #[tokio::test]
@@ -4361,6 +4608,206 @@ mod tests {
         });
 
         (format!("http://{addr}/responses"), requests, handshakes)
+    }
+
+    async fn websocket_abort_continuation_invalidation_server()
+    -> (String, Arc<StdMutex<Vec<Value>>>, oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let (close_tx, close_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-1").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_completed_with_output(
+                        "resp-ws-1",
+                        json!([{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hello"}]
+                        }]),
+                    )
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-abort")
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.next().await;
+            let _ = close_tx.send(());
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-3").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_completed("resp-ws-3").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.close(None).await;
+        });
+
+        (format!("http://{addr}/responses"), requests, close_rx)
+    }
+
+    async fn websocket_busy_continuation_invalidation_server()
+    -> (String, Arc<StdMutex<Vec<Value>>>, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let (complete_second_tx, complete_second_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-1").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_completed_with_output(
+                        "resp-ws-1",
+                        json!([{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hello"}]
+                        }]),
+                    )
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_created("resp-ws-2").to_string().into(),
+                ))
+                .await
+                .unwrap();
+
+            let captured_requests_for_second_connection = Arc::clone(&captured_requests);
+            let second_connection = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = accept_hdr_async(
+                    socket,
+                    |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+                )
+                .await
+                .unwrap();
+                for response_id in ["resp-ws-3", "resp-ws-4"] {
+                    if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                        captured_requests_for_second_connection
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_str(&text).unwrap());
+                    }
+                    websocket
+                        .send(WsMessage::Text(
+                            websocket_response_created(response_id).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    websocket
+                        .send(WsMessage::Text(
+                            websocket_response_completed(response_id).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                let _ = websocket.close(None).await;
+            });
+
+            let _ = complete_second_rx.await;
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_completed("resp-ws-2").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let _ = second_connection.await;
+        });
+
+        (
+            format!("http://{addr}/responses"),
+            requests,
+            complete_second_tx,
+        )
     }
 
     async fn websocket_continuation_then_sse_fallback_server() -> (
