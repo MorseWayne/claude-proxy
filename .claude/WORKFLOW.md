@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: User spec review
+Current phase: Phase 2 WebSocket transport next
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -17,21 +17,30 @@ Intent:
 Current todo:
 - [x] Finalize design scope and implementation sequence before code changes.
 - [x] Review the written design spec and address any issues.
-- [ ] Wait for user review of the committed design spec.
-- [ ] Run GitNexus impact analysis before editing each target symbol.
-- [ ] Implement in reviewable phases with provider tests and full validation.
+- [x] Wait for user review of the committed design spec.
+- [x] Run GitNexus impact analysis before editing each target symbol.
+- [x] Implement Phase 1 foundation: model/request/cache/usage correctness plus focused tests.
+- [x] Validate Phase 1 with fmt and targeted provider tests before moving to WebSocket work.
+- [x] Review Phase 1 diff and apply any reviewer fixes before starting WebSocket work.
+- [x] Commit Phase 1 and refresh GitNexus index.
+- [ ] Implement Phase 2 WebSocket transport with SSE fallback.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
 - Design spec committed in `c569751` at `docs/superpowers/specs/2026-05-25-chatgpt-codex-provider-modernization-design.md`.
 - Spec review found missing boundaries for continuation keys, canonical comparison, WebSocket fallback errors, prompt cache/usage defaults, and model matrices; the design was revised to define them.
 - Spec review passed after revision; latest design clarification commit is `a39e179`.
+- Phase 1 foundation diff now adds dedicated ChatGPT/Codex model capabilities, richer Codex request options, request-scoped/stable prompt cache keys, normalized cached-token usage accounting, and focused tests.
+- Validation so far: `cargo fmt --check`, ChatGPT/Responses provider tests, full `cargo test -p claude-proxy-providers`, `cargo test -p claude-proxy-server`, `cargo test -p claude-proxy-cli`, full `cargo test`, `cargo clippy -p claude-proxy-providers -p claude-proxy-server -p claude-proxy-cli -- -D warnings`, full `cargo clippy -- -D warnings`, and `git diff --check` passed.
+- Reviewer fanout found no blockers; accepted one small maintainability cleanup to share Responses usage JSON emission.
+- GitNexus detect_changes reports CRITICAL because the diff touches central ChatGPT request and Responses stream conversion paths; affected processes align with Phase 1 scope.
+- Phase 1 foundation committed, and `npx gitnexus analyze` completed successfully.
 
 Prerequisites:
-- User review before implementation planning.
+- User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Ask the user to review the committed spec, then move to implementation planning after approval.
+- Start Phase 2 WebSocket transport planning/implementation from the approved design. Run fresh GitNexus impact analysis before touching transport/session symbols.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

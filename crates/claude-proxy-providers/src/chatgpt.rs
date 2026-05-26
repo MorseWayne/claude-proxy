@@ -39,7 +39,7 @@ use crate::http::{
 };
 use crate::openai_compat::{
     apply_openai_intent, is_compact_request_body, log_compact_request_observability,
-    log_request_observability, openai_model_info,
+    log_request_observability,
 };
 use crate::provider::{
     Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
@@ -675,16 +675,23 @@ impl Provider for ChatGptProvider {
         let token = self.auth.get_existing_token().await?;
         let request = apply_openai_intent(request);
         let marker_mode = marker_mode_from_request(&request);
+        let prompt_cache_key_source = responses::prompt_cache_key_source(&request);
         let mut body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
-                prompt_cache_key: Some(&self.thread_id),
+                service_tier: self.runtime.openai.service_tier.as_deref(),
             },
         );
         let output_token_budget = chatgpt_output_token_budget(&request, &body);
         let request_id = next_chatgpt_request_id();
+        info!(
+            request_id,
+            prompt_cache_key_source = prompt_cache_key_source.as_str(),
+            prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
+            "ChatGPT prompt cache key policy applied"
+        );
         log_request_observability("chatgpt", "/responses", &body);
         let compact_request = is_compact_request_body(&body);
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
@@ -1816,7 +1823,7 @@ fn json_len(value: &Value) -> usize {
 }
 
 fn chatgpt_request_warning_threshold(model: &str) -> Option<usize> {
-    let context_window = openai_model_info(model)
+    let context_window = chatgpt_model_info(model)?
         .capabilities
         .limits
         .context_window? as usize;
@@ -1859,22 +1866,126 @@ fn warn_if_request_nears_context_window(
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChatGptModelSpec {
+    model_id: &'static str,
+    context_window: u32,
+    image_input: bool,
+}
+
+const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
+    ChatGptModelSpec {
+        model_id: "gpt-5.5",
+        context_window: 400_000,
+        image_input: true,
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.4",
+        context_window: 400_000,
+        image_input: true,
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.4-mini",
+        context_window: 400_000,
+        image_input: true,
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.3-codex",
+        context_window: 400_000,
+        image_input: false,
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.3-codex-spark",
+        context_window: 400_000,
+        image_input: false,
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.2",
+        context_window: 400_000,
+        image_input: true,
+    },
+];
+
 fn chatgpt_models() -> Vec<ModelInfo> {
-    [
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2",
-    ]
-    .into_iter()
-    .map(|model_id| {
-        let mut info = openai_model_info(model_id);
-        info.capabilities.modalities.input.image = CapabilityState::Supported;
-        info
-    })
-    .collect()
+    CHATGPT_MODEL_SPECS
+        .iter()
+        .copied()
+        .map(chatgpt_model_info_from_spec)
+        .collect()
+}
+
+fn chatgpt_model_info(model_id: &str) -> Option<ModelInfo> {
+    CHATGPT_MODEL_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.model_id == model_id)
+        .map(chatgpt_model_info_from_spec)
+}
+
+fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
+    let reasoning_efforts = ["low", "medium", "high", "xhigh"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    ModelInfo {
+        model_id: spec.model_id.to_string(),
+        vendor: Some("openai".to_string()),
+        is_chat_default: None,
+        capabilities: ModelCapabilities {
+            endpoints: EndpointCapabilities {
+                openai_responses: CapabilityState::Supported,
+                openai_chat_completions: CapabilityState::Unsupported,
+                anthropic_messages: CapabilityState::Unknown,
+            },
+            modalities: ModalityCapabilities {
+                input: InputModalities {
+                    text: CapabilityState::Supported,
+                    image: CapabilityState::from_bool(Some(spec.image_input)),
+                    document: CapabilityState::Unknown,
+                    audio: CapabilityState::Unsupported,
+                    video: CapabilityState::Unsupported,
+                },
+                output: OutputModalities {
+                    text: CapabilityState::Supported,
+                    image: CapabilityState::Unsupported,
+                    audio: CapabilityState::Unsupported,
+                },
+            },
+            features: FeatureCapabilities {
+                streaming: CapabilityState::Supported,
+                system_prompt: CapabilityState::Supported,
+                tools: CapabilityState::Supported,
+                tool_choice: CapabilityState::Supported,
+                thinking: CapabilityState::Supported,
+                adaptive_thinking: CapabilityState::Supported,
+                reasoning_effort: CapabilityState::Supported,
+                prompt_cache: CapabilityState::Supported,
+                sampling: CapabilityState::Unsupported,
+                stop_sequences: CapabilityState::Unsupported,
+            },
+            limits: ModelLimits {
+                context_window: Some(spec.context_window),
+                max_output_tokens: None,
+                min_thinking_budget: None,
+                max_thinking_budget: None,
+                reasoning_effort_levels: reasoning_efforts,
+            },
+            supported_parameters: vec![
+                "system".to_string(),
+                "messages".to_string(),
+                "stream".to_string(),
+                "tools".to_string(),
+                "tool_choice".to_string(),
+                "thinking".to_string(),
+                "reasoning_effort".to_string(),
+                "prompt_cache_key".to_string(),
+                "parallel_tool_calls".to_string(),
+                "service_tier".to_string(),
+                "verbosity".to_string(),
+            ],
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2240,20 +2351,75 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_models_include_reasoning_capabilities() {
+    fn chatgpt_models_use_dedicated_codex_capability_contract() {
         let models = chatgpt_models();
+        let ids = models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2",
+            ]
+        );
+
         let gpt55 = models
             .iter()
             .find(|model| model.model_id == "gpt-5.5")
             .expect("gpt-5.5 model");
 
-        assert_eq!(gpt55.capabilities.limits.max_output_tokens, Some(128_000));
+        assert_eq!(gpt55.capabilities.limits.max_output_tokens, None);
         assert_eq!(gpt55.capabilities.limits.context_window, Some(400_000));
         assert!(gpt55.capabilities.endpoints.openai_responses.is_supported());
+        assert_eq!(
+            gpt55.capabilities.endpoints.openai_chat_completions,
+            CapabilityState::Unsupported
+        );
         assert!(gpt55.capabilities.modalities.input.image.is_supported());
+        assert_eq!(
+            gpt55.capabilities.features.stop_sequences,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            gpt55.capabilities.features.sampling,
+            CapabilityState::Unsupported
+        );
+        assert!(
+            !gpt55
+                .capabilities
+                .supported_parameters
+                .contains(&"max_tokens".to_string())
+        );
+        assert!(
+            !gpt55
+                .capabilities
+                .supported_parameters
+                .contains(&"stop_sequences".to_string())
+        );
+        assert!(
+            gpt55
+                .capabilities
+                .supported_parameters
+                .contains(&"service_tier".to_string())
+        );
         assert_eq!(
             gpt55.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
+        );
+
+        let codex = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.3-codex")
+            .expect("codex model");
+        assert_eq!(
+            codex.capabilities.modalities.input.image,
+            CapabilityState::Unsupported
         );
     }
 
@@ -2466,6 +2632,115 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_adds_codex_request_options() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("parallel_tool_calls".to_string(), json!(false));
+        extra.insert("verbosity".to_string(), json!("high"));
+        extra.insert("service_tier".to_string(), json!("priority"));
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "Read".to_string(),
+                description: None,
+                input_schema: json!({"type": "object", "properties": {}}),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                installation_id: None,
+                service_tier: Some("flex"),
+            },
+        );
+
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["text"], json!({"verbosity": "high"}));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_uses_stable_prompt_cache_sources() {
+        let long_key = "界".repeat(70);
+        let expected_key = "界".repeat(64);
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("prompt_cache_key".to_string(), json!(long_key));
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"prompt_cache_key": "metadata-key"})),
+            extra,
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["prompt_cache_key"], expected_key);
+        assert_eq!(
+            responses::prompt_cache_key_source(&req),
+            responses::PromptCacheKeySource::Explicit
+        );
+    }
+
+    #[test]
+    fn chatgpt_responses_body_uses_stable_conversation_id_as_prompt_cache_key() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"conversation_id": "conversation-123"})),
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["prompt_cache_key"], "conversation-123");
+        assert_eq!(
+            responses::prompt_cache_key_source(&req),
+            responses::PromptCacheKeySource::StableClientConversation
+        );
+    }
+
+    #[test]
     fn chatgpt_responses_body_adds_codex_runtime_context() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
@@ -2491,11 +2766,12 @@ mod tests {
             &req,
             responses::CodexRequestContext {
                 installation_id: Some("install-123"),
-                prompt_cache_key: Some("thread-123"),
+                service_tier: Some("priority"),
             },
         );
 
-        assert_eq!(body["prompt_cache_key"], "thread-123");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(body["service_tier"], "priority");
         let client_metadata = body["client_metadata"].as_object().unwrap();
         assert_eq!(
             client_metadata.get("x-codex-installation-id"),
@@ -2550,7 +2826,7 @@ mod tests {
             &req,
             responses::CodexRequestContext {
                 installation_id: Some("install-fixture"),
-                prompt_cache_key: Some("thread-fallback"),
+                service_tier: None,
             },
         );
 

@@ -2584,6 +2584,7 @@ mod tests {
         assert_eq!(metrics[0].0, "chatgpt");
         assert_eq!(metrics[0].1.requests, 2);
         assert_eq!(metrics[0].1.cache_read_input_tokens, 20);
+        assert_eq!(metrics[0].1.total_tokens(), 155);
         assert_eq!(metrics[1].0, "openai");
         assert_eq!(metrics[1].1.total_tokens(), 7);
     }

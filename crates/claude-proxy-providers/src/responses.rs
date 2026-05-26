@@ -1074,12 +1074,48 @@ pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>,
 }
 
 fn provider_usage_from_responses_response(response: &Value) -> Option<ProviderUsageMetadata> {
-    let usage = response.get("usage")?;
-    Some(ProviderUsageMetadata {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+    response
+        .get("usage")
+        .map(provider_usage_from_responses_usage)
+}
+
+fn provider_usage_from_responses_usage(usage: &Value) -> ProviderUsageMetadata {
+    let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = responses_cached_input_tokens(usage).min(input_tokens);
+
+    ProviderUsageMetadata {
+        input_tokens: input_tokens.saturating_sub(cached_input_tokens),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-        cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+        cache_read_input_tokens: cached_input_tokens,
+    }
+}
+
+fn responses_cached_input_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cached_input_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn responses_usage_json(
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+) -> Value {
+    json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
     })
 }
 
@@ -1151,6 +1187,8 @@ struct ResponsesStreamConverter {
     saw_function_call: bool,
     input_tokens: u32,
     output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
     stopped: bool,
 }
 
@@ -1293,7 +1331,12 @@ impl ResponsesStreamConverter {
                     "model": self.model,
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
+                    "usage": responses_usage_json(
+                        self.input_tokens,
+                        0,
+                        self.cache_creation_input_tokens,
+                        self.cache_read_input_tokens,
+                    )
                 }
             }),
         });
@@ -1756,7 +1799,12 @@ impl ResponsesStreamConverter {
             data: json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": reason, "stop_sequence": null},
-                "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
+                "usage": responses_usage_json(
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.cache_creation_input_tokens,
+                    self.cache_read_input_tokens,
+                )
             }),
         });
         events.push(SseEvent {
@@ -1768,8 +1816,12 @@ impl ResponsesStreamConverter {
 
     fn set_usage(&mut self, response: &Value) {
         if let Some(usage) = response.get("usage") {
-            self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-            self.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+            let usage = provider_usage_from_responses_usage(usage);
+            self.input_tokens = u64_to_u32_saturating(usage.input_tokens);
+            self.output_tokens = u64_to_u32_saturating(usage.output_tokens);
+            self.cache_creation_input_tokens =
+                u64_to_u32_saturating(usage.cache_creation_input_tokens);
+            self.cache_read_input_tokens = u64_to_u32_saturating(usage.cache_read_input_tokens);
         }
     }
 }
@@ -1850,18 +1902,22 @@ struct NonStreamingResponsesConverter<'a> {
     next_block_index: u32,
     input_tokens: u32,
     output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
     marker_mode: ReasoningMarkerMode,
 }
 
 impl<'a> NonStreamingResponsesConverter<'a> {
     fn new(data: &'a Value, marker_mode: ReasoningMarkerMode) -> Self {
-        let usage = &data["usage"];
+        let usage = provider_usage_from_responses_usage(&data["usage"]);
         Self {
             data,
             events: Vec::new(),
             next_block_index: 0,
-            input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
-            output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
+            input_tokens: u64_to_u32_saturating(usage.input_tokens),
+            output_tokens: u64_to_u32_saturating(usage.output_tokens),
+            cache_creation_input_tokens: u64_to_u32_saturating(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: u64_to_u32_saturating(usage.cache_read_input_tokens),
             marker_mode,
         }
     }
@@ -1879,7 +1935,12 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                     "model": self.data["model"].as_str().unwrap_or("unknown"),
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}
+                    "usage": responses_usage_json(
+                        self.input_tokens,
+                        0,
+                        self.cache_creation_input_tokens,
+                        self.cache_read_input_tokens,
+                    )
                 }
             }),
         });
@@ -1901,7 +1962,12 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             data: json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": response_stop_reason(self.data, false), "stop_sequence": null},
-                "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
+                "usage": responses_usage_json(
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.cache_creation_input_tokens,
+                    self.cache_read_input_tokens,
+                )
             }),
         });
         self.events.push(SseEvent {
@@ -2285,6 +2351,63 @@ mod tests {
 
         let observed = observed.lock().unwrap();
         assert!(observed.iter().any(|kind| kind == "codex.rate_limits"));
+    }
+
+    #[test]
+    fn responses_usage_accounting_treats_cached_tokens_as_input_subset() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 30}
+        }));
+
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens + usage.output_tokens,
+            120
+        );
+    }
+
+    #[test]
+    fn responses_usage_accounting_defaults_missing_cached_details_to_zero() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 11,
+            "output_tokens": 7
+        }));
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn stream_converter_emits_normalized_cached_usage() {
+        let mut converter = ResponsesStreamConverter::new();
+        let events = converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 30}
+                }
+            }
+        }));
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(stop.data["usage"]["input_tokens"], 70);
+        assert_eq!(stop.data["usage"]["cache_read_input_tokens"], 30);
+        assert_eq!(stop.data["usage"]["output_tokens"], 20);
     }
 
     #[test]

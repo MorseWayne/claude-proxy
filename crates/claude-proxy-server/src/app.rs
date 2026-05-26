@@ -135,7 +135,10 @@ pub struct TokenUsage {
 
 impl TokenUsage {
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
     }
 }
 
@@ -151,7 +154,10 @@ pub struct UsageMetrics {
 
 impl UsageMetrics {
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
     }
 
     fn add_usage(&mut self, usage: &TokenUsage) {
@@ -532,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn total_tokens_excludes_cache_tokens() {
+    fn total_tokens_includes_cache_token_components() {
         let metrics = ModelMetrics {
             requests: 1,
             input_tokens: 100,
@@ -541,7 +547,7 @@ mod tests {
             cache_read_input_tokens: 60,
         };
 
-        assert_eq!(metrics.total_tokens(), 125);
+        assert_eq!(metrics.total_tokens(), 225);
     }
 
     #[tokio::test]
