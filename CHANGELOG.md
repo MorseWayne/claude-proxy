@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.0 - 2026-05-26
+
+### Added in v1.3.0
+
+- Added dedicated ChatGPT/Codex model capability metadata and richer Responses request options for Codex-style requests.
+- Added configurable ChatGPT transport selection with Responses WebSocket support, automatic SSE fallback before the first upstream event, and completed WebSocket connection reuse.
+- Added WebSocket-only ChatGPT continuation support using safe `previous_response_id` delta input when the request body, account, model, and stable client conversation key all match.
+- Added continuation regression coverage for prefix/body/account mismatches, terminal failures, downstream aborts, same-key busy overlaps, auto-transport fallback, and function-call/tool-result deltas.
+
+### Changed in v1.3.0
+
+- Improved ChatGPT/Codex prompt cache key generation to avoid unsafe shared thread-id fallbacks and prefer stable request-scoped sources.
+- Improved cached-token usage accounting so cache reads and writes are reflected consistently in provider metrics, admin totals, and the TUI.
+- Improved ChatGPT WebSocket startup behavior to honor configured HTTP proxies and extra CA certificates where supported.
+
 ## v1.2.1 - 2026-05-24
 
 ### Added in v1.2.1
