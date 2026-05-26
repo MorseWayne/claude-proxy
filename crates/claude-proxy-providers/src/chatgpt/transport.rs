@@ -39,17 +39,50 @@ const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
 const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChatGptWebSocketPhase {
+    Connect,
+    ProxyConnect,
+    Send,
+    FirstEvent,
+    AfterFirstEvent,
+    Protocol,
+}
+
+impl ChatGptWebSocketPhase {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::ProxyConnect => "proxy_connect",
+            Self::Send => "send",
+            Self::FirstEvent => "first_event",
+            Self::AfterFirstEvent => "after_first_event",
+            Self::Protocol => "protocol",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ChatGptWebSocketStartError {
     pub error: ProviderError,
     pub fallback_allowed: bool,
+    pub phase: ChatGptWebSocketPhase,
 }
 
 impl ChatGptWebSocketStartError {
     fn new(error: ProviderError, fallback_allowed: bool) -> Self {
+        Self::with_phase(error, fallback_allowed, ChatGptWebSocketPhase::Protocol)
+    }
+
+    fn with_phase(
+        error: ProviderError,
+        fallback_allowed: bool,
+        phase: ChatGptWebSocketPhase,
+    ) -> Self {
         Self {
             error,
             fallback_allowed,
+            phase,
         }
     }
 }
@@ -623,6 +656,8 @@ where
         continuation_key_present = continuation.key.is_some(),
         continuation_used = continuation.used,
         continuation_disabled_reason = continuation.disabled_reason.as_str(),
+        prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
+        stable_client_conversation_id_present = stable_client_conversation_id.is_some(),
         continuation_delta_items = continuation
             .send_body
             .get("input")
@@ -663,7 +698,11 @@ where
             .lock()
             .await
             .fail_continuation(&continuation);
-        return Err(ChatGptWebSocketStartError::new(error, true));
+        return Err(ChatGptWebSocketStartError::with_phase(
+            error,
+            true,
+            ChatGptWebSocketPhase::Send,
+        ));
     }
 
     let first_event = match read_next_json_event(&mut stream, idle_timeout, true).await {
@@ -991,7 +1030,13 @@ async fn connect_websocket(
         }
     })
     .await
-    .map_err(|_| ChatGptWebSocketStartError::new(ProviderError::Timeout, true))??;
+    .map_err(|_| {
+        ChatGptWebSocketStartError::with_phase(
+            ProviderError::Timeout,
+            true,
+            ChatGptWebSocketPhase::Connect,
+        )
+    })??;
 
     info!(
         transport = "websocket",
@@ -1050,34 +1095,38 @@ async fn connect_proxy_tunnel(
     target_url: &Url,
 ) -> Result<TcpStream, ChatGptWebSocketStartError> {
     let proxy_url = Url::parse(proxy).map_err(|error| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::InvalidRequest(format!("invalid ChatGPT websocket proxy URL: {error}")),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
     if proxy_url.scheme() != "http" {
-        return Err(ChatGptWebSocketStartError::new(
+        return Err(ChatGptWebSocketStartError::with_phase(
             ProviderError::InvalidRequest(
                 "ChatGPT websocket transport currently supports HTTP proxy URLs only".to_string(),
             ),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         ));
     }
 
     let proxy_host = proxy_url.host_str().ok_or_else(|| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::InvalidRequest(
                 "ChatGPT websocket proxy URL is missing host".to_string(),
             ),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
     let proxy_port = proxy_url.port_or_known_default().ok_or_else(|| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::InvalidRequest(
                 "ChatGPT websocket proxy URL is missing port".to_string(),
             ),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
     let target_host = target_url.host_str().ok_or_else(|| {
@@ -1102,13 +1151,20 @@ async fn connect_proxy_tunnel(
         TcpStream::connect((proxy_host, proxy_port)),
     )
     .await
-    .map_err(|_| ChatGptWebSocketStartError::new(ProviderError::Timeout, true))?
+    .map_err(|_| {
+        ChatGptWebSocketStartError::with_phase(
+            ProviderError::Timeout,
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        )
+    })?
     .map_err(|error| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::Network(format!(
                 "failed to connect ChatGPT websocket proxy: {error}"
             )),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
 
@@ -1130,29 +1186,38 @@ async fn connect_proxy_tunnel(
         socket.write_all(request.as_bytes()),
     )
     .await
-    .map_err(|_| ChatGptWebSocketStartError::new(ProviderError::Timeout, true))?
+    .map_err(|_| {
+        ChatGptWebSocketStartError::with_phase(
+            ProviderError::Timeout,
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        )
+    })?
     .map_err(|error| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::Network(format!(
                 "failed to write ChatGPT websocket proxy CONNECT: {error}"
             )),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
 
     let response = read_proxy_connect_response(&mut socket).await?;
     let status = parse_proxy_connect_status(&response).ok_or_else(|| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::Network("invalid ChatGPT websocket proxy CONNECT response".to_string()),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         )
     })?;
     if !(200..300).contains(&status) {
-        return Err(ChatGptWebSocketStartError::new(
+        return Err(ChatGptWebSocketStartError::with_phase(
             ProviderError::Network(format!(
                 "ChatGPT websocket proxy CONNECT failed with HTTP {status}"
             )),
             true,
+            ChatGptWebSocketPhase::ProxyConnect,
         ));
     }
 
@@ -1168,13 +1233,20 @@ async fn read_proxy_connect_response(
         let read =
             tokio::time::timeout(CHATGPT_WEBSOCKET_CONNECT_TIMEOUT, socket.read(&mut buffer))
                 .await
-                .map_err(|_| ChatGptWebSocketStartError::new(ProviderError::Timeout, true))?
+                .map_err(|_| {
+                    ChatGptWebSocketStartError::with_phase(
+                        ProviderError::Timeout,
+                        true,
+                        ChatGptWebSocketPhase::ProxyConnect,
+                    )
+                })?
                 .map_err(|error| {
-                    ChatGptWebSocketStartError::new(
+                    ChatGptWebSocketStartError::with_phase(
                         ProviderError::Network(format!(
                             "failed to read ChatGPT websocket proxy CONNECT response: {error}"
                         )),
                         true,
+                        ChatGptWebSocketPhase::ProxyConnect,
                     )
                 })?;
         if read == 0 {
@@ -1185,11 +1257,12 @@ async fn read_proxy_connect_response(
             break;
         }
         if response.len() > 16 * 1024 {
-            return Err(ChatGptWebSocketStartError::new(
+            return Err(ChatGptWebSocketStartError::with_phase(
                 ProviderError::Network(
                     "ChatGPT websocket proxy CONNECT response too large".to_string(),
                 ),
                 true,
+                ChatGptWebSocketPhase::ProxyConnect,
             ));
         }
     }
@@ -1216,14 +1289,16 @@ fn map_websocket_connect_error(error: WsError) -> ChatGptWebSocketStartError {
                 .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
                 .unwrap_or_default();
             let fallback_allowed = websocket_http_fallback_allowed(status, &body);
-            ChatGptWebSocketStartError::new(
+            ChatGptWebSocketStartError::with_phase(
                 map_chatgpt_error_status_body_with_headers(status, &headers, body),
                 fallback_allowed,
+                ChatGptWebSocketPhase::Connect,
             )
         }
-        other => ChatGptWebSocketStartError::new(
+        other => ChatGptWebSocketStartError::with_phase(
             ProviderError::Network(format!("ChatGPT websocket connect failed: {other}")),
             true,
+            ChatGptWebSocketPhase::Connect,
         ),
     }
 }
@@ -1276,32 +1351,45 @@ async fn read_next_json_event(
         let message = tokio::time::timeout(idle_timeout, stream.next())
             .await
             .map_err(|_| {
-                ChatGptWebSocketStartError::new(ProviderError::Timeout, before_first_event)
+                ChatGptWebSocketStartError::with_phase(
+                    ProviderError::Timeout,
+                    before_first_event,
+                    websocket_read_phase(before_first_event),
+                )
             })?;
         let message = match message {
             Some(Ok(message)) => message,
             Some(Err(error)) => {
                 let error =
                     ProviderError::Network(format!("ChatGPT websocket read failed: {error}"));
-                return Err(ChatGptWebSocketStartError::new(error, before_first_event));
+                return Err(ChatGptWebSocketStartError::with_phase(
+                    error,
+                    before_first_event,
+                    websocket_read_phase(before_first_event),
+                ));
             }
             None => {
                 let error = ProviderError::Network(
                     "ChatGPT websocket closed before response.completed".to_string(),
                 );
-                return Err(ChatGptWebSocketStartError::new(error, before_first_event));
+                return Err(ChatGptWebSocketStartError::with_phase(
+                    error,
+                    before_first_event,
+                    websocket_read_phase(before_first_event),
+                ));
             }
         };
 
         match message {
             Message::Text(text) => return parse_text_event(&text, before_first_event),
             Message::Binary(_) => {
-                return Err(ChatGptWebSocketStartError::new(
+                return Err(ChatGptWebSocketStartError::with_phase(
                     ProviderError::UpstreamError {
                         status: 200,
                         body: "unexpected binary ChatGPT websocket event".to_string(),
                     },
                     false,
+                    ChatGptWebSocketPhase::Protocol,
                 ));
             }
             Message::Close(frame) => {
@@ -1310,20 +1398,22 @@ async fn read_next_json_event(
                     .map(|frame| frame.reason.to_string())
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or_else(|| "no close reason".to_string());
-                return Err(ChatGptWebSocketStartError::new(
+                return Err(ChatGptWebSocketStartError::with_phase(
                     ProviderError::Network(format!(
                         "ChatGPT websocket closed before response.completed: {reason}"
                     )),
                     before_first_event,
+                    websocket_read_phase(before_first_event),
                 ));
             }
             Message::Ping(payload) => {
                 stream.send(Message::Pong(payload)).await.map_err(|error| {
-                    ChatGptWebSocketStartError::new(
+                    ChatGptWebSocketStartError::with_phase(
                         ProviderError::Network(format!(
                             "failed to send ChatGPT websocket pong: {error}"
                         )),
                         before_first_event,
+                        websocket_read_phase(before_first_event),
                     )
                 })?;
             }
@@ -1332,24 +1422,34 @@ async fn read_next_json_event(
     }
 }
 
+fn websocket_read_phase(before_first_event: bool) -> ChatGptWebSocketPhase {
+    if before_first_event {
+        ChatGptWebSocketPhase::FirstEvent
+    } else {
+        ChatGptWebSocketPhase::AfterFirstEvent
+    }
+}
+
 fn parse_text_event(
     text: &str,
     before_first_event: bool,
 ) -> Result<Value, ChatGptWebSocketStartError> {
     let value = serde_json::from_str::<Value>(text).map_err(|error| {
-        ChatGptWebSocketStartError::new(
+        ChatGptWebSocketStartError::with_phase(
             ProviderError::UpstreamError {
                 status: 200,
                 body: format!("invalid ChatGPT websocket event JSON: {error}"),
             },
             false,
+            ChatGptWebSocketPhase::Protocol,
         )
     })?;
 
     if value.get("type").and_then(|value| value.as_str()) == Some("error") {
-        return Err(ChatGptWebSocketStartError::new(
+        return Err(ChatGptWebSocketStartError::with_phase(
             map_wrapped_websocket_error_event(&value, text),
             false,
+            ChatGptWebSocketPhase::Protocol,
         ));
     }
 

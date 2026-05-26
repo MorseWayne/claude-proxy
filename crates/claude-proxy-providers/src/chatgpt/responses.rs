@@ -131,7 +131,7 @@ fn apply_codex_request_options(
 }
 
 fn apply_codex_reasoning_defaults(body: &mut Map<String, Value>, request: &MessagesRequest) {
-    if request.extra.get("reasoning").is_some() {
+    if request.extra.contains_key("reasoning") {
         return;
     }
     let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) else {

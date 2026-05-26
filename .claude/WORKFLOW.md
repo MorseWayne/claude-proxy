@@ -36,6 +36,7 @@ Current todo:
 - [x] Validate continuation hardening tests.
 - [x] Commit continuation hardening tests and refresh GitNexus metadata.
 - [x] Remove untracked review report artifacts.
+- [x] Implement post-validation WebSocket startup fallback tuning: phase-aware diagnostics, short Auto cooldown, and lightweight WebSocket counters.
 - [ ] Prepare v1.3.0 release metadata and tag.
 
 Changes:
@@ -71,12 +72,15 @@ Changes:
 - Applied additional pi-aligned stability tuning: ChatGPT/Codex model context metadata now uses 272k tokens, Codex reasoning summary defaults to `auto` for generated reasoning requests, and WebSocket `server_error` activates a short SSE cooldown so repeated retries do not immediately hit the same WebSocket failure path.
 - Committed and pushed the ChatGPT/Codex stability fixes in `6fd905a`.
 - Started the next stability round by enriching incoming `/v1/messages` requests with `client_session_id` from safe session headers when the request does not already carry stable session metadata; this lets ChatGPT/Codex derive prompt cache and continuation keys when clients provide a session header, without inventing a provider-global cross-session key.
+- Post-validation WebSocket startup fallback tuning replaces provider-wide permanent Auto fallback with a 120s startup-failure SSE cooldown, adds phase-aware WebSocket startup errors, lightweight provider-local WebSocket counters, and prompt-cache/continuation presence logs without logging key values.
+- Validation for the WebSocket tuning passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_`, full `cargo clippy -- -D warnings`, and provider-file `git diff --check`.
+- GitNexus detect_changes reports CRITICAL because the diff intentionally touches ChatGPT WebSocket transport/session and related test flows; affected processes align with the planned WebSocket fallback/diagnostics scope.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Validate release metadata, commit the v1.3.0 prep, and create the release tag if approved.
+- Commit the validated WebSocket startup fallback tuning if desired, then validate release metadata and continue v1.3.0 prep.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
