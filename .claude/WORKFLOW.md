@@ -69,6 +69,8 @@ Changes:
 - During live ChatGPT/Codex validation, upstream `server_error` reproduced on both WebSocket and SSE; added diagnostics plus a runtime-id recovery fix so SSE requests use per-request `x-client-request-id` and ChatGPT `server_error` rotates session/thread/window IDs and clears WebSocket volatile state.
 - Compared `/home/quzhihao/workspace/source/open/pi/packages/ai/src/providers/openai-codex-responses.ts`: its WebSocket cache is session-scoped, marks entries busy, drops cache on errors, and does not use a provider-global reusable connection. Mirrored the safer direction by keying claude-proxy cached WebSocket reuse by provider/account/model/session/thread/window to prevent cross-model/account reuse.
 - Applied additional pi-aligned stability tuning: ChatGPT/Codex model context metadata now uses 272k tokens, Codex reasoning summary defaults to `auto` for generated reasoning requests, and WebSocket `server_error` activates a short SSE cooldown so repeated retries do not immediately hit the same WebSocket failure path.
+- Committed and pushed the ChatGPT/Codex stability fixes in `6fd905a`.
+- Started the next stability round by enriching incoming `/v1/messages` requests with `client_session_id` from safe session headers when the request does not already carry stable session metadata; this lets ChatGPT/Codex derive prompt cache and continuation keys when clients provide a session header, without inventing a provider-global cross-session key.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.

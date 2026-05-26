@@ -48,6 +48,67 @@ fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     false
 }
 
+fn attach_client_session_metadata(
+    mut request: MessagesRequest,
+    headers: &HeaderMap,
+) -> MessagesRequest {
+    if request_has_stable_client_session(&request) {
+        return request;
+    }
+    let Some(session_id) = client_session_id_from_headers(headers) else {
+        return request;
+    };
+    request
+        .extra
+        .insert("client_session_id".to_string(), json!(session_id));
+    request
+}
+
+fn request_has_stable_client_session(request: &MessagesRequest) -> bool {
+    const KEYS: &[&str] = &[
+        "conversation_id",
+        "thread_id",
+        "session_id",
+        "client_conversation_id",
+        "client_thread_id",
+        "client_session_id",
+        "x-client-conversation-id",
+        "x-client-thread-id",
+        "x-client-session-id",
+    ];
+    KEYS.iter().any(|key| {
+        request.extra.get(*key).and_then(Value::as_str).is_some()
+            || request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(*key))
+                .and_then(Value::as_str)
+                .is_some()
+    })
+}
+
+fn client_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    const HEADER_NAMES: &[&str] = &[
+        "x-client-conversation-id",
+        "x-client-session-id",
+        "x-client-thread-id",
+        "x-claude-conversation-id",
+        "x-claude-session-id",
+        "x-claude-thread-id",
+        "x-session-id",
+        "session-id",
+        "session_id",
+    ];
+    HEADER_NAMES.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
 /// Check authorization header against admin token.
 fn check_admin_auth(headers: &HeaderMap, admin_token: &str) -> bool {
     let auth = headers
@@ -90,6 +151,8 @@ pub async fn messages(
             );
         }
     }
+
+    let request = attach_client_session_metadata(request, &headers);
 
     // Concurrency limiting
     let request_permit = match acquire_request_permit(&state, start).await {
@@ -2023,6 +2086,49 @@ mod tests {
         request.metadata = Some(json!({"intent": "deep_think"}));
 
         assert_eq!(request_intent(&request), Some("deep_think"));
+    }
+
+    #[test]
+    fn client_session_metadata_uses_safe_headers_when_missing() {
+        let request = request_with_system(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("session-123"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("session-123")
+        );
+    }
+
+    #[test]
+    fn client_session_metadata_preserves_explicit_request_value() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert("client_session_id".to_string(), json!("explicit-session"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("header-session"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("explicit-session")
+        );
     }
 
     #[test]
