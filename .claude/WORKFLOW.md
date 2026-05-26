@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 3 continuation hardening tests validated; commit pending
+Current phase: Phase 3 continuation hardening complete; optional follow-ups pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -34,7 +34,7 @@ Current todo:
 - [x] Decide whether to add non-blocking continuation hardening tests.
 - [x] Implement continuation hardening tests for busy overlap, abort invalidation, and function-call/tool-result delta.
 - [x] Validate continuation hardening tests.
-- [ ] Commit continuation hardening tests and refresh GitNexus metadata.
+- [x] Commit continuation hardening tests and refresh GitNexus metadata.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -61,12 +61,13 @@ Changes:
 - Follow-up hardening tests now cover same-key busy overlap invalidating in-flight continuation state, downstream abort clearing continuation state before the next request, and function-call/tool-result continuation sending only the tool-result delta.
 - Reviewer found the initial busy-overlap test could pass via prefix mismatch; fixed by making the fourth request extend the stale in-flight transcript so a bad late cache update would send `previous_response_id: resp-ws-2` and fail.
 - Hardening validation passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_websocket_continuation`, `cargo test -p claude-proxy-providers chatgpt`, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
+- Continuation hardening tests committed in `26d4893`; GitNexus metadata refreshed in `c0c480b`; final `gitnexus_detect_changes` reported no changes detected.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit the continuation hardening tests and refresh GitNexus metadata.
+- Decide whether to pursue optional WebSocket transport hardening (SOCKS/HTTPS proxy parity, proxy credential edge cases, custom-CA local TLS fixture) or close the modernization workflow.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
