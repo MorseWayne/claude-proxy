@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.1 - 2026-05-27
+
+### Fixed in v1.3.1
+
+- ChatGPT WebSocket connections now honor `HTTPS_PROXY` / `ALL_PROXY` when no provider proxy is configured, while preserving provider proxy priority and `NO_PROXY` bypass behavior.
+
 ## v1.3.0 - 2026-05-26
 
 ### Added in v1.3.0
