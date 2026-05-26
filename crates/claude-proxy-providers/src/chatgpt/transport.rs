@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -85,6 +86,29 @@ impl ChatGptWebSocketStartError {
             phase,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptWebSocketProxySource {
+    Provider,
+    Env,
+    None,
+}
+
+impl ChatGptWebSocketProxySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Env => "env",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedChatGptWebSocketProxy {
+    url: Option<String>,
+    source: ChatGptWebSocketProxySource,
 }
 
 type ChatGptWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -1016,9 +1040,12 @@ async fn connect_websocket(
     })?;
     request.headers_mut().extend(headers);
     let connector = websocket_tls_connector(&provider.extra_ca_certs)?;
+    let resolved_proxy = resolve_websocket_proxy(provider.proxy.as_deref(), &url)?;
+    let proxy_source = resolved_proxy.source;
+    let proxy_enabled = resolved_proxy.url.is_some();
 
     let (stream, response) = tokio::time::timeout(CHATGPT_WEBSOCKET_CONNECT_TIMEOUT, async {
-        if let Some(proxy) = provider.proxy.as_deref() {
+        if let Some(proxy) = resolved_proxy.url.as_deref() {
             let socket = connect_proxy_tunnel(proxy, &url).await?;
             client_async_tls_with_config(request, socket, None, connector)
                 .await
@@ -1042,11 +1069,148 @@ async fn connect_websocket(
         transport = "websocket",
         status = response.status().as_u16(),
         endpoint = %url,
-        proxy = provider.proxy.is_some(),
+        proxy = proxy_enabled,
+        proxy_source = proxy_source.as_str(),
         extra_ca_certs = provider.extra_ca_certs.len(),
         "ChatGPT websocket connected"
     );
     Ok(stream)
+}
+
+fn resolve_websocket_proxy(
+    provider_proxy: Option<&str>,
+    target_url: &Url,
+) -> Result<ResolvedChatGptWebSocketProxy, ChatGptWebSocketStartError> {
+    if let Some(proxy) = provider_proxy
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_websocket_proxy_url(proxy)?;
+        return Ok(ResolvedChatGptWebSocketProxy {
+            url: Some(proxy.to_string()),
+            source: ChatGptWebSocketProxySource::Provider,
+        });
+    }
+
+    if no_proxy_matches(target_url)? {
+        return Ok(ResolvedChatGptWebSocketProxy {
+            url: None,
+            source: ChatGptWebSocketProxySource::None,
+        });
+    }
+
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Some(proxy) = env::var_os(key)
+            .and_then(|value| value.into_string().ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            validate_websocket_proxy_url(&proxy)?;
+            return Ok(ResolvedChatGptWebSocketProxy {
+                url: Some(proxy),
+                source: ChatGptWebSocketProxySource::Env,
+            });
+        }
+    }
+
+    Ok(ResolvedChatGptWebSocketProxy {
+        url: None,
+        source: ChatGptWebSocketProxySource::None,
+    })
+}
+
+fn validate_websocket_proxy_url(proxy: &str) -> Result<(), ChatGptWebSocketStartError> {
+    let proxy_url = Url::parse(proxy).map_err(|error| {
+        ChatGptWebSocketStartError::with_phase(
+            ProviderError::InvalidRequest(format!("invalid ChatGPT websocket proxy URL: {error}")),
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        )
+    })?;
+    if proxy_url.scheme() != "http" {
+        return Err(ChatGptWebSocketStartError::with_phase(
+            ProviderError::InvalidRequest(
+                "ChatGPT websocket transport currently supports HTTP proxy URLs only".to_string(),
+            ),
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        ));
+    }
+    if proxy_url.host_str().is_none() {
+        return Err(ChatGptWebSocketStartError::with_phase(
+            ProviderError::InvalidRequest(
+                "ChatGPT websocket proxy URL is missing host".to_string(),
+            ),
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        ));
+    }
+    if proxy_url.port_or_known_default().is_none() {
+        return Err(ChatGptWebSocketStartError::with_phase(
+            ProviderError::InvalidRequest(
+                "ChatGPT websocket proxy URL is missing port".to_string(),
+            ),
+            true,
+            ChatGptWebSocketPhase::ProxyConnect,
+        ));
+    }
+    Ok(())
+}
+
+fn no_proxy_matches(target_url: &Url) -> Result<bool, ChatGptWebSocketStartError> {
+    let Some(raw_no_proxy) = env::var_os("NO_PROXY").or_else(|| env::var_os("no_proxy")) else {
+        return Ok(false);
+    };
+    let Some(no_proxy) = raw_no_proxy.to_str() else {
+        return Ok(false);
+    };
+    let target_host = target_url.host_str().ok_or_else(|| {
+        ChatGptWebSocketStartError::new(
+            ProviderError::InvalidRequest(
+                "ChatGPT websocket target URL is missing host".to_string(),
+            ),
+            false,
+        )
+    })?;
+    let target_port = target_url.port_or_known_default();
+    let normalized_host = target_host
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+
+    Ok(no_proxy
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| no_proxy_entry_matches(entry, &normalized_host, target_port)))
+}
+
+fn no_proxy_entry_matches(entry: &str, target_host: &str, target_port: Option<u16>) -> bool {
+    if entry == "*" {
+        return true;
+    }
+
+    let normalized_entry = entry.to_ascii_lowercase();
+    if let Some((entry_host, entry_port)) = parse_no_proxy_host_port(&normalized_entry)
+        && Some(entry_port) == target_port
+        && entry_host == target_host
+    {
+        return true;
+    }
+
+    if let Some(domain) = normalized_entry.strip_prefix('.') {
+        return target_host == domain || target_host.ends_with(&format!(".{domain}"));
+    }
+
+    normalized_entry == target_host
+}
+
+fn parse_no_proxy_host_port(entry: &str) -> Option<(&str, u16)> {
+    let (host, port) = entry.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host, port.parse().ok()?))
 }
 
 fn websocket_tls_connector(

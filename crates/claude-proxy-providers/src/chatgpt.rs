@@ -2459,6 +2459,8 @@ mod tests {
     use super::*;
     use futures::SinkExt;
     use serde_json::json;
+    use std::env;
+    use std::ffi::OsString;
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2468,6 +2470,39 @@ mod tests {
     use tokio_tungstenite::tungstenite::handshake::server::{
         Request as WsServerRequest, Response as WsServerResponse,
     };
+
+    static CHATGPT_WEBSOCKET_PROXY_ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[derive(Debug)]
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var_os(key);
+            unsafe { env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = env::var_os(key);
+            unsafe { env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe { env::set_var(self.key, value) };
+            } else {
+                unsafe { env::remove_var(self.key) };
+            }
+        }
+    }
 
     #[test]
     fn builds_default_codex_responses_endpoint() {
@@ -4304,10 +4339,10 @@ mod tests {
 
     #[tokio::test]
     async fn chatgpt_websocket_uses_configured_http_proxy() {
-        let (endpoint, proxy_url, connect_requests) = websocket_proxy_server(vec![
+        let (endpoint, proxy_url, connect_requests) = websocket_proxy_server(vec![vec![
             websocket_response_created("resp-ws-proxy"),
             websocket_response_completed("resp-ws-proxy"),
-        ])
+        ]])
         .await;
         let mut provider = test_chatgpt_provider(endpoint).await;
         provider.transport = ChatGptTransport::Websocket;
@@ -4327,6 +4362,107 @@ mod tests {
                 .headers
                 .starts_with("CONNECT chatgpt.test:80 HTTP/1.1")
         );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_uses_env_https_proxy_when_provider_proxy_missing() {
+        let _env_lock = CHATGPT_WEBSOCKET_PROXY_ENV_LOCK.lock().await;
+        let _https_proxy = EnvVarGuard::remove("HTTPS_PROXY");
+        let _https_proxy_lower = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("ALL_PROXY");
+        let _all_proxy_lower = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("NO_PROXY");
+        let _no_proxy_lower = EnvVarGuard::remove("no_proxy");
+        let (endpoint, proxy_url, connect_requests) = websocket_proxy_server(vec![vec![
+            websocket_response_created("resp-ws-env-proxy"),
+            websocket_response_completed("resp-ws-env-proxy"),
+        ]])
+        .await;
+        let _env_proxy = EnvVarGuard::set("HTTPS_PROXY", &proxy_url);
+        let _loopback_no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let stream = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(80), chatgpt_test_token())
+            .await
+            .expect("websocket stream should start through env proxy");
+        let events = collect_stream_results(stream).await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let connect_requests = connect_requests.lock().await;
+        assert_eq!(connect_requests.len(), 1);
+        assert!(
+            connect_requests[0]
+                .headers
+                .starts_with("CONNECT chatgpt.test:80 HTTP/1.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_provider_proxy_overrides_env_proxy() {
+        let _env_lock = CHATGPT_WEBSOCKET_PROXY_ENV_LOCK.lock().await;
+        let _https_proxy = EnvVarGuard::remove("HTTPS_PROXY");
+        let _https_proxy_lower = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("ALL_PROXY");
+        let _all_proxy_lower = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("NO_PROXY");
+        let _no_proxy_lower = EnvVarGuard::remove("no_proxy");
+        let (endpoint, provider_proxy_url, provider_connect_requests) =
+            websocket_proxy_server(vec![vec![
+                websocket_response_created("resp-ws-provider-proxy"),
+                websocket_response_completed("resp-ws-provider-proxy"),
+            ]])
+            .await;
+        let (_unused_endpoint, env_proxy_url, env_connect_requests) =
+            websocket_proxy_server(vec![]).await;
+        let _env_proxy = EnvVarGuard::set("HTTPS_PROXY", &env_proxy_url);
+        let _loopback_no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+        provider.proxy = Some(provider_proxy_url);
+
+        let stream = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(81), chatgpt_test_token())
+            .await
+            .expect("websocket stream should start through provider proxy");
+        let events = collect_stream_results(stream).await;
+        assert!(events.iter().all(Result::is_ok));
+
+        assert_eq!(provider_connect_requests.lock().await.len(), 1);
+        assert_eq!(env_connect_requests.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_no_proxy_bypasses_env_proxy() {
+        let _env_lock = CHATGPT_WEBSOCKET_PROXY_ENV_LOCK.lock().await;
+        let _https_proxy = EnvVarGuard::remove("HTTPS_PROXY");
+        let _https_proxy_lower = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("ALL_PROXY");
+        let _all_proxy_lower = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("NO_PROXY");
+        let _no_proxy_lower = EnvVarGuard::remove("no_proxy");
+        let (endpoint, requests, _handshakes) = websocket_events_server(vec![
+            websocket_response_created("resp-ws-no-proxy"),
+            websocket_response_completed("resp-ws-no-proxy"),
+        ])
+        .await;
+        let (_unused_endpoint, env_proxy_url, env_connect_requests) =
+            websocket_proxy_server(vec![]).await;
+        let _env_proxy = EnvVarGuard::set("HTTPS_PROXY", &env_proxy_url);
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1");
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let stream = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(82), chatgpt_test_token())
+            .await
+            .expect("websocket stream should bypass env proxy");
+        let events = collect_stream_results(stream).await;
+        assert!(events.iter().all(Result::is_ok));
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(env_connect_requests.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -5359,7 +5495,7 @@ mod tests {
     }
 
     async fn websocket_proxy_server(
-        events: Vec<Value>,
+        responses: Vec<Vec<Value>>,
     ) -> (String, String, Arc<Mutex<Vec<CapturedHttpRequest>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5367,28 +5503,30 @@ mod tests {
         let captured_connect_requests = Arc::clone(&connect_requests);
 
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_http_request_allow_empty_body(&mut socket).await;
-            captured_connect_requests.lock().await.push(request);
-            socket
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .unwrap();
-
-            let mut websocket = accept_hdr_async(
-                socket,
-                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
-            )
-            .await
-            .unwrap();
-            let _ = websocket.next().await;
-            for event in events {
-                websocket
-                    .send(WsMessage::Text(event.to_string().into()))
+            for events in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request_allow_empty_body(&mut socket).await;
+                captured_connect_requests.lock().await.push(request);
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await
                     .unwrap();
+
+                let mut websocket = accept_hdr_async(
+                    socket,
+                    |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+                )
+                .await
+                .unwrap();
+                let _ = websocket.next().await;
+                for event in events {
+                    websocket
+                        .send(WsMessage::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                let _ = websocket.close(None).await;
             }
-            let _ = websocket.close(None).await;
         });
 
         (

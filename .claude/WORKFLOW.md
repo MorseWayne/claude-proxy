@@ -8,8 +8,8 @@
 Status: In Progress
 Level: 3
 Started: 2026-05-25
-Last updated: 2026-05-26
-Current phase: Release prep for v1.3.0
+Last updated: 2026-05-27
+Current phase: WebSocket env proxy validation
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -37,6 +37,8 @@ Current todo:
 - [x] Commit continuation hardening tests and refresh GitNexus metadata.
 - [x] Remove untracked review report artifacts.
 - [x] Implement post-validation WebSocket startup fallback tuning: phase-aware diagnostics, short Auto cooldown, and lightweight WebSocket counters.
+- [x] Implement ChatGPT WebSocket environment proxy fallback with NO_PROXY bypass.
+- [x] Validate ChatGPT WebSocket environment proxy fallback and commit if checks pass.
 - [ ] Prepare v1.3.0 release metadata and tag.
 
 Changes:
@@ -75,12 +77,17 @@ Changes:
 - Post-validation WebSocket startup fallback tuning replaces provider-wide permanent Auto fallback with a 120s startup-failure SSE cooldown, adds phase-aware WebSocket startup errors, lightweight provider-local WebSocket counters, and prompt-cache/continuation presence logs without logging key values.
 - Validation for the WebSocket tuning passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_`, full `cargo clippy -- -D warnings`, and provider-file `git diff --check`.
 - GitNexus detect_changes reports CRITICAL because the diff intentionally touches ChatGPT WebSocket transport/session and related test flows; affected processes align with the planned WebSocket fallback/diagnostics scope.
+- Follow-up diagnosis found first WebSocket attempts consistently fail in `connect` phase when ChatGPT provider has no explicit proxy but the shell has `HTTPS_PROXY` / `ALL_PROXY`; the WebSocket path only used provider proxy while the HTTP/SSE path can still succeed.
+- Implemented WebSocket proxy resolution so explicit provider proxy still wins, otherwise `HTTPS_PROXY` / `https_proxy` / `ALL_PROXY` / `all_proxy` are used unless `NO_PROXY` / `no_proxy` matches the target host; only HTTP proxy URLs are accepted, matching the existing CONNECT tunnel support.
+- Added focused tests for env `HTTPS_PROXY` fallback, provider proxy overriding env proxy, and `NO_PROXY` bypass; env-proxy tests set loopback `NO_PROXY` while holding an async lock so concurrent local WebSocket tests are not polluted by process-wide proxy variables.
+- Validation for the WebSocket env proxy fallback passed: `cargo fmt --check`, the three new target tests, `cargo test -p claude-proxy-providers chatgpt_`, and `cargo clippy -- -D warnings`.
+- GitNexus detect_changes reports HIGH because the diff touches ChatGPT WebSocket connect/proxy paths and related test helpers; affected processes align with the intended WebSocket proxy resolution scope. The report also includes pre-existing `AGENTS.md` / `CLAUDE.md` metadata edits that are excluded from this fix commit.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit the validated WebSocket startup fallback tuning if desired, then validate release metadata and continue v1.3.0 prep.
+- Commit/push the validated WebSocket env proxy fallback fix, refresh GitNexus metadata, then continue v1.3.0 prep.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
