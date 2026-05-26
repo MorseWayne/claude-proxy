@@ -9,14 +9,15 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Spec review
+Current phase: User spec review
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
 
 Current todo:
 - [x] Finalize design scope and implementation sequence before code changes.
-- [ ] Review the written design spec and address any issues.
+- [x] Review the written design spec and address any issues.
+- [ ] Wait for user review of the committed design spec.
 - [ ] Run GitNexus impact analysis before editing each target symbol.
 - [ ] Implement in reviewable phases with provider tests and full validation.
 
@@ -24,12 +25,13 @@ Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
 - Design spec committed in `c569751` at `docs/superpowers/specs/2026-05-25-chatgpt-codex-provider-modernization-design.md`.
 - Spec review found missing boundaries for continuation keys, canonical comparison, WebSocket fallback errors, prompt cache/usage defaults, and model matrices; the design was revised to define them.
+- Spec review passed after revision; latest design clarification commit is `a39e179`.
 
 Prerequisites:
-- Spec review and user review before implementation planning.
+- User review before implementation planning.
 
 Resume next:
-- Run design spec review, fix any issues, then ask the user to review the committed spec.
+- Ask the user to review the committed spec, then move to implementation planning after approval.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
