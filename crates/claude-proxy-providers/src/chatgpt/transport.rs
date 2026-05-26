@@ -25,7 +25,10 @@ use tokio_tungstenite::{
 };
 use tracing::info;
 
-use super::{ChatGptProvider, ChatGptToken, map_chatgpt_error_status_body_with_headers};
+use super::{
+    ChatGptProvider, ChatGptToken, map_chatgpt_error_status_body_with_headers,
+    provider_error_is_chatgpt_server_error, rotate_chatgpt_runtime_ids_after_server_error,
+};
 use crate::provider::ProviderError;
 
 const OPENAI_BETA_HEADER: &str = "openai-beta";
@@ -103,26 +106,33 @@ impl ChatGptWebSocketSession {
         }
     }
 
-    fn take_fresh(&mut self) -> Option<ChatGptWsStream> {
+    fn take_fresh(&mut self, key: &WebSocketConnectionKey) -> Option<ChatGptWsStream> {
         let cached = self.cached.take()?;
-        if cached.last_used.elapsed() <= CHATGPT_WEBSOCKET_SESSION_IDLE_TTL {
+        if cached.key == *key && cached.last_used.elapsed() <= CHATGPT_WEBSOCKET_SESSION_IDLE_TTL {
             Some(cached.stream)
         } else {
-            self.continuations.clear();
-            self.busy.clear();
+            self.clear_volatile_state();
             None
         }
     }
 
-    fn store_if_empty(&mut self, stream: ChatGptWsStream) -> bool {
+    fn store_if_empty(&mut self, stream: ChatGptWsStream, key: WebSocketConnectionKey) -> bool {
         if self.cached.is_some() {
             return false;
         }
         self.cached = Some(CachedWebSocketConnection {
             stream,
+            key,
             last_used: Instant::now(),
         });
         true
+    }
+
+    fn clear_volatile_state(&mut self) {
+        self.cached = None;
+        self.continuations.clear();
+        self.busy.clear();
+        self.generations.clear();
     }
 
     fn prepare_continuation(
@@ -409,7 +419,38 @@ impl ContinuationAttempt {
 
 struct CachedWebSocketConnection {
     stream: ChatGptWsStream,
+    key: WebSocketConnectionKey,
     last_used: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketConnectionKey {
+    provider_id: String,
+    account_id: String,
+    model: String,
+    session_id: String,
+    thread_id: String,
+    window_id: String,
+}
+
+fn websocket_connection_key(
+    provider: &ChatGptProvider,
+    token: &ChatGptToken,
+    body: &Value,
+) -> WebSocketConnectionKey {
+    let runtime_ids = provider.runtime_ids_snapshot();
+    WebSocketConnectionKey {
+        provider_id: provider.id.clone(),
+        account_id: token.account_id.as_deref().unwrap_or_default().to_string(),
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        session_id: runtime_ids.session_id,
+        thread_id: runtime_ids.thread_id,
+        window_id: runtime_ids.window_id,
+    }
 }
 
 fn continuation_key(
@@ -565,6 +606,7 @@ pub(super) async fn open_websocket_stream<F>(
     token: &ChatGptToken,
     marker_mode: ReasoningMarkerMode,
     stable_client_conversation_id: Option<&str>,
+    request_id: u64,
     on_event: F,
 ) -> Result<(BoxStream<'static, Result<SseEvent, ProviderError>>, bool), ChatGptWebSocketStartError>
 where
@@ -592,7 +634,8 @@ where
         "ChatGPT websocket continuation decision"
     );
 
-    let (mut stream, reused) = match checkout_connection(provider, token).await {
+    let connection_key = websocket_connection_key(provider, token, &body);
+    let (mut stream, reused) = match checkout_connection(provider, token, &connection_key).await {
         Ok((stream, reused)) => (stream, reused),
         Err(error) => {
             provider
@@ -649,14 +692,32 @@ where
     }
 
     let websocket_session = provider.websocket_session.clone();
+    let runtime_ids = provider.runtime_ids_handle();
+    let websocket_sse_cooldown_until_secs = provider.websocket_sse_cooldown_handle();
     let (abort_tx, mut abort_rx) = watch::channel(false);
     tokio::spawn(async move {
         if first_event_terminal {
+            let server_error = super::chatgpt_event_is_server_error(&first_event);
             websocket_session
                 .lock()
                 .await
                 .complete_continuation(&continuation, &first_event);
-            store_completed_connection(websocket_session, stream).await;
+            if server_error {
+                rotate_chatgpt_runtime_ids_after_server_error(
+                    &runtime_ids,
+                    request_id,
+                    "websocket",
+                );
+                ChatGptProvider::activate_websocket_sse_cooldown(
+                    &websocket_sse_cooldown_until_secs,
+                    request_id,
+                    "websocket",
+                );
+                websocket_session.lock().await.clear_volatile_state();
+                close_or_release_websocket(stream).await;
+            } else {
+                store_completed_connection(websocket_session, stream, connection_key).await;
+            }
             return;
         }
 
@@ -683,19 +744,49 @@ where
                                 return;
                             }
                             if terminal {
+                                let server_error = super::chatgpt_event_is_server_error(&event);
                                 websocket_session
                                     .lock()
                                     .await
                                     .complete_continuation(&continuation, &event);
-                                store_completed_connection(websocket_session, stream).await;
+                                if server_error {
+                                    rotate_chatgpt_runtime_ids_after_server_error(
+                                        &runtime_ids,
+                                        request_id,
+                                        "websocket",
+                                    );
+                                    ChatGptProvider::activate_websocket_sse_cooldown(
+                                        &websocket_sse_cooldown_until_secs,
+                                        request_id,
+                                        "websocket",
+                                    );
+                                    websocket_session.lock().await.clear_volatile_state();
+                                    close_or_release_websocket(stream).await;
+                                } else {
+                                    store_completed_connection(websocket_session, stream, connection_key).await;
+                                }
                                 return;
                             }
                         }
                         Err(error) => {
+                            let server_error = provider_error_is_chatgpt_server_error(&error.error);
                             websocket_session
                                 .lock()
                                 .await
                                 .fail_continuation(&continuation);
+                            if server_error {
+                                rotate_chatgpt_runtime_ids_after_server_error(
+                                    &runtime_ids,
+                                    request_id,
+                                    "websocket",
+                                );
+                                ChatGptProvider::activate_websocket_sse_cooldown(
+                                    &websocket_sse_cooldown_until_secs,
+                                    request_id,
+                                    "websocket",
+                                );
+                                websocket_session.lock().await.clear_volatile_state();
+                            }
                             let _ = tx_event.send(Err(error.error)).await;
                             return;
                         }
@@ -716,8 +807,9 @@ where
 async fn checkout_connection(
     provider: &ChatGptProvider,
     token: &ChatGptToken,
+    key: &WebSocketConnectionKey,
 ) -> Result<(ChatGptWsStream, bool), ChatGptWebSocketStartError> {
-    if let Some(stream) = provider.websocket_session.lock().await.take_fresh() {
+    if let Some(stream) = provider.websocket_session.lock().await.take_fresh(key) {
         return Ok((stream, true));
     }
 
@@ -730,8 +822,9 @@ async fn checkout_connection(
 async fn store_completed_connection(
     websocket_session: std::sync::Arc<tokio::sync::Mutex<ChatGptWebSocketSession>>,
     stream: ChatGptWsStream,
+    key: WebSocketConnectionKey,
 ) {
-    let stored = websocket_session.lock().await.store_if_empty(stream);
+    let stored = websocket_session.lock().await.store_if_empty(stream, key);
     info!(
         transport = "websocket",
         websocket_reused = false,
@@ -789,6 +882,8 @@ fn websocket_headers(
 ) -> Result<HeaderMap, ChatGptWebSocketStartError> {
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", token.access_token);
+    let runtime_ids = provider.runtime_ids_snapshot();
+    let client_request_id = super::chatgpt_runtime_id();
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&authorization).map_err(invalid_header_error("authorization"))?,
@@ -801,20 +896,21 @@ fn websocket_headers(
     );
     headers.insert(
         HeaderName::from_static("x-client-request-id"),
-        HeaderValue::from_str(&provider.thread_id)
+        HeaderValue::from_str(&client_request_id)
             .map_err(invalid_header_error("x-client-request-id"))?,
     );
     headers.insert(
         HeaderName::from_static("session-id"),
-        HeaderValue::from_str(&provider.session_id).map_err(invalid_header_error("session-id"))?,
+        HeaderValue::from_str(&runtime_ids.session_id)
+            .map_err(invalid_header_error("session-id"))?,
     );
     headers.insert(
         HeaderName::from_static("thread-id"),
-        HeaderValue::from_str(&provider.thread_id).map_err(invalid_header_error("thread-id"))?,
+        HeaderValue::from_str(&runtime_ids.thread_id).map_err(invalid_header_error("thread-id"))?,
     );
     headers.insert(
         HeaderName::from_static("x-codex-window-id"),
-        HeaderValue::from_str(&provider.window_id)
+        HeaderValue::from_str(&runtime_ids.window_id)
             .map_err(invalid_header_error("x-codex-window-id"))?,
     );
     headers.insert(

@@ -12,7 +12,7 @@ use std::fs;
 #[cfg(not(test))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -61,6 +61,7 @@ const CHATGPT_PTL_MAX_RETRIES: usize = 3;
 const CHATGPT_PTL_FALLBACK_DROP_DIVISOR: usize = 5;
 const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
+const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -142,6 +143,23 @@ struct ChatGptRequestHeaders {
     user_agent: HeaderValue,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ChatGptRuntimeIds {
+    pub(super) session_id: String,
+    pub(super) thread_id: String,
+    pub(super) window_id: String,
+}
+
+impl ChatGptRuntimeIds {
+    fn new() -> Self {
+        Self {
+            session_id: chatgpt_runtime_id(),
+            thread_id: chatgpt_runtime_id(),
+            window_id: chatgpt_runtime_id(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChatGptPreparedRequest {
     body: Value,
@@ -161,9 +179,7 @@ pub struct ChatGptProvider {
     endpoint: String,
     usage_endpoint: String,
     installation_id: String,
-    session_id: String,
-    thread_id: String,
-    window_id: String,
+    runtime_ids: Arc<RwLock<ChatGptRuntimeIds>>,
     request_headers: ChatGptRequestHeaders,
     request_policy: UpstreamRequestPolicy,
     runtime: ProviderRuntimeConfig,
@@ -171,6 +187,7 @@ pub struct ChatGptProvider {
     extra_ca_certs: Vec<String>,
     transport: ChatGptTransport,
     websocket_disabled: AtomicBool,
+    websocket_sse_cooldown_until_secs: Arc<AtomicU64>,
     websocket_session: Arc<Mutex<transport::ChatGptWebSocketSession>>,
     auth: Arc<ChatGptAuth>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
@@ -192,9 +209,7 @@ impl ChatGptProvider {
             endpoint: codex_responses_endpoint(&config.base_url),
             usage_endpoint: codex_usage_endpoint(&config.base_url),
             installation_id: chatgpt_installation_id(),
-            session_id: chatgpt_runtime_id(),
-            thread_id: chatgpt_runtime_id(),
-            window_id: chatgpt_runtime_id(),
+            runtime_ids: Arc::new(RwLock::new(ChatGptRuntimeIds::new())),
             request_headers: chatgpt_request_headers(&chatgpt_config)?,
             request_policy: chatgpt_upstream_request_policy(&config.runtime),
             runtime: config.runtime.clone(),
@@ -202,6 +217,7 @@ impl ChatGptProvider {
             extra_ca_certs: settings.http.extra_ca_certs.clone(),
             transport: chatgpt_config.transport,
             websocket_disabled: AtomicBool::new(false),
+            websocket_sse_cooldown_until_secs: Arc::new(AtomicU64::new(0)),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
             auth,
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
@@ -209,6 +225,38 @@ impl ChatGptProvider {
                 fetched_at: None,
             })),
         })
+    }
+
+    pub(super) fn runtime_ids_snapshot(&self) -> ChatGptRuntimeIds {
+        self.runtime_ids
+            .read()
+            .expect("ChatGPT runtime ids lock poisoned")
+            .clone()
+    }
+
+    pub(super) fn runtime_ids_handle(&self) -> Arc<RwLock<ChatGptRuntimeIds>> {
+        Arc::clone(&self.runtime_ids)
+    }
+
+    pub(super) fn websocket_sse_cooldown_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.websocket_sse_cooldown_until_secs)
+    }
+
+    pub(super) fn activate_websocket_sse_cooldown(
+        cooldown_until_secs: &Arc<AtomicU64>,
+        request_id: u64,
+        transport: &'static str,
+    ) {
+        let cooldown_until =
+            unix_timestamp_secs().saturating_add(CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS);
+        cooldown_until_secs.store(cooldown_until, Ordering::Relaxed);
+        warn!(
+            request_id,
+            transport,
+            cooldown_secs = CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS,
+            cooldown_until,
+            "ChatGPT websocket temporarily disabled after upstream server_error"
+        );
     }
 
     async fn send_responses_request(
@@ -233,16 +281,18 @@ impl ChatGptProvider {
             body_bytes,
         );
         let started_at = Instant::now();
+        let runtime_ids = self.runtime_ids_snapshot();
+        let client_request_id = chatgpt_runtime_id();
         info!(
             request_id,
             compact_request,
             prompt_too_long_attempt,
             model,
             body_bytes,
-            upstream_request_id = %self.thread_id,
-            session_id = %self.session_id,
-            thread_id = %self.thread_id,
-            window_id = %self.window_id,
+            upstream_request_id = %client_request_id,
+            session_id = %runtime_ids.session_id,
+            thread_id = %runtime_ids.thread_id,
+            window_id = %runtime_ids.window_id,
             requested_output_tokens = budget.requested.unwrap_or(0),
             requested_output_tokens_present = budget.requested.is_some(),
             effective_output_tokens = budget.effective.unwrap_or(0),
@@ -259,10 +309,10 @@ impl ChatGptProvider {
             .header("Accept", "text/event-stream")
             .header("originator", self.request_headers.originator.clone())
             .header("User-Agent", self.request_headers.user_agent.clone())
-            .header("x-client-request-id", self.thread_id.as_str())
-            .header("session-id", self.session_id.as_str())
-            .header("thread-id", self.thread_id.as_str())
-            .header("x-codex-window-id", self.window_id.as_str());
+            .header("x-client-request-id", client_request_id)
+            .header("session-id", runtime_ids.session_id)
+            .header("thread-id", runtime_ids.thread_id)
+            .header("x-codex-window-id", runtime_ids.window_id);
 
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
@@ -462,6 +512,14 @@ impl ChatGptProvider {
             ChatGptTransport::Auto if self.websocket_disabled.load(Ordering::Relaxed) => {
                 ChatGptTransport::Sse
             }
+            ChatGptTransport::Auto
+                if self
+                    .websocket_sse_cooldown_until_secs
+                    .load(Ordering::Relaxed)
+                    > unix_timestamp_secs() =>
+            {
+                ChatGptTransport::Sse
+            }
             transport => transport,
         }
     }
@@ -593,6 +651,7 @@ impl ChatGptProvider {
             token,
             marker_mode,
             stable_client_conversation_id.as_deref(),
+            request_id,
             on_event,
         )
         .await?;
@@ -663,6 +722,8 @@ impl ChatGptProvider {
     ) -> impl Fn(&Value) + Send + Sync + 'static {
         let cache = Arc::clone(&self.cached_rate_limits);
         let provider_id = self.id.clone();
+        let runtime_ids = self.runtime_ids_handle();
+        let websocket_sse_cooldown_until_secs = self.websocket_sse_cooldown_handle();
         move |event| {
             if !first_upstream_event_seen.swap(true, Ordering::Relaxed) {
                 let event_type = event
@@ -701,10 +762,25 @@ impl ChatGptProvider {
                     compact_request,
                     transport,
                     upstream_stop_reason = stop_reason,
+                    upstream_response_status = chatgpt_sse_response_status(event).unwrap_or(""),
+                    upstream_error_code = chatgpt_sse_error_code(event).unwrap_or(""),
+                    upstream_error_message = chatgpt_sse_error_message(event).unwrap_or(""),
                     upstream_model = chatgpt_sse_model(event).unwrap_or("unknown"),
                     upstream_response_id = chatgpt_sse_response_id(event).unwrap_or(""),
                     "ChatGPT upstream terminal event received"
                 );
+                if chatgpt_event_is_server_error(event) {
+                    rotate_chatgpt_runtime_ids_after_server_error(
+                        &runtime_ids,
+                        request_id,
+                        transport,
+                    );
+                    Self::activate_websocket_sse_cooldown(
+                        &websocket_sse_cooldown_until_secs,
+                        request_id,
+                        transport,
+                    );
+                }
             }
         }
     }
@@ -945,6 +1021,63 @@ fn chatgpt_sse_stop_reason(event: &Value) -> Option<&'static str> {
     } else {
         Some("end_turn")
     }
+}
+
+fn chatgpt_sse_response_status(event: &Value) -> Option<&str> {
+    event
+        .get("response")
+        .unwrap_or(event)
+        .get("status")
+        .and_then(Value::as_str)
+}
+
+fn chatgpt_sse_error_code(event: &Value) -> Option<&str> {
+    let response = event.get("response").unwrap_or(event);
+    response["error"]["code"]
+        .as_str()
+        .or_else(|| response["error"]["type"].as_str())
+}
+
+fn chatgpt_sse_error_message(event: &Value) -> Option<&str> {
+    event.get("response").unwrap_or(event)["error"]["message"].as_str()
+}
+
+pub(super) fn chatgpt_event_is_server_error(event: &Value) -> bool {
+    chatgpt_sse_error_code(event) == Some("server_error")
+}
+
+pub(super) fn provider_error_is_chatgpt_server_error(error: &ProviderError) -> bool {
+    let ProviderError::UpstreamError { body, .. } = error.without_upstream_metadata() else {
+        return false;
+    };
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|event| chatgpt_event_is_server_error(&event))
+}
+
+pub(super) fn rotate_chatgpt_runtime_ids_after_server_error(
+    runtime_ids: &Arc<RwLock<ChatGptRuntimeIds>>,
+    request_id: u64,
+    transport: &'static str,
+) {
+    let mut ids = runtime_ids
+        .write()
+        .expect("ChatGPT runtime ids lock poisoned");
+    let previous_session_id = ids.session_id.clone();
+    let previous_thread_id = ids.thread_id.clone();
+    let previous_window_id = ids.window_id.clone();
+    *ids = ChatGptRuntimeIds::new();
+    warn!(
+        request_id,
+        transport,
+        previous_session_id,
+        previous_thread_id,
+        previous_window_id,
+        new_session_id = %ids.session_id,
+        new_thread_id = %ids.thread_id,
+        new_window_id = %ids.window_id,
+        "ChatGPT runtime ids rotated after upstream server_error"
+    );
 }
 
 fn chatgpt_sse_model(event: &Value) -> Option<&str> {
@@ -1267,7 +1400,7 @@ fn chatgpt_installation_id() -> String {
     id
 }
 
-fn chatgpt_runtime_id() -> String {
+pub(super) fn chatgpt_runtime_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -2115,32 +2248,32 @@ struct ChatGptModelSpec {
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     ChatGptModelSpec {
         model_id: "gpt-5.5",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4-mini",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: false,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: false,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.2",
-        context_window: 400_000,
+        context_window: 272_000,
         image_input: true,
     },
 ];
@@ -2572,13 +2705,59 @@ mod tests {
             })),
             Some("max_tokens")
         );
-        assert_eq!(
-            chatgpt_sse_stop_reason(&json!({
-                "type": "response.failed",
-                "response": {"status": "failed"}
-            })),
-            Some("error")
+        let failed = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "server_error",
+                    "message": "internal error"
+                }
+            }
+        });
+        assert_eq!(chatgpt_sse_stop_reason(&failed), Some("error"));
+        assert_eq!(chatgpt_sse_response_status(&failed), Some("failed"));
+        assert_eq!(chatgpt_sse_error_code(&failed), Some("server_error"));
+        assert_eq!(chatgpt_sse_error_message(&failed), Some("internal error"));
+        assert!(chatgpt_event_is_server_error(&failed));
+        assert!(provider_error_is_chatgpt_server_error(
+            &ProviderError::UpstreamError {
+                status: 200,
+                body: failed.to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn chatgpt_server_error_rotates_runtime_ids() {
+        let runtime_ids = Arc::new(RwLock::new(ChatGptRuntimeIds {
+            session_id: "session-test".to_string(),
+            thread_id: "thread-test".to_string(),
+            window_id: "window-test".to_string(),
+        }));
+
+        rotate_chatgpt_runtime_ids_after_server_error(&runtime_ids, 1, "sse");
+
+        let rotated = runtime_ids.read().unwrap();
+        assert_ne!(rotated.session_id, "session-test");
+        assert_ne!(rotated.thread_id, "thread-test");
+        assert_ne!(rotated.window_id, "window-test");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_auto_transport_uses_sse_during_server_error_cooldown() {
+        let mut provider = test_chatgpt_provider("http://127.0.0.1/responses".to_string()).await;
+        provider.transport = ChatGptTransport::Auto;
+        assert_eq!(provider.effective_transport(), ChatGptTransport::Auto);
+
+        ChatGptProvider::activate_websocket_sse_cooldown(
+            &provider.websocket_sse_cooldown_until_secs,
+            1,
+            "websocket",
         );
+
+        assert_eq!(provider.effective_transport(), ChatGptTransport::Sse);
     }
 
     #[test]
@@ -2587,7 +2766,7 @@ mod tests {
 
         assert_eq!(
             threshold,
-            400_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
+            272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
         );
         assert!(request_size_warning("gpt-5.3-codex", threshold - 1).is_none());
         assert_eq!(
@@ -2622,7 +2801,7 @@ mod tests {
             .expect("gpt-5.5 model");
 
         assert_eq!(gpt55.capabilities.limits.max_output_tokens, None);
-        assert_eq!(gpt55.capabilities.limits.context_window, Some(400_000));
+        assert_eq!(gpt55.capabilities.limits.context_window, Some(272_000));
         assert!(gpt55.capabilities.endpoints.openai_responses.is_supported());
         assert_eq!(
             gpt55.capabilities.endpoints.openai_chat_completions,
@@ -3237,6 +3416,36 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_responses_body_defaults_reasoning_summary_to_auto() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("reasoning_effort".to_string(), json!("xhigh"));
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
     fn chatgpt_intent_fast_affects_responses_body() {
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
@@ -3378,7 +3587,8 @@ mod tests {
         assert!(headers.contains("accept: text/event-stream"));
         assert!(headers.contains("authorization: bearer access"));
         assert!(headers.contains("chatgpt-account-id: account"));
-        assert!(headers.contains("x-client-request-id: thread-test"));
+        assert!(headers.contains("x-client-request-id: "));
+        assert!(!headers.contains("x-client-request-id: thread-test"));
         assert!(headers.contains("session-id: session-test"));
         assert!(headers.contains("thread-id: thread-test"));
         assert!(headers.contains("x-codex-window-id: window-test"));
@@ -3644,7 +3854,7 @@ mod tests {
             {"role": "assistant", "content": "hello"},
             {"role": "user", "content": "next"}
         ]);
-        let (endpoint, requests, _handshakes) = websocket_sequence_server(vec![
+        let (endpoint, requests, handshakes) = websocket_one_request_per_connection_server(vec![
             vec![
                 websocket_response_created("resp-ws-1"),
                 websocket_response_completed_with_output(
@@ -3703,6 +3913,7 @@ mod tests {
                 .all(Result::is_ok)
         );
 
+        assert_eq!(handshakes.lock().unwrap().len(), 2);
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].get("previous_response_id").is_none());
@@ -4180,6 +4391,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_does_not_reuse_completed_connection_across_models() {
+        let (endpoint, requests, handshakes) = websocket_one_request_per_connection_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed("resp-ws-1"),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let first = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(4), chatgpt_test_token())
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["model"] = json!("gpt-5.5");
+        let second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(5, second_body, Some("conversation-test")),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("second websocket stream should start");
+        assert!(
+            collect_stream_results(second)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        assert_eq!(handshakes.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn chatgpt_prompt_too_long_retry_notifies_observer() {
         let (endpoint, _requests) = prompt_too_long_retry_server().await;
         let provider = test_chatgpt_provider(endpoint).await;
@@ -4550,6 +4808,64 @@ mod tests {
         Arc<StdMutex<Vec<CapturedWsHandshake>>>,
     ) {
         websocket_sequence_server(vec![events]).await
+    }
+
+    async fn websocket_one_request_per_connection_server(
+        responses: Vec<Vec<Value>>,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        Arc<StdMutex<Vec<CapturedWsHandshake>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let handshakes = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let captured_handshakes = Arc::clone(&handshakes);
+
+        tokio::spawn(async move {
+            for events in responses {
+                let (socket, _) = listener.accept().await.unwrap();
+                let handshakes = Arc::clone(&captured_handshakes);
+                let mut websocket = accept_hdr_async(
+                    socket,
+                    move |request: &WsServerRequest, response: WsServerResponse| {
+                        handshakes.lock().unwrap().push(CapturedWsHandshake {
+                            headers: request
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        value.to_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect(),
+                        });
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+
+                if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                    captured_requests
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&text).unwrap());
+                }
+                for event in events {
+                    websocket
+                        .send(WsMessage::Text(event.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                let _ = websocket.close(None).await;
+            }
+        });
+
+        (format!("http://{addr}/responses"), requests, handshakes)
     }
 
     async fn websocket_sequence_server(
@@ -5059,9 +5375,11 @@ mod tests {
             endpoint,
             usage_endpoint: "http://127.0.0.1/usage".to_string(),
             installation_id: "install-test".to_string(),
-            session_id: "session-test".to_string(),
-            thread_id: "thread-test".to_string(),
-            window_id: "window-test".to_string(),
+            runtime_ids: Arc::new(RwLock::new(ChatGptRuntimeIds {
+                session_id: "session-test".to_string(),
+                thread_id: "thread-test".to_string(),
+                window_id: "window-test".to_string(),
+            })),
             request_headers: ChatGptRequestHeaders {
                 originator: HeaderValue::from_static("opencode"),
                 user_agent: HeaderValue::from_static("opencode/claude-proxy-test"),
@@ -5072,6 +5390,7 @@ mod tests {
             extra_ca_certs: Vec::new(),
             transport: ChatGptTransport::Sse,
             websocket_disabled: AtomicBool::new(false),
+            websocket_sse_cooldown_until_secs: Arc::new(AtomicU64::new(0)),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
             auth: ChatGptAuth::new(Client::new()).await.unwrap(),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {

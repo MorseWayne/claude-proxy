@@ -66,6 +66,9 @@ Changes:
 - Continuation hardening tests committed in `26d4893`; GitNexus metadata refreshed in `c0c480b`; final `gitnexus_detect_changes` reported no changes detected.
 - Removed untracked `reports/` review/planning artifacts because their useful outcomes are already captured in commits and this ledger.
 - Started release prep for v1.3.0 by bumping workspace package version and drafting changelog notes for the ChatGPT/Codex modernization.
+- During live ChatGPT/Codex validation, upstream `server_error` reproduced on both WebSocket and SSE; added diagnostics plus a runtime-id recovery fix so SSE requests use per-request `x-client-request-id` and ChatGPT `server_error` rotates session/thread/window IDs and clears WebSocket volatile state.
+- Compared `/home/quzhihao/workspace/source/open/pi/packages/ai/src/providers/openai-codex-responses.ts`: its WebSocket cache is session-scoped, marks entries busy, drops cache on errors, and does not use a provider-global reusable connection. Mirrored the safer direction by keying claude-proxy cached WebSocket reuse by provider/account/model/session/thread/window to prevent cross-model/account reuse.
+- Applied additional pi-aligned stability tuning: ChatGPT/Codex model context metadata now uses 272k tokens, Codex reasoning summary defaults to `auto` for generated reasoning requests, and WebSocket `server_error` activates a short SSE cooldown so repeated retries do not immediately hit the same WebSocket failure path.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.

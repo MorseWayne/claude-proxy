@@ -76,6 +76,7 @@ pub(super) fn build_body_with_context(
         object.insert("stream".to_string(), json!(true));
         apply_codex_defaults(object);
         apply_codex_request_options(object, request, context);
+        apply_codex_reasoning_defaults(object, request);
         let missing_instructions = object
             .get("instructions")
             .and_then(Value::as_str)
@@ -126,6 +127,18 @@ fn apply_codex_request_options(
 
     if let Some(verbosity) = codex_responses_verbosity(request) {
         body.insert("text".to_string(), json!({ "verbosity": verbosity }));
+    }
+}
+
+fn apply_codex_reasoning_defaults(body: &mut Map<String, Value>, request: &MessagesRequest) {
+    if request.extra.get("reasoning").is_some() {
+        return;
+    }
+    let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if reasoning.get("summary").and_then(Value::as_str) == Some("detailed") {
+        reasoning.insert("summary".to_string(), json!("auto"));
     }
 }
 
