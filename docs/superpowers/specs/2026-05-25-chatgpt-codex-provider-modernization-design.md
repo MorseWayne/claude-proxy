@@ -79,6 +79,13 @@ It should:
 - Parse WebSocket messages into the same Responses event stream consumed by the existing converter.
 - Close or return cached connections based on session state.
 
+WebSocket startup errors are classified before fallback:
+
+- Network, DNS, TCP/TLS, WebSocket handshake, and close-before-first-event failures may fall back to SSE in `auto` mode.
+- 401 authentication errors must follow the normal token refresh path before transport fallback is considered.
+- 429/rate-limit and usage-limit responses must surface as rate/usage errors, not fallback retries.
+- Malformed protocol frames, invalid event JSON, unknown terminal errors, or close-after-first-event failures are stream/protocol errors and must not replay through SSE.
+
 ### Auto fallback
 
 In `auto` mode:
@@ -93,18 +100,24 @@ This avoids duplicate model output.
 
 Continuation is enabled only for WebSocket sessions with a stable session/thread key.
 
+The session key must isolate reusable state by at least provider id, ChatGPT account id, upstream model id, stable client conversation id, and a continuation schema version. If any component is missing or changes, continuation is disabled for that request. Cached sessions must have an idle expiry, and continuation state must be dropped when the entry expires.
+
 Each reusable session may cache:
 
-- last full request body
+- last full canonical request body
 - last upstream response id
 - assistant response items produced by the previous turn
 
 A later request may use continuation only when:
 
-- the non-input parts of the request body match the cached body
+- the non-input parts of the request body match the cached body by a stable canonical comparison
 - the new input starts with previous input plus previous assistant response items
 - the cached response id is available
 - the session is not concurrently busy
+
+The canonical request-body comparison must remove only `input` and continuation-only fields such as `previous_response_id`, preserve provider defaults, sort object keys before comparison, and compare semantically meaningful request options exactly. Field order and serialization formatting must not affect the result.
+
+Input prefix matching must compare normalized Responses input items, including tool calls and tool results. Any parse failure, item type mismatch, content mismatch, body option mismatch, or unsafe ambiguity falls back to full input.
 
 When these checks pass, send:
 
@@ -113,7 +126,7 @@ When these checks pass, send:
 
 When any check fails, send the full input. This fallback is silent and expected.
 
-Continuation state must be cleared on transport errors, aborts, protocol errors, and request shape mismatch that indicates unsafe reuse.
+Continuation state must be cleared on transport errors, aborts, protocol errors, expiry, account/model/session key mismatch, and request shape mismatch that indicates unsafe reuse.
 
 ## Prompt cache key policy
 
@@ -122,10 +135,12 @@ Prompt cache keys must not be provider-instance-global.
 Priority:
 
 1. Explicit request metadata/extra prompt cache key.
-2. Stable client session/thread id.
-3. No key or a request-scoped generated key, depending on final compatibility constraints.
+2. Stable client session/thread id from request metadata or headers that already identify the client conversation.
+3. No key when no stable client conversation id exists.
 
-Keys are clamped to OpenAI's 64-character prompt cache key limit.
+The implementation must not use a long-lived provider instance id, installation id, or generated random id as a shared prompt cache key. If a request-scoped generated key is needed for upstream compatibility, it must be unique to that request and should not imply cache reuse.
+
+Keys are clamped to OpenAI's 64-character prompt cache key limit using Unicode scalar boundaries, matching the source string prefix without logging the key value.
 
 The implementation should log the key source, not the key value.
 
@@ -142,6 +157,8 @@ The ChatGPT/Codex contract must reflect the actual request builder:
 - Service tier and verbosity options where supported.
 - Stop sequences and max output token behavior must not be advertised if the ChatGPT request builder deliberately omits them.
 
+The implementation plan should include a per-model capability matrix for the known ChatGPT/Codex model ids. Adding or updating a model should require either an explicit matrix entry or a conservative default that does not advertise unsupported request fields.
+
 This avoids client-visible capability drift.
 
 ## Usage and cost accounting
@@ -150,10 +167,14 @@ Usage extraction should treat OpenAI cached input tokens as a subset of input to
 
 When upstream returns cached-token details:
 
-- non-cached input = input tokens minus cached tokens
+- non-cached input = saturating `input tokens - cached tokens`
 - cache read = cached tokens
 - output = output tokens
 - total should match upstream total when available
+
+When upstream omits `total_tokens`, total should be computed as non-cached input + cache read + output so that it still matches the visible upstream token components. When upstream omits cached-token details, cached tokens default to zero and input tokens are treated as non-cached input.
+
+SSE and WebSocket transports must feed the same usage extraction logic so accounting does not depend on transport choice.
 
 Service tier may adjust estimated cost when the model metadata supports pricing multipliers.
 
@@ -186,9 +207,10 @@ Diagnostics should help debug transport and continuation choices without logging
 
 ### Phase 1 tests
 
-- ChatGPT/Codex `ModelInfo` capability assertions.
+- ChatGPT/Codex `ModelInfo` capability assertions and a per-model capability matrix snapshot.
 - Request body tests for verbosity, service tier, reasoning summary, tools, and prompt cache key source/length.
-- Usage extraction tests for cached-token accounting.
+- Request body tests proving unsupported stop/max-output fields are not advertised or sent on the ChatGPT/Codex path.
+- Usage extraction tests for cached-token accounting, missing cached-token details, and missing total tokens.
 - Existing ChatGPT SSE and prompt-too-long tests remain passing.
 
 ### Phase 2 tests
@@ -197,6 +219,7 @@ Diagnostics should help debug transport and continuation choices without logging
 - WebSocket first-event-before-failure starts stream normally.
 - WebSocket failure before first event falls back to SSE in auto mode.
 - WebSocket failure after first event does not fall back.
+- WebSocket 401 follows token refresh, while 429/usage-limit/protocol errors do not replay through SSE.
 - Abort closes or releases resources.
 - Reusable session connection is reused; busy session uses a temporary connection.
 
@@ -205,7 +228,9 @@ Diagnostics should help debug transport and continuation choices without logging
 - Continuation sends `previous_response_id` and delta input on a safe prefix match.
 - Body option changes disable continuation.
 - Prefix mismatch disables continuation.
+- Account/model/session key mismatch disables continuation.
 - Missing session disables continuation.
+- Expired session clears continuation state.
 - Transport/protocol failure clears continuation state.
 
 ### Final validation
