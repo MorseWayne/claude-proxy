@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 3 continuation/delta-input support reviewed; commit pending
+Current phase: Phase 3 continuation/delta-input support complete; follow-up hardening pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -30,7 +30,8 @@ Current todo:
 - [x] Plan Phase 3 continuation/delta-input support.
 - [x] Implement Phase 3 continuation/delta-input support.
 - [x] Validate/review Phase 3.
-- [ ] Commit Phase 3 and refresh GitNexus metadata.
+- [x] Commit Phase 3 and refresh GitNexus metadata.
+- [ ] Decide whether to add non-blocking continuation hardening tests.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -53,12 +54,13 @@ Changes:
 - Phase 3 focused/full validation passed so far: `cargo fmt --check`, transport helper tests, ChatGPT WebSocket/auto/chatgpt tests, Responses tests, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
 - GitNexus detect_changes for Phase 3 reports CRITICAL because the diff touches ChatGPT WebSocket transport/session flow and test helpers; affected flows align with planned ChatGPT continuation/WebSocket scope.
 - Phase 3 reviewer found no blockers; non-blocking follow-ups are explicit busy/concurrency coverage, abort-state invalidation coverage, and e2e function-call/tool-result continuation coverage.
+- Phase 3 committed in `5967589` and GitNexus metadata refreshed afterward.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit Phase 3, refresh GitNexus metadata, then decide whether to add the reviewer’s non-blocking continuation hardening tests as a follow-up.
+- Decide whether to add the reviewer’s non-blocking continuation hardening tests as a follow-up.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
