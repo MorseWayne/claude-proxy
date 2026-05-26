@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-26
-Current phase: Phase 2 WebSocket transport accepted; commit and GitNexus refresh pending
+Current phase: Phase 2 WebSocket transport complete; next phase pending
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -26,7 +26,8 @@ Current todo:
 - [x] Implement Phase 2 WebSocket transport with SSE fallback.
 - [x] Review Phase 2 diff and address reviewer blockers.
 - [x] Final focused reviewer pass found no remaining blockers.
-- [ ] Commit Phase 2 and refresh GitNexus metadata.
+- [x] Commit Phase 2 and refresh GitNexus metadata.
+- [ ] Plan/implement next modernization phase: continuation/delta-input support.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -44,12 +45,13 @@ Changes:
 - Final focused reviewer pass found no remaining blockers for abort/drop cleanup, proxy/custom-CA support, or connector correctness; noted non-blocking gaps around SOCKS/HTTPS proxy parity, proxy credential coverage, and custom-CA fixture coverage.
 - After blocker fixes, validation passed again: `cargo fmt --check`, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt`, `cargo test -p claude-proxy-providers responses`, full `cargo test -p claude-proxy-providers`, full `cargo test`, full `cargo clippy -- -D warnings`, and `git diff --check`.
 - GitNexus detect_changes reports HIGH; affected flows are expected ChatGPT provider/test-helper paths plus Responses stream metadata usage extraction.
+- Phase 2 committed in `08cf57a` and GitNexus metadata refreshed afterward.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit Phase 2, refresh GitNexus index, then proceed to the next modernization phase (continuation/delta-input support).
+- Start the next modernization phase: continuation/delta-input support.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
