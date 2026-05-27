@@ -2292,6 +2292,7 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 18082,
                 auth_token: "proxy-token".to_string(),
+                ..ServerConfig::default()
             },
             ..Settings::default()
         };

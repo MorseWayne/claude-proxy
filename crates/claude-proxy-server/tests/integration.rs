@@ -47,6 +47,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             host: "127.0.0.1".to_string(),
             port: 0,
             auth_token: auth_token.to_string(),
+            ..ServerConfig::default()
         },
         admin: AdminConfig { auth_token: None },
         limits: LimitsConfig {

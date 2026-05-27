@@ -98,6 +98,49 @@ pub struct RequestObservabilityStored {
     pub recent: Vec<RequestObservabilityEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveStreamSnapshot {
+    pub request_id: String,
+    pub provider: String,
+    pub initiator: String,
+    pub model: String,
+    pub age_ms: u64,
+    pub idle_ms: u64,
+    pub event_count: u64,
+    pub last_event_type: String,
+    pub tool_use_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStreamState {
+    provider: String,
+    initiator: String,
+    model: String,
+    started_at: Instant,
+    last_event_at: Instant,
+    event_count: u64,
+    last_event_type: String,
+    tool_use_pending: bool,
+}
+
+impl ActiveStreamState {
+    fn snapshot(&self, request_id: &str, now: Instant) -> ActiveStreamSnapshot {
+        ActiveStreamSnapshot {
+            request_id: request_id.to_string(),
+            provider: self.provider.clone(),
+            initiator: self.initiator.clone(),
+            model: self.model.clone(),
+            age_ms: now.saturating_duration_since(self.started_at).as_millis() as u64,
+            idle_ms: now
+                .saturating_duration_since(self.last_event_at)
+                .as_millis() as u64,
+            event_count: self.event_count,
+            last_event_type: self.last_event_type.clone(),
+            tool_use_pending: self.tool_use_pending,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RequestObservabilityMetrics {
     summary: RequestObservabilitySummary,
@@ -230,6 +273,7 @@ pub struct Metrics {
     pub usage_metrics: Mutex<MetricsDimensions>,
     pub observability_metrics: Mutex<RequestObservabilityMetrics>,
     pub error_diagnostics: Mutex<ErrorDiagnostics>,
+    active_streams: Mutex<HashMap<String, ActiveStreamState>>,
     /// Persistent store for all-time metrics.
     store: Option<Arc<MetricsStore>>,
     /// All-time totals loaded from store at startup.
@@ -246,6 +290,7 @@ impl Metrics {
             usage_metrics: Mutex::new(MetricsDimensions::default()),
             observability_metrics: Mutex::new(RequestObservabilityMetrics::default()),
             error_diagnostics: Mutex::new(ErrorDiagnostics::default()),
+            active_streams: Mutex::new(HashMap::new()),
             store,
             stored_totals: Mutex::new(StoredTotals::default()),
         }
@@ -331,6 +376,57 @@ impl Metrics {
         }
     }
 
+    pub async fn register_active_stream(
+        &self,
+        request_id: String,
+        provider: String,
+        initiator: String,
+        model: String,
+    ) {
+        let now = Instant::now();
+        self.active_streams.lock().await.insert(
+            request_id,
+            ActiveStreamState {
+                provider,
+                initiator,
+                model,
+                started_at: now,
+                last_event_at: now,
+                event_count: 0,
+                last_event_type: "registered".to_string(),
+                tool_use_pending: false,
+            },
+        );
+    }
+
+    pub async fn update_active_stream(
+        &self,
+        request_id: &str,
+        event_type: String,
+        tool_use_pending: bool,
+    ) {
+        if let Some(stream) = self.active_streams.lock().await.get_mut(request_id) {
+            stream.last_event_at = Instant::now();
+            stream.event_count += 1;
+            stream.last_event_type = event_type;
+            stream.tool_use_pending = tool_use_pending;
+        }
+    }
+
+    pub async fn remove_active_stream(&self, request_id: &str) {
+        self.active_streams.lock().await.remove(request_id);
+    }
+
+    async fn active_stream_snapshots(&self) -> Vec<ActiveStreamSnapshot> {
+        let now = Instant::now();
+        self.active_streams
+            .lock()
+            .await
+            .iter()
+            .map(|(request_id, stream)| stream.snapshot(request_id, now))
+            .collect()
+    }
+
     pub async fn to_json(&self) -> serde_json::Value {
         let requests = self.requests_total.load(Ordering::Relaxed);
         let errors = self.errors_total.load(Ordering::Relaxed);
@@ -369,6 +465,8 @@ impl Metrics {
 
         let mut observability = self.observability_metrics.lock().await.snapshot();
         observability.stored = self.load_stored_observability().await;
+        let active_streams = self.active_stream_snapshots().await;
+        let active_stream_count = active_streams.len();
 
         json!({
             "requests_total": requests,
@@ -379,6 +477,10 @@ impl Metrics {
             "initiators": initiators,
             "diagnostics": diagnostics,
             "observability": serde_json::to_value(observability).unwrap_or_default(),
+            "active_streams": {
+                "count": active_stream_count,
+                "streams": active_streams,
+            },
             "stored": {
                 "requests_total": stored_requests_total,
                 "errors_total": stored_errors_total,
@@ -522,6 +624,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 auth_token: String::new(),
+                ..ServerConfig::default()
             },
             admin: AdminConfig { auth_token: None },
             limits: LimitsConfig {
@@ -585,6 +688,36 @@ mod tests {
         assert_eq!(data["diagnostics"]["errors"], 1);
         assert_eq!(data["diagnostics"]["terminal_reasons"]["stream_error"], 1);
         assert_eq!(data["diagnostics"]["error_kinds"]["stream"], 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_reports_active_streams_without_prompt_content() {
+        let metrics = Metrics::default();
+        metrics
+            .register_active_stream(
+                "req-1".to_string(),
+                "chatgpt".to_string(),
+                "user".to_string(),
+                "gpt-5.5".to_string(),
+            )
+            .await;
+        metrics
+            .update_active_stream("req-1", "content_block_start".to_string(), true)
+            .await;
+
+        let data = metrics.to_json().await;
+        assert_eq!(data["active_streams"]["count"], 1);
+        let stream = &data["active_streams"]["streams"][0];
+        assert_eq!(stream["request_id"], "req-1");
+        assert_eq!(stream["provider"], "chatgpt");
+        assert_eq!(stream["model"], "gpt-5.5");
+        assert_eq!(stream["last_event_type"], "content_block_start");
+        assert_eq!(stream["tool_use_pending"], true);
+        assert!(stream.get("prompt").is_none());
+
+        metrics.remove_active_stream("req-1").await;
+        let data = metrics.to_json().await;
+        assert_eq!(data["active_streams"]["count"], 0);
     }
 
     #[tokio::test]

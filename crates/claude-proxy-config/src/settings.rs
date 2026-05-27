@@ -542,6 +542,14 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_auth_token")]
     pub auth_token: String,
+    #[serde(default = "default_sse_heartbeat_interval_seconds")]
+    pub sse_heartbeat_interval_seconds: u64,
+    #[serde(default = "default_stream_idle_timeout_seconds")]
+    pub stream_idle_timeout_seconds: u64,
+    #[serde(default = "default_stream_overall_timeout_seconds")]
+    pub stream_overall_timeout_seconds: u64,
+    #[serde(default = "default_tool_use_terminal_timeout_seconds")]
+    pub tool_use_terminal_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -629,6 +637,18 @@ fn default_port() -> u16 {
 fn default_auth_token() -> String {
     "freecc".to_string()
 }
+fn default_sse_heartbeat_interval_seconds() -> u64 {
+    15
+}
+fn default_stream_idle_timeout_seconds() -> u64 {
+    120
+}
+fn default_stream_overall_timeout_seconds() -> u64 {
+    600
+}
+fn default_tool_use_terminal_timeout_seconds() -> u64 {
+    30
+}
 fn default_rate_limit() -> u32 {
     40
 }
@@ -678,6 +698,10 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             auth_token: default_auth_token(),
+            sse_heartbeat_interval_seconds: default_sse_heartbeat_interval_seconds(),
+            stream_idle_timeout_seconds: default_stream_idle_timeout_seconds(),
+            stream_overall_timeout_seconds: default_stream_overall_timeout_seconds(),
+            tool_use_terminal_timeout_seconds: default_tool_use_terminal_timeout_seconds(),
         }
     }
 }
@@ -1231,6 +1255,28 @@ auth_token = "test-token"
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.port, 9090);
         assert_eq!(settings.server.auth_token, "test-token");
+    }
+
+    #[test]
+    fn server_stream_safeguard_defaults_and_overrides() {
+        let settings = Settings::from_toml("", Path::new("test.toml")).unwrap();
+        assert_eq!(settings.server.sse_heartbeat_interval_seconds, 15);
+        assert_eq!(settings.server.stream_idle_timeout_seconds, 120);
+        assert_eq!(settings.server.stream_overall_timeout_seconds, 600);
+        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 30);
+
+        let toml = r#"
+[server]
+sse_heartbeat_interval_seconds = 10
+stream_idle_timeout_seconds = 90
+stream_overall_timeout_seconds = 300
+tool_use_terminal_timeout_seconds = 20
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        assert_eq!(settings.server.sse_heartbeat_interval_seconds, 10);
+        assert_eq!(settings.server.stream_idle_timeout_seconds, 90);
+        assert_eq!(settings.server.stream_overall_timeout_seconds, 300);
+        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 20);
     }
 
     #[test]

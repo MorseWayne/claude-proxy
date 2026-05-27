@@ -139,6 +139,10 @@ haiku = "anthropic/claude-haiku-4-5-20251001"
 host = "127.0.0.1"
 port = 8082
 auth_token = "freecc"                   # API key required from clients
+sse_heartbeat_interval_seconds = 15     # Downstream SSE keepalive interval
+stream_idle_timeout_seconds = 120       # Upstream stream idle timeout
+stream_overall_timeout_seconds = 600    # Per streaming request overall timeout
+tool_use_terminal_timeout_seconds = 30  # Timeout waiting for message_stop after tool_use starts
 
 [admin]
 auth_token = ""                         # Admin API token (empty = fallback to server.auth_token)
@@ -215,6 +219,7 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 ```
 
 - Top-level fields: current process session statistics
+- `active_streams`: currently open streaming requests with request/provider/model/age/last event diagnostics only (no prompt content), useful for debugging long-session stalls
 - `stored` field: all-time cumulative data persisted in SQLite (survives restarts)
 - Dashboard automatically merges both layers to show totals
 

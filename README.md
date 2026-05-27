@@ -416,6 +416,10 @@ haiku = "anthropic/claude-haiku-4-5-20251001"
 host = "127.0.0.1"
 port = 8082
 auth_token = "freecc"                   # 客户端连接所需的 API key
+sse_heartbeat_interval_seconds = 15     # 下游 SSE keepalive 心跳间隔
+stream_idle_timeout_seconds = 120       # 上游流无事件超时
+stream_overall_timeout_seconds = 600    # 单次流式请求总超时
+tool_use_terminal_timeout_seconds = 30  # tool_use 开始后等待 message_stop 的超时
 
 [admin]
 auth_token = ""                         # 留空时使用 server.auth_token
@@ -512,6 +516,7 @@ raw_sse_events = false
 - `avg_latency_ms` 表示已完成请求的端到端耗时；流式请求会在 stream 结束后计入。
 - `diagnostics` 按结束原因和错误类型聚合错误请求，方便定位 auth、rate limit、stream 等问题。
 - `observability.summary` 汇总请求阶段耗时、上游连接耗时、最大事件间隔和 prompt-too-long retry 次数。
+- `active_streams` 显示当前未结束的流式请求（仅 request/provider/model/耗时/最后事件类型，不包含 prompt 内容），用于诊断长会话卡住位置。
 - `stored` 是 SQLite 持久化的历史累计，跨重启保留。
 - TUI Dashboard 会合并实时数据和历史数据展示总计。
 

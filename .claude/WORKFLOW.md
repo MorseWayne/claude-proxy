@@ -147,6 +147,20 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-05-27-004 — Stream stability optimization
+Status: Completed
+Completed: 2026-05-27
+Level: 2
+
+Intent:
+- Improve Claude Code long-session stability and responsiveness by adding HTTP/SSE safeguards, clearer stream timeout behavior, and consistent provider idle handling without changing the Claude Code ↔ proxy protocol.
+
+Close summary:
+- Outcome: committed stream stability diagnostics, adding SSE heartbeat comments, stream idle/overall watchdogs, conservative tool-use terminal timeout, configurable `[server]` safeguard durations, provider idle-timeout consistency for Anthropic/Copilot streams, and prompt-content-free `active_streams` admin diagnostics using random request UUIDs.
+- Validation: `cargo fmt --check`, focused config/server tests, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-server`, `cargo test -p claude-proxy-cli`, `cargo clippy -p claude-proxy-config -p claude-proxy-server -p claude-proxy-cli -p claude-proxy-providers -- -D warnings`, `git diff --check`, and GitNexus detect_changes passed/run.
+- GitNexus: detect_changes reported CRITICAL because the patch intentionally touches broad `ServerConfig`, stream leader/follower, admin metrics, and provider streaming paths; scoped impact for `stream_leader_response` remained LOW and changed processes align with the stability/diagnostics scope.
+- Gaps: no real Claude Code long-session soak test was run; optional follow-up is richer admin stuck-stream UI/diagnostics if needed.
+
 ### WF-2026-05-27-003 — Remove completions command
 Status: Completed
 Level: 2

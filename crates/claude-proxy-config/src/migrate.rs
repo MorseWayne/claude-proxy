@@ -195,6 +195,7 @@ fn build_settings_from_env(env: &HashMap<String, String>) -> Settings {
             .get("ANTHROPIC_AUTH_TOKEN")
             .cloned()
             .unwrap_or_else(|| "freecc".to_string()),
+        ..ServerConfig::default()
     };
 
     let limits = crate::settings::LimitsConfig {

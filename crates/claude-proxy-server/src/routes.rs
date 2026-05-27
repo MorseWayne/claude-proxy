@@ -23,12 +23,16 @@ use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::app::{
     AppState, InflightEvent, RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
 };
 use crate::persistence::CompletedUsageRecord;
+
+const SSE_HEARTBEAT_FRAME: &[u8] = b": ping\n\n";
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -131,11 +135,12 @@ pub async fn messages(
     Json(request): Json<MessagesRequest>,
 ) -> Response {
     let start = std::time::Instant::now();
-    let (observability_enabled, observability_idle_gap_ms) = {
+    let (observability_enabled, observability_idle_gap_ms, stream_config) = {
         let settings = state.settings.read().await;
         (
             settings.observability.enabled,
             settings.observability.idle_gap_ms,
+            StreamResponseConfig::from_settings(&settings),
         )
     };
     state.metrics.record_request();
@@ -178,6 +183,7 @@ pub async fn messages(
                         _request: request_permit,
                         _provider: None,
                     },
+                    stream_config,
                 )
             } else {
                 join_inflight_non_stream(receiver, request_permit).await
@@ -272,6 +278,7 @@ pub async fn messages(
                         start,
                         observer_state: observer_state.clone(),
                         observability,
+                        stream_config,
                     },
                 )
                 .await
@@ -290,6 +297,7 @@ pub async fn messages(
                         start,
                         observer_state: observer_state.clone(),
                         observability,
+                        stream_config,
                     },
                 )
                 .await
@@ -885,6 +893,31 @@ struct StreamPermits {
     _provider: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamResponseConfig {
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
+    overall_timeout: Duration,
+    tool_use_terminal_timeout: Duration,
+}
+
+impl StreamResponseConfig {
+    fn from_settings(settings: &claude_proxy_config::Settings) -> Self {
+        Self {
+            heartbeat_interval: seconds_duration(settings.server.sse_heartbeat_interval_seconds),
+            idle_timeout: seconds_duration(settings.server.stream_idle_timeout_seconds),
+            overall_timeout: seconds_duration(settings.server.stream_overall_timeout_seconds),
+            tool_use_terminal_timeout: seconds_duration(
+                settings.server.tool_use_terminal_timeout_seconds,
+            ),
+        }
+    }
+}
+
+fn seconds_duration(seconds: u64) -> Duration {
+    Duration::from_secs(seconds.max(1))
+}
+
 struct LeaderResponseContext {
     request_hash: u64,
     broadcast_tx: broadcast::Sender<InflightEvent>,
@@ -892,6 +925,7 @@ struct LeaderResponseContext {
     start: std::time::Instant,
     observer_state: Arc<StdMutex<RequestObserverState>>,
     observability: Option<ObservabilityContext>,
+    stream_config: StreamResponseConfig,
 }
 
 async fn acquire_request_permit(
@@ -980,34 +1014,47 @@ async fn register_or_subscribe_inflight_request(
 fn join_inflight_stream(
     mut receiver: broadcast::Receiver<InflightEvent>,
     permits: StreamPermits,
+    stream_config: StreamResponseConfig,
 ) -> Response {
     let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
     tokio::spawn(async move {
         let _permits = permits;
+        let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
         loop {
-            match receiver.recv().await {
-                Ok(InflightEvent::Event(event)) => {
-                    let sse_text = format_sse_event(&event);
-                    if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
-                        break;
+            tokio::select! {
+                event = receiver.recv() => {
+                    match event {
+                        Ok(InflightEvent::Event(event)) => {
+                            let sse_text = format_sse_event(&event);
+                            if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            let error_event = stream_api_error_event(format!(
+                                "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                            ));
+                            let _ = tx
+                                .send(Ok(format_sse_event(&error_event).into_bytes()))
+                                .await;
+                            break;
+                        }
+                        Ok(InflightEvent::Error(msg)) => {
+                            let error_event = stream_api_error_event(msg);
+                            let _ = tx
+                                .send(Ok(format_sse_event(&error_event).into_bytes()))
+                                .await;
+                            break;
+                        }
                     }
                 }
-                Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let error_event = stream_api_error_event(format!(
-                        "duplicate request stream fell behind and missed {skipped} event(s); please retry"
-                    ));
-                    let _ = tx
-                        .send(Ok(format_sse_event(&error_event).into_bytes()))
-                        .await;
-                    break;
-                }
-                Ok(InflightEvent::Error(msg)) => {
-                    let error_event = stream_api_error_event(msg);
-                    let _ = tx
-                        .send(Ok(format_sse_event(&error_event).into_bytes()))
-                        .await;
-                    break;
+                _ = heartbeat.tick() => {
+                    if tx.send(Ok(SSE_HEARTBEAT_FRAME.to_vec())).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -1058,6 +1105,7 @@ async fn stream_leader_response(
         start: _,
         observer_state,
         observability,
+        stream_config,
     } = context;
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
@@ -1067,6 +1115,15 @@ async fn stream_leader_response(
     let initiator = request.initiator;
     let model_name = request.model.clone();
     let inflight_map = state.inflight.clone();
+    let request_id = Uuid::new_v4().to_string();
+    metrics
+        .register_active_stream(
+            request_id.clone(),
+            provider_id.clone(),
+            initiator.to_string(),
+            model_name.clone(),
+        )
+        .await;
     tokio::spawn(async move {
         let _permits = permits;
         let task_start = std::time::Instant::now();
@@ -1076,19 +1133,85 @@ async fn stream_leader_response(
         let mut terminal_reason = "completed";
         let mut last_error = None;
         let mut leader_tx_open = true;
-        while let Some(event_result) = stream.next().await {
-            match event_result {
-                Ok(event) => {
-                    let now = std::time::Instant::now();
-                    if let Some(context) = &observability {
-                        timing.record_event(context.start, now, context.idle_gap_ms);
+        let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut idle_deadline = Box::pin(tokio::time::sleep(stream_config.idle_timeout));
+        let mut overall_deadline = Box::pin(tokio::time::sleep(stream_config.overall_timeout));
+        let mut tool_use_deadline =
+            Box::pin(tokio::time::sleep(stream_config.tool_use_terminal_timeout));
+        let mut tool_use_pending = false;
+
+        loop {
+            tokio::select! {
+                event_result = stream.next() => {
+                    let Some(event_result) = event_result else {
+                        break;
+                    };
+                    idle_deadline
+                        .as_mut()
+                        .reset(TokioInstant::now() + stream_config.idle_timeout);
+                    match event_result {
+                        Ok(event) => {
+                            let now = std::time::Instant::now();
+                            if let Some(context) = &observability {
+                                timing.record_event(context.start, now, context.idle_gap_ms);
+                            }
+                            extract_usage_from_event(&event.data, &mut usage);
+                            if sse_event_starts_tool_use(&event) {
+                                tool_use_pending = true;
+                                tool_use_deadline.as_mut().reset(
+                                    TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                                );
+                            } else if sse_event_finishes_message(&event) {
+                                tool_use_pending = false;
+                            } else if tool_use_pending {
+                                tool_use_deadline.as_mut().reset(
+                                    TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                                );
+                            }
+                            metrics
+                                .update_active_stream(
+                                    &request_id,
+                                    sse_event_type(&event),
+                                    tool_use_pending,
+                                )
+                                .await;
+                            let sse_text = leader_tx_open.then(|| format_sse_event(&event));
+                            let _ = broadcast_tx.send(InflightEvent::Event(event));
+                            if let Some(sse_text) = sse_text
+                                && sender.send(Ok(sse_text.into_bytes())).await.is_err()
+                            {
+                                leader_tx_open = false;
+                            }
+                            if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
+                                terminal_reason = "client_disconnected";
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let error_message = e.to_string();
+                            error!(
+                                provider_id = %provider_id,
+                                model = %model_name,
+                                error = %error_message,
+                                "stream error from provider"
+                            );
+                            had_error = true;
+                            terminal_reason = "stream_error";
+                            last_error = Some(error_message.clone());
+                            let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
+                            let error_event = stream_api_error_event(error_message);
+                            if leader_tx_open {
+                                let sse_text = format_sse_event(&error_event);
+                                let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                            }
+                            break;
+                        }
                     }
-                    extract_usage_from_event(&event.data, &mut usage);
-                    let sse_text = leader_tx_open.then(|| format_sse_event(&event));
-                    let _ = broadcast_tx.send(InflightEvent::Event(event));
-                    if let Some(sse_text) = sse_text
-                        && sender.send(Ok(sse_text.into_bytes())).await.is_err()
-                    {
+                }
+                _ = heartbeat.tick(), if leader_tx_open => {
+                    if sender.send(Ok(SSE_HEARTBEAT_FRAME.to_vec())).await.is_err() {
                         leader_tx_open = false;
                     }
                     if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
@@ -1096,20 +1219,67 @@ async fn stream_leader_response(
                         break;
                     }
                 }
-                Err(e) => {
-                    let error_message = e.to_string();
-                    error!(
+                _ = &mut idle_deadline => {
+                    let error_message = format!(
+                        "upstream stream idle for {}s",
+                        stream_config.idle_timeout.as_secs()
+                    );
+                    warn!(
                         provider_id = %provider_id,
                         model = %model_name,
-                        error = %error_message,
-                        "stream error from provider"
+                        timeout_seconds = stream_config.idle_timeout.as_secs(),
+                        "stream idle watchdog fired"
                     );
                     had_error = true;
-                    terminal_reason = "stream_error";
+                    terminal_reason = "stream_idle_timeout";
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
-                    let error_event = stream_api_error_event(error_message);
                     if leader_tx_open {
+                        let error_event = stream_api_error_event(error_message);
+                        let sse_text = format_sse_event(&error_event);
+                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                    }
+                    break;
+                }
+                _ = &mut tool_use_deadline, if tool_use_pending => {
+                    let error_message = format!(
+                        "tool_use stream did not reach message_stop within {}",
+                        format_timeout_duration(stream_config.tool_use_terminal_timeout)
+                    );
+                    warn!(
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        timeout_seconds = stream_config.tool_use_terminal_timeout.as_secs(),
+                        "tool_use terminal watchdog fired"
+                    );
+                    had_error = true;
+                    terminal_reason = "tool_use_terminal_timeout";
+                    last_error = Some(error_message.clone());
+                    let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
+                    if leader_tx_open {
+                        let error_event = stream_api_error_event(error_message);
+                        let sse_text = format_sse_event(&error_event);
+                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                    }
+                    break;
+                }
+                _ = &mut overall_deadline => {
+                    let error_message = format!(
+                        "upstream stream exceeded overall timeout of {}s",
+                        stream_config.overall_timeout.as_secs()
+                    );
+                    warn!(
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        timeout_seconds = stream_config.overall_timeout.as_secs(),
+                        "stream overall watchdog fired"
+                    );
+                    had_error = true;
+                    terminal_reason = "stream_overall_timeout";
+                    last_error = Some(error_message.clone());
+                    let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
+                    if leader_tx_open {
+                        let error_event = stream_api_error_event(error_message);
                         let sse_text = format_sse_event(&error_event);
                         let _ = sender.send(Ok(sse_text.into_bytes())).await;
                     }
@@ -1119,6 +1289,7 @@ async fn stream_leader_response(
         }
         let _ = broadcast_tx.send(InflightEvent::Done);
         inflight_map.lock().await.remove(&request_hash);
+        metrics.remove_active_stream(&request_id).await;
         let latency_ms = task_start.elapsed().as_millis() as u64;
         timing.stream_duration_ms = latency_ms;
         if let Some(error) = last_error {
@@ -1168,6 +1339,7 @@ async fn collect_leader_response(
         start,
         observer_state,
         observability,
+        stream_config: _,
     } = context;
     let stream_start = std::time::Instant::now();
     let mut timing = ObservabilityTiming::default();
@@ -1612,6 +1784,33 @@ fn stream_api_error_event(message: impl Into<String>) -> SseEvent {
     }
 }
 
+fn sse_event_starts_tool_use(event: &SseEvent) -> bool {
+    event.event == "content_block_start"
+        && event.data["content_block"]["type"].as_str() == Some("tool_use")
+}
+
+fn sse_event_finishes_message(event: &SseEvent) -> bool {
+    event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
+}
+
+fn sse_event_type(event: &SseEvent) -> String {
+    event
+        .data
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| (!event.event.is_empty()).then_some(event.event.as_str()))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn format_timeout_duration(duration: Duration) -> String {
+    if duration.as_millis().is_multiple_of(1000) {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 fn overloaded_status() -> StatusCode {
     StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -1929,12 +2128,22 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 auth_token: String::new(),
+                ..ServerConfig::default()
             },
             admin: AdminConfig { auth_token: None },
             limits: LimitsConfig::default(),
             http: HttpConfig::default(),
             log: LogConfig::default(),
             observability: ObservabilityConfig::default(),
+        }
+    }
+
+    fn test_stream_config() -> StreamResponseConfig {
+        StreamResponseConfig {
+            heartbeat_interval: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(120),
+            overall_timeout: Duration::from_secs(600),
+            tool_use_terminal_timeout: Duration::from_millis(50),
         }
     }
 
@@ -2229,6 +2438,7 @@ mod tests {
                 start: std::time::Instant::now(),
                 observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
                 observability: None,
+                stream_config: test_stream_config(),
             },
         )
         .await;
@@ -2267,6 +2477,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_leader_times_out_unfinished_tool_use() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(2);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = stream_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0xbeef_dead,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config: test_stream_config(),
+            },
+        )
+        .await;
+
+        event_tx
+            .send(Ok(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {}
+                    }
+                }),
+            }))
+            .await
+            .unwrap();
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("tool_use watchdog should finish the response")
+        .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("content_block_start"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("tool_use stream did not reach message_stop"));
+    }
+
+    #[tokio::test]
     async fn inflight_stream_follower_reports_lagged_broadcast() {
         let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(1);
         let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
@@ -2291,6 +2566,7 @@ mod tests {
                 _request: request_permit,
                 _provider: None,
             },
+            test_stream_config(),
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = std::str::from_utf8(&body).unwrap();

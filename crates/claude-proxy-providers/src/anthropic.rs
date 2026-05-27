@@ -13,8 +13,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, read_upstream_response_text,
-    send_upstream_request,
+    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, next_upstream_stream_item,
+    read_upstream_response_text, send_upstream_request,
 };
 use crate::provider::{Provider, ProviderError};
 
@@ -102,12 +102,35 @@ impl Provider for AnthropicProvider {
         }
 
         if request.stream {
-            let stream = response.bytes_stream().map(|chunk| {
-                chunk
-                    .map(|bytes| parse_anthropic_sse(&bytes))
-                    .map_err(|e| ProviderError::Network(fmt_reqwest_err(&e)))
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+            tokio::spawn(async move {
+                let mut byte_stream = response.bytes_stream();
+                loop {
+                    let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
+                        Ok(Some(chunk_result)) => chunk_result,
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    };
+
+                    match chunk_result {
+                        Ok(bytes) => {
+                            if tx.send(Ok(parse_anthropic_sse(&bytes))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
+                                .await;
+                            return;
+                        }
+                    }
+                }
             });
-            Ok(Box::pin(stream))
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
