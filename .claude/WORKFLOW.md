@@ -4,28 +4,6 @@
 
 ## Active（进行中）
 
-### WF-2026-05-27-002 — v1.3.2 tool release
-Status: In Progress
-Level: 2
-Started: 2026-05-27
-Last updated: 2026-05-27
-Current phase: Release
-
-Intent:
-- Commit the CLI maintenance commands, bump the tool to v1.3.2, push main, and publish the GitHub release via the tag workflow.
-
-Current todo:
-- [x] Confirm release workflow and current version/tag state.
-- [x] Bump workspace version and changelog to v1.3.2.
-- [ ] Run focused validation and detect changed scope.
-- [ ] Commit, push main, tag v1.3.2, and push tag.
-
-Prerequisites:
-- Existing release workflow builds GitHub Releases on `v*` tags.
-
-Resume next:
-- Run validation after Cargo.lock updates, then commit and push `v1.3.2`.
-
 ### WF-2026-05-25-001 — ChatGPT/Codex provider modernization
 Status: In Progress
 Level: 3
@@ -168,6 +146,36 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-27-003 — Remove completions command
+Status: Completed
+Level: 2
+Started: 2026-05-27
+Last updated: 2026-05-27
+Current phase: Closed
+
+Intent:
+- Remove the `claude-proxy completions` CLI command because the user does not want to keep shell-completion generation as a visible tool command.
+
+Close summary:
+- Outcome: removed the `completions` subcommand, `clap_complete` dependency, and README shell-completion sections; updated CLI architecture docs and Unreleased changelog.
+- Validation: `cargo fmt --check`, `cargo check -p claude-proxy-cli`, `cargo test -p claude-proxy-cli`, `cargo clippy -p claude-proxy-cli -- -D warnings`, `git diff --check`, and GitNexus detect_changes passed.
+- Gaps: prepared for v1.3.3 commit/release after user requested publishing without CI tracking.
+
+### WF-2026-05-27-002 — v1.3.2 tool release
+Status: Completed
+Level: 2
+Started: 2026-05-27
+Last updated: 2026-05-27
+Current phase: Closed
+
+Intent:
+- Commit the CLI maintenance commands, bump the tool to v1.3.2, push main, and publish the GitHub release via the tag workflow.
+
+Close summary:
+- Outcome: committed `69e6371` (`Prepare v1.3.2 release`), pushed `main`, tagged and pushed `v1.3.2`, and the GitHub release workflow completed successfully.
+- Validation: `cargo fmt --check`, `cargo test -p claude-proxy-cli`, `cargo clippy -p claude-proxy-cli -- -D warnings`, CLI help checks, `git diff --check`, and GitNexus detect_changes were run before release.
+- Gaps: GitNexus detect_changes reported CRITICAL from broad CLI entrypoint/doc line shifts; scoped impact checks for touched CLI entry symbols were LOW.
 
 ### WF-2026-05-27-001 — CLI maintenance commands
 Status: Completed

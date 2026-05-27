@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use clap::{Parser, Subcommand};
 use claude_proxy_config::settings::{ProviderConfig, ProviderType};
 use colored::Colorize;
 
@@ -62,12 +61,6 @@ enum Commands {
         /// Number of existing lines to print before following
         #[arg(short = 'n', long, default_value_t = DEFAULT_LOG_TAIL_LINES)]
         lines: usize,
-    },
-    /// Generate shell completions
-    Completions {
-        /// Shell to generate completions for
-        #[arg(value_enum)]
-        shell: Shell,
     },
     /// Launch interactive TUI configuration interface
     Tui,
@@ -198,10 +191,6 @@ async fn async_main(cli: Cli) {
         Commands::Server { action } => handle_server(action).await,
         Commands::Clean { yes, force } => handle_clean(yes, force).await,
         Commands::Logs { file, lines } => handle_logs(file, lines).await,
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "claude-proxy", &mut std::io::stdout());
-        }
         Commands::Tui => {
             if let Err(e) = tui::run() {
                 eprintln!("{} TUI error: {e}", "Error:".red().bold());

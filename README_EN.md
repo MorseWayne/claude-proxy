@@ -85,19 +85,6 @@ claude-proxy logs --file /path/app.log  # Stream a specific log file
 claude-proxy clean --yes                # Clear local logs and metrics.db (stop the server first, or pass --force)
 ```
 
-### Shell Completions
-
-```bash
-claude-proxy completions bash           # Generate bash completions
-claude-proxy completions zsh            # Generate zsh completions
-claude-proxy completions fish           # Generate fish completions
-```
-
-Add to shell (example for bash):
-
-```bash
-eval "$(claude-proxy completions bash)"
-```
 
 ### TUI Configuration
 

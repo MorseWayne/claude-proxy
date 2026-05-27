@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.3 - 2026-05-27
+
+### Removed in v1.3.3
+
+- Removed the `claude-proxy completions` command and shell-completion documentation.
+
 ## v1.3.2 - 2026-05-27
 
 ### Added in v1.3.2

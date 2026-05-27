@@ -34,7 +34,7 @@ Rust workspace (edition 2024) — 5 crates:
   - `extract_usage_from_event()` parses token counts from SSE events — relies on `message_start` for input_tokens/cache and `message_delta` for output_tokens.
 
 - **`claude-proxy-cli`** — Single binary `claude-proxy`. Combines all other crates.
-  - CLI via `clap`: `provider add|edit|delete|test...`, `config show|edit|validate...`, `server start|stop|restart|status`, `completions`, `tui`
+  - CLI via `clap`: `provider add|edit|delete|test...`, `config show|edit|validate...`, `server start|stop|restart|status`, `clean`, `logs`, `tui`
   - TUI via `ratatui`: 8 pages (Dashboard, Providers, Server, Limits, HTTP, Logging, Model, System). Dashboard polls `/admin/metrics` every 5s and merges session + stored totals.
 
 ## Data flow (request proxying)

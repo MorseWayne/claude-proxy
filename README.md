@@ -204,20 +204,6 @@ claude-proxy logs --file /path/app.log  # 跟随指定日志文件
 claude-proxy clean --yes                # 清空本地日志和 metrics.db（服务运行时需先停止或加 --force）
 ```
 
-### Shell 补全
-
-```bash
-claude-proxy completions bash           # 生成 bash 补全脚本
-claude-proxy completions zsh            # 生成 zsh 补全脚本
-claude-proxy completions fish           # 生成 fish 补全脚本
-claude-proxy completions powershell     # 生成 PowerShell 补全脚本
-```
-
-添加到 shell（以 bash 为例）：
-
-```bash
-eval "$(claude-proxy completions bash)"
-```
 
 ## TUI 终端控制台
 
@@ -545,7 +531,6 @@ raw_sse_events = false
 | 持久化指标 | 请求、错误、延迟、模型 token 用量写入 SQLite |
 | TUI Dashboard | 终端内查看实时/历史统计和配置状态 |
 | 企业网络支持 | Provider 代理和 `extra_ca_certs` 适配企业 TLS 拦截环境 |
-| Shell 补全 | bash、zsh、fish、PowerShell、Elvish 补全脚本 |
 
 ## 与其他开源工具对比
 
