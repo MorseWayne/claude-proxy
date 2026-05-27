@@ -147,6 +147,19 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-05-27-005 — Release v1.3.4
+Status: Completed
+Completed: 2026-05-27
+Level: 2
+
+Intent:
+- Publish a new tool version for the stream stability diagnostics work without tracking the CI workflow after pushing.
+
+Close summary:
+- Outcome: bumped workspace release metadata to v1.3.4 and added changelog notes for stream safeguards and active stream diagnostics; next shell actions publish by pushing main and tag `v1.3.4` without waiting for CI.
+- Validation: `cargo check -p claude-proxy-cli`, `cargo fmt --check`, `git diff --check`, and GitNexus detect_changes passed/run; detect_changes was LOW with no changed symbols or affected processes.
+- Gaps: CI/release workflow status intentionally not tracked per user request.
+
 ### WF-2026-05-27-004 — Stream stability optimization
 Status: Completed
 Completed: 2026-05-27

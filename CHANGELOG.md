@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.4 - 2026-05-27
+
+### Added in v1.3.4
+
+- Added configurable SSE stream safeguards for Claude Code long sessions, including heartbeat, idle timeout, overall timeout, and conservative unfinished `tool_use` timeout handling.
+- Added prompt-content-free active stream diagnostics in `/admin/metrics` for currently open streams.
+
+### Changed in v1.3.4
+
+- Improved Anthropic and Copilot provider streaming idle handling so stalled upstream streams fail with explicit timeouts instead of hanging indefinitely.
+
 ## v1.3.3 - 2026-05-27
 
 ### Removed in v1.3.3
