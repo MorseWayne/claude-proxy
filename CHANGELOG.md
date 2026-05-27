@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.5 - 2026-05-27
+
+### Added in v1.3.5
+
+- Added prompt-content-free ChatGPT/OpenAI request payload diagnostics for tool count, total tool schema bytes, largest tool schema, and top tool schema contributors.
+
+### Changed in v1.3.5
+
+- Claude Code settings sync now defaults `ENABLE_TOOL_SEARCH=true` for proxy-backed sessions, including during `claude-proxy server start`, while preserving an explicit user override.
+- Improved Anthropic streaming correctness by decoding complete SSE frames before forwarding events.
+- Added anti-buffering headers to SSE responses to discourage intermediary response buffering.
+
 ## v1.3.4 - 2026-05-27
 
 ### Added in v1.3.4

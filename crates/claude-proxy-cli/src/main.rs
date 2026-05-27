@@ -748,6 +748,13 @@ async fn handle_server(action: ServerAction) {
                 process::exit(1);
             }
 
+            if let Err(e) = tui::sync_claude_code_settings(&settings, false) {
+                eprintln!(
+                    "{} Claude Code settings sync failed: {e}",
+                    "Warning:".yellow().bold()
+                );
+            }
+
             if daemon {
                 println!("Starting claude-proxy in daemon mode...");
             } else {

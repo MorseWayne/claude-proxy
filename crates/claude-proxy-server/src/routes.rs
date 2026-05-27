@@ -1502,8 +1502,9 @@ fn sse_body_response(body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Infallibl
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
+        .header("cache-control", "no-cache, no-transform")
         .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream_body))
         .unwrap()
 }
@@ -2145,6 +2146,18 @@ mod tests {
             overall_timeout: Duration::from_secs(600),
             tool_use_terminal_timeout: Duration::from_millis(50),
         }
+    }
+
+    #[test]
+    fn sse_body_response_disables_intermediary_buffering() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = sse_body_response(rx);
+        let headers = response.headers();
+
+        assert_eq!(headers["content-type"], "text/event-stream");
+        assert_eq!(headers["cache-control"], "no-cache, no-transform");
+        assert_eq!(headers["connection"], "keep-alive");
+        assert_eq!(headers["x-accel-buffering"], "no");
     }
 
     #[test]

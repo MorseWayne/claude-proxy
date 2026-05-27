@@ -347,6 +347,11 @@ pub(crate) struct RequestObservability {
     pub has_include: bool,
     pub has_instructions: bool,
     pub body_bytes: usize,
+    tools_count: usize,
+    tools_schema_bytes: usize,
+    largest_tool_schema_bytes: usize,
+    largest_tool_name: String,
+    top_tool_schema_bytes: String,
     history_payload_budget_bytes: usize,
     history_payload_bytes_after: usize,
     history_payload_bytes_before: usize,
@@ -379,6 +384,7 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
         + breakdown.truncated_text_bytes_saved
         + breakdown.truncated_tool_output_bytes_saved;
     let history_payload_budget_bytes = history_payload_budget_bytes_for_stats(&model);
+    let tools = tools_schema_breakdown(body);
     RequestObservability {
         model,
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
@@ -396,6 +402,11 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
         has_include: body.get("include").is_some(),
         has_instructions: body.get("instructions").is_some(),
         body_bytes: serde_json::to_vec(body).map_or(0, |bytes| bytes.len()),
+        tools_count: tools.count,
+        tools_schema_bytes: tools.schema_bytes,
+        largest_tool_schema_bytes: tools.largest_schema_bytes,
+        largest_tool_name: tools.largest_name,
+        top_tool_schema_bytes: tools.top_schema_bytes,
         history_payload_budget_bytes,
         history_payload_bytes_after,
         history_payload_bytes_before,
@@ -457,6 +468,63 @@ fn history_payload_budget_bytes_for_stats(model: &str) -> usize {
     } else {
         512 * 1024
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolsSchemaBreakdown {
+    count: usize,
+    schema_bytes: usize,
+    largest_schema_bytes: usize,
+    largest_name: String,
+    top_schema_bytes: String,
+}
+
+fn tools_schema_breakdown(body: &Value) -> ToolsSchemaBreakdown {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return ToolsSchemaBreakdown::default();
+    };
+
+    let schema_bytes = serde_json::to_vec(tools).map_or(0, |bytes| bytes.len());
+    let mut entries = tools
+        .iter()
+        .map(|tool| {
+            (
+                tool_schema_name(tool),
+                serde_json::to_vec(tool).map_or(0, |bytes| bytes.len()),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let (largest_name, largest_schema_bytes) = entries
+        .first()
+        .map(|(name, bytes)| (name.clone(), *bytes))
+        .unwrap_or_default();
+    let top_schema_bytes = entries
+        .iter()
+        .take(10)
+        .map(|(name, bytes)| format!("{name}:{bytes}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    ToolsSchemaBreakdown {
+        count: tools.len(),
+        schema_bytes,
+        largest_schema_bytes,
+        largest_name,
+        top_schema_bytes,
+    }
+}
+
+fn tool_schema_name(tool: &Value) -> String {
+    tool.get("name")
+        .or_else(|| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>")
+        .to_string()
 }
 
 fn payload_breakdown(body: &Value) -> PayloadBreakdown {
@@ -581,6 +649,11 @@ pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &V
         has_include = stats.has_include,
         has_instructions = stats.has_instructions,
         body_bytes = stats.body_bytes,
+        tools_count = stats.tools_count,
+        tools_schema_bytes = stats.tools_schema_bytes,
+        largest_tool_schema_bytes = stats.largest_tool_schema_bytes,
+        largest_tool_name = %stats.largest_tool_name,
+        top_tool_schema_bytes = %stats.top_tool_schema_bytes,
         history_payload_budget_bytes = stats.history_payload_budget_bytes,
         history_payload_bytes_after = stats.history_payload_bytes_after,
         history_payload_bytes_before = stats.history_payload_bytes_before,
@@ -621,6 +694,11 @@ pub(crate) fn log_compact_request_observability(
         stream = stats.stream,
         input_items = stats.input_items,
         body_bytes = stats.body_bytes,
+        tools_count = stats.tools_count,
+        tools_schema_bytes = stats.tools_schema_bytes,
+        largest_tool_schema_bytes = stats.largest_tool_schema_bytes,
+        largest_tool_name = %stats.largest_tool_name,
+        top_tool_schema_bytes = %stats.top_tool_schema_bytes,
         history_payload_budget_bytes = stats.history_payload_budget_bytes,
         history_payload_bytes_after = stats.history_payload_bytes_after,
         history_payload_bytes_before = stats.history_payload_bytes_before,
@@ -702,6 +780,10 @@ mod tests {
             "instructions": "system text"
         });
 
+        let tool_schema_bytes = serde_json::to_vec(body.get("tools").unwrap())
+            .unwrap()
+            .len();
+        let largest_tool_schema_bytes = serde_json::to_vec(&body["tools"][0]).unwrap().len();
         let stats = request_observability(&body);
 
         assert_eq!(stats.model, "gpt-5.4-mini");
@@ -713,6 +795,15 @@ mod tests {
         assert!(stats.has_include);
         assert!(stats.has_instructions);
         assert!(stats.body_bytes > 0);
+        assert_eq!(stats.tools_count, 1);
+        assert_eq!(stats.tools_schema_bytes, tool_schema_bytes);
+        assert_eq!(stats.largest_tool_schema_bytes, largest_tool_schema_bytes);
+        assert_eq!(stats.largest_tool_name, "read");
+        assert_eq!(
+            stats.top_tool_schema_bytes,
+            format!("read:{largest_tool_schema_bytes}")
+        );
+        assert!(stats.tools_schema_bytes >= stats.largest_tool_schema_bytes);
         assert_eq!(stats.text_items, 3);
         assert_eq!(stats.thinking_items, 0);
         assert_eq!(stats.function_call_items, 1);
@@ -781,6 +872,11 @@ mod tests {
         assert!(!stats.has_include);
         assert!(!stats.has_instructions);
         assert!(stats.body_bytes > 0);
+        assert_eq!(stats.tools_count, 0);
+        assert_eq!(stats.tools_schema_bytes, 0);
+        assert_eq!(stats.largest_tool_schema_bytes, 0);
+        assert!(stats.largest_tool_name.is_empty());
+        assert!(stats.top_tool_schema_bytes.is_empty());
         assert_eq!(stats.text_items, 2);
         assert_eq!(stats.text_bytes, "secret prompt".len() + "answer".len());
         assert_eq!(stats.thinking_items, 1);

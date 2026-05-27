@@ -1629,7 +1629,7 @@ fn save_settings(app: &App) -> Result<SaveOutcome, String> {
     }
 }
 
-fn sync_claude_code_settings(
+pub(crate) fn sync_claude_code_settings(
     settings: &Settings,
     mark_onboarding_complete: bool,
 ) -> Result<PathBuf, String> {
@@ -1852,6 +1852,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
     set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
+    set_default_env(env, "ENABLE_TOOL_SEARCH", "true");
     env.remove("ANTHROPIC_AUTH_TOKEN");
     set_env(env, "ANTHROPIC_MODEL", &settings.model.default.name);
     set_optional_env(
@@ -1899,6 +1900,11 @@ fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>
 
 fn set_env(env: &mut Map<String, Value>, key: &str, value: &str) {
     env.insert(key.to_string(), Value::String(value.trim().to_string()));
+}
+
+fn set_default_env(env: &mut Map<String, Value>, key: &str, value: &str) {
+    env.entry(key.to_string())
+        .or_insert_with(|| Value::String(value.trim().to_string()));
 }
 
 fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
@@ -2329,6 +2335,10 @@ mod tests {
             Some("128000")
         );
         assert_eq!(
+            env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
+            Some("true")
+        );
+        assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
             Some("copilot/claude-sonnet-4")
         );
@@ -2391,7 +2401,8 @@ mod tests {
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "old-sonnet",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "old-haiku",
                 "ANTHROPIC_REASONING_MODEL": "old-reasoning",
-                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+                "ENABLE_TOOL_SEARCH": "false"
             }
         });
 
@@ -2406,6 +2417,10 @@ mod tests {
             env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
                 .and_then(|v| v.as_str()),
             Some("128000")
+        );
+        assert_eq!(
+            env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
+            Some("false")
         );
         assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));

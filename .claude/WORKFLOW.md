@@ -147,6 +147,32 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-05-27-007 — Release v1.3.5
+Status: Completed
+Completed: 2026-05-27
+Level: 2
+
+Intent:
+- Publish a new tool version with Claude Code ToolSearch defaults, request payload diagnostics, and streaming responsiveness fixes.
+
+Close summary:
+- Outcome: bumped workspace release metadata to v1.3.5 and added changelog notes for ToolSearch defaults, ChatGPT/OpenAI tool-schema diagnostics, Anthropic SSE frame decoding, and SSE anti-buffering headers.
+- Validation: `cargo check -p claude-proxy-cli`, `cargo fmt --check`, focused CLI/provider/server tests, full `cargo test`, `git diff --check`, and GitNexus detect_changes passed/run.
+- Gaps: GitNexus detect_changes reported HIGH due broad CLI server-start, Anthropic streaming, OpenAI request observability, and SSE response changes; affected flows align with the intended release scope. CI/release workflow status will be verified after pushing the tag.
+
+### WF-2026-05-27-006 — Streaming responsiveness optimizations
+Status: Completed
+Completed: 2026-05-27
+Level: 2
+
+Intent:
+- Improve Claude Code streaming responsiveness and correctness by fixing Anthropic SSE frame handling and adding anti-buffering stream response headers.
+
+Close summary:
+- Outcome: Anthropic streaming now decodes complete SSE frames before forwarding events, avoiding TCP-chunk boundary bugs; SSE responses now send `cache-control: no-cache, no-transform` and `x-accel-buffering: no` to discourage intermediary buffering.
+- Validation: GitNexus impact was LOW for `AnthropicProvider::chat` and HIGH for shared `sse_body_response`; user confirmed proceeding after warning. `cargo fmt --check`, focused Anthropic/header tests, full `cargo test -p claude-proxy-server`, `git diff --check`, and GitNexus detect_changes passed/run.
+- Gaps: no real Claude Code streaming soak test was run; `crates/claude-proxy-providers/src/openai_compat.rs` had pre-existing uncommitted edits outside this workflow.
+
 ### WF-2026-05-27-005 — Release v1.3.4
 Status: Completed
 Completed: 2026-05-27

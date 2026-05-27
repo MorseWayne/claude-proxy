@@ -17,6 +17,7 @@ use crate::http::{
     read_upstream_response_text, send_upstream_request,
 };
 use crate::provider::{Provider, ProviderError};
+use crate::sse::{SseDecoder, parse_sse_frame};
 
 pub struct AnthropicProvider {
     id: String,
@@ -104,6 +105,7 @@ impl Provider for AnthropicProvider {
         if request.stream {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(64);
             tokio::spawn(async move {
+                let mut decoder = SseDecoder::new();
                 let mut byte_stream = response.bytes_stream();
                 loop {
                     let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
@@ -117,8 +119,14 @@ impl Provider for AnthropicProvider {
 
                     match chunk_result {
                         Ok(bytes) => {
-                            if tx.send(Ok(parse_anthropic_sse(&bytes))).await.is_err() {
-                                return;
+                            decoder.push(&bytes);
+                            while let Some(frame) = decoder.next_frame() {
+                                let Some(event) = parse_anthropic_sse_frame(&frame) else {
+                                    continue;
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {
@@ -128,6 +136,12 @@ impl Provider for AnthropicProvider {
                             return;
                         }
                     }
+                }
+
+                if let Some(frame) = decoder.finish()
+                    && let Some(event) = parse_anthropic_sse_frame(&frame)
+                {
+                    let _ = tx.send(Ok(event)).await;
                 }
             });
             Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
@@ -249,28 +263,15 @@ fn trim_text(text: &mut String) {
     }
 }
 
-/// Parse raw bytes from an Anthropic SSE stream.
-fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
-    let text = String::from_utf8_lossy(bytes);
-    let mut event_type = String::new();
-    let mut data = Value::Null;
+/// Parse a complete Anthropic SSE frame.
+fn parse_anthropic_sse_frame(text: &str) -> Option<SseEvent> {
+    let frame = parse_sse_frame(text)?;
+    let data = serde_json::from_str::<Value>(frame.data.trim()).unwrap_or(Value::Null);
 
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = rest.trim().to_string();
-        } else if let Some(rest) = line
-            .strip_prefix("data: ")
-            .or_else(|| line.strip_prefix("data:"))
-            && let Ok(parsed) = serde_json::from_str::<Value>(rest.trim())
-        {
-            data = parsed;
-        }
-    }
-
-    SseEvent {
-        event: event_type,
+    Some(SseEvent {
+        event: frame.event.unwrap_or_default(),
         data,
-    }
+    })
 }
 
 /// Inject `cache_control: {"type": "ephemeral"}` into the request body to enable
@@ -451,6 +452,25 @@ mod tests {
         });
 
         (format!("http://{addr}"), attempts, handle)
+    }
+
+    #[test]
+    fn anthropic_sse_decoder_waits_for_complete_frames() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"");
+
+        assert!(decoder.next_frame().is_none());
+
+        decoder.push(b"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        let first = parse_anthropic_sse_frame(&decoder.next_frame().unwrap()).unwrap();
+        assert_eq!(first.event, "content_block_delta");
+        assert_eq!(first.data["type"], "content_block_delta");
+
+        let second = parse_anthropic_sse_frame(&decoder.next_frame().unwrap()).unwrap();
+        assert_eq!(second.event, "message_stop");
+        assert_eq!(second.data["type"], "message_stop");
+        assert!(decoder.next_frame().is_none());
     }
 
     #[test]
