@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.2 - 2026-05-27
+
+### Added in v1.3.2
+
+- Added `claude-proxy clean` to remove local log files and the persisted `metrics.db` SQLite database files, with daemon-running protection by default.
+- Added `claude-proxy logs` to stream the active or explicitly selected log file in real time from the terminal.
+
 ## v1.3.1 - 2026-05-27
 
 ### Fixed in v1.3.1

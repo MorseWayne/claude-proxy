@@ -196,6 +196,14 @@ claude-proxy server restart             # 通过 SIGUSR1 重载配置（仅 Unix
 claude-proxy server status              # 查看守护进程运行状态
 ```
 
+### 本地维护
+
+```bash
+claude-proxy logs                       # 实时打印日志（默认跟随当前日志文件）
+claude-proxy logs --file /path/app.log  # 跟随指定日志文件
+claude-proxy clean --yes                # 清空本地日志和 metrics.db（服务运行时需先停止或加 --force）
+```
+
 ### Shell 补全
 
 ```bash

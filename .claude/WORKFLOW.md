@@ -4,6 +4,28 @@
 
 ## Active（进行中）
 
+### WF-2026-05-27-002 — v1.3.2 tool release
+Status: In Progress
+Level: 2
+Started: 2026-05-27
+Last updated: 2026-05-27
+Current phase: Release
+
+Intent:
+- Commit the CLI maintenance commands, bump the tool to v1.3.2, push main, and publish the GitHub release via the tag workflow.
+
+Current todo:
+- [x] Confirm release workflow and current version/tag state.
+- [x] Bump workspace version and changelog to v1.3.2.
+- [ ] Run focused validation and detect changed scope.
+- [ ] Commit, push main, tag v1.3.2, and push tag.
+
+Prerequisites:
+- Existing release workflow builds GitHub Releases on `v*` tags.
+
+Resume next:
+- Run validation after Cargo.lock updates, then commit and push `v1.3.2`.
+
 ### WF-2026-05-25-001 — ChatGPT/Codex provider modernization
 Status: In Progress
 Level: 3
@@ -146,6 +168,21 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-05-27-001 — CLI maintenance commands
+Status: Completed
+Level: 2
+Started: 2026-05-27
+Last updated: 2026-05-27
+Current phase: Closed
+
+Intent:
+- Add CLI maintenance commands to clear local logs/metrics database files and stream logs live in the terminal.
+
+Close summary:
+- Outcome: added `claude-proxy clean` for local log/metrics cleanup and `claude-proxy logs` for live log streaming, plus README/README_EN command docs.
+- Validation: `cargo fmt --check`, `cargo check -p claude-proxy-cli`, `cargo test -p claude-proxy-cli`, CLI help checks, and a temp-file log streaming smoke test passed.
+- Gaps: GitNexus detect_changes reports CRITICAL due broad CLI entrypoint/doc line shifts; scoped impact checks for `Commands`, `main`, `async_main`, and `log_dir` were LOW and changed behavior is limited to new maintenance commands plus skipping self-logging for them.
 
 ### WF-2026-05-23-001 — Capability contract optimization
 Completed: 2026-05-23

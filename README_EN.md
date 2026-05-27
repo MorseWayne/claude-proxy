@@ -77,6 +77,14 @@ claude-proxy server restart             # Graceful config reload via SIGUSR1 (Un
 claude-proxy server status              # Check if daemon is running
 ```
 
+### Local Maintenance
+
+```bash
+claude-proxy logs                       # Stream the active log file in real time
+claude-proxy logs --file /path/app.log  # Stream a specific log file
+claude-proxy clean --yes                # Clear local logs and metrics.db (stop the server first, or pass --force)
+```
+
 ### Shell Completions
 
 ```bash

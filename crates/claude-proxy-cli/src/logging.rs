@@ -173,6 +173,10 @@ fn build_filter(log_config: &LogConfig) -> EnvFilter {
         .add_directive("tower_http=info".parse().expect("valid filter"))
 }
 
+pub fn default_log_file() -> PathBuf {
+    log_dir().join("claude-proxy.log")
+}
+
 fn log_dir() -> PathBuf {
     claude_proxy_config::Settings::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))

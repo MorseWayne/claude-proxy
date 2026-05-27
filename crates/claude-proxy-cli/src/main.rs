@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,9 @@ mod tui;
 
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(7);
 const SERVER_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_LOG_TAIL_LINES: usize = 20;
+const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const LOG_ROTATION_FILES: usize = 5;
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +44,24 @@ enum Commands {
     Server {
         #[command(subcommand)]
         action: ServerAction,
+    },
+    /// Clear local logs and metrics database files
+    Clean {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+        /// Allow cleanup while the daemon appears to be running
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stream log output in the terminal
+    Logs {
+        /// Log file to stream (defaults to configured file or config_dir/logs/claude-proxy.log)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Number of existing lines to print before following
+        #[arg(short = 'n', long, default_value_t = DEFAULT_LOG_TAIL_LINES)]
+        lines: usize,
     },
     /// Generate shell completions
     Completions {
@@ -156,20 +178,26 @@ fn main() {
 
 async fn async_main(cli: Cli) {
     // Initialize logging (early — before any work)
-    let is_tui = matches!(cli.command, Commands::Tui);
+    let is_tui = matches!(&cli.command, Commands::Tui);
     let settings = claude_proxy_config::Settings::config_file_path()
         .filter(|p| p.exists())
         .and_then(|p| claude_proxy_config::Settings::load(&p).ok());
 
-    let log_config = settings.as_ref().map(|s| &s.log);
-    if let Err(e) = logging::init_logging(log_config.unwrap_or(&Default::default()), is_tui) {
-        eprintln!("Warning: failed to initialize logging: {e}");
+    let should_init_logging =
+        !matches!(&cli.command, Commands::Clean { .. } | Commands::Logs { .. });
+    if should_init_logging {
+        let log_config = settings.as_ref().map(|s| &s.log);
+        if let Err(e) = logging::init_logging(log_config.unwrap_or(&Default::default()), is_tui) {
+            eprintln!("Warning: failed to initialize logging: {e}");
+        }
     }
 
     match cli.command {
         Commands::Provider { action } => handle_provider(action).await,
         Commands::Config { action } => handle_config(action).await,
         Commands::Server { action } => handle_server(action).await,
+        Commands::Clean { yes, force } => handle_clean(yes, force).await,
+        Commands::Logs { file, lines } => handle_logs(file, lines).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "claude-proxy", &mut std::io::stdout());
@@ -855,6 +883,210 @@ async fn handle_server(action: ServerAction) {
             }
         },
     }
+}
+
+async fn handle_clean(yes: bool, force: bool) {
+    if !force
+        && let Some(pid) = read_pid_file()
+        && is_process_running(pid)
+    {
+        eprintln!(
+            "{} claude-proxy appears to be running (PID {pid}). Stop it first or pass --force.",
+            "Error:".red().bold()
+        );
+        process::exit(1);
+    }
+
+    let mut paths = cleanup_paths();
+    paths.retain(|path| path.exists());
+    paths.sort_by_key(|path| std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false));
+
+    if paths.is_empty() {
+        println!(
+            "{} No local log or metrics database files found.",
+            "✓".green()
+        );
+        return;
+    }
+
+    println!("The following local files/directories will be removed:");
+    for path in &paths {
+        println!("  - {}", path.display());
+    }
+
+    if !yes {
+        let confirmed = dialoguer::Confirm::new()
+            .with_prompt("Continue?")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !confirmed {
+            println!("Cancelled.");
+            return;
+        }
+    }
+
+    let mut removed = 0usize;
+    for path in paths {
+        match remove_path(&path) {
+            Ok(true) => {
+                removed += 1;
+                println!("{} Removed {}", "✓".green(), path.display());
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("{} Failed to remove {}: {e}", "✗".red(), path.display()),
+        }
+    }
+
+    println!(
+        "{} Removed {removed} local log/database path(s).",
+        "✓".green().bold()
+    );
+}
+
+async fn handle_logs(file: Option<PathBuf>, lines: usize) {
+    let path = file.unwrap_or_else(resolve_log_file);
+    println!(
+        "{} Streaming {} (Ctrl-C to stop)",
+        "▸".green().bold(),
+        path.display()
+    );
+
+    let mut position = match print_last_lines(&path, lines) {
+        Ok(position) => position,
+        Err(e) => {
+            eprintln!(
+                "{} Failed to read {}: {e}",
+                "Error:".red().bold(),
+                path.display()
+            );
+            process::exit(1);
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nStopped log streaming.");
+                return;
+            }
+            _ = tokio::time::sleep(LOG_TAIL_POLL_INTERVAL) => {
+                match print_new_log_content(&path, position) {
+                    Ok(new_position) => position = new_position,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        position = 0;
+                    }
+                    Err(e) => {
+                        eprintln!("{} Failed to read {}: {e}", "Error:".red().bold(), path.display());
+                        process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(config_dir) = claude_proxy_config::Settings::config_dir() {
+        push_unique_path(&mut paths, config_dir.join("logs"));
+        push_rotated_paths(&mut paths, &config_dir.join("claude-proxy.log"));
+        push_sqlite_paths(&mut paths, &config_dir.join("metrics.db"));
+    }
+
+    if let Some(configured_log_file) = configured_log_file() {
+        push_rotated_paths(&mut paths, &configured_log_file);
+    }
+
+    paths
+}
+
+fn resolve_log_file() -> PathBuf {
+    configured_log_file().unwrap_or_else(logging::default_log_file)
+}
+
+fn configured_log_file() -> Option<PathBuf> {
+    let path = claude_proxy_config::Settings::config_file_path()?;
+    let settings = claude_proxy_config::Settings::load(&path).ok()?;
+    let log_file = settings.log.file.as_deref()?.trim();
+    if log_file.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(log_file))
+    }
+}
+
+fn push_rotated_paths(paths: &mut Vec<PathBuf>, path: &Path) {
+    push_unique_path(paths, path.to_path_buf());
+    for index in 1..=LOG_ROTATION_FILES {
+        push_unique_path(
+            paths,
+            PathBuf::from(format!("{}.{}", path.display(), index)),
+        );
+    }
+}
+
+fn push_sqlite_paths(paths: &mut Vec<PathBuf>, path: &Path) {
+    push_unique_path(paths, path.to_path_buf());
+    for suffix in ["-wal", "-shm", "-journal"] {
+        push_unique_path(paths, PathBuf::from(format!("{}{suffix}", path.display())));
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn remove_path(path: &Path) -> std::io::Result<bool> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(false);
+    };
+
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(true)
+}
+
+fn print_last_lines(path: &Path, lines: usize) -> std::io::Result<u64> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+
+    if lines > 0 {
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start = all_lines.len().saturating_sub(lines);
+        for line in &all_lines[start..] {
+            println!("{line}");
+        }
+        std::io::stdout().flush()?;
+    }
+
+    Ok(content.len() as u64)
+}
+
+fn print_new_log_content(path: &Path, position: u64) -> std::io::Result<u64> {
+    let metadata = std::fs::metadata(path)?;
+    let len = metadata.len();
+    let start = if len < position { 0 } else { position };
+    if len == start {
+        return Ok(start);
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    print!("{}", String::from_utf8_lossy(&bytes));
+    std::io::stdout().flush()?;
+    Ok(len)
 }
 
 async fn login_oauth_provider(
