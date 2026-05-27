@@ -40,6 +40,8 @@ Current todo:
 - [x] Implement ChatGPT WebSocket environment proxy fallback with NO_PROXY bypass.
 - [x] Validate ChatGPT WebSocket environment proxy fallback and commit if checks pass.
 - [ ] Prepare v1.3.0 release metadata and tag.
+- [x] Implement agreed ChatGPT upstream payload optimizations: reuse continuation for SSE/HTTP where safe, proactively compact oversized ChatGPT bodies before send, and add a ChatGPT tool-schema budget guard.
+- [x] Prepare v1.3.6 release metadata and changelog for ChatGPT payload optimizations.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -82,12 +84,15 @@ Changes:
 - Added focused tests for env `HTTPS_PROXY` fallback, provider proxy overriding env proxy, and `NO_PROXY` bypass; env-proxy tests set loopback `NO_PROXY` while holding an async lock so concurrent local WebSocket tests are not polluted by process-wide proxy variables.
 - Validation for the WebSocket env proxy fallback passed: `cargo fmt --check`, the three new target tests, `cargo test -p claude-proxy-providers chatgpt_`, and `cargo clippy -- -D warnings`.
 - GitNexus detect_changes reports HIGH because the diff touches ChatGPT WebSocket connect/proxy paths and related test helpers; affected processes align with the intended WebSocket proxy resolution scope. The report also includes pre-existing `AGENTS.md` / `CLAUDE.md` metadata edits that are excluded from this fix commit.
+- Implemented agreed post-v1.3.5 ChatGPT upstream payload optimizations: SSE/HTTP now shares safe continuation state and can send `previous_response_id` plus delta input, oversized ChatGPT request bodies are compacted before first send when they approach the model context window, and oversized tool catalogs fail fast with a ToolSearch hint.
+- Validation for the payload optimization diff passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_ -- --nocapture`, full `cargo test -p claude-proxy-providers`, and `git diff --check`.
+- GitNexus detect_changes reports CRITICAL because the diff intentionally touches ChatGPT SSE/WebSocket continuation/session handling and prompt-too-long request shrinking; affected processes align with the planned ChatGPT payload optimization scope.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit/push the validated WebSocket env proxy fallback fix, refresh GitNexus metadata, then continue v1.3.0 prep.
+- Commit and tag v1.3.6, push the tag, then patch the GitHub Release body with the v1.3.6 changelog notes after the release workflow creates it.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

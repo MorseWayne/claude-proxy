@@ -192,7 +192,7 @@ impl ChatGptWebSocketSession {
         self.generations.clear();
     }
 
-    fn prepare_continuation(
+    pub(super) fn prepare_continuation(
         &mut self,
         provider: &ChatGptProvider,
         token: &ChatGptToken,
@@ -287,7 +287,11 @@ impl ChatGptWebSocketSession {
         }
     }
 
-    fn complete_continuation(&mut self, attempt: &ContinuationAttempt, terminal_event: &Value) {
+    pub(super) fn complete_continuation(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        terminal_event: &Value,
+    ) {
         let Some(key) = attempt.key.as_ref() else {
             return;
         };
@@ -332,7 +336,7 @@ impl ChatGptWebSocketSession {
         );
     }
 
-    fn fail_continuation(&mut self, attempt: &ContinuationAttempt) {
+    pub(super) fn fail_continuation(&mut self, attempt: &ContinuationAttempt) {
         if let Some(key) = attempt.key.as_ref() {
             if attempt.owns_busy {
                 self.busy.remove(key);
@@ -399,7 +403,7 @@ struct CachedContinuation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContinuationDisabledReason {
+pub(super) enum ContinuationDisabledReason {
     None,
     MissingKey,
     MissingSession,
@@ -412,7 +416,7 @@ enum ContinuationDisabledReason {
 }
 
 impl ContinuationDisabledReason {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::MissingKey => "missing_key",
@@ -428,16 +432,16 @@ impl ContinuationDisabledReason {
 }
 
 #[derive(Debug, Clone)]
-struct ContinuationAttempt {
+pub(super) struct ContinuationAttempt {
     key: Option<ContinuationKey>,
-    send_body: Value,
+    pub(super) send_body: Value,
     canonical_body: Value,
     full_input: Vec<Value>,
-    used: bool,
+    pub(super) used: bool,
     update_on_success: bool,
     owns_busy: bool,
     generation: u64,
-    disabled_reason: ContinuationDisabledReason,
+    pub(super) disabled_reason: ContinuationDisabledReason,
 }
 
 impl ContinuationAttempt {

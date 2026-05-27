@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.6 - 2026-05-27
+
+### Added in v1.3.6
+
+- Added a ChatGPT tool-schema budget guard that fails fast with an actionable ToolSearch hint before oversized tool catalogs are sent upstream.
+
+### Changed in v1.3.6
+
+- ChatGPT SSE/HTTP requests can now reuse safe `previous_response_id` continuation state and send only delta input when WebSocket transport is unavailable.
+- ChatGPT request bodies that approach the known model context window are proactively compacted before the first upstream send, reducing avoidable prompt-too-long retries.
+
 ## v1.3.5 - 2026-05-27
 
 ### Added in v1.3.5
