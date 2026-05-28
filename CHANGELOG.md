@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.0 - 2026-05-28
+
+### Fixed in v2.0.0
+
+- Surface ChatGPT `context_length_exceeded` SSE/WebSocket error frames as request-too-large failures, returning HTTP 413 for non-stream aggregate requests instead of retry-amplifying them as generic 502 Bad Gateway responses.
+- Treat Responses `type: "error"` stream frames as provider errors so upstream prompt/context failures do not get converted into malformed successful streams.
+- Reduce false `prefix_mismatch` WebSocket continuation misses by allowing safe delta inference when clients omit or reformat cached assistant/function-call output while preserving the cached user/tool-input prefix check.
+- Shorten cached ChatGPT WebSocket connection idle reuse from 300s to 60s to avoid stale connection reuse and Broken pipe fallback after longer idle gaps.
+
+### Changed in v2.0.0
+
+- ChatGPT continuation diagnostics should now remain near small delta payloads after reconnect/redeploy, with full-history fallback reserved for true prefix/body/account/model mismatches.
+- Request observability for overlong ChatGPT prompts records provider/request-too-large failures instead of stream/network failures where the upstream error is classifiable.
+
 ## v1.3.10 - 2026-05-28
 
 ### Fixed in v1.3.10
