@@ -59,7 +59,6 @@ const CHATGPT_PTL_RETRY_MARKER: &str =
     "[earlier conversation truncated for ChatGPT prompt-too-long retry]";
 const CHATGPT_PTL_MAX_RETRIES: usize = 3;
 const CHATGPT_PTL_FALLBACK_DROP_DIVISOR: usize = 5;
-const CHATGPT_PRE_SEND_COMPACTION_MAX_PASSES: usize = 3;
 const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
 const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
@@ -603,19 +602,9 @@ impl ChatGptProvider {
             compact_request,
             request_id,
             output_token_budget,
-            stable_client_conversation_id,
             observer,
+            ..
         } = prepared;
-        let mut continuation = Some(
-            self.prepare_sse_continuation(
-                &token,
-                &mut body,
-                stable_client_conversation_id.as_deref(),
-                request_id,
-                compact_request,
-            )
-            .await,
-        );
         let mut response = self
             .send_responses_request_with_prompt_too_long_retry(
                 &mut body,
@@ -626,15 +615,7 @@ impl ChatGptProvider {
                 observer.as_ref(),
             )
             .await?;
-        self.fail_sse_continuation_if_body_changed(&mut continuation, &body)
-            .await;
         if response.status() == StatusCode::UNAUTHORIZED {
-            if let Some(attempt) = continuation.take() {
-                self.websocket_session
-                    .lock()
-                    .await
-                    .fail_continuation(&attempt);
-            }
             let refreshed = match self.auth.force_refresh_token().await {
                 Ok(token) => token,
                 Err(error) => {
@@ -644,16 +625,6 @@ impl ChatGptProvider {
                     return Err(error);
                 }
             };
-            continuation = Some(
-                self.prepare_sse_continuation(
-                    &refreshed,
-                    &mut body,
-                    stable_client_conversation_id.as_deref(),
-                    request_id,
-                    compact_request,
-                )
-                .await,
-            );
             response = self
                 .send_responses_request_with_prompt_too_long_retry(
                     &mut body,
@@ -664,82 +635,18 @@ impl ChatGptProvider {
                     observer.as_ref(),
                 )
                 .await?;
-            self.fail_sse_continuation_if_body_changed(&mut continuation, &body)
-                .await;
             if response.status() == StatusCode::UNAUTHORIZED {
                 self.auth.clear_token().await;
             }
         }
 
         if !response.status().is_success() {
-            if let Some(attempt) = continuation.take() {
-                self.websocket_session
-                    .lock()
-                    .await
-                    .fail_continuation(&attempt);
-            }
             return Err(map_upstream_response(response).await);
         }
 
         Ok(self
-            .stream_sse_response(
-                response,
-                marker_mode,
-                request_id,
-                compact_request,
-                observer,
-                continuation,
-            )
+            .stream_sse_response(response, marker_mode, request_id, compact_request, observer)
             .await)
-    }
-
-    async fn fail_sse_continuation_if_body_changed(
-        &self,
-        continuation: &mut Option<transport::ContinuationAttempt>,
-        body: &Value,
-    ) {
-        let changed = continuation
-            .as_ref()
-            .is_some_and(|attempt| attempt.send_body != *body);
-        if changed && let Some(attempt) = continuation.take() {
-            self.websocket_session
-                .lock()
-                .await
-                .fail_continuation(&attempt);
-        }
-    }
-
-    async fn prepare_sse_continuation(
-        &self,
-        token: &ChatGptToken,
-        body: &mut Value,
-        stable_client_conversation_id: Option<&str>,
-        request_id: u64,
-        compact_request: bool,
-    ) -> transport::ContinuationAttempt {
-        let continuation = self.websocket_session.lock().await.prepare_continuation(
-            self,
-            token,
-            body,
-            stable_client_conversation_id,
-        );
-        info!(
-            request_id,
-            compact_request,
-            transport = "sse",
-            continuation_key_present = stable_client_conversation_id.is_some(),
-            continuation_used = continuation.used,
-            continuation_disabled_reason = continuation.disabled_reason.as_str(),
-            continuation_delta_items = continuation
-                .send_body
-                .get("input")
-                .and_then(|value| value.as_array())
-                .map(Vec::len)
-                .unwrap_or(0),
-            "ChatGPT SSE continuation decision"
-        );
-        *body = continuation.send_body.clone();
-        continuation
     }
 
     async fn chat_via_websocket_with_auth_retry(
@@ -867,7 +774,6 @@ impl ChatGptProvider {
         request_id: u64,
         compact_request: bool,
         observer: Option<ProviderRequestObserver>,
-        continuation: Option<transport::ContinuationAttempt>,
     ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
@@ -881,7 +787,7 @@ impl ChatGptProvider {
 
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
         let stream_started_at = Instant::now();
-        let base_on_event = self.upstream_event_handler(
+        let on_event = self.upstream_event_handler(
             request_id,
             compact_request,
             "sse",
@@ -889,23 +795,6 @@ impl ChatGptProvider {
             stream_started_at,
             observer,
         );
-        let continuation_session = Arc::clone(&self.websocket_session);
-        let continuation_for_event = continuation.clone();
-        let continuation_completed_for_event = Arc::new(AtomicBool::new(false));
-        let on_event = move |event: &Value| {
-            base_on_event(event);
-            if let Some(attempt) = continuation_for_event.as_ref()
-                && chatgpt_sse_stop_reason(event).is_some()
-                && !continuation_completed_for_event.swap(true, Ordering::Relaxed)
-            {
-                let session = Arc::clone(&continuation_session);
-                let attempt = attempt.clone();
-                let event = event.clone();
-                tokio::spawn(async move {
-                    session.lock().await.complete_continuation(&attempt, &event);
-                });
-            }
-        };
         let stream = responses::stream_response_with_marker_mode(response, marker_mode, on_event);
         wrap_chatgpt_stream_logging(
             stream,
@@ -1326,7 +1215,7 @@ impl Provider for ChatGptProvider {
         let prompt_cache_key_source = responses::prompt_cache_key_source(&request);
         let stable_client_conversation_id =
             responses::stable_client_conversation_id_for_continuation(&request);
-        let mut body = responses::build_body_with_context(
+        let body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
             responses::CodexRequestContext {
@@ -1336,8 +1225,6 @@ impl Provider for ChatGptProvider {
         );
         let request_id = next_chatgpt_request_id();
         validate_chatgpt_tool_schema_budget(&body)?;
-        let initial_compact_request = is_compact_request_body(&body);
-        proactively_shrink_oversized_body(&mut body, request_id, initial_compact_request);
         let output_token_budget = chatgpt_output_token_budget(&request, &body);
         info!(
             request_id,
@@ -2143,69 +2030,6 @@ fn chatgpt_tool_schema_stats(body: &Value) -> (usize, usize) {
     )
 }
 
-fn proactively_shrink_oversized_body(
-    body: &mut Value,
-    request_id: u64,
-    compact_request: bool,
-) -> Option<PromptTooLongShrinkStats> {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let threshold_bytes = chatgpt_request_warning_threshold(&model)?;
-    let mut total_stats: Option<PromptTooLongShrinkStats> = None;
-
-    for pass in 1..=CHATGPT_PRE_SEND_COMPACTION_MAX_PASSES {
-        let body_bytes = json_len(body);
-        if body_bytes < threshold_bytes {
-            break;
-        }
-        let token_gap = body_bytes
-            .saturating_sub(threshold_bytes)
-            .saturating_div(CHATGPT_BYTES_PER_ESTIMATED_TOKEN)
-            .saturating_add(1024)
-            .max(1);
-        let Some(stats) = shrink_prompt_too_long_body(body, Some(token_gap)) else {
-            warn!(
-                request_id,
-                compact_request,
-                model,
-                body_bytes,
-                threshold_bytes,
-                pass,
-                "ChatGPT pre-send compaction skipped because request body is not shrinkable"
-            );
-            break;
-        };
-        warn!(
-            request_id,
-            compact_request,
-            model,
-            pass,
-            threshold_bytes,
-            original_body_bytes = stats.original_body_bytes,
-            shrunk_body_bytes = stats.shrunk_body_bytes,
-            dropped_groups = stats.dropped_groups,
-            dropped_items = stats.dropped_items,
-            truncated_text_items = stats.truncated_text_items,
-            "Proactively compacted ChatGPT request before sending"
-        );
-        match total_stats.as_mut() {
-            Some(total) => {
-                total.dropped_groups += stats.dropped_groups;
-                total.dropped_items += stats.dropped_items;
-                total.inserted_marker |= stats.inserted_marker;
-                total.truncated_text_items += stats.truncated_text_items;
-                total.shrunk_body_bytes = stats.shrunk_body_bytes;
-            }
-            None => total_stats = Some(stats),
-        }
-    }
-
-    total_stats
-}
-
 fn shrink_prompt_too_long_body(
     body: &mut Value,
     token_gap: Option<usize>,
@@ -2627,8 +2451,8 @@ fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
                 adaptive_thinking: CapabilityState::Supported,
                 reasoning_effort: CapabilityState::Supported,
                 prompt_cache: CapabilityState::Supported,
-                sampling: CapabilityState::Unsupported,
-                stop_sequences: CapabilityState::Unsupported,
+                sampling: CapabilityState::Unknown,
+                stop_sequences: CapabilityState::Unknown,
             },
             limits: ModelLimits {
                 context_window: Some(spec.context_window),
@@ -3139,11 +2963,11 @@ mod tests {
         assert!(gpt55.capabilities.modalities.input.image.is_supported());
         assert_eq!(
             gpt55.capabilities.features.stop_sequences,
-            CapabilityState::Unsupported
+            CapabilityState::Unknown
         );
         assert_eq!(
             gpt55.capabilities.features.sampling,
-            CapabilityState::Unsupported
+            CapabilityState::Unknown
         );
         assert!(
             !gpt55
@@ -3965,60 +3789,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_sse_continuation_sends_previous_response_id_and_delta_input() {
-        let provider = test_chatgpt_provider("http://127.0.0.1/responses".to_string()).await;
-        let token = chatgpt_test_token();
-        let mut first_body = chatgpt_websocket_test_body();
-        let first = provider
-            .prepare_sse_continuation(
-                &token,
-                &mut first_body,
-                Some("conversation-sse-continuation"),
-                30,
-                false,
-            )
-            .await;
-        assert!(!first.used);
-        assert!(first.send_body.get("previous_response_id").is_none());
-        provider
-            .websocket_session
-            .lock()
-            .await
-            .complete_continuation(
-                &first,
-                &websocket_response_completed_with_output(
-                    "resp-sse-1",
-                    json!([{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "hello"}]
-                    }]),
-                ),
-            );
-
-        let second_delta = json!({"role": "user", "content": "next"});
-        let mut second_body = chatgpt_websocket_test_body();
-        second_body["input"] = json!([
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
-            second_delta.clone()
-        ]);
-        let second = provider
-            .prepare_sse_continuation(
-                &token,
-                &mut second_body,
-                Some("conversation-sse-continuation"),
-                31,
-                false,
-            )
-            .await;
-
-        assert!(second.used);
-        assert_eq!(second.send_body["previous_response_id"], "resp-sse-1");
-        assert_eq!(second.send_body["input"], json!([second_delta]));
-    }
-
-    #[tokio::test]
     async fn chatgpt_websocket_continuation_sends_previous_response_id_and_delta_input() {
         let first_body = chatgpt_websocket_test_body();
         let second_delta = json!({"role": "user", "content": "next"});
@@ -4720,68 +4490,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_auto_transport_sse_fallback_preserves_full_body_after_continuation_attempt() {
-        let second_delta = json!({"role": "user", "content": "next"});
-        let mut second_body = chatgpt_websocket_test_body();
-        second_body["input"] = json!([
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"},
-            second_delta.clone()
-        ]);
-        let (endpoint, websocket_requests, sse_requests) =
-            websocket_continuation_then_sse_fallback_server().await;
-        let mut provider = test_chatgpt_provider(endpoint).await;
-        provider.transport = ChatGptTransport::Auto;
-
-        let first = provider
-            .chat_prepared_with_token(
-                chatgpt_test_prepared_request_with_body(
-                    20,
-                    chatgpt_websocket_test_body(),
-                    Some("conversation-auto-fallback"),
-                ),
-                chatgpt_test_token(),
-            )
-            .await
-            .expect("first websocket stream should start");
-        assert!(
-            collect_stream_results(first)
-                .await
-                .iter()
-                .all(Result::is_ok)
-        );
-
-        let second = provider
-            .chat_prepared_with_token(
-                chatgpt_test_prepared_request_with_body(
-                    21,
-                    second_body,
-                    Some("conversation-auto-fallback"),
-                ),
-                chatgpt_test_token(),
-            )
-            .await
-            .expect("auto transport should fall back to SSE");
-        assert!(
-            collect_stream_results(second)
-                .await
-                .iter()
-                .all(Result::is_ok)
-        );
-
-        let websocket_requests = websocket_requests.lock().unwrap();
-        assert_eq!(websocket_requests.len(), 2);
-        assert_eq!(websocket_requests[1]["previous_response_id"], "resp-ws-1");
-        assert_eq!(websocket_requests[1]["input"], json!([second_delta]));
-        let sse_requests = sse_requests.lock().await;
-        assert_eq!(sse_requests.len(), 1);
-        let sse_body: Value = serde_json::from_slice(&sse_requests[0].body).unwrap();
-        assert!(sse_body.get("previous_response_id").is_none());
-        assert_eq!(sse_body["input"].as_array().map(Vec::len), Some(3));
-        assert_eq!(provider.effective_transport(), ChatGptTransport::Sse);
-    }
-
-    #[tokio::test]
     async fn chatgpt_auto_transport_falls_back_to_sse_before_first_websocket_event() {
         let (endpoint, requests) = websocket_upgrade_required_then_sse_server().await;
         let mut provider = test_chatgpt_provider(endpoint).await;
@@ -5135,29 +4843,6 @@ mod tests {
 
         assert!(matches!(error, ProviderError::InvalidRequest(_)));
         assert!(error.to_string().contains("ToolSearch"));
-    }
-
-    #[test]
-    fn chatgpt_pre_send_compaction_truncates_oversized_body() {
-        let huge = "x".repeat(900_000);
-        let mut body = json!({
-            "model": "gpt-5.5",
-            "input": [{"role": "user", "content": huge}],
-            "tools": []
-        });
-        let threshold = chatgpt_request_warning_threshold("gpt-5.5").unwrap();
-        assert!(json_len(&body) >= threshold);
-
-        let stats = proactively_shrink_oversized_body(&mut body, 7, false).unwrap();
-
-        assert_eq!(stats.truncated_text_items, 1);
-        assert!(json_len(&body) < stats.original_body_bytes);
-        assert!(
-            body["input"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("chatgpt prompt truncated for retry")
-        );
     }
 
     #[test]
@@ -5708,85 +5393,6 @@ mod tests {
             format!("http://{addr}/responses"),
             requests,
             complete_second_tx,
-        )
-    }
-
-    async fn websocket_continuation_then_sse_fallback_server() -> (
-        String,
-        Arc<StdMutex<Vec<Value>>>,
-        Arc<Mutex<Vec<CapturedHttpRequest>>>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let websocket_requests = Arc::new(StdMutex::new(Vec::new()));
-        let sse_requests = Arc::new(Mutex::new(Vec::new()));
-        let captured_websocket_requests = Arc::clone(&websocket_requests);
-        let captured_sse_requests = Arc::clone(&sse_requests);
-
-        tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = accept_hdr_async(
-                socket,
-                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
-            )
-            .await
-            .unwrap();
-
-            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
-                captured_websocket_requests
-                    .lock()
-                    .unwrap()
-                    .push(serde_json::from_str(&text).unwrap());
-            }
-            websocket
-                .send(WsMessage::Text(
-                    websocket_response_created("resp-ws-1").to_string().into(),
-                ))
-                .await
-                .unwrap();
-            websocket
-                .send(WsMessage::Text(
-                    websocket_response_completed_with_output(
-                        "resp-ws-1",
-                        json!([{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "hello"}]
-                        }]),
-                    )
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-
-            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
-                captured_websocket_requests
-                    .lock()
-                    .unwrap()
-                    .push(serde_json::from_str(&text).unwrap());
-            }
-            let _ = websocket.close(None).await;
-
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_http_request_allow_empty_body(&mut socket).await;
-            captured_sse_requests.lock().await.push(request);
-            let response_body = format!(
-                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                websocket_response_created("resp-sse-2"),
-                websocket_response_completed("resp-sse-2")
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        (
-            format!("http://{addr}/responses"),
-            websocket_requests,
-            sse_requests,
         )
     }
 

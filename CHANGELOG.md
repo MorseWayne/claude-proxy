@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.7 - 2026-05-28
+
+### Changed in v1.3.7
+
+- Removed the ChatGPT SSE/HTTP `previous_response_id` continuation reuse added in v1.3.6; continuation remains limited to the WebSocket transport.
+- Removed proactive pre-send ChatGPT request compaction; prompt-too-long shrinking now only happens after an upstream prompt-too-long response.
+- Relaxed ChatGPT model capability metadata for sampling and stop-sequence parameters so clients are not rejected before provider-side request normalization.
+
 ## v1.3.6 - 2026-05-27
 
 ### Added in v1.3.6

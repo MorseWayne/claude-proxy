@@ -8,8 +8,8 @@
 Status: In Progress
 Level: 3
 Started: 2026-05-25
-Last updated: 2026-05-27
-Current phase: WebSocket env proxy validation
+Last updated: 2026-05-28
+Current phase: v1.3.7 reduced-risk ChatGPT payload fix
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -42,6 +42,8 @@ Current todo:
 - [ ] Prepare v1.3.0 release metadata and tag.
 - [x] Implement agreed ChatGPT upstream payload optimizations: reuse continuation for SSE/HTTP where safe, proactively compact oversized ChatGPT bodies before send, and add a ChatGPT tool-schema budget guard.
 - [x] Prepare v1.3.6 release metadata and changelog for ChatGPT payload optimizations.
+- [x] Fix ChatGPT capability metadata so client sampling/stop parameters are tolerated while the provider continues stripping unsupported upstream fields.
+- [x] Prepare v1.3.7 reduced-risk release metadata: remove v1.3.6 SSE/HTTP continuation and pre-send compaction, keep tool-schema guard.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -87,12 +89,14 @@ Changes:
 - Implemented agreed post-v1.3.5 ChatGPT upstream payload optimizations: SSE/HTTP now shares safe continuation state and can send `previous_response_id` plus delta input, oversized ChatGPT request bodies are compacted before first send when they approach the model context window, and oversized tool catalogs fail fast with a ToolSearch hint.
 - Validation for the payload optimization diff passed: `cargo fmt --check`, `cargo test -p claude-proxy-providers chatgpt_ -- --nocapture`, full `cargo test -p claude-proxy-providers`, and `git diff --check`.
 - GitNexus detect_changes reports CRITICAL because the diff intentionally touches ChatGPT SSE/WebSocket continuation/session handling and prompt-too-long request shrinking; affected processes align with the planned ChatGPT payload optimization scope.
+- Fixed compaction compatibility for ChatGPT/Codex models: capability metadata now reports sampling and stop_sequences as Unknown instead of Unsupported, so server capability validation tolerates client-supplied optional parameters that the ChatGPT Responses builder strips before sending upstream. Validation passed: `cargo fmt --all --check`, targeted ChatGPT model capability test, targeted Responses sampling-omission test, and GitNexus detect_changes (LOW).
+- User agreed v1.3.6 payload optimizations had low benefit for their complexity; v1.3.7 now removes SSE/HTTP continuation reuse and proactive pre-send compaction, while preserving the safer tool-schema budget guard and the sampling/stop capability compatibility fix. Validation passed: `cargo fmt --all --check`, targeted ChatGPT capability/tool-schema/Responses sampling/transport/continuation tests, `cargo test -p claude-proxy-providers chatgpt_`, `git diff --check`, and GitNexus detect_changes (LOW, no affected processes).
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit and tag v1.3.6, push the tag, then patch the GitHub Release body with the v1.3.6 changelog notes after the release workflow creates it.
+- Commit and tag v1.3.7 if the reduced-risk diff is accepted.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
