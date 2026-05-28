@@ -709,12 +709,14 @@ impl ChatGptProvider {
             .attempts
             .fetch_add(1, Ordering::Relaxed);
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
+        let thinking_diagnostics = Arc::new(ChatGptThinkingDiagnostics::default());
         let stream_started_at = Instant::now();
         let on_event = self.upstream_event_handler(
             request_id,
             compact_request,
             "websocket",
             Arc::clone(&first_upstream_event_seen),
+            Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
         );
@@ -766,6 +768,7 @@ impl ChatGptProvider {
             "websocket",
             stream_started_at,
             first_upstream_event_seen,
+            thinking_diagnostics,
         ))
     }
 
@@ -788,12 +791,14 @@ impl ChatGptProvider {
         self.cache_rate_limits(header_snapshots).await;
 
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
+        let thinking_diagnostics = Arc::new(ChatGptThinkingDiagnostics::default());
         let stream_started_at = Instant::now();
         let on_event = self.upstream_event_handler(
             request_id,
             compact_request,
             "sse",
             Arc::clone(&first_upstream_event_seen),
+            Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
         );
@@ -805,6 +810,7 @@ impl ChatGptProvider {
             "sse",
             stream_started_at,
             first_upstream_event_seen,
+            thinking_diagnostics,
         )
     }
 
@@ -814,6 +820,7 @@ impl ChatGptProvider {
         compact_request: bool,
         transport: &'static str,
         first_upstream_event_seen: Arc<AtomicBool>,
+        thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
         stream_started_at: Instant,
         observer: Option<ProviderRequestObserver>,
     ) -> impl Fn(&Value) + Send + Sync + 'static {
@@ -822,11 +829,11 @@ impl ChatGptProvider {
         let runtime_ids = self.runtime_ids_handle();
         let websocket_sse_cooldown_until_secs = self.websocket_sse_cooldown_handle();
         move |event| {
+            let event_type = event
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
             if !first_upstream_event_seen.swap(true, Ordering::Relaxed) {
-                let event_type = event
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
                 info!(
                     request_id,
                     compact_request,
@@ -835,6 +842,31 @@ impl ChatGptProvider {
                     event_type,
                     "ChatGPT upstream first event received"
                 );
+            }
+            if is_chatgpt_reasoning_delta_event(event_type) {
+                let delta_bytes = chatgpt_sse_delta_len(event) as u64;
+                let count = thinking_diagnostics
+                    .upstream_reasoning_delta_events
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                thinking_diagnostics
+                    .upstream_reasoning_delta_bytes
+                    .fetch_add(delta_bytes, Ordering::Relaxed);
+                if !thinking_diagnostics
+                    .first_upstream_reasoning_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    info!(
+                        request_id,
+                        compact_request,
+                        transport,
+                        elapsed_ms = elapsed_millis(stream_started_at),
+                        event_type,
+                        upstream_reasoning_delta_events = count,
+                        upstream_reasoning_delta_bytes = delta_bytes,
+                        "ChatGPT upstream reasoning delta observed"
+                    );
+                }
             }
             if let Some(snapshot) =
                 rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
@@ -864,6 +896,18 @@ impl ChatGptProvider {
                     upstream_error_message = chatgpt_sse_error_message(event).unwrap_or(""),
                     upstream_model = chatgpt_sse_model(event).unwrap_or("unknown"),
                     upstream_response_id = chatgpt_sse_response_id(event).unwrap_or(""),
+                    upstream_reasoning_delta_events = thinking_diagnostics
+                        .upstream_reasoning_delta_events
+                        .load(Ordering::Relaxed),
+                    upstream_reasoning_delta_bytes = thinking_diagnostics
+                        .upstream_reasoning_delta_bytes
+                        .load(Ordering::Relaxed),
+                    downstream_thinking_delta_events = thinking_diagnostics
+                        .downstream_thinking_delta_events
+                        .load(Ordering::Relaxed),
+                    downstream_thinking_delta_bytes = thinking_diagnostics
+                        .downstream_thinking_delta_bytes
+                        .load(Ordering::Relaxed),
                     "ChatGPT upstream terminal event received"
                 );
                 if chatgpt_event_is_server_error(event) {
@@ -1284,6 +1328,17 @@ impl Provider for ChatGptProvider {
     }
 }
 
+#[derive(Default)]
+struct ChatGptThinkingDiagnostics {
+    upstream_reasoning_delta_events: AtomicU64,
+    upstream_reasoning_delta_bytes: AtomicU64,
+    downstream_thinking_delta_events: AtomicU64,
+    downstream_thinking_delta_bytes: AtomicU64,
+    first_upstream_reasoning_logged: AtomicBool,
+    first_downstream_thinking_logged: AtomicBool,
+    summary_logged: AtomicBool,
+}
+
 fn wrap_chatgpt_stream_logging(
     stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
     request_id: u64,
@@ -1291,10 +1346,52 @@ fn wrap_chatgpt_stream_logging(
     transport: &'static str,
     stream_started_at: Instant,
     first_upstream_event_seen: Arc<AtomicBool>,
+    thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let first_stream_item_seen = Arc::new(AtomicBool::new(false));
     let first_stream_item_seen_for_map = Arc::clone(&first_stream_item_seen);
     Box::pin(stream.map(move |result| {
+        if let Ok(event) = &result {
+            if let Some(delta_bytes) = downstream_thinking_delta_len(event) {
+                let count = thinking_diagnostics
+                    .downstream_thinking_delta_events
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                thinking_diagnostics
+                    .downstream_thinking_delta_bytes
+                    .fetch_add(delta_bytes as u64, Ordering::Relaxed);
+                if !thinking_diagnostics
+                    .first_downstream_thinking_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    info!(
+                        request_id,
+                        compact_request,
+                        transport,
+                        elapsed_ms = elapsed_millis(stream_started_at),
+                        downstream_thinking_delta_events = count,
+                        downstream_thinking_delta_bytes = delta_bytes,
+                        upstream_reasoning_delta_events = thinking_diagnostics
+                            .upstream_reasoning_delta_events
+                            .load(Ordering::Relaxed),
+                        upstream_reasoning_delta_bytes = thinking_diagnostics
+                            .upstream_reasoning_delta_bytes
+                            .load(Ordering::Relaxed),
+                        "ChatGPT downstream thinking delta emitted"
+                    );
+                }
+            }
+            if sse_event_finishes_message(event) {
+                log_chatgpt_thinking_diagnostics(
+                    &thinking_diagnostics,
+                    request_id,
+                    compact_request,
+                    transport,
+                    stream_started_at,
+                    "message_stop",
+                );
+            }
+        }
         if !first_stream_item_seen_for_map.swap(true, Ordering::Relaxed) {
             match &result {
                 Ok(event) => {
@@ -1317,11 +1414,86 @@ fn wrap_chatgpt_stream_logging(
                         first_upstream_event_seen = first_upstream_event_seen.load(Ordering::Relaxed),
                         "ChatGPT stream failed before first downstream item"
                     );
+                    log_chatgpt_thinking_diagnostics(
+                        &thinking_diagnostics,
+                        request_id,
+                        compact_request,
+                        transport,
+                        stream_started_at,
+                        "stream_error_before_first_item",
+                    );
                 }
             }
         }
+        if result.is_err() {
+            log_chatgpt_thinking_diagnostics(
+                &thinking_diagnostics,
+                request_id,
+                compact_request,
+                transport,
+                stream_started_at,
+                "stream_error",
+            );
+        }
         result
     }))
+}
+
+fn log_chatgpt_thinking_diagnostics(
+    diagnostics: &ChatGptThinkingDiagnostics,
+    request_id: u64,
+    compact_request: bool,
+    transport: &'static str,
+    stream_started_at: Instant,
+    terminal_reason: &'static str,
+) {
+    if diagnostics.summary_logged.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    info!(
+        request_id,
+        compact_request,
+        transport,
+        terminal_reason,
+        elapsed_ms = elapsed_millis(stream_started_at),
+        upstream_reasoning_delta_events = diagnostics
+            .upstream_reasoning_delta_events
+            .load(Ordering::Relaxed),
+        upstream_reasoning_delta_bytes = diagnostics
+            .upstream_reasoning_delta_bytes
+            .load(Ordering::Relaxed),
+        downstream_thinking_delta_events = diagnostics
+            .downstream_thinking_delta_events
+            .load(Ordering::Relaxed),
+        downstream_thinking_delta_bytes = diagnostics
+            .downstream_thinking_delta_bytes
+            .load(Ordering::Relaxed),
+        "ChatGPT thinking stream diagnostics"
+    );
+}
+
+fn is_chatgpt_reasoning_delta_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta"
+    )
+}
+
+fn chatgpt_sse_delta_len(event: &Value) -> usize {
+    event
+        .get("delta")
+        .and_then(Value::as_str)
+        .map_or(0, str::len)
+}
+
+fn downstream_thinking_delta_len(event: &SseEvent) -> Option<usize> {
+    (event.event == "content_block_delta"
+        && event.data["delta"]["type"].as_str() == Some("thinking_delta"))
+    .then(|| event.data["delta"]["thinking"].as_str().map_or(0, str::len))
+}
+
+fn sse_event_finishes_message(event: &SseEvent) -> bool {
+    event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
 }
 
 fn chatgpt_request_headers(

@@ -647,7 +647,7 @@ fn default_stream_overall_timeout_seconds() -> u64 {
     600
 }
 fn default_tool_use_terminal_timeout_seconds() -> u64 {
-    30
+    120
 }
 fn default_rate_limit() -> u32 {
     40
@@ -1263,7 +1263,7 @@ auth_token = "test-token"
         assert_eq!(settings.server.sse_heartbeat_interval_seconds, 15);
         assert_eq!(settings.server.stream_idle_timeout_seconds, 120);
         assert_eq!(settings.server.stream_overall_timeout_seconds, 600);
-        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 30);
+        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 120);
 
         let toml = r#"
 [server]

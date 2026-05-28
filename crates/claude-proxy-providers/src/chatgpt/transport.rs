@@ -151,6 +151,7 @@ pub(super) struct ChatGptWebSocketSession {
     continuations: HashMap<ContinuationKey, CachedContinuation>,
     busy: HashSet<ContinuationKey>,
     generations: HashMap<ContinuationKey, u64>,
+    next_connection_id: u64,
 }
 
 impl ChatGptWebSocketSession {
@@ -160,29 +161,43 @@ impl ChatGptWebSocketSession {
             continuations: HashMap::new(),
             busy: HashSet::new(),
             generations: HashMap::new(),
+            next_connection_id: 1,
         }
     }
 
-    fn take_fresh(&mut self, key: &WebSocketConnectionKey) -> Option<ChatGptWsStream> {
+    fn take_fresh(&mut self, key: &WebSocketConnectionKey) -> Option<(ChatGptWsStream, u64)> {
         let cached = self.cached.take()?;
         if cached.key == *key && cached.last_used.elapsed() <= CHATGPT_WEBSOCKET_SESSION_IDLE_TTL {
-            Some(cached.stream)
+            Some((cached.stream, cached.connection_id))
         } else {
             self.clear_volatile_state();
             None
         }
     }
 
-    fn store_if_empty(&mut self, stream: ChatGptWsStream, key: WebSocketConnectionKey) -> bool {
+    fn store_if_empty(
+        &mut self,
+        stream: ChatGptWsStream,
+        key: WebSocketConnectionKey,
+        connection_id: Option<u64>,
+    ) -> Option<u64> {
         if self.cached.is_some() {
-            return false;
+            return None;
         }
+        let connection_id = connection_id.unwrap_or_else(|| self.allocate_connection_id());
         self.cached = Some(CachedWebSocketConnection {
             stream,
             key,
+            connection_id,
             last_used: Instant::now(),
         });
-        true
+        Some(connection_id)
+    }
+
+    fn allocate_connection_id(&mut self) -> u64 {
+        let connection_id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.saturating_add(1).max(1);
+        connection_id
     }
 
     fn clear_volatile_state(&mut self) {
@@ -198,6 +213,7 @@ impl ChatGptWebSocketSession {
         token: &ChatGptToken,
         body: &Value,
         stable_client_conversation_id: Option<&str>,
+        active_connection_id: Option<u64>,
     ) -> ContinuationAttempt {
         self.prune_expired_continuations();
         let Some(key) = continuation_key(provider, token, body, stable_client_conversation_id)
@@ -230,11 +246,32 @@ impl ChatGptWebSocketSession {
             );
         }
 
+        let Some(active_connection_id) = active_connection_id else {
+            let generation = self.current_generation(&key);
+            self.busy.insert(key.clone());
+            return ContinuationAttempt {
+                key: Some(key),
+                send_body: body.clone(),
+                canonical_body,
+                full_input,
+                used: false,
+                synthetic_fallback_used: false,
+                update_on_success: true,
+                owns_busy: true,
+                generation,
+                disabled_reason: ContinuationDisabledReason::ConnectionNotReused,
+            };
+        };
+
         let mut active_key = key.clone();
         let mut synthetic_fallback_used = false;
         if !self.continuations.contains_key(&active_key)
-            && let Some(fallback_key) =
-                self.synthetic_continuation_fallback_key(&key, &canonical_body, &full_input)
+            && let Some(fallback_key) = self.synthetic_continuation_fallback_key(
+                &key,
+                &canonical_body,
+                &full_input,
+                active_connection_id,
+            )
         {
             active_key = fallback_key;
             synthetic_fallback_used = true;
@@ -265,6 +302,10 @@ impl ChatGptWebSocketSession {
             {
                 self.clear_continuation_for_key(&active_key);
                 disabled_reason = ContinuationDisabledReason::BodyMismatch;
+            }
+            Some(cached) if cached.connection_id != active_connection_id => {
+                self.clear_continuation_for_key(&active_key);
+                disabled_reason = ContinuationDisabledReason::ConnectionNotReused;
             }
             Some(cached) if cached.response_id.is_empty() => {
                 self.clear_continuation_for_key(&active_key);
@@ -312,7 +353,12 @@ impl ChatGptWebSocketSession {
         }
     }
 
-    fn complete_continuation(&mut self, attempt: &ContinuationAttempt, terminal_event: &Value) {
+    fn complete_continuation(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        terminal_event: &Value,
+        connection_id: u64,
+    ) {
         let Some(key) = attempt.key.as_ref() else {
             return;
         };
@@ -352,6 +398,7 @@ impl ChatGptWebSocketSession {
                 full_input: attempt.full_input.clone(),
                 assistant_output_items,
                 response_id: response_id.to_string(),
+                connection_id,
                 updated_at: Instant::now(),
             },
         );
@@ -366,6 +413,34 @@ impl ChatGptWebSocketSession {
                 self.clear_continuation_for_key(key);
                 self.bump_generation(key);
             }
+        }
+    }
+
+    fn fail_continuation_for_connection(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        checked_out_connection_id: Option<u64>,
+    ) {
+        if let Some(connection_id) = checked_out_connection_id {
+            self.invalidate_continuations_for_connection(connection_id);
+        }
+        self.fail_continuation(attempt);
+    }
+
+    fn complete_continuation_if_connection_cached(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        terminal_event: &Value,
+        cached_connection_id: Option<u64>,
+        checked_out_connection_id: Option<u64>,
+    ) {
+        if let Some(connection_id) = cached_connection_id {
+            self.complete_continuation(attempt, terminal_event, connection_id);
+        } else {
+            if let Some(connection_id) = checked_out_connection_id {
+                self.invalidate_continuations_for_connection(connection_id);
+            }
+            self.fail_continuation(attempt);
         }
     }
 
@@ -391,11 +466,17 @@ impl ChatGptWebSocketSession {
         self.continuations.remove(key);
     }
 
+    fn invalidate_continuations_for_connection(&mut self, connection_id: u64) {
+        self.continuations
+            .retain(|_, cached| cached.connection_id != connection_id);
+    }
+
     fn synthetic_continuation_fallback_key(
         &self,
         key: &ContinuationKey,
         canonical_body: &Value,
         full_input: &[Value],
+        active_connection_id: u64,
     ) -> Option<ContinuationKey> {
         if !is_synthetic_continuation_id(&key.stable_client_conversation_id) {
             return None;
@@ -408,6 +489,7 @@ impl ChatGptWebSocketSession {
                     && same_continuation_fallback_scope(candidate, key)
                     && is_synthetic_continuation_id(&candidate.stable_client_conversation_id)
                     && !self.busy.contains(*candidate)
+                    && cached.connection_id == active_connection_id
                     && !cached.response_id.is_empty()
                     && canonical_bodies_match_for_continuation(
                         &cached.canonical_body,
@@ -450,6 +532,7 @@ struct CachedContinuation {
     full_input: Vec<Value>,
     assistant_output_items: Vec<Value>,
     response_id: String,
+    connection_id: u64,
     updated_at: Instant,
 }
 
@@ -464,6 +547,7 @@ enum ContinuationDisabledReason {
     BodyMismatch,
     PrefixMismatch,
     MissingResponseId,
+    ConnectionNotReused,
 }
 
 impl ContinuationDisabledReason {
@@ -478,6 +562,7 @@ impl ContinuationDisabledReason {
             Self::BodyMismatch => "body_mismatch",
             Self::PrefixMismatch => "prefix_mismatch",
             Self::MissingResponseId => "missing_response_id",
+            Self::ConnectionNotReused => "connection_not_reused",
         }
     }
 }
@@ -535,6 +620,7 @@ impl ContinuationAttempt {
 struct CachedWebSocketConnection {
     stream: ChatGptWsStream,
     key: WebSocketConnectionKey,
+    connection_id: u64,
     last_used: Instant,
 }
 
@@ -807,11 +893,25 @@ where
     F: Fn(&Value) + Send + Sync + 'static,
 {
     let idle_timeout = websocket_idle_timeout(provider);
+    let connection_key = websocket_connection_key(provider, token, &body);
+    let (mut stream, reused, checked_out_connection_id) =
+        match checkout_connection(provider, token, &connection_key).await {
+            Ok((stream, reused, connection_id)) => (stream, reused, connection_id),
+            Err(error) => {
+                return Err(error);
+            }
+        };
     let continuation = provider
         .websocket_session
         .lock()
         .await
-        .prepare_continuation(provider, token, &body, stable_client_conversation_id);
+        .prepare_continuation(
+            provider,
+            token,
+            &body,
+            stable_client_conversation_id,
+            checked_out_connection_id,
+        );
     info!(
         transport = "websocket",
         continuation_key_present = continuation.key.is_some(),
@@ -820,6 +920,8 @@ where
         continuation_disabled_reason = continuation.disabled_reason.as_str(),
         continuation_send_body_bytes =
             serde_json::to_vec(&continuation.send_body).map_or(0, |bytes| bytes.len()),
+        continuation_websocket_reused = reused,
+        websocket_connection_id = checked_out_connection_id.unwrap_or(0),
         prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
         stable_client_conversation_id_present = stable_client_conversation_id.is_some(),
         continuation_delta_items = continuation
@@ -833,18 +935,6 @@ where
         "ChatGPT websocket continuation decision"
     );
 
-    let connection_key = websocket_connection_key(provider, token, &body);
-    let (mut stream, reused) = match checkout_connection(provider, token, &connection_key).await {
-        Ok((stream, reused)) => (stream, reused),
-        Err(error) => {
-            provider
-                .websocket_session
-                .lock()
-                .await
-                .fail_continuation(&continuation);
-            return Err(error);
-        }
-    };
     let request_text = match response_create_request_text(continuation.send_body.clone()) {
         Ok(request_text) => request_text,
         Err(error) => {
@@ -852,7 +942,7 @@ where
                 .websocket_session
                 .lock()
                 .await
-                .fail_continuation(&continuation);
+                .fail_continuation_for_connection(&continuation, checked_out_connection_id);
             return Err(error);
         }
     };
@@ -861,7 +951,7 @@ where
             .websocket_session
             .lock()
             .await
-            .fail_continuation(&continuation);
+            .fail_continuation_for_connection(&continuation, checked_out_connection_id);
         return Err(ChatGptWebSocketStartError::with_phase(
             error,
             true,
@@ -876,7 +966,7 @@ where
                 .websocket_session
                 .lock()
                 .await
-                .fail_continuation(&continuation);
+                .fail_continuation_for_connection(&continuation, checked_out_connection_id);
             return Err(error);
         }
     };
@@ -887,7 +977,7 @@ where
             .websocket_session
             .lock()
             .await
-            .fail_continuation(&continuation);
+            .fail_continuation_for_connection(&continuation, checked_out_connection_id);
         return Err(ChatGptWebSocketStartError::new(
             response_consumer_dropped_error(),
             false,
@@ -901,10 +991,6 @@ where
     tokio::spawn(async move {
         if first_event_terminal {
             let server_error = super::chatgpt_event_is_server_error(&first_event);
-            websocket_session
-                .lock()
-                .await
-                .complete_continuation(&continuation, &first_event);
             if server_error {
                 rotate_chatgpt_runtime_ids_after_server_error(
                     &runtime_ids,
@@ -919,7 +1005,17 @@ where
                 websocket_session.lock().await.clear_volatile_state();
                 close_or_release_websocket(stream).await;
             } else {
-                store_completed_connection(websocket_session, stream, connection_key).await;
+                complete_and_store_connection(
+                    websocket_session,
+                    stream,
+                    connection_key,
+                    &continuation,
+                    &first_event,
+                    request_id,
+                    reused,
+                    checked_out_connection_id,
+                )
+                .await;
             }
             return;
         }
@@ -930,7 +1026,7 @@ where
                     websocket_session
                         .lock()
                         .await
-                        .fail_continuation(&continuation);
+                        .fail_continuation_for_connection(&continuation, checked_out_connection_id);
                     close_or_release_websocket(stream).await;
                     return;
                 }
@@ -942,16 +1038,15 @@ where
                                 websocket_session
                                     .lock()
                                     .await
-                                    .fail_continuation(&continuation);
+                                    .fail_continuation_for_connection(
+                                        &continuation,
+                                        checked_out_connection_id,
+                                    );
                                 close_or_release_websocket(stream).await;
                                 return;
                             }
                             if terminal {
                                 let server_error = super::chatgpt_event_is_server_error(&event);
-                                websocket_session
-                                    .lock()
-                                    .await
-                                    .complete_continuation(&continuation, &event);
                                 if server_error {
                                     rotate_chatgpt_runtime_ids_after_server_error(
                                         &runtime_ids,
@@ -966,7 +1061,17 @@ where
                                     websocket_session.lock().await.clear_volatile_state();
                                     close_or_release_websocket(stream).await;
                                 } else {
-                                    store_completed_connection(websocket_session, stream, connection_key).await;
+                                    complete_and_store_connection(
+                                        websocket_session,
+                                        stream,
+                                        connection_key,
+                                        &continuation,
+                                        &event,
+                                        request_id,
+                                        reused,
+                                        checked_out_connection_id,
+                                    )
+                                    .await;
                                 }
                                 return;
                             }
@@ -976,7 +1081,10 @@ where
                             websocket_session
                                 .lock()
                                 .await
-                                .fail_continuation(&continuation);
+                                .fail_continuation_for_connection(
+                                    &continuation,
+                                    checked_out_connection_id,
+                                );
                             if server_error {
                                 rotate_chatgpt_runtime_ids_after_server_error(
                                     &runtime_ids,
@@ -1011,27 +1119,44 @@ async fn checkout_connection(
     provider: &ChatGptProvider,
     token: &ChatGptToken,
     key: &WebSocketConnectionKey,
-) -> Result<(ChatGptWsStream, bool), ChatGptWebSocketStartError> {
-    if let Some(stream) = provider.websocket_session.lock().await.take_fresh(key) {
-        return Ok((stream, true));
+) -> Result<(ChatGptWsStream, bool, Option<u64>), ChatGptWebSocketStartError> {
+    if let Some((stream, connection_id)) = provider.websocket_session.lock().await.take_fresh(key) {
+        return Ok((stream, true, Some(connection_id)));
     }
 
     let url = websocket_url(provider)?;
     let headers = websocket_headers(provider, token)?;
     let stream = connect_websocket(provider, url, headers).await?;
-    Ok((stream, false))
+    Ok((stream, false, None))
 }
 
-async fn store_completed_connection(
+async fn complete_and_store_connection(
     websocket_session: std::sync::Arc<tokio::sync::Mutex<ChatGptWebSocketSession>>,
     stream: ChatGptWsStream,
     key: WebSocketConnectionKey,
+    continuation: &ContinuationAttempt,
+    terminal_event: &Value,
+    request_id: u64,
+    request_websocket_reused: bool,
+    checked_out_connection_id: Option<u64>,
 ) {
-    let stored = websocket_session.lock().await.store_if_empty(stream, key);
+    let mut session = websocket_session.lock().await;
+    let cached_connection_id = session.store_if_empty(stream, key, checked_out_connection_id);
+    session.complete_continuation_if_connection_cached(
+        continuation,
+        terminal_event,
+        cached_connection_id,
+        checked_out_connection_id,
+    );
+    drop(session);
+
     info!(
+        request_id,
         transport = "websocket",
-        websocket_reused = false,
-        websocket_cached = stored,
+        websocket_reused = request_websocket_reused,
+        websocket_cached = cached_connection_id.is_some(),
+        websocket_connection_id = cached_connection_id.unwrap_or(0),
+        continuation_cached = cached_connection_id.is_some(),
         "ChatGPT websocket response stream completed"
     );
 }
@@ -1957,6 +2082,7 @@ mod tests {
                 full_input: vec![json!({"role": "user", "content": "first"})],
                 assistant_output_items: assistant_output,
                 response_id: "resp-1".to_string(),
+                connection_id: 1,
                 updated_at: Instant::now(),
             },
         );
@@ -1975,6 +2101,7 @@ mod tests {
                 json!({"role": "assistant", "content": "answer"}),
                 json!({"role": "user", "content": "follow-up"}),
             ],
+            1,
         );
 
         assert_eq!(fallback, Some(cached_key));
@@ -2005,6 +2132,7 @@ mod tests {
                 full_input: vec![json!({"role": "user", "content": "first"})],
                 assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
                 response_id: "resp-1".to_string(),
+                connection_id: 1,
                 updated_at: Instant::now(),
             },
         );
@@ -2021,6 +2149,7 @@ mod tests {
                 json!({"role": "assistant", "content": "answer"}),
                 json!({"role": "user", "content": "follow-up"}),
             ],
+            1,
         );
 
         assert_eq!(fallback, None);
@@ -2085,6 +2214,7 @@ mod tests {
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: Vec::new(),
             response_id: "resp-1".to_string(),
+            connection_id: 1,
             updated_at: Instant::now(),
         };
         let full_input = vec![
@@ -2105,6 +2235,7 @@ mod tests {
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: Vec::new(),
             response_id: "resp-1".to_string(),
+            connection_id: 1,
             updated_at: Instant::now(),
         };
         let full_input = vec![
@@ -2162,6 +2293,109 @@ mod tests {
     }
 
     #[test]
+    fn continuation_synthetic_fallback_rejects_different_connection_id() {
+        let cached_key = ContinuationKey {
+            provider_id: "chatgpt".to_string(),
+            account_id: "account".to_string(),
+            model: "gpt-5.5".to_string(),
+            stable_client_conversation_id: "cp-synth-old".to_string(),
+            schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        };
+        let current_key = ContinuationKey {
+            stable_client_conversation_id: "cp-synth-new".to_string(),
+            ..cached_key.clone()
+        };
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "follow-up"}),
+        ];
+        let mut session = ChatGptWebSocketSession::new();
+        session.continuations.insert(
+            cached_key,
+            CachedContinuation {
+                canonical_body: canonical_request_body(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "prompt_cache_key": "cp-synth-old",
+                    "input": [{"role": "user", "content": "first"}],
+                })),
+                full_input: vec![json!({"role": "user", "content": "first"})],
+                assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
+                response_id: "resp-old".to_string(),
+                connection_id: 1,
+                updated_at: Instant::now(),
+            },
+        );
+
+        let fallback = session.synthetic_continuation_fallback_key(
+            &current_key,
+            &canonical_request_body(&json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "prompt_cache_key": "cp-synth-new",
+                "input": full_input,
+            })),
+            &[
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "assistant", "content": "answer"}),
+                json!({"role": "user", "content": "follow-up"}),
+            ],
+            2,
+        );
+
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn continuation_does_not_cache_response_id_when_connection_not_cached() {
+        let mut session = ChatGptWebSocketSession::new();
+        let key = ContinuationKey {
+            provider_id: "chatgpt".to_string(),
+            account_id: "account".to_string(),
+            model: "gpt-5.5".to_string(),
+            stable_client_conversation_id: "conversation".to_string(),
+            schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        };
+        let attempt = ContinuationAttempt {
+            key: Some(key.clone()),
+            send_body: json!({}),
+            canonical_body: json!({"model": "gpt-5.5"}),
+            full_input: vec![json!({"role": "user", "content": "hi"})],
+            used: true,
+            synthetic_fallback_used: false,
+            update_on_success: true,
+            owns_busy: true,
+            generation: 0,
+            disabled_reason: ContinuationDisabledReason::None,
+        };
+        session.busy.insert(key.clone());
+        let terminal_event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-new",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }]
+            }
+        });
+
+        session.complete_continuation_if_connection_cached(
+            &attempt,
+            &terminal_event,
+            None,
+            Some(1),
+        );
+
+        assert!(session.continuations.is_empty());
+        assert!(session.busy.is_empty());
+        assert_eq!(session.current_generation(&key), 1);
+    }
+
+    #[test]
     fn continuation_prunes_expired_entries() {
         let mut session = ChatGptWebSocketSession::new();
         let key = ContinuationKey {
@@ -2178,6 +2412,7 @@ mod tests {
                 full_input: vec![json!({"role": "user", "content": "hi"})],
                 assistant_output_items: Vec::new(),
                 response_id: "resp-1".to_string(),
+                connection_id: 1,
                 updated_at: Instant::now()
                     - CHATGPT_WEBSOCKET_SESSION_IDLE_TTL
                     - Duration::from_secs(1),
