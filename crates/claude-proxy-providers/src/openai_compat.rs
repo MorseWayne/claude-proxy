@@ -295,6 +295,17 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 reasoning_effort_levels: reasoning_efforts,
                 ..Default::default()
             },
+            quality: QualityGateCapabilities {
+                tool_search: ToolSearchCapability::unsupported(),
+                prompt_cache: PromptCacheCapability::basic(),
+                max_effort: CapabilityState::from_bool(
+                    supports_reasoning_effort(model_id, "xhigh").then_some(true),
+                ),
+                structured_outputs: CapabilityState::Supported,
+                fast_mode: CapabilityState::Supported,
+                token_counting: TokenCountingCapability::rough(),
+                ..Default::default()
+            },
             supported_parameters: openai_supported_parameters(supports_reasoning),
         },
     }
@@ -735,6 +746,19 @@ mod tests {
         assert_eq!(
             info.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            info.capabilities.quality.tool_search.state,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            info.capabilities.quality.prompt_cache.scope,
+            PromptCacheScope::Basic
+        );
+        assert!(info.capabilities.quality.max_effort.is_supported());
+        assert_eq!(
+            info.capabilities.quality.token_counting.mode,
+            TokenCountingMode::Rough
         );
     }
 

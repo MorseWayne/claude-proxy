@@ -2462,6 +2462,15 @@ fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
                 max_thinking_budget: None,
                 reasoning_effort_levels: reasoning_efforts,
             },
+            quality: QualityGateCapabilities {
+                tool_search: ToolSearchCapability::unsupported(),
+                prompt_cache: PromptCacheCapability::basic(),
+                max_effort: CapabilityState::Supported,
+                structured_outputs: CapabilityState::Supported,
+                fast_mode: CapabilityState::Supported,
+                token_counting: TokenCountingCapability::rough(),
+                ..Default::default()
+            },
             supported_parameters: vec![
                 "system".to_string(),
                 "messages".to_string(),
@@ -2987,6 +2996,20 @@ mod tests {
                 .capabilities
                 .supported_parameters
                 .contains(&"service_tier".to_string())
+        );
+        assert_eq!(
+            gpt55.capabilities.quality.tool_search.state,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            gpt55.capabilities.quality.prompt_cache.scope,
+            PromptCacheScope::Basic
+        );
+        assert!(gpt55.capabilities.quality.structured_outputs.is_supported());
+        assert!(gpt55.capabilities.quality.fast_mode.is_supported());
+        assert_eq!(
+            gpt55.capabilities.quality.token_counting.mode,
+            TokenCountingMode::Rough
         );
         assert_eq!(
             gpt55.capabilities.limits.reasoning_effort_levels,

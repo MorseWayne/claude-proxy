@@ -1,6 +1,8 @@
 use claude_proxy_core::{
     CapabilityState, EndpointCapabilities, FeatureCapabilities, InputModalities,
-    ModalityCapabilities, ModelCapabilities, ModelInfo, ModelLimits,
+    ModalityCapabilities, ModelCapabilities, ModelInfo, ModelLimits, PromptCacheCapability,
+    QualityGateBetaLocation, QualityGateCapabilities, QualityGateHeaderKind,
+    TokenCountingCapability, ToolSearchCapability,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -33,6 +35,18 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
         .as_bool()
         .or_else(|| capabilities["supports_adaptive_thinking"].as_bool())
         .or_else(|| supports["adaptive_thinking"].as_bool());
+    let supports_tool_search = model["supports_tool_search"]
+        .as_bool()
+        .or_else(|| capabilities["supports_tool_search"].as_bool())
+        .or_else(|| supports["tool_search"].as_bool());
+    let supports_structured_outputs = model["supports_structured_outputs"]
+        .as_bool()
+        .or_else(|| capabilities["supports_structured_outputs"].as_bool())
+        .or_else(|| supports["structured_outputs"].as_bool());
+    let supports_strict_tools = model["supports_strict_tools"]
+        .as_bool()
+        .or_else(|| capabilities["supports_strict_tools"].as_bool())
+        .or_else(|| supports["strict_tools"].as_bool());
     let min_thinking_budget = model["min_thinking_budget"]
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
@@ -64,6 +78,7 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
         })
         .unwrap_or_default();
     let supported_endpoints = parse_supported_endpoints(&model["supported_endpoints"]);
+    let supports_reasoning_effort = !reasoning_effort_levels.is_empty();
 
     Some(ModelInfo {
         model_id: model_id.to_string(),
@@ -90,7 +105,7 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
                 thinking: CapabilityState::from_bool(supports_thinking),
                 adaptive_thinking: CapabilityState::from_bool(supports_adaptive_thinking),
                 reasoning_effort: CapabilityState::from_bool(
-                    (!reasoning_effort_levels.is_empty()).then_some(true),
+                    supports_reasoning_effort.then_some(true),
                 ),
                 sampling: CapabilityState::Supported,
                 stop_sequences: CapabilityState::Supported,
@@ -108,6 +123,23 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
                 min_thinking_budget,
                 max_thinking_budget,
                 reasoning_effort_levels,
+            },
+            quality: QualityGateCapabilities {
+                tool_search: match supports_tool_search {
+                    Some(true) => ToolSearchCapability::supported(
+                        QualityGateHeaderKind::Anthropic3p,
+                        QualityGateBetaLocation::Header,
+                    ),
+                    Some(false) => ToolSearchCapability::unsupported(),
+                    None => ToolSearchCapability::default(),
+                },
+                prompt_cache: PromptCacheCapability::basic(),
+                interleaved_thinking: CapabilityState::from_bool(supports_thinking),
+                max_effort: CapabilityState::from_bool(supports_reasoning_effort.then_some(true)),
+                structured_outputs: CapabilityState::from_bool(supports_structured_outputs),
+                strict_tools: CapabilityState::from_bool(supports_strict_tools),
+                token_counting: TokenCountingCapability::rough(),
+                ..Default::default()
             },
             supported_parameters: copilot_supported_parameters(supports_thinking.is_some()),
         },
@@ -159,6 +191,7 @@ fn parse_supported_endpoints(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_proxy_core::TokenCountingMode;
 
     #[test]
     fn parse_copilot_model_extracts_capabilities() {
@@ -177,6 +210,9 @@ mod tests {
                 "supports": {
                     "vision": true,
                     "adaptive_thinking": true,
+                    "tool_search": true,
+                    "structured_outputs": true,
+                    "strict_tools": false,
                     "min_thinking_budget": 2048,
                     "max_thinking_budget": 12000,
                     "reasoning_effort": ["low", "medium", "high", "xhigh"]
@@ -205,6 +241,20 @@ mod tests {
         assert_eq!(
             model.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh"]
+        );
+        assert!(model.capabilities.quality.tool_search.state.is_supported());
+        assert_eq!(
+            model.capabilities.quality.tool_search.header_kind,
+            QualityGateHeaderKind::Anthropic3p
+        );
+        assert!(model.capabilities.quality.structured_outputs.is_supported());
+        assert_eq!(
+            model.capabilities.quality.strict_tools,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            model.capabilities.quality.token_counting.mode,
+            TokenCountingMode::Rough
         );
     }
 

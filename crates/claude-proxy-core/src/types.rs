@@ -452,6 +452,161 @@ pub struct FeatureCapabilities {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QualityGateCapabilities {
+    #[serde(default)]
+    pub tool_search: ToolSearchCapability,
+    #[serde(default)]
+    pub fine_grained_tool_streaming: CapabilityState,
+    #[serde(default)]
+    pub prompt_cache: PromptCacheCapability,
+    #[serde(default)]
+    pub context_management: ContextManagementCapability,
+    #[serde(default)]
+    pub interleaved_thinking: CapabilityState,
+    #[serde(default)]
+    pub max_effort: CapabilityState,
+    #[serde(default)]
+    pub structured_outputs: CapabilityState,
+    #[serde(default)]
+    pub strict_tools: CapabilityState,
+    #[serde(default)]
+    pub token_efficient_tools: CapabilityState,
+    #[serde(default)]
+    pub fast_mode: CapabilityState,
+    #[serde(default)]
+    pub token_counting: TokenCountingCapability,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityGateHeaderKind {
+    #[default]
+    None,
+    #[serde(rename = "anthropic_1p")]
+    Anthropic1p,
+    #[serde(rename = "anthropic_3p")]
+    Anthropic3p,
+    ExtraBody,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityGateBetaLocation {
+    #[default]
+    None,
+    Header,
+    ExtraBody,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ToolSearchCapability {
+    #[serde(default)]
+    pub state: CapabilityState,
+    #[serde(default)]
+    pub header_kind: QualityGateHeaderKind,
+    #[serde(default)]
+    pub beta_location: QualityGateBetaLocation,
+}
+
+impl ToolSearchCapability {
+    pub fn supported(
+        header_kind: QualityGateHeaderKind,
+        beta_location: QualityGateBetaLocation,
+    ) -> Self {
+        Self {
+            state: CapabilityState::Supported,
+            header_kind,
+            beta_location,
+        }
+    }
+
+    pub fn unsupported() -> Self {
+        Self {
+            state: CapabilityState::Unsupported,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheScope {
+    #[default]
+    Unknown,
+    None,
+    Basic,
+    GlobalScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PromptCacheCapability {
+    #[serde(default)]
+    pub state: CapabilityState,
+    #[serde(default)]
+    pub scope: PromptCacheScope,
+}
+
+impl PromptCacheCapability {
+    pub fn basic() -> Self {
+        Self {
+            state: CapabilityState::Supported,
+            scope: PromptCacheScope::Basic,
+        }
+    }
+
+    pub fn unsupported() -> Self {
+        Self {
+            state: CapabilityState::Unsupported,
+            scope: PromptCacheScope::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ContextManagementCapability {
+    #[serde(default)]
+    pub thinking_preservation: CapabilityState,
+    #[serde(default)]
+    pub tool_result_clearing: CapabilityState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenCountingMode {
+    #[default]
+    Unknown,
+    None,
+    Rough,
+    Native,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TokenCountingCapability {
+    #[serde(default)]
+    pub mode: TokenCountingMode,
+}
+
+impl TokenCountingCapability {
+    pub fn none() -> Self {
+        Self {
+            mode: TokenCountingMode::None,
+        }
+    }
+
+    pub fn rough() -> Self {
+        Self {
+            mode: TokenCountingMode::Rough,
+        }
+    }
+
+    pub fn native() -> Self {
+        Self {
+            mode: TokenCountingMode::Native,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
@@ -475,6 +630,8 @@ pub struct ModelCapabilities {
     pub features: FeatureCapabilities,
     #[serde(default)]
     pub limits: ModelLimits,
+    #[serde(default)]
+    pub quality: QualityGateCapabilities,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_parameters: Vec<String>,
 }
@@ -659,6 +816,20 @@ mod tests {
                     reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
                     ..Default::default()
                 },
+                quality: QualityGateCapabilities {
+                    tool_search: ToolSearchCapability::supported(
+                        QualityGateHeaderKind::Anthropic1p,
+                        QualityGateBetaLocation::Header,
+                    ),
+                    prompt_cache: PromptCacheCapability::basic(),
+                    context_management: ContextManagementCapability {
+                        thinking_preservation: CapabilityState::Supported,
+                        tool_result_clearing: CapabilityState::Unsupported,
+                    },
+                    structured_outputs: CapabilityState::Supported,
+                    token_counting: TokenCountingCapability::native(),
+                    ..Default::default()
+                },
                 supported_parameters: vec!["messages".to_string(), "tools".to_string()],
             },
         };
@@ -673,6 +844,18 @@ mod tests {
             "unknown"
         );
         assert_eq!(value["capabilities"]["limits"]["context_window"], 400_000);
+        assert_eq!(
+            value["capabilities"]["quality"]["tool_search"]["header_kind"],
+            "anthropic_1p"
+        );
+        assert_eq!(
+            value["capabilities"]["quality"]["prompt_cache"]["scope"],
+            "basic"
+        );
+        assert_eq!(
+            value["capabilities"]["quality"]["token_counting"]["mode"],
+            "native"
+        );
         assert_eq!(value["capabilities"]["supported_parameters"][1], "tools");
 
         let parsed: ModelInfo = serde_json::from_value(value).unwrap();
@@ -684,6 +867,10 @@ mod tests {
                 .is_supported()
         );
         assert_eq!(parsed.capabilities.limits.max_output_tokens, Some(128_000));
+        assert_eq!(
+            parsed.capabilities.quality.prompt_cache.scope,
+            PromptCacheScope::Basic
+        );
     }
 
     #[test]

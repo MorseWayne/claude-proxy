@@ -542,7 +542,8 @@ mod tests {
     };
     use claude_proxy_core::{
         CapabilityState, EndpointCapabilities, FeatureCapabilities, InputModalities,
-        ModalityCapabilities, ModelCapabilities, ModelLimits,
+        ModalityCapabilities, ModelCapabilities, ModelLimits, PromptCacheCapability,
+        QualityGateCapabilities, TokenCountingCapability,
     };
 
     fn model_capability_fixture(model_id: &str) -> ModelInfo {
@@ -575,6 +576,11 @@ mod tests {
                     min_thinking_budget: Some(1024),
                     max_thinking_budget: Some(32_000),
                     reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+                },
+                quality: QualityGateCapabilities {
+                    prompt_cache: PromptCacheCapability::basic(),
+                    token_counting: TokenCountingCapability::rough(),
+                    ..Default::default()
                 },
                 supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
             },
@@ -935,6 +941,14 @@ mod tests {
         assert_eq!(
             capabilities["chatgpt/gpt-5.5"]["capabilities"]["limits"]["reasoning_effort_levels"][1],
             "high"
+        );
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["quality"]["prompt_cache"]["scope"],
+            "basic"
+        );
+        assert_eq!(
+            capabilities["chatgpt/gpt-5.5"]["capabilities"]["quality"]["token_counting"]["mode"],
+            "rough"
         );
     }
 

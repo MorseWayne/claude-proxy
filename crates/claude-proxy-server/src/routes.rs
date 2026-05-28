@@ -347,9 +347,16 @@ struct RequestFeatures {
     tools: bool,
     tool_choice: bool,
     thinking: bool,
+    reasoning_effort: bool,
     vision: bool,
     sampling: bool,
     stop_sequences: bool,
+    prompt_cache_key: bool,
+    fast_mode: bool,
+    structured_outputs: bool,
+    strict_tools: bool,
+    token_efficient_tools: bool,
+    context_management: bool,
 }
 
 impl RequestFeatures {
@@ -363,6 +370,7 @@ impl RequestFeatures {
                 .is_some_and(|tools| !tools.is_empty()),
             tool_choice: request.tool_choice.is_some(),
             thinking: request.thinking.is_some(),
+            reasoning_effort: request.extra.contains_key("reasoning_effort"),
             vision: request_uses_vision(request),
             sampling: request.temperature.is_some()
                 || request.top_p.is_some()
@@ -371,6 +379,14 @@ impl RequestFeatures {
                 .stop_sequences
                 .as_ref()
                 .is_some_and(|sequences| !sequences.is_empty()),
+            prompt_cache_key: request.extra.contains_key("prompt_cache_key"),
+            fast_mode: request.extra.contains_key("service_tier")
+                || request.extra.contains_key("fast_mode"),
+            structured_outputs: request.extra.contains_key("output_config")
+                || request.extra.contains_key("response_format"),
+            strict_tools: request.extra.get("strict_tools").and_then(Value::as_bool) == Some(true),
+            token_efficient_tools: request.extra.contains_key("token_efficient_tools"),
+            context_management: request.extra.contains_key("context_management"),
         }
     }
 }
@@ -436,6 +452,55 @@ fn validate_request_capabilities(
     reject_unsupported(
         provider_id,
         model,
+        "reasoning_effort",
+        features.reasoning_effort,
+        capabilities.features.reasoning_effort,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "prompt cache key",
+        features.prompt_cache_key,
+        prompt_cache_state(capabilities),
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "fast mode",
+        features.fast_mode,
+        capabilities.quality.fast_mode,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "structured outputs",
+        features.structured_outputs,
+        capabilities.quality.structured_outputs,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "strict tools",
+        features.strict_tools,
+        capabilities.quality.strict_tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "token-efficient tools",
+        features.token_efficient_tools,
+        capabilities.quality.token_efficient_tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "context management",
+        features.context_management,
+        context_management_state(capabilities),
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
         "vision input",
         features.vision,
         capabilities.modalities.input.image,
@@ -454,6 +519,30 @@ fn validate_request_capabilities(
         features.stop_sequences,
         capabilities.features.stop_sequences,
     )
+}
+
+fn prompt_cache_state(capabilities: &ModelCapabilities) -> CapabilityState {
+    if capabilities.quality.prompt_cache.state == CapabilityState::Unknown {
+        capabilities.features.prompt_cache
+    } else {
+        capabilities.quality.prompt_cache.state
+    }
+}
+
+fn context_management_state(capabilities: &ModelCapabilities) -> CapabilityState {
+    match (
+        capabilities
+            .quality
+            .context_management
+            .thinking_preservation,
+        capabilities.quality.context_management.tool_result_clearing,
+    ) {
+        (CapabilityState::Unsupported, _) | (_, CapabilityState::Unsupported) => {
+            CapabilityState::Unsupported
+        }
+        (CapabilityState::Supported, CapabilityState::Supported) => CapabilityState::Supported,
+        _ => CapabilityState::Unknown,
+    }
 }
 
 fn reject_unsupported(
@@ -2195,6 +2284,11 @@ mod tests {
                     reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
                     ..Default::default()
                 },
+                quality: QualityGateCapabilities {
+                    prompt_cache: PromptCacheCapability::basic(),
+                    token_counting: TokenCountingCapability::rough(),
+                    ..Default::default()
+                },
                 supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
                 ..Default::default()
             },
@@ -2904,6 +2998,28 @@ mod tests {
             input_schema: json!({"type": "object"}),
         }]);
         request.tool_choice = Some(json!({"type": "auto"}));
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("high"));
+        request
+            .extra
+            .insert("prompt_cache_key".to_string(), json!("session-key"));
+        request
+            .extra
+            .insert("service_tier".to_string(), json!("priority"));
+        request.extra.insert(
+            "response_format".to_string(),
+            json!({"type": "json_object"}),
+        );
+        request
+            .extra
+            .insert("strict_tools".to_string(), json!(true));
+        request
+            .extra
+            .insert("token_efficient_tools".to_string(), json!(true));
+        request
+            .extra
+            .insert("context_management".to_string(), json!({"edits": []}));
         request.messages = vec![Message {
             role: Role::User,
             content: MessageContent::Blocks(vec![Content::Unknown(json!({
@@ -2919,9 +3035,16 @@ mod tests {
         assert!(features.tools);
         assert!(features.tool_choice);
         assert!(features.thinking);
+        assert!(features.reasoning_effort);
         assert!(features.vision);
         assert!(features.sampling);
         assert!(features.stop_sequences);
+        assert!(features.prompt_cache_key);
+        assert!(features.fast_mode);
+        assert!(features.structured_outputs);
+        assert!(features.strict_tools);
+        assert!(features.token_efficient_tools);
+        assert!(features.context_management);
     }
 
     #[test]
@@ -2946,12 +3069,40 @@ mod tests {
     }
 
     #[test]
+    fn capability_validation_rejects_explicitly_unsupported_quality_gates() {
+        let capabilities = ModelCapabilities {
+            quality: QualityGateCapabilities {
+                strict_tools: CapabilityState::Unsupported,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let features = RequestFeatures {
+            strict_tools: true,
+            ..Default::default()
+        };
+
+        let error = validate_request_capabilities("openai", "gpt-x", &capabilities, &features)
+            .expect_err("unsupported strict tools should fail");
+
+        assert_eq!(error.error.error_type, "invalid_request_error");
+        assert!(
+            error
+                .error
+                .message
+                .contains("does not support strict tools")
+        );
+    }
+
+    #[test]
     fn capability_validation_allows_unknown_features() {
         let capabilities = ModelCapabilities::default();
         let features = RequestFeatures {
             tools: true,
             thinking: true,
             vision: true,
+            structured_outputs: true,
+            strict_tools: true,
             ..Default::default()
         };
 
@@ -2999,6 +3150,10 @@ mod tests {
         assert_eq!(
             body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["endpoints"]["openai_responses"],
             "supported"
+        );
+        assert_eq!(
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["quality"]["prompt_cache"]["scope"],
+            "basic"
         );
         assert_eq!(body["model_cache"][0]["provider"], "test");
         assert_eq!(body["model_cache"][0]["cached"], true);

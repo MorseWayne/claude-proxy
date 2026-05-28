@@ -406,6 +406,14 @@ pub struct ModelCapability {
     pub vision: bool,
     pub adaptive_thinking: bool,
     pub prompt_cache: bool,
+    pub prompt_cache_scope: Option<String>,
+    pub tool_search: bool,
+    pub fine_grained_tool_streaming: bool,
+    pub structured_outputs: bool,
+    pub strict_tools: bool,
+    pub token_efficient_tools: bool,
+    pub fast_mode: bool,
+    pub token_counting_mode: Option<String>,
     pub reasoning_effort_levels: Vec<String>,
 }
 

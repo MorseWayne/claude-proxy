@@ -69,7 +69,13 @@ pub(super) fn build_body_with_context(
     default_instructions: &str,
     context: CodexRequestContext<'_>,
 ) -> Value {
-    let mut body = crate::responses::convert_to_responses(request);
+    let mut body = crate::responses::convert_to_responses_with_context(
+        request,
+        crate::responses::ConversionContext {
+            provider_id: Some("chatgpt"),
+            model: None,
+        },
+    );
     if let Some(object) = body.as_object_mut() {
         object.remove("stop");
         object.remove("max_output_tokens");

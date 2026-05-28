@@ -197,6 +197,17 @@ fn anthropic_model(model_id: &str, thinking: CapabilityState) -> ModelInfo {
                 stop_sequences: CapabilityState::Supported,
                 ..Default::default()
             },
+            quality: QualityGateCapabilities {
+                tool_search: ToolSearchCapability::supported(
+                    QualityGateHeaderKind::Anthropic1p,
+                    QualityGateBetaLocation::Header,
+                ),
+                fine_grained_tool_streaming: CapabilityState::Unknown,
+                prompt_cache: PromptCacheCapability::basic(),
+                interleaved_thinking: thinking,
+                token_counting: TokenCountingCapability::none(),
+                ..Default::default()
+            },
             supported_parameters: vec![
                 "system".to_string(),
                 "messages".to_string(),

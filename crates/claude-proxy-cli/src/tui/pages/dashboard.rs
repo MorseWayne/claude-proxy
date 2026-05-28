@@ -552,7 +552,33 @@ fn capability_flags(capability: &ModelCapability) -> String {
         flags.push("effort");
     }
     if capability.prompt_cache {
-        flags.push("cache");
+        match capability.prompt_cache_scope.as_deref() {
+            Some("global_scope") => flags.push("cache:g"),
+            Some("basic") => flags.push("cache"),
+            _ => flags.push("cache"),
+        }
+    }
+    if capability.tool_search {
+        flags.push("search");
+    }
+    if capability.structured_outputs {
+        flags.push("json");
+    }
+    if capability.strict_tools {
+        flags.push("strict");
+    }
+    if capability.fast_mode {
+        flags.push("fast");
+    }
+    if let Some(mode) = capability.token_counting_mode.as_deref()
+        && mode != "unknown"
+        && mode != "none"
+    {
+        flags.push(match mode {
+            "native" => "tok:n",
+            "rough" => "tok:r",
+            _ => "tok",
+        });
     }
     if capability
         .supported_endpoints

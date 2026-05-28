@@ -4,6 +4,37 @@
 
 ## Active（进行中）
 
+### WF-2026-05-28-001 — Claude Code quality gate capability rollout
+Status: In Progress
+Level: 2
+Started: 2026-05-28
+Last updated: 2026-05-28
+Current phase: Low-risk capability infrastructure and provider diagnostics
+
+Intent:
+- Turn the third-party provider quality-gates research into implementation: add explicit quality gate capability metadata, populate provider/model mappings, expose diagnostics, and begin capability-driven request/conversion safety.
+
+Current todo:
+- [x] Add `QualityGateCapabilities` to `ModelCapabilities` with serialization coverage.
+- [x] Populate conservative provider mappings for Anthropic, ChatGPT, OpenAI compat, and Copilot.
+- [x] Expose diagnostics in model capabilities/admin metrics and TUI.
+- [x] Start request feature/conversion groundwork without changing request behavior beyond metadata/validation-safe checks.
+
+Changes:
+- GitNexus impact for `ModelCapabilities` is HIGH because the schema is central to provider metadata, server validation fixtures, and CLI/TUI display. Proceeded with a metadata-first, default-safe scope.
+- Added `QualityGateCapabilities` plus tool-search, prompt-cache-scope, context-management, token-counting, and related capability enums to the core model capability payload.
+- Provider mappings now expose conservative quality gate metadata for Anthropic, ChatGPT, OpenAI compat, and Copilot-discovered models.
+- `/model_capabilities`, admin metrics, and TUI parsing/display now surface quality gate diagnostics.
+- Request capability detection now covers reasoning effort, prompt cache key, service tier/fast mode, structured outputs, strict tools, token-efficient tools, and context management; explicitly unsupported quality gates are rejected while unknown gates remain allowed.
+- Responses conversion now has `ConversionContext` and can clamp reasoning effort from `ModelInfo` metadata when provided.
+- Validation passed: `cargo fmt --all --check`, focused core/provider/server/CLI tests, multi-crate `cargo test -p claude-proxy-core -p claude-proxy-providers -p claude-proxy-server -p claude-proxy-cli`, `cargo clippy -p claude-proxy-core -p claude-proxy-providers -p claude-proxy-server -p claude-proxy-cli -- -D warnings`, `git diff --check`, and GitNexus detect_changes (CRITICAL expected due central model schema / Responses conversion / server validation paths).
+
+Prerequisites:
+- User asked to implement the first three batches from the quality-gates implementation plan.
+
+Resume next:
+- Review the diff, decide whether to keep the unrelated pre-existing docs changes, then commit or continue with deeper capability-driven conversion controls.
+
 ### WF-2026-05-25-001 — ChatGPT/Codex provider modernization
 Status: In Progress
 Level: 3

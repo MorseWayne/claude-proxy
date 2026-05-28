@@ -2039,6 +2039,7 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
             let capability = v.get("capabilities");
             let limits = capability.and_then(|c| c.get("limits"));
             let features = capability.and_then(|c| c.get("features"));
+            let quality = capability.and_then(|c| c.get("quality"));
             let endpoints = capability.and_then(|c| c.get("endpoints"));
             let modalities = capability.and_then(|c| c.get("modalities"));
             let input_modalities = modalities.and_then(|m| m.get("input"));
@@ -2068,7 +2069,19 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
                     thinking: feature_supported(features, "thinking"),
                     vision: feature_supported(input_modalities, "image"),
                     adaptive_thinking: feature_supported(features, "adaptive_thinking"),
-                    prompt_cache: feature_supported(features, "prompt_cache"),
+                    prompt_cache: feature_supported(features, "prompt_cache")
+                        || nested_capability_supported(quality, "prompt_cache"),
+                    prompt_cache_scope: nested_capability_value(quality, "prompt_cache", "scope"),
+                    tool_search: nested_capability_supported(quality, "tool_search"),
+                    fine_grained_tool_streaming: feature_supported(
+                        quality,
+                        "fine_grained_tool_streaming",
+                    ),
+                    structured_outputs: feature_supported(quality, "structured_outputs"),
+                    strict_tools: feature_supported(quality, "strict_tools"),
+                    token_efficient_tools: feature_supported(quality, "token_efficient_tools"),
+                    fast_mode: feature_supported(quality, "fast_mode"),
+                    token_counting_mode: nested_capability_value(quality, "token_counting", "mode"),
                     reasoning_effort_levels: limits
                         .and_then(|l| l.get("reasoning_effort_levels"))
                         .and_then(|x| x.as_array())
@@ -2084,6 +2097,18 @@ fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapabili
 
 fn feature_supported(value: Option<&Value>, key: &str) -> bool {
     value.and_then(|v| v.get(key)).and_then(Value::as_str) == Some("supported")
+}
+
+fn nested_capability_supported(value: Option<&Value>, key: &str) -> bool {
+    nested_capability_value(value, key, "state").as_deref() == Some("supported")
+}
+
+fn nested_capability_value(value: Option<&Value>, key: &str, field: &str) -> Option<String> {
+    value
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn parse_string_array(items: &[Value]) -> Vec<String> {
@@ -2721,6 +2746,20 @@ mod tests {
                         "context_window": 400000,
                         "reasoning_effort_levels": ["low", "high"]
                     },
+                    "quality": {
+                        "tool_search": {
+                            "state": "supported",
+                            "header_kind": "anthropic_1p",
+                            "beta_location": "header"
+                        },
+                        "prompt_cache": {
+                            "state": "supported",
+                            "scope": "basic"
+                        },
+                        "structured_outputs": "supported",
+                        "fast_mode": "supported",
+                        "token_counting": {"mode": "rough"}
+                    },
                     "supported_parameters": ["messages", "tools", "thinking"]
                 }
             }
@@ -2737,6 +2776,18 @@ mod tests {
         assert!(capabilities[0].1.thinking);
         assert!(capabilities[0].1.vision);
         assert!(!capabilities[0].1.adaptive_thinking);
+        assert!(capabilities[0].1.prompt_cache);
+        assert_eq!(
+            capabilities[0].1.prompt_cache_scope.as_deref(),
+            Some("basic")
+        );
+        assert!(capabilities[0].1.tool_search);
+        assert!(capabilities[0].1.structured_outputs);
+        assert!(capabilities[0].1.fast_mode);
+        assert_eq!(
+            capabilities[0].1.token_counting_mode.as_deref(),
+            Some("rough")
+        );
         assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");
         assert_eq!(capabilities[0].1.supported_parameters[1], "tools");
     }

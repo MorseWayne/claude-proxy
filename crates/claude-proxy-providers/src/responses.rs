@@ -53,7 +53,25 @@ enum ResponsesMessagePart {
     Input(Value),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConversionContext<'a> {
+    pub provider_id: Option<&'a str>,
+    pub model: Option<&'a ModelInfo>,
+}
+
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
+    convert_to_responses_with_context(req, ConversionContext::default())
+}
+
+pub fn convert_to_responses_with_context(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+) -> Value {
+    let _ = context.provider_id;
+    convert_to_responses_inner(req, context)
+}
+
+fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<'_>) -> Value {
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
     let historical_stats = req
@@ -127,7 +145,7 @@ pub fn convert_to_responses(req: &MessagesRequest) -> Value {
     if let Some(tool_choice) = &req.tool_choice {
         body["tool_choice"] = normalize_for_responses(tool_choice);
     }
-    if let Some(reasoning) = convert_reasoning(req) {
+    if let Some(reasoning) = convert_reasoning(req, context) {
         body["reasoning"] = reasoning;
     }
     body
@@ -840,12 +858,12 @@ fn normalize_tool_schema(schema: &Value) -> Value {
     Value::Object(normalized)
 }
 
-fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
+fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> Option<Value> {
     if let Some(reasoning) = req.extra.get("reasoning") {
         return Some(reasoning_for_model(req, reasoning.clone()));
     }
     if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
-        return Some(reasoning_effort_for_model(req, effort));
+        return Some(reasoning_effort_for_context(req, context, effort));
     }
     let thinking = req.thinking.as_ref()?;
     if thinking.r#type.as_deref() == Some("disabled") {
@@ -853,16 +871,38 @@ fn convert_reasoning(req: &MessagesRequest) -> Option<Value> {
     }
     if let Some(budget_tokens) = thinking.budget_tokens {
         let effort = thinking_budget_to_reasoning_effort(budget_tokens, &req.model);
-        return Some(reasoning_effort_for_model(req, effort));
+        return Some(reasoning_effort_for_context(req, context, effort));
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
         let effort = default_adaptive_reasoning_effort(&req.model);
-        return Some(reasoning_effort_for_model(req, effort));
+        return Some(reasoning_effort_for_context(req, context, effort));
     }
     if thinking.r#type.as_deref() == Some("enabled") {
-        return Some(reasoning_effort_for_model(req, "medium"));
+        return Some(reasoning_effort_for_context(req, context, "medium"));
     }
     None
+}
+
+fn reasoning_effort_for_context(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    effort: &str,
+) -> Value {
+    let effort = context
+        .model
+        .and_then(|model| {
+            clamp_reasoning_effort(effort, &model.capabilities.limits.reasoning_effort_levels)
+        })
+        .unwrap_or(effort);
+    reasoning_effort_for_model(req, effort)
+}
+
+fn clamp_reasoning_effort<'a>(effort: &'a str, supported: &'a [String]) -> Option<&'a str> {
+    if supported.is_empty() || supported.iter().any(|level| level == effort) {
+        Some(effort)
+    } else {
+        supported.last().map(String::as_str)
+    }
 }
 
 fn reasoning_effort_for_model(req: &MessagesRequest, effort: &str) -> Value {
@@ -3148,6 +3188,53 @@ mod tests {
             assert_eq!(body["reasoning"]["effort"], expected_effort);
             assert_eq!(body["reasoning"]["summary"], "detailed");
         }
+    }
+
+    #[test]
+    fn test_convert_to_responses_context_clamps_reasoning_effort_to_model_metadata() {
+        let mut extra = HashMap::new();
+        extra.insert("reasoning_effort".to_string(), json!("xhigh"));
+        let req = MessagesRequest {
+            model: "custom-reasoning".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+        let model = ModelInfo {
+            model_id: "custom-reasoning".to_string(),
+            vendor: Some("test".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                limits: ModelLimits {
+                    reasoning_effort_levels: vec!["low".to_string(), "medium".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        let body = convert_to_responses_with_context(
+            &req,
+            ConversionContext {
+                provider_id: Some("test"),
+                model: Some(&model),
+            },
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "medium");
     }
 
     #[test]

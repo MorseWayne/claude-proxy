@@ -4,6 +4,8 @@ Date: 2026-05-25
 Status: Approved for planning
 Scope: `claude-proxy` ChatGPT/OpenAI provider layer
 
+Related notes: [Claude Code Third-Party Provider Quality Gates](./2026-05-28-claude-code-third-party-provider-quality-gates.md)
+
 ## Goal
 
 Modernize the ChatGPT/Codex provider path using the strongest patterns observed in `/home/wayne/source/open/pi/packages/ai`, while preserving the existing stable SSE path as a fallback.
