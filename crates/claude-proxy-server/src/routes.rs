@@ -1314,6 +1314,7 @@ async fn stream_leader_response(
                         stream_config.idle_timeout.as_secs()
                     );
                     warn!(
+                        request_id = %request_id,
                         provider_id = %provider_id,
                         model = %model_name,
                         timeout_seconds = stream_config.idle_timeout.as_secs(),
@@ -1336,6 +1337,7 @@ async fn stream_leader_response(
                         format_timeout_duration(stream_config.tool_use_terminal_timeout)
                     );
                     warn!(
+                        request_id = %request_id,
                         provider_id = %provider_id,
                         model = %model_name,
                         timeout_seconds = stream_config.tool_use_terminal_timeout.as_secs(),
@@ -1358,6 +1360,7 @@ async fn stream_leader_response(
                         stream_config.overall_timeout.as_secs()
                     );
                     warn!(
+                        request_id = %request_id,
                         provider_id = %provider_id,
                         model = %model_name,
                         timeout_seconds = stream_config.overall_timeout.as_secs(),

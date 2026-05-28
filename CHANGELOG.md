@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.10 - 2026-05-28
+
+### Fixed in v1.3.10
+
+- Bound ChatGPT WebSocket continuation state to concrete cached connection IDs to prevent stale `previous_response_id` reuse under concurrent sessions.
+- Invalidated continuation state when reused WebSocket connections fail, abort, or cannot be re-cached.
+- Disabled delta continuation on new WebSocket connections and improved continuation/cache diagnostics with connection IDs.
+
+### Changed in v1.3.10
+
+- Raised default stream idle timeout from 120s to 300s for long `gpt-5.5` high-reasoning turns.
+- Raised default tool-use terminal timeout from 30s to 120s.
+- Added ChatGPT upstream/downstream thinking stream diagnostics and request IDs on stream watchdog logs.
+
 ## v1.3.9 - 2026-05-28
 
 ### Changed in v1.3.9

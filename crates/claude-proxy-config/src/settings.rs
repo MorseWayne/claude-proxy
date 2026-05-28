@@ -641,7 +641,7 @@ fn default_sse_heartbeat_interval_seconds() -> u64 {
     15
 }
 fn default_stream_idle_timeout_seconds() -> u64 {
-    120
+    300
 }
 fn default_stream_overall_timeout_seconds() -> u64 {
     600
@@ -1261,7 +1261,7 @@ auth_token = "test-token"
     fn server_stream_safeguard_defaults_and_overrides() {
         let settings = Settings::from_toml("", Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.sse_heartbeat_interval_seconds, 15);
-        assert_eq!(settings.server.stream_idle_timeout_seconds, 120);
+        assert_eq!(settings.server.stream_idle_timeout_seconds, 300);
         assert_eq!(settings.server.stream_overall_timeout_seconds, 600);
         assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 120);
 
