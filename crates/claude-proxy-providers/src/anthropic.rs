@@ -305,12 +305,8 @@ fn inject_cache_control(body: &mut Value) {
         let system = body.get_mut("system").unwrap();
         match system {
             Value::String(text) => {
-                let block = serde_json::json!([{
-                    "type": "text",
-                    "text": text.clone(),
-                    "cache_control": cache_control.clone()
-                }]);
-                *system = block;
+                let text = std::mem::take(text);
+                *system = Value::Array(vec![cache_controlled_text_block(text, &cache_control)]);
                 budget -= 1;
             }
             Value::Array(blocks) => {
@@ -348,20 +344,27 @@ fn inject_cache_control(body: &mut Value) {
                 if let Some(last_block) = blocks.last_mut()
                     && let Value::Object(obj) = last_block
                 {
-                    obj.insert("cache_control".to_string(), cache_control.clone());
+                    obj.insert("cache_control".to_string(), cache_control);
                 }
             }
-            Some(Value::String(text)) => {
-                let block = serde_json::json!([{
-                    "type": "text",
-                    "text": text.clone(),
-                    "cache_control": cache_control.clone()
-                }]);
-                *last_user.get_mut("content").unwrap() = block;
+            Some(content @ Value::String(_)) => {
+                let Value::String(text) = content else {
+                    unreachable!();
+                };
+                let text = std::mem::take(text);
+                *content = Value::Array(vec![cache_controlled_text_block(text, &cache_control)]);
             }
             _ => {}
         }
     }
+}
+
+fn cache_controlled_text_block(text: String, cache_control: &Value) -> Value {
+    let mut block = serde_json::Map::with_capacity(3);
+    block.insert("type".to_string(), Value::String("text".to_string()));
+    block.insert("text".to_string(), Value::String(text));
+    block.insert("cache_control".to_string(), cache_control.clone());
+    Value::Object(block)
 }
 
 /// Count existing `cache_control` annotations in the request body.
@@ -463,6 +466,29 @@ mod tests {
         });
 
         (format!("http://{addr}"), attempts, handle)
+    }
+
+    #[test]
+    fn inject_cache_control_wraps_string_prompts() {
+        let mut body = serde_json::json!({
+            "system": "system prompt",
+            "messages": [
+                {"role": "user", "content": "first user"},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "user", "content": "latest user"}
+            ]
+        });
+
+        inject_cache_control(&mut body);
+
+        assert_eq!(body["system"][0]["text"], "system prompt");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["messages"][0]["content"], "first user");
+        assert_eq!(body["messages"][2]["content"][0]["text"], "latest user");
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]

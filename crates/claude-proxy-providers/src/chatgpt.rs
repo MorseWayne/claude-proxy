@@ -208,6 +208,162 @@ struct ChatGptPreparedRequest {
     observer: Option<ProviderRequestObserver>,
 }
 
+struct ChatGptUpstreamEventContext {
+    request_id: u64,
+    compact_request: bool,
+    transport: &'static str,
+    first_upstream_event_seen: Arc<AtomicBool>,
+    thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
+    stream_started_at: Instant,
+    observer: Option<ProviderRequestObserver>,
+}
+
+struct ChatGptUpstreamEventHandlerState {
+    request_id: u64,
+    compact_request: bool,
+    transport: &'static str,
+    first_upstream_event_seen: Arc<AtomicBool>,
+    thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
+    stream_started_at: Instant,
+    observer: Option<ProviderRequestObserver>,
+    cache: Arc<Mutex<CachedRateLimits>>,
+    provider_id: String,
+    runtime_ids: Arc<RwLock<ChatGptRuntimeIds>>,
+    websocket_sse_cooldown_until_secs: Arc<AtomicU64>,
+}
+
+impl ChatGptUpstreamEventHandlerState {
+    fn handle(&self, event: &Value) {
+        let event_type = event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+
+        self.log_first_event(event_type);
+        self.record_reasoning_delta(event_type, event);
+        self.cache_stream_rate_limit(event);
+        self.notify_observer(event);
+        self.log_terminal_event(event);
+    }
+
+    fn log_first_event(&self, event_type: &str) {
+        if !self.first_upstream_event_seen.swap(true, Ordering::Relaxed) {
+            info!(
+                request_id = self.request_id,
+                compact_request = self.compact_request,
+                transport = self.transport,
+                elapsed_ms = elapsed_millis(self.stream_started_at),
+                event_type,
+                "ChatGPT upstream first event received"
+            );
+        }
+    }
+
+    fn record_reasoning_delta(&self, event_type: &str, event: &Value) {
+        if !is_chatgpt_reasoning_delta_event(event_type) {
+            return;
+        }
+
+        let delta_bytes = chatgpt_sse_delta_len(event) as u64;
+        let count = self
+            .thinking_diagnostics
+            .upstream_reasoning_delta_events
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.thinking_diagnostics
+            .upstream_reasoning_delta_bytes
+            .fetch_add(delta_bytes, Ordering::Relaxed);
+        if !self
+            .thinking_diagnostics
+            .first_upstream_reasoning_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            info!(
+                request_id = self.request_id,
+                compact_request = self.compact_request,
+                transport = self.transport,
+                elapsed_ms = elapsed_millis(self.stream_started_at),
+                event_type,
+                upstream_reasoning_delta_events = count,
+                upstream_reasoning_delta_bytes = delta_bytes,
+                "ChatGPT upstream reasoning delta observed"
+            );
+        }
+    }
+
+    fn cache_stream_rate_limit(&self, event: &Value) {
+        let Some(snapshot) =
+            rate_limit_snapshot_from_sse_event(&self.provider_id, event, unix_timestamp_secs())
+        else {
+            return;
+        };
+
+        log_rate_limit_summary(
+            self.request_id,
+            self.compact_request,
+            "stream_event",
+            std::slice::from_ref(&snapshot),
+        );
+        let cache = Arc::clone(&self.cache);
+        tokio::spawn(async move {
+            cache_rate_limits_into(&cache, vec![snapshot]).await;
+        });
+    }
+
+    fn notify_observer(&self, event: &Value) {
+        if let Some(observer) = self.observer.as_ref() {
+            crate::responses::notify_stream_metadata(Some(observer), event);
+        }
+    }
+
+    fn log_terminal_event(&self, event: &Value) {
+        let Some(stop_reason) = chatgpt_sse_stop_reason(event) else {
+            return;
+        };
+
+        info!(
+            request_id = self.request_id,
+            compact_request = self.compact_request,
+            transport = self.transport,
+            upstream_stop_reason = stop_reason,
+            upstream_response_status = chatgpt_sse_response_status(event).unwrap_or(""),
+            upstream_error_code = chatgpt_sse_error_code(event).unwrap_or(""),
+            upstream_error_message = chatgpt_sse_error_message(event).unwrap_or(""),
+            upstream_model = chatgpt_sse_model(event).unwrap_or("unknown"),
+            upstream_response_id = chatgpt_sse_response_id(event).unwrap_or(""),
+            upstream_reasoning_delta_events = self
+                .thinking_diagnostics
+                .upstream_reasoning_delta_events
+                .load(Ordering::Relaxed),
+            upstream_reasoning_delta_bytes = self
+                .thinking_diagnostics
+                .upstream_reasoning_delta_bytes
+                .load(Ordering::Relaxed),
+            downstream_thinking_delta_events = self
+                .thinking_diagnostics
+                .downstream_thinking_delta_events
+                .load(Ordering::Relaxed),
+            downstream_thinking_delta_bytes = self
+                .thinking_diagnostics
+                .downstream_thinking_delta_bytes
+                .load(Ordering::Relaxed),
+            "ChatGPT upstream terminal event received"
+        );
+        if chatgpt_event_is_server_error(event) {
+            rotate_chatgpt_runtime_ids_after_server_error(
+                &self.runtime_ids,
+                self.request_id,
+                self.transport,
+            );
+            ChatGptProvider::activate_websocket_sse_cooldown(
+                &self.websocket_sse_cooldown_until_secs,
+                self.request_id,
+                self.transport,
+            );
+        }
+    }
+}
+
 pub use auth::{ChatGptAuth, ChatGptToken, DeviceCodeInfo};
 
 pub struct ChatGptProvider {
@@ -711,15 +867,15 @@ impl ChatGptProvider {
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
         let thinking_diagnostics = Arc::new(ChatGptThinkingDiagnostics::default());
         let stream_started_at = Instant::now();
-        let on_event = self.upstream_event_handler(
+        let on_event = self.upstream_event_handler(ChatGptUpstreamEventContext {
             request_id,
             compact_request,
-            "websocket",
-            Arc::clone(&first_upstream_event_seen),
-            Arc::clone(&thinking_diagnostics),
+            transport: "websocket",
+            first_upstream_event_seen: Arc::clone(&first_upstream_event_seen),
+            thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
-        );
+        });
         let (stream, reused) = transport::open_websocket_stream(
             self,
             body,
@@ -793,15 +949,15 @@ impl ChatGptProvider {
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
         let thinking_diagnostics = Arc::new(ChatGptThinkingDiagnostics::default());
         let stream_started_at = Instant::now();
-        let on_event = self.upstream_event_handler(
+        let on_event = self.upstream_event_handler(ChatGptUpstreamEventContext {
             request_id,
             compact_request,
-            "sse",
-            Arc::clone(&first_upstream_event_seen),
-            Arc::clone(&thinking_diagnostics),
+            transport: "sse",
+            first_upstream_event_seen: Arc::clone(&first_upstream_event_seen),
+            thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
-        );
+        });
         let stream = responses::stream_response_with_marker_mode(response, marker_mode, on_event);
         wrap_chatgpt_stream_logging(
             stream,
@@ -816,114 +972,31 @@ impl ChatGptProvider {
 
     fn upstream_event_handler(
         &self,
-        request_id: u64,
-        compact_request: bool,
-        transport: &'static str,
-        first_upstream_event_seen: Arc<AtomicBool>,
-        thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
-        stream_started_at: Instant,
-        observer: Option<ProviderRequestObserver>,
+        context: ChatGptUpstreamEventContext,
     ) -> impl Fn(&Value) + Send + Sync + 'static {
-        let cache = Arc::clone(&self.cached_rate_limits);
-        let provider_id = self.id.clone();
-        let runtime_ids = self.runtime_ids_handle();
-        let websocket_sse_cooldown_until_secs = self.websocket_sse_cooldown_handle();
-        move |event| {
-            let event_type = event
-                .get("type")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown");
-            if !first_upstream_event_seen.swap(true, Ordering::Relaxed) {
-                info!(
-                    request_id,
-                    compact_request,
-                    transport,
-                    elapsed_ms = elapsed_millis(stream_started_at),
-                    event_type,
-                    "ChatGPT upstream first event received"
-                );
-            }
-            if is_chatgpt_reasoning_delta_event(event_type) {
-                let delta_bytes = chatgpt_sse_delta_len(event) as u64;
-                let count = thinking_diagnostics
-                    .upstream_reasoning_delta_events
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
-                thinking_diagnostics
-                    .upstream_reasoning_delta_bytes
-                    .fetch_add(delta_bytes, Ordering::Relaxed);
-                if !thinking_diagnostics
-                    .first_upstream_reasoning_logged
-                    .swap(true, Ordering::Relaxed)
-                {
-                    info!(
-                        request_id,
-                        compact_request,
-                        transport,
-                        elapsed_ms = elapsed_millis(stream_started_at),
-                        event_type,
-                        upstream_reasoning_delta_events = count,
-                        upstream_reasoning_delta_bytes = delta_bytes,
-                        "ChatGPT upstream reasoning delta observed"
-                    );
-                }
-            }
-            if let Some(snapshot) =
-                rate_limit_snapshot_from_sse_event(&provider_id, event, unix_timestamp_secs())
-            {
-                log_rate_limit_summary(
-                    request_id,
-                    compact_request,
-                    "stream_event",
-                    std::slice::from_ref(&snapshot),
-                );
-                let cache = Arc::clone(&cache);
-                tokio::spawn(async move {
-                    cache_rate_limits_into(&cache, vec![snapshot]).await;
-                });
-            }
-            if let Some(observer) = observer.as_ref() {
-                crate::responses::notify_stream_metadata(Some(observer), event);
-            }
-            if let Some(stop_reason) = chatgpt_sse_stop_reason(event) {
-                info!(
-                    request_id,
-                    compact_request,
-                    transport,
-                    upstream_stop_reason = stop_reason,
-                    upstream_response_status = chatgpt_sse_response_status(event).unwrap_or(""),
-                    upstream_error_code = chatgpt_sse_error_code(event).unwrap_or(""),
-                    upstream_error_message = chatgpt_sse_error_message(event).unwrap_or(""),
-                    upstream_model = chatgpt_sse_model(event).unwrap_or("unknown"),
-                    upstream_response_id = chatgpt_sse_response_id(event).unwrap_or(""),
-                    upstream_reasoning_delta_events = thinking_diagnostics
-                        .upstream_reasoning_delta_events
-                        .load(Ordering::Relaxed),
-                    upstream_reasoning_delta_bytes = thinking_diagnostics
-                        .upstream_reasoning_delta_bytes
-                        .load(Ordering::Relaxed),
-                    downstream_thinking_delta_events = thinking_diagnostics
-                        .downstream_thinking_delta_events
-                        .load(Ordering::Relaxed),
-                    downstream_thinking_delta_bytes = thinking_diagnostics
-                        .downstream_thinking_delta_bytes
-                        .load(Ordering::Relaxed),
-                    "ChatGPT upstream terminal event received"
-                );
-                if chatgpt_event_is_server_error(event) {
-                    rotate_chatgpt_runtime_ids_after_server_error(
-                        &runtime_ids,
-                        request_id,
-                        transport,
-                    );
-                    Self::activate_websocket_sse_cooldown(
-                        &websocket_sse_cooldown_until_secs,
-                        request_id,
-                        transport,
-                    );
-                }
-            }
-        }
+        let ChatGptUpstreamEventContext {
+            request_id,
+            compact_request,
+            transport,
+            first_upstream_event_seen,
+            thinking_diagnostics,
+            stream_started_at,
+            observer,
+        } = context;
+        let state = ChatGptUpstreamEventHandlerState {
+            request_id,
+            compact_request,
+            transport,
+            first_upstream_event_seen,
+            thinking_diagnostics,
+            stream_started_at,
+            observer,
+            cache: Arc::clone(&self.cached_rate_limits),
+            provider_id: self.id.clone(),
+            runtime_ids: self.runtime_ids_handle(),
+            websocket_sse_cooldown_until_secs: self.websocket_sse_cooldown_handle(),
+        };
+        move |event| state.handle(event)
     }
 
     async fn fetch_usage_rate_limits(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {

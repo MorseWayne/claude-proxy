@@ -1435,10 +1435,7 @@ fn poll_oauth(app: &mut App) {
                 app.oauth_device_info = Some((device_code, interval));
                 // Update the overlay to show URL + code
                 if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
-                    oa.step = OAuthStep::ShowCode {
-                        url: url.clone(),
-                        code: code.clone(),
-                    };
+                    oa.step = OAuthStep::ShowCode { url, code };
                 }
             }
             OAuthResult::Token(_) => {
@@ -1462,7 +1459,7 @@ fn poll_oauth(app: &mut App) {
             OAuthResult::Error(err) => {
                 app.oauth_rx = None;
                 if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
-                    oa.step = OAuthStep::Failed(err.clone());
+                    oa.step = OAuthStep::Failed(err);
                 }
                 // Keep overlay open so user can see the error; Esc to dismiss
             }

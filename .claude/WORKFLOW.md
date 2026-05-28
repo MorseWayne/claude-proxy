@@ -4,6 +4,65 @@
 
 ## Active（进行中）
 
+### WF-2026-05-28-003 — v2.0 deep quality/performance audit
+Status: In Progress
+Level: 2
+Started: 2026-05-28
+Last updated: 2026-05-28
+Current phase: ChatGPT event-handler decomposition validated
+
+Intent:
+- Deep-dive claude-proxy 2.0 code details and improve code quality, performance, and resource usage with lean, targeted validation.
+
+Current todo:
+- [x] Establish clean baseline and validation commands.
+- [x] Identify concrete optimization targets from code metrics and GitNexus flows.
+- [x] Run GitNexus impact before editing any selected symbol.
+- [x] Implement the first low-risk/high-value improvement and validate.
+- [x] Continue with the next optimization target from clippy/metric hotspots.
+- [x] Assess ChatGPT too-many-arguments refactor risk before editing.
+- [x] Review accumulated diff and decide next hotspot or commit boundary.
+- [x] Decompose ChatGPT upstream event handler into focused responsibilities.
+- [ ] Decide whether to proceed with CRITICAL-risk Responses conversion decomposition.
+
+Changes:
+- Baseline: `cargo check --workspace` passed; repo root was clean before this audit.
+- Hotspot scan found largest runtime areas in ChatGPT/Responses/server routes/TUI and clippy allocation warnings.
+- GitNexus impact for `inject_cache_control` was LOW (0 direct callers/processes reported by index).
+- Optimized Anthropic cache-control injection to move string prompt content into wrapped text blocks instead of cloning large system/latest-user strings, and added regression coverage for string prompt wrapping.
+- Removed five redundant CLI/TUI clones by moving owned provider defaults and OAuth result payloads directly into their consumers.
+- Refactored ChatGPT stream callback setup and WebSocket completion storage to use small context structs, removing the remaining clippy `too_many_arguments` warnings without changing transport behavior.
+- Further decomposed ChatGPT upstream stream-event handling: introduced `ChatGptUpstreamEventHandlerState` with focused methods for first-event logging, reasoning-delta accounting, rate-limit caching, observer notification, and terminal-event handling. `upstream_event_handler` now only builds state and returns the callback.
+
+Validation:
+- `cargo test -p claude-proxy-providers inject_cache_control` passed.
+- `cargo test -p claude-proxy-providers anthropic_` passed.
+- `cargo clippy -p claude-proxy-providers --lib -- -W clippy::redundant_clone` no longer reports Anthropic redundant-clone warnings; remaining warnings are pre-existing ChatGPT too-many-arguments.
+- `cargo fmt --all --check` and `git diff --check` passed.
+- GitNexus detect_changes scope all after Anthropic change: LOW risk, no affected processes.
+- GitNexus impact before CLI/TUI edits: `handle_provider` LOW (1 direct caller, 2 affected process roots), `poll_oauth` LOW (1 direct caller, 2 affected process roots).
+- `cargo clippy -p claude-proxy-cli --bin claude-proxy -- -W clippy::redundant_clone` no longer reports CLI/TUI redundant-clone warnings; remaining warnings are pre-existing provider ChatGPT too-many-arguments.
+- `cargo test -p claude-proxy-cli --bin claude-proxy` passed.
+- `cargo fmt --all --check` and `git diff --check` passed after CLI/TUI cleanup.
+- GitNexus detect_changes scope all after CLI/TUI cleanup: HIGH due central CLI provider/TUI flows, expected for touched `handle_provider`; changed code is move-only clone removal.
+- GitNexus impact before ChatGPT context-struct refactor: `upstream_event_handler` LOW, `open_websocket_stream` LOW (index reported 0 callers/processes for both target lookups).
+- `cargo clippy -p claude-proxy-providers --lib -- -W clippy::too_many_arguments` passed with no warnings.
+- `cargo test -p claude-proxy-providers chatgpt_` passed.
+- `cargo clippy --workspace -- -W clippy::redundant_clone -W clippy::too_many_arguments` passed with no warnings.
+- Final `cargo fmt --all --check` and `git diff --check` passed.
+- GitNexus detect_changes scope all after first ChatGPT context refactor: CRITICAL due central ChatGPT provider/WebSocket and CLI flows, expected for signature/context refactors; targeted ChatGPT and CLI tests passed.
+- GitNexus impact before deeper event-handler decomposition: `upstream_event_handler` LOW.
+- `cargo test -p claude-proxy-providers chatgpt_` passed after event-handler state extraction.
+- `cargo clippy -p claude-proxy-providers --lib -- -W clippy::too_many_arguments -W clippy::too_many_lines` shows `upstream_event_handler` no longer as too-long; remaining relevant provider warnings are broader transport and `send_responses_request_with_prompt_too_long_retry`.
+- Final `cargo fmt --all --check` and `git diff --check` passed.
+- Final GitNexus detect_changes scope all: CRITICAL due central ChatGPT provider/WebSocket and CLI flows, expected for touched ChatGPT provider internals plus previous CLI changes.
+
+Prerequisites:
+- Preserve existing uncommitted/user work; current repo status is clean at claude-proxy root.
+
+Resume next:
+- Do not edit `responses.rs::append_message_items` until user acknowledges CRITICAL impact. If proceeding, extract block handling helpers and run the full `responses::tests::test_convert_to_responses_*` set plus ChatGPT body tests.
+
 ### WF-2026-05-28-002 — ChatGPT request context efficiency follow-up
 Status: In Progress
 Level: 2

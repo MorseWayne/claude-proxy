@@ -487,7 +487,7 @@ async fn handle_provider(action: ProviderAction) {
                 1 => {
                     let new_url: String = dialoguer::Input::new()
                         .with_prompt("New Base URL")
-                        .default(provider.base_url.clone())
+                        .default(provider.base_url)
                         .interact_text()
                         .unwrap();
                     settings.providers.get_mut(&id).unwrap().base_url = new_url;
@@ -495,7 +495,7 @@ async fn handle_provider(action: ProviderAction) {
                 2 => {
                     let new_proxy: String = dialoguer::Input::new()
                         .with_prompt("New Proxy")
-                        .default(provider.proxy.clone())
+                        .default(provider.proxy)
                         .interact_text()
                         .unwrap();
                     settings.providers.get_mut(&id).unwrap().proxy = new_proxy;

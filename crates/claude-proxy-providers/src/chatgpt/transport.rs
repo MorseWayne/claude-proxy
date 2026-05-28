@@ -1012,9 +1012,11 @@ where
                     connection_key,
                     &continuation,
                     &first_event,
-                    request_id,
-                    reused,
-                    checked_out_connection_id,
+                    WebSocketCompletionContext {
+                        request_id,
+                        request_websocket_reused: reused,
+                        checked_out_connection_id,
+                    },
                 )
                 .await;
             }
@@ -1068,9 +1070,11 @@ where
                                         connection_key,
                                         &continuation,
                                         &event,
-                                        request_id,
-                                        reused,
-                                        checked_out_connection_id,
+                                        WebSocketCompletionContext {
+                                            request_id,
+                                            request_websocket_reused: reused,
+                                            checked_out_connection_id,
+                                        },
                                     )
                                     .await;
                                 }
@@ -1131,16 +1135,25 @@ async fn checkout_connection(
     Ok((stream, false, None))
 }
 
+struct WebSocketCompletionContext {
+    request_id: u64,
+    request_websocket_reused: bool,
+    checked_out_connection_id: Option<u64>,
+}
+
 async fn complete_and_store_connection(
-    websocket_session: std::sync::Arc<tokio::sync::Mutex<ChatGptWebSocketSession>>,
+    websocket_session: Arc<tokio::sync::Mutex<ChatGptWebSocketSession>>,
     stream: ChatGptWsStream,
     key: WebSocketConnectionKey,
     continuation: &ContinuationAttempt,
     terminal_event: &Value,
-    request_id: u64,
-    request_websocket_reused: bool,
-    checked_out_connection_id: Option<u64>,
+    context: WebSocketCompletionContext,
 ) {
+    let WebSocketCompletionContext {
+        request_id,
+        request_websocket_reused,
+        checked_out_connection_id,
+    } = context;
     let mut session = websocket_session.lock().await;
     let cached_connection_id = session.store_if_empty(stream, key, checked_out_connection_id);
     session.complete_continuation_if_connection_cached(
