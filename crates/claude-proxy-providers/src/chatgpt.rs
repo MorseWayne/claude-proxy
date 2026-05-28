@@ -1351,6 +1351,7 @@ fn wrap_chatgpt_stream_logging(
     let first_stream_item_seen = Arc::new(AtomicBool::new(false));
     let first_stream_item_seen_for_map = Arc::clone(&first_stream_item_seen);
     Box::pin(stream.map(move |result| {
+        let result = result.map_err(map_chatgpt_stream_error);
         if let Ok(event) = &result {
             if let Some(delta_bytes) = downstream_thinking_delta_len(event) {
                 let count = thinking_diagnostics
@@ -1437,6 +1438,17 @@ fn wrap_chatgpt_stream_logging(
         }
         result
     }))
+}
+
+fn map_chatgpt_stream_error(error: ProviderError) -> ProviderError {
+    match error {
+        ProviderError::UpstreamError { status, body } => {
+            let status_code =
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            map_chatgpt_error_status_body_with_headers(status_code, &HeaderMap::new(), body)
+        }
+        other => other,
+    }
 }
 
 fn log_chatgpt_thinking_diagnostics(
@@ -2108,22 +2120,26 @@ fn map_chatgpt_error_status_body_with_headers(
 
     let metadata =
         upstream_error_metadata_from_parts(status.as_u16(), headers, &body, message.clone());
-    let error = match status {
-        StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
-        StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
-        StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
-        StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
-        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited {
-            retry_after: metadata.retry_after,
-        },
-        status if status.is_server_error() => ProviderError::Overloaded {
-            message,
-            retry_after: metadata.retry_after,
-        },
-        status => ProviderError::UpstreamError {
-            status: status.as_u16(),
-            body,
-        },
+    let error = if is_prompt_too_long_error(status, &body) {
+        ProviderError::RequestTooLarge(message)
+    } else {
+        match status {
+            StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
+            StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
+            StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
+            StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
+            StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited {
+                retry_after: metadata.retry_after,
+            },
+            status if status.is_server_error() => ProviderError::Overloaded {
+                message,
+                retry_after: metadata.retry_after,
+            },
+            status => ProviderError::UpstreamError {
+                status: status.as_u16(),
+                body,
+            },
+        }
     };
     error.with_upstream_metadata(metadata)
 }
@@ -5092,6 +5108,33 @@ mod tests {
             StatusCode::BAD_REQUEST,
             r#"{"error":{"code":"invalid_request","message":"bad tool schema"}}"#
         ));
+    }
+
+    #[test]
+    fn context_length_errors_map_to_request_too_large_even_with_http_200() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#;
+        let error = map_chatgpt_error_status_body(StatusCode::OK, body.to_string());
+
+        match error.without_upstream_metadata() {
+            ProviderError::RequestTooLarge(message) => {
+                assert!(message.contains("exceeds the context window"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn chatgpt_stream_context_length_error_maps_to_request_too_large() {
+        let body = r#"{"type":"error","error":{"code":"context_length_exceeded","message":"context limit"}}"#;
+        let error = map_chatgpt_stream_error(ProviderError::UpstreamError {
+            status: 200,
+            body: body.to_string(),
+        });
+
+        match error.without_upstream_metadata() {
+            ProviderError::RequestTooLarge(message) => assert_eq!(message, "context limit"),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

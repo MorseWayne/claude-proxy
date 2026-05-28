@@ -1452,7 +1452,10 @@ async fn collect_leader_response(
                 events.push(event);
             }
             Err(e) => {
+                let terminal_reason = provider_stream_error_terminal_reason(&e);
+                let error_kind = provider_error_kind(&e);
                 let error_message = e.to_string();
+                let response = provider_error_to_response(&e);
                 let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                 let _ = broadcast_tx.send(InflightEvent::Done);
                 state.inflight.lock().await.remove(&request_hash);
@@ -1476,8 +1479,8 @@ async fn collect_leader_response(
                         usage: &usage,
                         is_error: true,
                         latency_ms,
-                        terminal_reason: "stream_error",
-                        error_kind: "stream",
+                        terminal_reason,
+                        error_kind,
                     })
                     .await;
                 if let Some(context) = observability {
@@ -1485,15 +1488,12 @@ async fn collect_leader_response(
                     state
                         .metrics
                         .record_observability(
-                            build_observability_event(context, timing, true, "stream_error"),
+                            build_observability_event(context, timing, true, terminal_reason),
                             true,
                         )
                         .await;
                 }
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &ErrorResponse::api_error(&error_message),
-                );
+                return response;
             }
         }
     }
@@ -1933,6 +1933,13 @@ fn overloaded_response(message: &str, retry_after: Option<u64>) -> Response {
 
 fn is_retryable_upstream_error_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 500..=599)
+}
+
+fn provider_stream_error_terminal_reason(error: &ProviderError) -> &'static str {
+    match error.without_upstream_metadata() {
+        ProviderError::InvalidRequest(_) | ProviderError::RequestTooLarge(_) => "provider_error",
+        _ => "stream_error",
+    }
 }
 
 fn provider_error_kind(error: &ProviderError) -> &'static str {
@@ -2738,6 +2745,29 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "overloaded_error");
         assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[test]
+    fn request_too_large_stream_error_uses_provider_error_reason() {
+        let error = ProviderError::RequestTooLarge("too long".to_string());
+
+        assert_eq!(
+            provider_stream_error_terminal_reason(&error),
+            "provider_error"
+        );
+        assert_eq!(provider_error_kind(&error), "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn request_too_large_provider_error_maps_to_413() {
+        let response =
+            provider_error_to_response(&ProviderError::RequestTooLarge("too long".to_string()));
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "too long");
     }
 
     #[tokio::test]

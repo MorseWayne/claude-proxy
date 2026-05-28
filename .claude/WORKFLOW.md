@@ -9,7 +9,7 @@ Status: In Progress
 Level: 2
 Started: 2026-05-28
 Last updated: 2026-05-28
-Current phase: Synthetic-session continuation fallback live-validated
+Current phase: Continuation mismatch/stale WebSocket patch validated
 
 Intent:
 - Reduce repeated large ChatGPT upstream request payloads observed in `~/.config/claude-proxy/logs/claude-proxy.log`, prioritizing stable prompt cache / WebSocket continuation keys and better payload observability.
@@ -33,12 +33,14 @@ Changes:
 - Final live validation succeeded: follow-up requests showed `continuation_used=true`, `continuation_disabled_reason="none"`, and `continuation_delta_items=1` while full logical input was 71/73 items, confirming upstream WebSocket sends only the delta.
 - Added `continuation_send_body_bytes` to the WebSocket continuation decision log so live logs show the actual JSON body size sent after applying continuation/delta input.
 - Validation passed after fallback/reasoning/empty-output/log-size fix: `cargo fmt --all --check`, `cargo test -p claude-proxy-providers chatgpt_`, `cargo test -p claude-proxy-providers continuation_`, `git diff --check`, and GitNexus detect_changes (HIGH, expected because `open_websocket_stream` / continuation flow is intentionally affected).
+- Overlong context handling now surfaces ChatGPT `context_length_exceeded` SSE/WebSocket error events as `ProviderError::RequestTooLarge`, maps non-stream aggregate failures to HTTP 413 instead of generic 502, and records provider-error/request-too-large metrics. Focused validation passed: targeted ChatGPT mapping tests, Responses SSE error-event test, server request-too-large tests, `cargo test -p claude-proxy-providers --lib chatgpt_`, `cargo test -p claude-proxy-providers --lib responses::tests::test_stream_response`, `cargo test -p claude-proxy-server --lib provider_error`, `cargo fmt --all --check`, `git diff --check`; GitNexus detect_changes reports HIGH expected due central stream/error paths.
+- Recent live logs showed 2/18 continuation decisions degraded to `prefix_mismatch`, sending ~690KB full bodies, and one stale WebSocket Broken pipe after ~94s idle. Continuation delta now falls back to inferred assistant-prefix matching even when terminal output was cached but the client omits/reformats assistant output; true divergent prefixes still send full input. WebSocket cached-session idle TTL was reduced from 300s to 60s to avoid reusing stale connections. Validation passed: targeted continuation delta/prefix-mismatch tests, `cargo test -p claude-proxy-providers --lib chatgpt_`, `cargo test -p claude-proxy-providers --lib responses::tests::test_stream_response`, `cargo test -p claude-proxy-server --lib provider_error`, `cargo fmt --all --check`, `git diff --check`; GitNexus detect_changes reports CRITICAL expected due central `open_websocket_stream` plus existing stream/error patches.
 
 Prerequisites:
 - User approved applying the recommended optimizations after log analysis showed prompt cache and continuation were always disabled by missing stable conversation ids.
 
 Resume next:
-- Optionally commit the live-validated ChatGPT context efficiency fix, then run `npx gitnexus analyze` if committing/index refresh is desired.
+- Review and optionally commit the overlong-context handling patch, then run `npx gitnexus analyze` if committing/index refresh is desired.
 
 ### WF-2026-05-28-001 — Claude Code quality gate capability rollout
 Status: In Progress

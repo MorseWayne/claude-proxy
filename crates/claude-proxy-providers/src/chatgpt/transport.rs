@@ -36,7 +36,7 @@ const OPENAI_BETA_HEADER: &str = "openai-beta";
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const CHATGPT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
+const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(60);
 const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 
@@ -694,14 +694,15 @@ fn canonical_body_without_prompt_cache_key(body: &Value) -> Value {
 }
 
 fn continuation_delta(cached: &CachedContinuation, full_input: &[Value]) -> Option<Vec<Value>> {
-    if cached.assistant_output_items.is_empty() {
-        return continuation_delta_with_inferred_assistant_prefix(cached, full_input);
+    if !cached.assistant_output_items.is_empty() {
+        let mut baseline = cached.full_input.clone();
+        baseline.extend(cached.assistant_output_items.clone());
+        if full_input.starts_with(&baseline) && full_input.len() > baseline.len() {
+            return Some(full_input[baseline.len()..].to_vec());
+        }
     }
 
-    let mut baseline = cached.full_input.clone();
-    baseline.extend(cached.assistant_output_items.clone());
-    (full_input.starts_with(&baseline) && full_input.len() > baseline.len())
-        .then(|| full_input[baseline.len()..].to_vec())
+    continuation_delta_with_inferred_assistant_prefix(cached, full_input)
 }
 
 fn continuation_delta_with_inferred_assistant_prefix(
@@ -2205,6 +2206,26 @@ mod tests {
         let items = terminal_assistant_output_items(&event).expect("missing output is cacheable");
 
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn continuation_delta_allows_client_to_omit_cached_assistant_output() {
+        let cached = CachedContinuation {
+            canonical_body: json!({}),
+            full_input: vec![json!({"role": "user", "content": "first"})],
+            assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
+            response_id: "resp-1".to_string(),
+            connection_id: 1,
+            updated_at: Instant::now(),
+        };
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "user", "content": "follow-up"}),
+        ];
+
+        let delta = continuation_delta(&cached, &full_input).expect("delta");
+
+        assert_eq!(delta, vec![json!({"role": "user", "content": "follow-up"})]);
     }
 
     #[test]

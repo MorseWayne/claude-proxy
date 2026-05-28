@@ -1007,6 +1007,10 @@ where
                             continue;
                         }
                         if let Some(value) = parse_sse_json(&event) {
+                            if let Some(error) = responses_error_event(&value) {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
                             on_event(&value);
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
@@ -1024,6 +1028,10 @@ where
                         if is_sse_done(&event) {
                             saw_done = true;
                         } else if let Some(value) = parse_sse_json(&event) {
+                            if let Some(error) = responses_error_event(&value) {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
                             on_event(&value);
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
@@ -1047,6 +1055,10 @@ where
             && !is_sse_done(&event)
             && let Some(value) = parse_sse_json(&event)
         {
+            if let Some(error) = responses_error_event(&value) {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
             on_event(&value);
             for event in converter.process_event(&value) {
                 if tx.send(Ok(event)).await.is_err() {
@@ -1099,6 +1111,10 @@ where
                 }
             };
 
+            if let Some(error) = responses_error_event(&value) {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
             on_event(&value);
             for event in converter.process_event(&value) {
                 if tx.send(Ok(event)).await.is_err() {
@@ -1126,6 +1142,21 @@ where
 
 fn parse_sse_json(text: &str) -> Option<Value> {
     parse_sse_json_value(text)
+}
+
+fn responses_error_event(value: &Value) -> Option<ProviderError> {
+    (value.get("type").and_then(Value::as_str) == Some("error")).then(|| {
+        let status = value
+            .get("status")
+            .or_else(|| value.get("status_code"))
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+            .unwrap_or(200);
+        ProviderError::UpstreamError {
+            status,
+            body: value.to_string(),
+        }
+    })
 }
 
 pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, event: &Value) {
@@ -2325,6 +2356,29 @@ mod tests {
     fn test_parse_sse_json_accepts_data_without_space() {
         let value = parse_sse_json(r#"data:{"type":"response.output_text.delta"}"#).unwrap();
         assert_eq!(value["type"], "response.output_text.delta");
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_surfaces_sse_error_event() {
+        let body = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should emit error")
+            .expect_err("error SSE frame should fail the stream");
+        match error.without_upstream_metadata() {
+            ProviderError::UpstreamError { status, body } => {
+                assert_eq!(*status, 200);
+                assert!(body.contains("context_length_exceeded"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
