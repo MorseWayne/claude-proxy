@@ -296,78 +296,120 @@ fn append_message_items(
 ) {
     match &msg.content {
         MessageContent::Text(text) => {
-            input.push(message_item(
-                &msg.role,
-                compressed_text_item(text, is_current_message, compression),
-            ));
+            append_text_message_item(input, &msg.role, text, is_current_message, compression);
         }
         MessageContent::Blocks(blocks) => {
-            let mut parts = Vec::new();
-            for block in blocks {
-                match block {
-                    Content::Text { text } => parts.push(ResponsesMessagePart::Text(text.clone())),
-                    Content::Thinking { .. } => {}
-                    Content::ToolUse {
-                        id,
-                        name,
-                        input: args,
-                    }
-                    | Content::ServerToolUse {
-                        id,
-                        name,
-                        input: args,
-                    } => {
-                        flush_message_parts(
-                            input,
-                            &msg.role,
-                            &mut parts,
-                            is_current_message,
-                            compression,
-                        );
-                        input.push(json!({
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": serde_json::to_string(args).unwrap_or_default(),
-                        }));
-                    }
-                    Content::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        flush_message_parts(
-                            input,
-                            &msg.role,
-                            &mut parts,
-                            is_current_message,
-                            compression,
-                        );
-                        let output = tool_result_output(
-                            content,
-                            *is_error,
-                            should_truncate_tool_output(content, is_current_message, compression),
-                        );
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": tool_use_id,
-                            "output": output,
-                        }));
-                    }
-                    Content::Unknown(value) => {
-                        parts.push(content_part_from_unknown(value));
-                    }
-                }
-            }
-            flush_message_parts(
+            append_block_message_items(input, &msg.role, blocks, is_current_message, compression);
+        }
+    }
+}
+
+fn append_text_message_item(
+    input: &mut Vec<Value>,
+    role: &Role,
+    text: &str,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    input.push(message_item(
+        role,
+        compressed_text_item(text, is_current_message, compression),
+    ));
+}
+
+fn append_block_message_items(
+    input: &mut Vec<Value>,
+    role: &Role,
+    blocks: &[Content],
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    let mut parts = Vec::new();
+    for block in blocks {
+        append_block_item(
+            input,
+            role,
+            &mut parts,
+            block,
+            is_current_message,
+            compression,
+        );
+    }
+    flush_message_parts(input, role, &mut parts, is_current_message, compression);
+}
+
+fn append_block_item(
+    input: &mut Vec<Value>,
+    role: &Role,
+    parts: &mut Vec<ResponsesMessagePart>,
+    block: &Content,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    match block {
+        Content::Text { text } => parts.push(ResponsesMessagePart::Text(text.clone())),
+        Content::Thinking { .. } => {}
+        Content::ToolUse {
+            id,
+            name,
+            input: args,
+        }
+        | Content::ServerToolUse {
+            id,
+            name,
+            input: args,
+        } => {
+            flush_message_parts(input, role, parts, is_current_message, compression);
+            append_function_call(input, id, name, args);
+        }
+        Content::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            flush_message_parts(input, role, parts, is_current_message, compression);
+            append_function_call_output(
                 input,
-                &msg.role,
-                &mut parts,
+                tool_use_id,
+                content,
+                *is_error,
                 is_current_message,
                 compression,
             );
         }
+        Content::Unknown(value) => {
+            parts.push(content_part_from_unknown(value));
+        }
     }
+}
+
+fn append_function_call(input: &mut Vec<Value>, id: &str, name: &str, args: &Value) {
+    input.push(json!({
+        "type": "function_call",
+        "call_id": id,
+        "name": name,
+        "arguments": serde_json::to_string(args).unwrap_or_default(),
+    }));
+}
+
+fn append_function_call_output(
+    input: &mut Vec<Value>,
+    tool_use_id: &str,
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    let output = tool_result_output(
+        content,
+        is_error,
+        should_truncate_tool_output(content, is_current_message, compression),
+    );
+    input.push(json!({
+        "type": "function_call_output",
+        "call_id": tool_use_id,
+        "output": output,
+    }));
 }
 
 fn flush_message_parts(

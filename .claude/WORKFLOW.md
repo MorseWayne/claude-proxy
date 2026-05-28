@@ -9,7 +9,7 @@ Status: In Progress
 Level: 2
 Started: 2026-05-28
 Last updated: 2026-05-28
-Current phase: ChatGPT event-handler decomposition validated
+Current phase: Responses conversion decomposition validated
 
 Intent:
 - Deep-dive claude-proxy 2.0 code details and improve code quality, performance, and resource usage with lean, targeted validation.
@@ -23,7 +23,9 @@ Current todo:
 - [x] Assess ChatGPT too-many-arguments refactor risk before editing.
 - [x] Review accumulated diff and decide next hotspot or commit boundary.
 - [x] Decompose ChatGPT upstream event handler into focused responsibilities.
-- [ ] Decide whether to proceed with CRITICAL-risk Responses conversion decomposition.
+- [x] Decide whether to proceed with CRITICAL-risk Responses conversion decomposition.
+- [x] Decompose `responses.rs::append_message_items` into focused block/text/tool helpers.
+- [ ] Review Responses decomposition diff and choose next hotspot.
 
 Changes:
 - Baseline: `cargo check --workspace` passed; repo root was clean before this audit.
@@ -33,6 +35,8 @@ Changes:
 - Removed five redundant CLI/TUI clones by moving owned provider defaults and OAuth result payloads directly into their consumers.
 - Refactored ChatGPT stream callback setup and WebSocket completion storage to use small context structs, removing the remaining clippy `too_many_arguments` warnings without changing transport behavior.
 - Further decomposed ChatGPT upstream stream-event handling: introduced `ChatGptUpstreamEventHandlerState` with focused methods for first-event logging, reasoning-delta accounting, rate-limit caching, observer notification, and terminal-event handling. `upstream_event_handler` now only builds state and returns the callback.
+- Committed the first cleanup/refactor batch as `12680bd` (`refactor provider cleanup hotspots`).
+- Decomposed `responses.rs::append_message_items` into focused helpers: text message append, block iteration, single-block dispatch, function-call append, and function-call-output append. Behavior is intended to be unchanged.
 
 Validation:
 - `cargo test -p claude-proxy-providers inject_cache_control` passed.
@@ -55,13 +59,19 @@ Validation:
 - `cargo test -p claude-proxy-providers chatgpt_` passed after event-handler state extraction.
 - `cargo clippy -p claude-proxy-providers --lib -- -W clippy::too_many_arguments -W clippy::too_many_lines` shows `upstream_event_handler` no longer as too-long; remaining relevant provider warnings are broader transport and `send_responses_request_with_prompt_too_long_retry`.
 - Final `cargo fmt --all --check` and `git diff --check` passed.
-- Final GitNexus detect_changes scope all: CRITICAL due central ChatGPT provider/WebSocket and CLI flows, expected for touched ChatGPT provider internals plus previous CLI changes.
+- Final GitNexus detect_changes scope all before commit `12680bd`: CRITICAL due central ChatGPT provider/WebSocket and CLI flows, expected for touched ChatGPT provider internals plus previous CLI changes.
+- GitNexus impact before Responses conversion decomposition: `append_message_items` CRITICAL (27 impacted, 9 affected process roots, direct caller `convert_to_responses`). User acknowledged by asking to continue after commit.
+- `cargo test -p claude-proxy-providers --lib test_convert_to_responses` passed (24 tests).
+- `cargo test -p claude-proxy-providers --lib chatgpt_responses_body` passed (14 tests).
+- `cargo clippy -p claude-proxy-providers --lib -- -W clippy::too_many_lines` shows `append_message_items` no longer among too-long functions; remaining relevant warnings are broader transport/stream functions and stream converter.
+- `cargo fmt --all --check` and `git diff --check` passed after Responses decomposition.
+- GitNexus detect_changes scope all after Responses decomposition: CRITICAL, expected because the Responses conversion path is central; changed file is only `responses.rs`.
 
 Prerequisites:
 - Preserve existing uncommitted/user work; current repo status is clean at claude-proxy root.
 
 Resume next:
-- Do not edit `responses.rs::append_message_items` until user acknowledges CRITICAL impact. If proceeding, extract block handling helpers and run the full `responses::tests::test_convert_to_responses_*` set plus ChatGPT body tests.
+- Review the uncommitted `responses.rs` + ledger diff. Next likely hotspots: `responses.rs::flush_message_parts`, `chatgpt.rs::send_responses_request_with_prompt_too_long_retry`, or `chatgpt/transport.rs::open_websocket_stream`, each with impact analysis first.
 
 ### WF-2026-05-28-002 — ChatGPT request context efficiency follow-up
 Status: In Progress
