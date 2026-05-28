@@ -4,6 +4,42 @@
 
 ## Active（进行中）
 
+### WF-2026-05-28-002 — ChatGPT request context efficiency follow-up
+Status: In Progress
+Level: 2
+Started: 2026-05-28
+Last updated: 2026-05-28
+Current phase: Synthetic-session continuation fallback live-validated
+
+Intent:
+- Reduce repeated large ChatGPT upstream request payloads observed in `~/.config/claude-proxy/logs/claude-proxy.log`, prioritizing stable prompt cache / WebSocket continuation keys and better payload observability.
+
+Current todo:
+- [x] Analyze live ChatGPT payload logs and identify dominant inefficiencies.
+- [x] Run GitNexus impact for planned ChatGPT request path edits.
+- [x] Implement stable synthetic conversation id fallback and request-id-aware payload stats.
+- [x] Validate with focused tests, `git diff --check`, and GitNexus detect_changes.
+- [x] Add safe continuation fallback for synthetic session-id drift observed in live logs.
+
+Changes:
+- ChatGPT requests without explicit stable session metadata now synthesize a deterministic `client_session_id` from model, system prompt, and first user message. This makes `prompt_cache_key` and WebSocket continuation keys present instead of `none` / `missing_key` for clients that do not pass session headers.
+- Existing explicit conversation/session ids are preserved.
+- Provider request payload stats now include optional `request_id` fields; ChatGPT passes the per-request id so payload stats can be correlated with upstream/transport logs.
+- Validation passed: `cargo fmt --all --check`, targeted synthetic-session tests, `cargo test -p claude-proxy-providers chatgpt_`, `cargo test -p claude-proxy-providers openai_compat::tests`, `git diff --check`, and GitNexus detect_changes (LOW, no affected processes).
+- Live validation after this change showed prompt cache/continuation keys are present, but `continuation_used=false` with `missing_session` across follow-up turns; likely synthetic id drift because the first user message in compacted Claude Code requests is not stable. User approved a safe prefix-match fallback.
+- WebSocket continuation fallback now applies only to synthetic `cp-synth-*` ids. On exact-key miss, it searches same provider/account/model/schema cached continuations, ignores only `prompt_cache_key` in canonical body comparison, requires cached full input + assistant output to prefix-match current input, and logs `continuation_synthetic_fallback_used`.
+- Second live validation still showed `missing_session`; root cause is likely terminal cache storage being rejected when ChatGPT output contains `reasoning` items. Updated terminal assistant output extraction to skip `reasoning` items while still rejecting unsupported custom tool calls, so successful reasoning responses can populate the continuation cache.
+- Third live validation still showed `missing_session`; root cause is likely terminal events that contain response id/status but omit `response.output`. Updated continuation caching to allow empty terminal output, then infer/skip the previous assistant/function-call prefix from the next request before computing delta.
+- Final live validation succeeded: follow-up requests showed `continuation_used=true`, `continuation_disabled_reason="none"`, and `continuation_delta_items=1` while full logical input was 71/73 items, confirming upstream WebSocket sends only the delta.
+- Added `continuation_send_body_bytes` to the WebSocket continuation decision log so live logs show the actual JSON body size sent after applying continuation/delta input.
+- Validation passed after fallback/reasoning/empty-output/log-size fix: `cargo fmt --all --check`, `cargo test -p claude-proxy-providers chatgpt_`, `cargo test -p claude-proxy-providers continuation_`, `git diff --check`, and GitNexus detect_changes (HIGH, expected because `open_websocket_stream` / continuation flow is intentionally affected).
+
+Prerequisites:
+- User approved applying the recommended optimizations after log analysis showed prompt cache and continuation were always disabled by missing stable conversation ids.
+
+Resume next:
+- Optionally commit the live-validated ChatGPT context efficiency fix, then run `npx gitnexus analyze` if committing/index refresh is desired.
+
 ### WF-2026-05-28-001 — Claude Code quality gate capability rollout
 Status: In Progress
 Level: 2

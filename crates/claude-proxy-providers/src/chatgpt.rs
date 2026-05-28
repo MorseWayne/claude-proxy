@@ -29,8 +29,9 @@ use reqwest::{
     Client, Response, StatusCode,
     header::{HeaderMap, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::http::{
@@ -62,6 +63,7 @@ const CHATGPT_PTL_FALLBACK_DROP_DIVISOR: usize = 5;
 const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
 const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
+const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
 const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 const CHATGPT_WEBSOCKET_STARTUP_FAILURE_COOLDOWN_SECS: u64 = 120;
 
@@ -1211,6 +1213,8 @@ impl Provider for ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_existing_token().await?;
         let request = apply_openai_intent(request);
+        let (request, synthetic_stable_client_conversation_id) =
+            ensure_chatgpt_stable_client_conversation_id(request);
         let marker_mode = marker_mode_from_request(&request);
         let prompt_cache_key_source = responses::prompt_cache_key_source(&request);
         let stable_client_conversation_id =
@@ -1231,9 +1235,10 @@ impl Provider for ChatGptProvider {
             prompt_cache_key_source = prompt_cache_key_source.as_str(),
             prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
             stable_client_conversation_id_present = stable_client_conversation_id.is_some(),
+            synthetic_stable_client_conversation_id,
             "ChatGPT prompt cache key policy applied"
         );
-        log_request_observability("chatgpt", "/responses", &body);
+        log_request_observability("chatgpt", "/responses", &body, Some(request_id));
         let compact_request = is_compact_request_body(&body);
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
 
@@ -1812,6 +1817,59 @@ fn build_chatgpt_responses_body_with_codex_context(
     context: responses::CodexRequestContext<'_>,
 ) -> Value {
     responses::build_body_with_context(request, DEFAULT_CHATGPT_INSTRUCTIONS, context)
+}
+
+fn ensure_chatgpt_stable_client_conversation_id(
+    mut request: MessagesRequest,
+) -> (MessagesRequest, bool) {
+    if responses::stable_client_conversation_id_for_continuation(&request).is_some() {
+        return (request, false);
+    }
+
+    let Some(session_id) = synthetic_chatgpt_client_session_id(&request) else {
+        return (request, false);
+    };
+    request
+        .extra
+        .insert("client_session_id".to_string(), Value::String(session_id));
+    (request, true)
+}
+
+fn synthetic_chatgpt_client_session_id(request: &MessagesRequest) -> Option<String> {
+    let first_user_message = request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"claude-proxy-chatgpt-synthetic-session-v1");
+    update_synthetic_session_hash(&mut hasher, &request.model);
+    update_synthetic_session_hash(&mut hasher, &request.system);
+    update_synthetic_session_hash(&mut hasher, first_user_message);
+    let digest = hasher.finalize();
+    Some(format!(
+        "cp-synth-{}",
+        hex_prefix(&digest, CHATGPT_SYNTHETIC_SESSION_HASH_BYTES)
+    ))
+}
+
+fn update_synthetic_session_hash<T: Serialize>(hasher: &mut Sha256, value: &T) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        Err(_) => hasher.update(b"<json-error>"),
+    }
+}
+
+fn hex_prefix(bytes: &[u8], len: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(len * 2);
+    for byte in bytes.iter().take(len) {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3386,6 +3444,87 @@ mod tests {
         assert_eq!(
             responses::stable_client_conversation_id_for_continuation(&stable).as_deref(),
             Some("conversation-123")
+        );
+    }
+
+    #[test]
+    fn chatgpt_synthesizes_stable_conversation_id_when_missing() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: Some(SystemPrompt::Text("system".to_string())),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("first task".to_string()),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("working".to_string()),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let (req, synthesized) = ensure_chatgpt_stable_client_conversation_id(req);
+        let session_id = req
+            .extra
+            .get("client_session_id")
+            .and_then(Value::as_str)
+            .expect("synthetic session id");
+
+        assert!(synthesized);
+        assert!(session_id.starts_with("cp-synth-"));
+        assert_eq!(session_id.len(), "cp-synth-".len() + 32);
+        assert_eq!(
+            responses::stable_client_conversation_id_for_continuation(&req).as_deref(),
+            Some(session_id)
+        );
+        assert_eq!(
+            build_chatgpt_responses_body(&req)["prompt_cache_key"],
+            session_id
+        );
+    }
+
+    #[test]
+    fn chatgpt_preserves_existing_stable_conversation_id() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("client_session_id".to_string(), json!("explicit-session"));
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("first task".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let (req, synthesized) = ensure_chatgpt_stable_client_conversation_id(req);
+
+        assert!(!synthesized);
+        assert_eq!(
+            req.extra.get("client_session_id").and_then(Value::as_str),
+            Some("explicit-session")
         );
     }
 

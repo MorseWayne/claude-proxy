@@ -642,7 +642,12 @@ fn truncated_original_bytes(text: &str) -> Option<usize> {
         .and_then(|bytes| bytes.parse().ok())
 }
 
-pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &Value) {
+pub(crate) fn log_request_observability(
+    provider: &str,
+    endpoint: &str,
+    body: &Value,
+    request_id: Option<u64>,
+) {
     if !enabled!(Level::DEBUG) {
         return;
     }
@@ -651,6 +656,8 @@ pub(crate) fn log_request_observability(provider: &str, endpoint: &str, body: &V
     debug!(
         provider,
         endpoint,
+        request_id = request_id.unwrap_or_default(),
+        request_id_present = request_id.is_some(),
         model = %stats.model,
         stream = stats.stream,
         input_items = stats.input_items,

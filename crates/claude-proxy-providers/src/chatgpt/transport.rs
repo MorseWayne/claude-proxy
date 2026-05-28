@@ -230,24 +230,48 @@ impl ChatGptWebSocketSession {
             );
         }
 
-        let generation = self.current_generation(&key);
+        let mut active_key = key.clone();
+        let mut synthetic_fallback_used = false;
+        if !self.continuations.contains_key(&active_key)
+            && let Some(fallback_key) =
+                self.synthetic_continuation_fallback_key(&key, &canonical_body, &full_input)
+        {
+            active_key = fallback_key;
+            synthetic_fallback_used = true;
+        }
+
+        if active_key != key && self.busy.contains(&active_key) {
+            self.clear_continuation_for_key(&active_key);
+            self.bump_generation(&active_key);
+            return ContinuationAttempt::disabled_with_key(
+                active_key,
+                body.clone(),
+                ContinuationDisabledReason::Busy,
+            );
+        }
+
+        let generation = self.current_generation(&active_key);
         let mut send_body = body.clone();
         let mut used = false;
         let mut disabled_reason = ContinuationDisabledReason::MissingSession;
-        match self.continuations.get(&key) {
-            Some(cached) if cached.canonical_body != canonical_body => {
-                self.clear_continuation_for_key(&key);
+        match self.continuations.get(&active_key) {
+            Some(cached)
+                if !canonical_bodies_match_for_continuation(
+                    &cached.canonical_body,
+                    &canonical_body,
+                    &active_key,
+                    &key,
+                ) =>
+            {
+                self.clear_continuation_for_key(&active_key);
                 disabled_reason = ContinuationDisabledReason::BodyMismatch;
             }
             Some(cached) if cached.response_id.is_empty() => {
-                self.clear_continuation_for_key(&key);
+                self.clear_continuation_for_key(&active_key);
                 disabled_reason = ContinuationDisabledReason::MissingResponseId;
             }
             Some(cached) => {
-                let mut baseline = cached.full_input.clone();
-                baseline.extend(cached.assistant_output_items.clone());
-                if full_input.starts_with(&baseline) && full_input.len() > baseline.len() {
-                    let delta = full_input[baseline.len()..].to_vec();
+                if let Some(delta) = continuation_delta(cached, &full_input) {
                     if let Some(object) = send_body.as_object_mut() {
                         object.insert(
                             "previous_response_id".to_string(),
@@ -257,29 +281,30 @@ impl ChatGptWebSocketSession {
                         used = true;
                         disabled_reason = ContinuationDisabledReason::None;
                     } else {
-                        self.clear_continuation_for_key(&key);
-                        self.bump_generation(&key);
+                        self.clear_continuation_for_key(&active_key);
+                        self.bump_generation(&active_key);
                         return ContinuationAttempt::disabled_with_key(
-                            key,
+                            active_key,
                             body.clone(),
                             ContinuationDisabledReason::InvalidBody,
                         );
                     }
                 } else {
-                    self.clear_continuation_for_key(&key);
+                    self.clear_continuation_for_key(&active_key);
                     disabled_reason = ContinuationDisabledReason::PrefixMismatch;
                 }
             }
             None => {}
         }
 
-        self.busy.insert(key.clone());
+        self.busy.insert(active_key.clone());
         ContinuationAttempt {
-            key: Some(key),
+            key: Some(active_key),
             send_body,
             canonical_body,
             full_input,
             used,
+            synthetic_fallback_used,
             update_on_success: true,
             owns_busy: true,
             generation,
@@ -366,6 +391,36 @@ impl ChatGptWebSocketSession {
         self.continuations.remove(key);
     }
 
+    fn synthetic_continuation_fallback_key(
+        &self,
+        key: &ContinuationKey,
+        canonical_body: &Value,
+        full_input: &[Value],
+    ) -> Option<ContinuationKey> {
+        if !is_synthetic_continuation_id(&key.stable_client_conversation_id) {
+            return None;
+        }
+
+        self.continuations
+            .iter()
+            .filter(|(candidate, cached)| {
+                candidate != &key
+                    && same_continuation_fallback_scope(candidate, key)
+                    && is_synthetic_continuation_id(&candidate.stable_client_conversation_id)
+                    && !self.busy.contains(*candidate)
+                    && !cached.response_id.is_empty()
+                    && canonical_bodies_match_for_continuation(
+                        &cached.canonical_body,
+                        canonical_body,
+                        candidate,
+                        key,
+                    )
+                    && continuation_delta(cached, full_input).is_some()
+            })
+            .max_by_key(|(_, cached)| cached.full_input.len() + cached.assistant_output_items.len())
+            .map(|(candidate, _)| candidate.clone())
+    }
+
     fn current_generation(&self, key: &ContinuationKey) -> u64 {
         self.generations.get(key).copied().unwrap_or(0)
     }
@@ -434,6 +489,7 @@ struct ContinuationAttempt {
     canonical_body: Value,
     full_input: Vec<Value>,
     used: bool,
+    synthetic_fallback_used: bool,
     update_on_success: bool,
     owns_busy: bool,
     generation: u64,
@@ -448,6 +504,7 @@ impl ContinuationAttempt {
             full_input: response_input_items(&body).unwrap_or_default(),
             send_body: body,
             used: false,
+            synthetic_fallback_used: false,
             update_on_success: false,
             owns_busy: false,
             generation: 0,
@@ -466,6 +523,7 @@ impl ContinuationAttempt {
             full_input: response_input_items(&body).unwrap_or_default(),
             send_body: body,
             used: false,
+            synthetic_fallback_used: false,
             update_on_success: false,
             owns_busy: false,
             generation: 0,
@@ -508,6 +566,78 @@ fn websocket_connection_key(
         thread_id: runtime_ids.thread_id,
         window_id: runtime_ids.window_id,
     }
+}
+
+fn same_continuation_fallback_scope(left: &ContinuationKey, right: &ContinuationKey) -> bool {
+    left.provider_id == right.provider_id
+        && left.account_id == right.account_id
+        && left.model == right.model
+        && left.schema_version == right.schema_version
+}
+
+fn is_synthetic_continuation_id(value: &str) -> bool {
+    value.starts_with("cp-synth-")
+}
+
+fn canonical_bodies_match_for_continuation(
+    cached: &Value,
+    current: &Value,
+    cached_key: &ContinuationKey,
+    current_key: &ContinuationKey,
+) -> bool {
+    if cached == current {
+        return true;
+    }
+    if !is_synthetic_continuation_id(&cached_key.stable_client_conversation_id)
+        || !is_synthetic_continuation_id(&current_key.stable_client_conversation_id)
+        || !same_continuation_fallback_scope(cached_key, current_key)
+    {
+        return false;
+    }
+
+    canonical_body_without_prompt_cache_key(cached)
+        == canonical_body_without_prompt_cache_key(current)
+}
+
+fn canonical_body_without_prompt_cache_key(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("prompt_cache_key");
+    }
+    body
+}
+
+fn continuation_delta(cached: &CachedContinuation, full_input: &[Value]) -> Option<Vec<Value>> {
+    if cached.assistant_output_items.is_empty() {
+        return continuation_delta_with_inferred_assistant_prefix(cached, full_input);
+    }
+
+    let mut baseline = cached.full_input.clone();
+    baseline.extend(cached.assistant_output_items.clone());
+    (full_input.starts_with(&baseline) && full_input.len() > baseline.len())
+        .then(|| full_input[baseline.len()..].to_vec())
+}
+
+fn continuation_delta_with_inferred_assistant_prefix(
+    cached: &CachedContinuation,
+    full_input: &[Value],
+) -> Option<Vec<Value>> {
+    if !full_input.starts_with(&cached.full_input) || full_input.len() <= cached.full_input.len() {
+        return None;
+    }
+
+    let mut delta_start = cached.full_input.len();
+    while delta_start < full_input.len()
+        && is_assistant_output_prefix_candidate(&full_input[delta_start])
+    {
+        delta_start += 1;
+    }
+    (delta_start < full_input.len()).then(|| full_input[delta_start..].to_vec())
+}
+
+fn is_assistant_output_prefix_candidate(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("assistant")
+        || item.get("type").and_then(Value::as_str) == Some("function_call")
 }
 
 fn continuation_key(
@@ -585,22 +715,29 @@ fn terminal_response_id(event: &Value) -> Option<&str> {
 }
 
 fn terminal_assistant_output_items(event: &Value) -> Option<Vec<Value>> {
-    let output = event
+    let Some(output) = event
         .get("response")
         .unwrap_or(event)
         .get("output")
-        .and_then(Value::as_array)?;
-    output
-        .iter()
-        .map(assistant_output_item_to_input_prefix_item)
-        .collect()
+        .and_then(Value::as_array)
+    else {
+        return Some(Vec::new());
+    };
+    let mut items = Vec::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+            continue;
+        }
+        items.push(assistant_output_item_to_input_prefix_item(item)?);
+    }
+    Some(items)
 }
 
 fn assistant_output_item_to_input_prefix_item(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => assistant_message_output_to_input_item(item),
         Some("function_call") => assistant_function_call_output_to_input_item(item),
-        Some("reasoning" | "custom_tool_call") => None,
+        Some("custom_tool_call") => None,
         Some(_) | None => None,
     }
 }
@@ -679,7 +816,10 @@ where
         transport = "websocket",
         continuation_key_present = continuation.key.is_some(),
         continuation_used = continuation.used,
+        continuation_synthetic_fallback_used = continuation.synthetic_fallback_used,
         continuation_disabled_reason = continuation.disabled_reason.as_str(),
+        continuation_send_body_bytes =
+            serde_json::to_vec(&continuation.send_body).map_or(0, |bytes| bytes.len()),
         prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
         stable_client_conversation_id_present = stable_client_conversation_id.is_some(),
         continuation_delta_items = continuation
@@ -1785,6 +1925,108 @@ mod tests {
     }
 
     #[test]
+    fn continuation_synthetic_fallback_uses_prefix_match_across_drifted_ids() {
+        let cached_key = ContinuationKey {
+            provider_id: "chatgpt".to_string(),
+            account_id: "account".to_string(),
+            model: "gpt-5.5".to_string(),
+            stable_client_conversation_id: "cp-synth-old".to_string(),
+            schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        };
+        let current_key = ContinuationKey {
+            stable_client_conversation_id: "cp-synth-new".to_string(),
+            ..cached_key.clone()
+        };
+        let cached_input = vec![json!({"role": "user", "content": "first"})];
+        let assistant_output = vec![json!({"role": "assistant", "content": "answer"})];
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "follow-up"}),
+        ];
+        let mut session = ChatGptWebSocketSession::new();
+        session.continuations.insert(
+            cached_key.clone(),
+            CachedContinuation {
+                canonical_body: canonical_request_body(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "prompt_cache_key": "cp-synth-old",
+                    "input": cached_input,
+                })),
+                full_input: vec![json!({"role": "user", "content": "first"})],
+                assistant_output_items: assistant_output,
+                response_id: "resp-1".to_string(),
+                updated_at: Instant::now(),
+            },
+        );
+        let current_canonical = canonical_request_body(&json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "prompt_cache_key": "cp-synth-new",
+            "input": full_input,
+        }));
+
+        let fallback = session.synthetic_continuation_fallback_key(
+            &current_key,
+            &current_canonical,
+            &[
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "assistant", "content": "answer"}),
+                json!({"role": "user", "content": "follow-up"}),
+            ],
+        );
+
+        assert_eq!(fallback, Some(cached_key));
+    }
+
+    #[test]
+    fn continuation_synthetic_fallback_rejects_non_synthetic_ids() {
+        let cached_key = ContinuationKey {
+            provider_id: "chatgpt".to_string(),
+            account_id: "account".to_string(),
+            model: "gpt-5.5".to_string(),
+            stable_client_conversation_id: "explicit-old".to_string(),
+            schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
+        };
+        let current_key = ContinuationKey {
+            stable_client_conversation_id: "explicit-new".to_string(),
+            ..cached_key.clone()
+        };
+        let mut session = ChatGptWebSocketSession::new();
+        session.continuations.insert(
+            cached_key,
+            CachedContinuation {
+                canonical_body: canonical_request_body(&json!({
+                    "model": "gpt-5.5",
+                    "prompt_cache_key": "explicit-old",
+                    "input": [{"role": "user", "content": "first"}],
+                })),
+                full_input: vec![json!({"role": "user", "content": "first"})],
+                assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
+                response_id: "resp-1".to_string(),
+                updated_at: Instant::now(),
+            },
+        );
+
+        let fallback = session.synthetic_continuation_fallback_key(
+            &current_key,
+            &canonical_request_body(&json!({
+                "model": "gpt-5.5",
+                "prompt_cache_key": "explicit-new",
+                "input": [{"role": "user", "content": "first"}],
+            })),
+            &[
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "assistant", "content": "answer"}),
+                json!({"role": "user", "content": "follow-up"}),
+            ],
+        );
+
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
     fn continuation_extracts_supported_assistant_output_prefix_items() {
         let event = json!({
             "type": "response.completed",
@@ -1818,6 +2060,90 @@ mod tests {
                 "name": "Read",
                 "arguments": "{\"file\":\"a\"}"
             })
+        );
+    }
+
+    #[test]
+    fn continuation_allows_terminal_event_without_output_items() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "status": "completed"
+            }
+        });
+
+        let items = terminal_assistant_output_items(&event).expect("missing output is cacheable");
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn continuation_delta_infers_missing_assistant_prefix() {
+        let cached = CachedContinuation {
+            canonical_body: json!({}),
+            full_input: vec![json!({"role": "user", "content": "first"})],
+            assistant_output_items: Vec::new(),
+            response_id: "resp-1".to_string(),
+            updated_at: Instant::now(),
+        };
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "follow-up"}),
+        ];
+
+        let delta = continuation_delta(&cached, &full_input).expect("delta");
+
+        assert_eq!(delta, vec![json!({"role": "user", "content": "follow-up"})]);
+    }
+
+    #[test]
+    fn continuation_delta_keeps_tool_output_after_inferred_function_call() {
+        let cached = CachedContinuation {
+            canonical_body: json!({}),
+            full_input: vec![json!({"role": "user", "content": "first"})],
+            assistant_output_items: Vec::new(),
+            response_id: "resp-1".to_string(),
+            updated_at: Instant::now(),
+        };
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"type": "function_call", "call_id": "call-1", "name": "Read", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call-1", "output": "result"}),
+        ];
+
+        let delta = continuation_delta(&cached, &full_input).expect("delta");
+
+        assert_eq!(
+            delta,
+            vec![json!({"type": "function_call_output", "call_id": "call-1", "output": "result"})]
+        );
+    }
+
+    #[test]
+    fn continuation_skips_reasoning_output_prefix_items() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "encrypted_content": "opaque"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }
+                ]
+            }
+        });
+
+        let items = terminal_assistant_output_items(&event).expect("reasoning is skipped");
+
+        assert_eq!(
+            items,
+            vec![json!({"role": "assistant", "content": "hello"})]
         );
     }
 

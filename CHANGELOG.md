@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.9 - 2026-05-28
+
+### Changed in v1.3.9
+
+- Added ChatGPT stable synthetic session fallback so WebSocket continuation and prompt cache keys are present even when clients omit explicit session metadata.
+- Improved ChatGPT WebSocket continuation caching for reasoning responses and terminal events without output payloads, allowing follow-up turns to send `previous_response_id` plus delta input instead of full history.
+- Added continuation send-body byte diagnostics to show the actual upstream WebSocket payload size after delta compaction.
+
 ## v1.3.8 - 2026-05-28
 
 ### Changed in v1.3.8

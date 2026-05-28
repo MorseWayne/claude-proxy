@@ -173,7 +173,7 @@ impl OpenAiProvider {
         let body = request::convert_request(&request);
         let url = format!("{}/chat/completions", self.base_url);
 
-        log_request_observability("openai", "/chat/completions", &body);
+        log_request_observability("openai", "/chat/completions", &body, None);
 
         let upstream_request =
             apply_runtime_request_config(self.client.post(&url), &self.runtime)?.json(&body);
@@ -218,7 +218,7 @@ impl OpenAiProvider {
         let body = self.responses_request_body(&request);
         let url = format!("{}/responses", self.base_url);
 
-        log_request_observability("openai", "/responses", &body);
+        log_request_observability("openai", "/responses", &body, None);
 
         let upstream_request =
             apply_runtime_request_config(self.client.post(&url), &self.runtime)?.json(&body);
