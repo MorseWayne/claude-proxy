@@ -9,7 +9,7 @@ Status: In Progress
 Level: 3
 Started: 2026-05-25
 Last updated: 2026-05-28
-Current phase: v1.3.7 reduced-risk ChatGPT payload fix
+Current phase: Pi 0.76-aligned ChatGPT stability follow-ups
 
 Intent:
 - Modernize ChatGPT/OpenAI provider integration using lessons from `/home/wayne/source/open/pi/packages/ai`: accurate ChatGPT/Codex capabilities, richer Responses options, safer prompt cache keys, usage accuracy, WebSocket transport with SSE fallback, and continuation/delta input.
@@ -44,6 +44,7 @@ Current todo:
 - [x] Prepare v1.3.6 release metadata and changelog for ChatGPT payload optimizations.
 - [x] Fix ChatGPT capability metadata so client sampling/stop parameters are tolerated while the provider continues stripping unsupported upstream fields.
 - [x] Prepare v1.3.7 reduced-risk release metadata: remove v1.3.6 SSE/HTTP continuation and pre-send compaction, keep tool-schema guard.
+- [x] Apply Pi 0.76-aligned ChatGPT follow-ups: Codex Spark 128k context metadata, shorter SSE header timeout, default no ChatGPT 429 retry, and session-id cache-affinity docs.
 
 Changes:
 - User approved the "full bold" scope including WebSocket transport and continuation, not just low-risk capability/request fixes.
@@ -91,12 +92,13 @@ Changes:
 - GitNexus detect_changes reports CRITICAL because the diff intentionally touches ChatGPT SSE/WebSocket continuation/session handling and prompt-too-long request shrinking; affected processes align with the planned ChatGPT payload optimization scope.
 - Fixed compaction compatibility for ChatGPT/Codex models: capability metadata now reports sampling and stop_sequences as Unknown instead of Unsupported, so server capability validation tolerates client-supplied optional parameters that the ChatGPT Responses builder strips before sending upstream. Validation passed: `cargo fmt --all --check`, targeted ChatGPT model capability test, targeted Responses sampling-omission test, and GitNexus detect_changes (LOW).
 - User agreed v1.3.6 payload optimizations had low benefit for their complexity; v1.3.7 now removes SSE/HTTP continuation reuse and proactive pre-send compaction, while preserving the safer tool-schema budget guard and the sampling/stop capability compatibility fix. Validation passed: `cargo fmt --all --check`, targeted ChatGPT capability/tool-schema/Responses sampling/transport/continuation tests, `cargo test -p claude-proxy-providers chatgpt_`, `git diff --check`, and GitNexus detect_changes (LOW, no affected processes).
+- Applied Pi 0.76-aligned follow-ups after reviewing Pi release notes/source: ChatGPT/Codex Spark now reports 128k context, ChatGPT SSE response header timeout is 10s, ChatGPT default policy no longer retries 429 responses, README documents using Pi `--session-id` for stable cache affinity, and CHANGELOG has an Unreleased entry. Validation passed: `cargo fmt --all --check`, targeted ChatGPT model/policy tests, `cargo test -p claude-proxy-providers chatgpt_`, `git diff --check`, and GitNexus detect_changes (LOW, no affected processes). Pre-edit impact for `chatgpt_upstream_request_policy` was CRITICAL due central ChatGPT path, so the change was scoped to policy defaults and covered by focused tests.
 
 Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit and tag v1.3.7 if the reduced-risk diff is accepted.
+- Commit and tag v1.3.8, then push main and tag.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed

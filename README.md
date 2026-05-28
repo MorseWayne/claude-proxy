@@ -257,6 +257,8 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 
 如果需要修改 `Base URL` 或 `Proxy`：在 Providers 详情页按 `→` / `Enter` 进入详情，移动到字段后按 `e` 编辑，确认后按 `Ctrl+S` 保存。
 
+使用 Pi 0.76.0+ 作为客户端时，自动化脚本可以用 `pi --session-id <id>` 固定项目内会话。claude-proxy 会把安全的客户端 session header 转成 ChatGPT prompt-cache / continuation key，稳定 session id 有助于提高 ChatGPT/Codex 的缓存亲和性。
+
 高级场景可以在 TOML 里覆盖 ChatGPT Codex 请求身份头；默认值通常不需要修改，默认会使用 Codex 风格的 `originator` 和 `User-Agent`。`User-Agent` 会优先使用本地 `codex --version` 探测到的版本；探测失败时使用内置默认值：
 
 ```toml

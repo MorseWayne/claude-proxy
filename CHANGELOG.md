@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.8 - 2026-05-28
+
+### Changed in v1.3.8
+
+- Updated ChatGPT/Codex Spark metadata to use its observed 128k context window.
+- Made ChatGPT SSE response-header waits shorter and disabled default ChatGPT 429 retries to avoid hiding account/quota limit responses behind provider retries.
+
 ## v1.3.7 - 2026-05-28
 
 ### Changed in v1.3.7

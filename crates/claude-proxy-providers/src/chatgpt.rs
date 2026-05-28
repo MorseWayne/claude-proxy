@@ -52,7 +52,7 @@ use tracing::{info, warn};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
-const CHATGPT_SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+const CHATGPT_SSE_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
 const CHATGPT_PTL_RETRY_MARKER: &str =
@@ -1426,7 +1426,8 @@ fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, Provide
 fn chatgpt_upstream_request_policy(runtime: &ProviderRuntimeConfig) -> UpstreamRequestPolicy {
     UpstreamRequestPolicy {
         max_attempts: CHATGPT_SEND_MAX_ATTEMPTS,
-        attempt_timeout: Some(CHATGPT_SEND_ATTEMPT_TIMEOUT),
+        attempt_timeout: Some(CHATGPT_SSE_RESPONSE_HEADER_TIMEOUT),
+        retry_rate_limits: false,
         ..UpstreamRequestPolicy::default()
     }
     .with_runtime_config(runtime)
@@ -2386,7 +2387,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
-        context_window: 272_000,
+        context_window: 128_000,
         image_input: false,
     },
     ChatGptModelSpec {
@@ -3000,6 +3001,12 @@ mod tests {
             codex.capabilities.modalities.input.image,
             CapabilityState::Unsupported
         );
+
+        let spark = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.3-codex-spark")
+            .expect("codex spark model");
+        assert_eq!(spark.capabilities.limits.context_window, Some(128_000));
     }
 
     #[test]
@@ -3007,7 +3014,8 @@ mod tests {
         let policy = chatgpt_upstream_request_policy(&ProviderRuntimeConfig::default());
 
         assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(10)));
+        assert!(!policy.retry_rate_limits);
     }
 
     #[test]
@@ -3027,6 +3035,7 @@ mod tests {
 
         assert_eq!(policy.max_attempts, 4);
         assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(20)));
+        assert!(!policy.retry_rate_limits);
     }
 
     #[test]
