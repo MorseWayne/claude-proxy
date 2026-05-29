@@ -1214,18 +1214,17 @@ fn add_provider(app: &mut App) {
     ];
     let items: Vec<String> = types
         .iter()
-        .map(|t| {
-            let desc = match t {
-                ProviderType::Copilot => " — OAuth, no API key needed",
-                ProviderType::ChatGPT => " — ChatGPT OAuth",
-                ProviderType::OpenAI => " — API key",
-                ProviderType::Anthropic => " — API key",
-                ProviderType::OpenRouter => " — API key, OpenAI-compatible",
-                ProviderType::Google => " — API key, OpenAI-compatible",
-                ProviderType::Custom(_) => " — custom, choose compatibility after adding",
-                ProviderType::CustomAnthropic(_) => unreachable!(),
-            };
-            format!("{}{}", t.display_name(), desc)
+        .map(|t| match t {
+            ProviderType::Copilot => format!("{} — OAuth, no API key needed", t.display_name()),
+            ProviderType::ChatGPT => format!("{} — ChatGPT OAuth", t.display_name()),
+            ProviderType::OpenAI => format!("{} — API key", t.display_name()),
+            ProviderType::Anthropic => format!("{} — API key", t.display_name()),
+            ProviderType::OpenRouter => {
+                format!("{} — API key, OpenAI-compatible", t.display_name())
+            }
+            ProviderType::Google => format!("{} — API key, OpenAI-compatible", t.display_name()),
+            ProviderType::Custom(_) => "Custom — choose compatibility after adding".to_string(),
+            ProviderType::CustomAnthropic(_) => unreachable!(),
         })
         .collect();
     app.pending_provider_types = Some(types);
@@ -3014,6 +3013,12 @@ mod tests {
 
         add_provider(&mut app);
         if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            assert!(
+                picker
+                    .items
+                    .contains(&"Custom — choose compatibility after adding".to_string())
+            );
+            assert!(!picker.items.iter().any(|item| item.starts_with("Custom (")));
             picker.selected = picker
                 .items
                 .iter()
