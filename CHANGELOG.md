@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.0.2 - 2026-05-29
+
+### Changed in v2.0.2
+
+- Simplified TUI custom provider creation to a single Custom option instead of separate OpenAI-compatible and Anthropic-compatible entries.
+- Custom providers now get unique default names (`custom`, `custom-2`, ...), can be renamed from the provider detail pane, and can switch compatibility between OpenAI-compatible and Anthropic-compatible after creation.
+
 ## v2.0.1 - 2026-05-29
 
 ### Fixed in v2.0.1

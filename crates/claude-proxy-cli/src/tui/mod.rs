@@ -569,17 +569,25 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             app.mark_dirty();
                             app.show_toast(Toast::success(format!("Log level: {selected}")));
                         }
+                        PickerAction::SetProviderCompatibility { provider_id } => {
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            set_provider_compatibility(app, &provider_id, &selected);
+                        }
                         PickerAction::AddProvider => {
                             let idx = picker.selected;
                             let types = app.pending_provider_types.take().unwrap_or_default();
-                            let provider_type = types
+                            let mut provider_type = types
                                 .into_iter()
                                 .nth(idx)
                                 .unwrap_or(ProviderType::Custom(String::new()));
 
-                            let default_id = default_provider_id(&provider_type).to_string();
-                            let id = default_id;
-                            let provider_type = provider_type_with_id(provider_type, &id);
+                            let id = if matches!(provider_type, ProviderType::Custom(_)) {
+                                next_custom_provider_id(app)
+                            } else {
+                                default_provider_id(&provider_type).to_string()
+                            };
+                            provider_type = provider_type_with_id(provider_type, &id);
 
                             let copilot = if provider_type == ProviderType::Copilot {
                                 Some(CopilotProviderConfig::default())
@@ -614,7 +622,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             app.focus = Focus::Content;
                             let action = if replaced { "Updated" } else { "Added" };
                             app.show_toast(Toast::success(format!(
-                                "{action} \"{id}\". Edit fields, Ctrl+S to save."
+                                "{action} \"{id}\". Edit name/type/fields, Ctrl+S to save."
                             )));
 
                             // Start OAuth flow for providers that need it
@@ -725,8 +733,34 @@ fn start_editing(app: &mut App) {
         if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
             let id = id.clone();
             let pt = cfg.resolve_type(&id);
+            if app.detail_idx == 1 {
+                if !is_custom_provider_type(&pt) {
+                    app.show_toast(Toast::info(
+                        "Only custom providers can change compatibility",
+                    ));
+                    return;
+                }
+                let items = vec![
+                    "OpenAI-compatible".to_string(),
+                    "Anthropic-compatible".to_string(),
+                ];
+                let selected = items
+                    .iter()
+                    .position(|item| item == provider_compatibility_label(&pt))
+                    .unwrap_or(0);
+                app.overlay = Some(Overlay::Picker(PickerOverlay {
+                    title: format!("Set {id} Compatibility"),
+                    items,
+                    selected,
+                    action: PickerAction::SetProviderCompatibility { provider_id: id },
+                }));
+                app.focus = Focus::Overlay;
+                return;
+            }
+
             let (field, prompt, value) = match app.detail_idx {
-                0 => {
+                0 => (ProviderField::Name, "Name", id.clone()),
+                2 => {
                     if !pt.needs_api_key() {
                         app.show_toast(Toast::info(format!(
                             "{} uses OAuth (API key not editable)",
@@ -736,8 +770,8 @@ fn start_editing(app: &mut App) {
                     }
                     (ProviderField::ApiKey, "API Key", cfg.api_key.clone())
                 }
-                1 => (ProviderField::BaseUrl, "Base URL", cfg.base_url.clone()),
-                2 => (ProviderField::Proxy, "Proxy", cfg.proxy.clone()),
+                3 => (ProviderField::BaseUrl, "Base URL", cfg.base_url.clone()),
+                4 => (ProviderField::Proxy, "Proxy", cfg.proxy.clone()),
                 _ => return,
             };
             let cursor = value.len();
@@ -1114,8 +1148,13 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
         InputAction::EditProviderField {
             provider_id, field, ..
         } => {
+            if matches!(field, ProviderField::Name) {
+                return rename_provider(app, provider_id, value);
+            }
+
             if let Some(cfg) = app.settings.providers.get_mut(provider_id) {
                 match field {
+                    ProviderField::Name => unreachable!(),
                     ProviderField::ApiKey => cfg.api_key = value.to_string(),
                     ProviderField::BaseUrl => cfg.base_url = value.to_string(),
                     ProviderField::Proxy => cfg.proxy = value.to_string(),
@@ -1164,7 +1203,15 @@ fn handle_toggle(app: &mut App) {
 }
 
 fn add_provider(app: &mut App) {
-    let types = ProviderType::known_types();
+    let types = vec![
+        ProviderType::OpenAI,
+        ProviderType::Anthropic,
+        ProviderType::Copilot,
+        ProviderType::ChatGPT,
+        ProviderType::OpenRouter,
+        ProviderType::Google,
+        ProviderType::Custom(String::new()),
+    ];
     let items: Vec<String> = types
         .iter()
         .map(|t| {
@@ -1175,8 +1222,8 @@ fn add_provider(app: &mut App) {
                 ProviderType::Anthropic => " — API key",
                 ProviderType::OpenRouter => " — API key, OpenAI-compatible",
                 ProviderType::Google => " — API key, OpenAI-compatible",
-                ProviderType::Custom(_) => " — OpenAI-compatible",
-                ProviderType::CustomAnthropic(_) => " — Anthropic-compatible",
+                ProviderType::Custom(_) => " — custom, choose compatibility after adding",
+                ProviderType::CustomAnthropic(_) => unreachable!(),
             };
             format!("{}{}", t.display_name(), desc)
         })
@@ -1193,10 +1240,21 @@ fn add_provider(app: &mut App) {
 
 fn default_provider_id(provider_type: &ProviderType) -> &str {
     match provider_type {
-        ProviderType::Custom(_) => "custom-openai",
-        ProviderType::CustomAnthropic(_) => "custom-anthropic",
+        ProviderType::Custom(_) | ProviderType::CustomAnthropic(_) => "custom",
         _ => provider_type.as_str(),
     }
+}
+
+fn next_custom_provider_id(app: &App) -> String {
+    let base = "custom";
+    if !app.settings.providers.contains_key(base) {
+        return base.to_string();
+    }
+
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !app.settings.providers.contains_key(id))
+        .unwrap()
 }
 
 fn provider_type_with_id(provider_type: ProviderType, id: &str) -> ProviderType {
@@ -1204,6 +1262,117 @@ fn provider_type_with_id(provider_type: ProviderType, id: &str) -> ProviderType 
         ProviderType::Custom(_) => ProviderType::Custom(id.to_string()),
         ProviderType::CustomAnthropic(_) => ProviderType::CustomAnthropic(id.to_string()),
         other => other,
+    }
+}
+
+fn is_custom_provider_type(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::Custom(_) | ProviderType::CustomAnthropic(_)
+    )
+}
+
+fn provider_compatibility_label(provider_type: &ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::CustomAnthropic(_) => "Anthropic-compatible",
+        ProviderType::Custom(_) => "OpenAI-compatible",
+        ProviderType::OpenAI | ProviderType::OpenRouter | ProviderType::Google => {
+            "OpenAI-compatible"
+        }
+        ProviderType::Anthropic => "Anthropic-compatible",
+        ProviderType::Copilot => "Copilot OAuth",
+        ProviderType::ChatGPT => "ChatGPT OAuth",
+    }
+}
+
+fn set_provider_compatibility(app: &mut App, provider_id: &str, selected: &str) -> bool {
+    let Some(cfg) = app.settings.providers.get_mut(provider_id) else {
+        return false;
+    };
+
+    let current_type = cfg.resolve_type(provider_id);
+    if !is_custom_provider_type(&current_type) {
+        app.show_toast(Toast::info(
+            "Only custom providers can change compatibility",
+        ));
+        return false;
+    }
+
+    cfg.provider_type = Some(match selected {
+        "Anthropic-compatible" => ProviderType::CustomAnthropic(provider_id.to_string()),
+        _ => ProviderType::Custom(provider_id.to_string()),
+    });
+    app.provider_statuses.remove(provider_id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!("Compatibility: {selected}")));
+    true
+}
+
+fn rename_provider(app: &mut App, old_id: &str, new_id: &str) -> bool {
+    let new_id = new_id.trim();
+    if new_id.is_empty() {
+        app.show_toast(Toast::error("Provider name cannot be empty"));
+        return false;
+    }
+    if new_id.contains('/') || new_id.chars().any(char::is_whitespace) {
+        app.show_toast(Toast::error("Provider name cannot contain spaces or '/'"));
+        return false;
+    }
+    if old_id == new_id {
+        return true;
+    }
+    if app.settings.providers.contains_key(new_id) {
+        app.show_toast(Toast::error(format!(
+            "Provider \"{new_id}\" already exists"
+        )));
+        return false;
+    }
+
+    let Some(mut cfg) = app.settings.providers.remove(old_id) else {
+        return false;
+    };
+
+    let provider_type = cfg.resolve_type(old_id);
+    if is_custom_provider_type(&provider_type) {
+        cfg.provider_type = Some(provider_type_with_id(provider_type, new_id));
+    }
+
+    app.settings.providers.insert(new_id.to_string(), cfg);
+    if let Some(status) = app.provider_statuses.remove(old_id) {
+        app.provider_statuses.insert(new_id.to_string(), status);
+    }
+    rewrite_model_provider_prefixes(&mut app.settings.model, old_id, new_id);
+    app.content_idx = app
+        .settings
+        .providers
+        .keys()
+        .position(|provider_id| provider_id == new_id)
+        .unwrap_or_else(|| app.settings.providers.len().saturating_sub(1));
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Renamed provider \"{old_id}\" to \"{new_id}\""
+    )));
+    true
+}
+
+fn rewrite_model_provider_prefixes(model: &mut ModelConfig, old_id: &str, new_id: &str) {
+    rewrite_model_alias_provider_prefix(&mut model.default, old_id, new_id);
+    for alias in [
+        &mut model.reasoning,
+        &mut model.opus,
+        &mut model.sonnet,
+        &mut model.haiku,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rewrite_model_alias_provider_prefix(alias, old_id, new_id);
+    }
+}
+
+fn rewrite_model_alias_provider_prefix(alias: &mut ModelAliasConfig, old_id: &str, new_id: &str) {
+    if let Some(model_name) = alias.name.strip_prefix(&format!("{old_id}/")) {
+        alias.name = format!("{new_id}/{model_name}");
     }
 }
 
@@ -2835,6 +3004,97 @@ mod tests {
         assert!(app.overlay.is_none());
         assert_eq!(app.focus, Focus::Content);
         assert!(app.dirty);
+    }
+
+    #[test]
+    fn custom_provider_add_generates_unique_ids() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        let mut app = App::new(settings);
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("Custom"))
+                .expect("custom provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("Custom"))
+                .expect("custom provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("custom")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::Custom(id)) if id == "custom"
+        ));
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("custom-2")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::Custom(id)) if id == "custom-2"
+        ));
+    }
+
+    #[test]
+    fn custom_provider_compatibility_and_rename_update_config_and_models() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                api_key: "sk-test".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::Custom("custom".into())),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new("custom/deepseek-chat");
+        settings.model.reasoning = Some(ModelAliasConfig::new("custom/deepseek-reasoner"));
+        let mut app = App::new(settings);
+
+        assert!(set_provider_compatibility(
+            &mut app,
+            "custom",
+            "Anthropic-compatible"
+        ));
+        assert!(rename_provider(&mut app, "custom", "deepseek"));
+
+        assert!(!app.settings.providers.contains_key("custom"));
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("deepseek")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::CustomAnthropic(id)) if id == "deepseek"
+        ));
+        assert_eq!(app.settings.model.default.name, "deepseek/deepseek-chat");
+        assert_eq!(
+            app.settings.model.reasoning.as_ref().unwrap().name,
+            "deepseek/deepseek-reasoner"
+        );
     }
 
     #[test]

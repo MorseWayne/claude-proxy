@@ -181,6 +181,10 @@ pub enum PickerAction {
     SetLogLevel,
     /// Add a new provider of the selected type
     AddProvider,
+    /// Set the compatibility mode for a custom provider
+    SetProviderCompatibility {
+        provider_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +286,7 @@ pub enum InputAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderField {
+    Name,
     ApiKey,
     BaseUrl,
     Proxy,
@@ -537,7 +542,7 @@ impl App {
 
     /// Number of editable fields in the provider detail pane.
     pub fn provider_detail_field_count(&self) -> usize {
-        3 // API Key, Base URL, Proxy
+        5 // Name, Compatibility, API Key, Base URL, Proxy
     }
 
     pub fn clamp_content_idx(&mut self) {

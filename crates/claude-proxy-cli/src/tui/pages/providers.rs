@@ -137,9 +137,28 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     let (id, cfg) = app.settings.providers.iter().nth(idx).unwrap();
     let pt = cfg.resolve_type(id);
 
-    let rows = widgets::field_rows(inner, 8);
+    let rows = widgets::field_rows(inner, 9);
 
-    // API Key (detail_idx == 0)
+    widgets::render_field(
+        f,
+        rows[0],
+        "Name",
+        id,
+        detail_focused && app.detail_idx == 0,
+        false,
+    );
+
+    let compatibility = provider_compatibility_label(&pt);
+    widgets::render_field(
+        f,
+        rows[1],
+        "Compatibility",
+        compatibility,
+        detail_focused && app.detail_idx == 1,
+        false,
+    );
+
+    // API Key (detail_idx == 2)
     let key_display = if !pt.needs_api_key() {
         "OAuth (auto)"
     } else {
@@ -147,24 +166,24 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     };
     widgets::render_field(
         f,
-        rows[0],
+        rows[2],
         "API Key",
         key_display,
-        detail_focused && app.detail_idx == 0,
+        detail_focused && app.detail_idx == 2,
         pt.needs_api_key(),
     );
 
-    // Base URL (detail_idx == 1)
+    // Base URL (detail_idx == 3)
     widgets::render_field(
         f,
-        rows[1],
+        rows[3],
         "Base URL",
         &cfg.base_url,
-        detail_focused && app.detail_idx == 1,
+        detail_focused && app.detail_idx == 3,
         false,
     );
 
-    // Proxy (detail_idx == 2)
+    // Proxy (detail_idx == 4)
     let proxy_display = if cfg.proxy.is_empty() {
         "(none)"
     } else {
@@ -172,16 +191,16 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     };
     widgets::render_field(
         f,
-        rows[2],
+        rows[4],
         "Proxy",
         proxy_display,
-        detail_focused && app.detail_idx == 2,
+        detail_focused && app.detail_idx == 4,
         false,
     );
 
     // Connectivity/auth check (read-only)
     let (check_status, _) = provider_status_detail(app, id, cfg);
-    widgets::render_field(f, rows[3], "Check", &check_status, false, false);
+    widgets::render_field(f, rows[5], "Check", &check_status, false, false);
 
     // Status (read-only)
     let is_default = app
@@ -195,7 +214,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Not default".into()
     };
-    widgets::render_field(f, rows[4], "Status", &status, false, false);
+    widgets::render_field(f, rows[6], "Status", &status, false, false);
 
     // Copilot info (read-only)
     if pt == ProviderType::Copilot
@@ -205,7 +224,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             "oauth={} small={} warmup={}",
             cc.oauth_app, cc.small_model, cc.enable_warmup
         );
-        widgets::render_field(f, rows[5], "Copilot", &info, false, false);
+        widgets::render_field(f, rows[7], "Copilot", &info, false, false);
     }
 
     // Actions hint at bottom
@@ -258,7 +277,20 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         }
         hints
     };
-    f.render_widget(Paragraph::new(Line::from(hints)), rows[7]);
+    f.render_widget(Paragraph::new(Line::from(hints)), rows[8]);
+}
+
+fn provider_compatibility_label(provider_type: &ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::CustomAnthropic(_) => "Anthropic-compatible",
+        ProviderType::Custom(_) => "OpenAI-compatible",
+        ProviderType::OpenAI | ProviderType::OpenRouter | ProviderType::Google => {
+            "OpenAI-compatible"
+        }
+        ProviderType::Anthropic => "Anthropic-compatible",
+        ProviderType::Copilot => "Copilot OAuth",
+        ProviderType::ChatGPT => "ChatGPT OAuth",
+    }
 }
 
 fn provider_status_label(app: &App, id: &str, cfg: &ProviderConfig) -> (&'static str, Style) {
