@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -114,6 +114,7 @@ where
                     handle_key(&mut app, key);
                 }
                 Event::Paste(text) => handle_paste(&mut app, &text),
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 _ => {}
             }
         }
@@ -198,6 +199,60 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
 
 fn is_ctrl_key(key: event::KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+fn is_paste_shortcut(key: event::KeyEvent) -> bool {
+    let ctrl_v = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'));
+    let shift_insert = key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Insert;
+    ctrl_v || shift_insert
+}
+
+fn is_right_click_paste(mouse: MouseEvent) -> bool {
+    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if matches!(app.overlay, Some(Overlay::Input(_))) && is_right_click_paste(mouse) {
+        paste_from_system_clipboard(app);
+    }
+}
+
+fn paste_from_system_clipboard(app: &mut App) {
+    match read_system_clipboard() {
+        Ok(text) => handle_paste(app, &text),
+        Err(e) => app.show_toast(Toast::warning(format!("Clipboard paste failed: {e}"))),
+    }
+}
+
+#[cfg(windows)]
+fn read_system_clipboard() -> Result<String, String> {
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; Get-Clipboard -Raw",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run PowerShell: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("PowerShell exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(windows))]
+fn read_system_clipboard() -> Result<String, String> {
+    Err("system clipboard shortcut is only implemented on Windows".into())
 }
 
 fn handle_paste(app: &mut App, text: &str) {
@@ -409,6 +464,11 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
 fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
     if matches!(app.overlay, Some(Overlay::OAuth(_))) {
         handle_oauth_overlay_key(app, key);
+        return;
+    }
+
+    if matches!(app.overlay, Some(Overlay::Input(_))) && is_paste_shortcut(key) {
+        paste_from_system_clipboard(app);
         return;
     }
 
@@ -3100,6 +3160,42 @@ mod tests {
             app.settings.model.reasoning.as_ref().unwrap().name,
             "deepseek/deepseek-reasoner"
         );
+    }
+
+    #[test]
+    fn paste_shortcuts_are_recognized() {
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn right_click_paste_is_recognized() {
+        assert!(is_right_click_paste(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!is_right_click_paste(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
     }
 
     #[test]

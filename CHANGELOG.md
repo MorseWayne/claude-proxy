@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.0.3 - 2026-05-29
+
+### Fixed in v2.0.3
+
+- Fixed Windows TUI input pasting for provider API keys and other edit fields by handling `Ctrl+V`, `Shift+Insert`, and right-click paste through the system clipboard when bracketed paste events are not emitted.
+
 ## v2.0.2 - 2026-05-29
 
 ### Changed in v2.0.2
