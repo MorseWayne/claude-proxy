@@ -22,6 +22,9 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use serde_json::{Map, Value};
 
+use claude_proxy_core::{Message, MessageContent, MessagesRequest, Role};
+use claude_proxy_providers::provider::ProviderError;
+
 use app::{
     App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, ErrorDiagnostics,
     FetchResult, Focus, InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay,
@@ -38,6 +41,7 @@ use tracing::{error, info};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const METRICS_FETCH_INTERVAL: Duration = Duration::from_secs(5);
+const CUSTOM_MODEL_ITEM: &str = "Custom model...";
 
 pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -564,13 +568,16 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                     let action = picker.action.clone();
                     match action {
                         PickerAction::SetModelDefault { provider_id } => {
+                            if selected == CUSTOM_MODEL_ITEM {
+                                show_manual_default_model_input(app, &provider_id, "");
+                                return;
+                            }
                             app.overlay = None;
                             app.focus = Focus::Content;
-                            app.settings.model.default.name = format!("{provider_id}/{selected}");
+                            let value = provider_model_ref(&provider_id, &selected);
+                            app.settings.model.default.name = value.clone();
                             app.mark_dirty();
-                            app.show_toast(Toast::success(format!(
-                                "Default model: {provider_id}/{selected}"
-                            )));
+                            app.show_toast(Toast::success(format!("Default model: {value}")));
                         }
                         PickerAction::PickProviderForModel { section } => {
                             // Step 1 complete: fetch models for the selected provider
@@ -600,9 +607,13 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             provider_id,
                             section,
                         } => {
+                            if selected == CUSTOM_MODEL_ITEM {
+                                show_manual_model_input(app, &provider_id, section, "");
+                                return;
+                            }
                             app.overlay = None;
                             app.focus = Focus::Content;
-                            let value = format!("{provider_id}/{selected}");
+                            let value = provider_model_ref(&provider_id, &selected);
                             set_model_field(app, &section, &value);
                             app.mark_dirty();
                             app.show_toast(Toast::success(format!(
@@ -1198,10 +1209,23 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
             true
         }
         InputAction::SetModelDefault { provider_id } => {
-            app.settings.model.default.name = format!("{provider_id}/{value}");
+            let value = provider_model_ref(provider_id, value);
+            app.settings.model.default.name = value.clone();
+            app.mark_dirty();
+            app.show_toast(Toast::success(format!("Default model: {value}")));
+            true
+        }
+        InputAction::SetProviderModelField {
+            provider_id,
+            section,
+        } => {
+            let value = provider_model_ref(provider_id, value);
+            set_model_field(app, section, &value);
             app.mark_dirty();
             app.show_toast(Toast::success(format!(
-                "Default model: {provider_id}/{value}"
+                "{} = {}",
+                get_section_label(section),
+                value
             )));
             true
         }
@@ -1458,17 +1482,6 @@ fn check_selected_provider(app: &mut App) {
         return;
     }
 
-    if matches!(
-        provider_type,
-        ProviderType::Anthropic | ProviderType::CustomAnthropic(_)
-    ) {
-        let message = "Configured; auth not verified by model list".to_string();
-        app.provider_statuses
-            .insert(id.clone(), ProviderCheckStatus::Warning(message));
-        app.show_toast(Toast::warning(format!("{id}: Anthropic auth not verified")));
-        return;
-    }
-
     let settings = app.settings.clone();
     let handle = app.tokio_handle.clone();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1479,11 +1492,18 @@ fn check_selected_provider(app: &mut App) {
     app.show_toast(Toast::info(format!("Checking {id}...")));
 
     std::thread::spawn(move || {
-        let result = fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
-            ProviderCheckOk {
-                message: format!("OK, {} models available", models.len()),
-            }
-        });
+        let result = if matches!(
+            provider_type,
+            ProviderType::Anthropic | ProviderType::CustomAnthropic(_)
+        ) {
+            check_anthropic_provider_via_chat(&id, &settings, handle.as_ref())
+        } else {
+            fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
+                ProviderCheckOk {
+                    message: format!("OK, {} models available", models.len()),
+                }
+            })
+        };
         let _ = tx.send(ProviderCheckResult {
             provider_id: id,
             result,
@@ -1533,6 +1553,95 @@ fn fetch_models_via_provider(
     }
 
     result
+}
+
+fn check_anthropic_provider_via_chat(
+    provider_id: &str,
+    settings: &claude_proxy_config::Settings,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<ProviderCheckOk, String> {
+    let Some(cfg) = settings.providers.get(provider_id) else {
+        return Err("Provider not found in config".into());
+    };
+    let handle = handle.ok_or_else(|| {
+        error!("No tokio runtime handle available");
+        "No async runtime".to_string()
+    })?;
+    let model = provider_probe_model(settings, provider_id).ok_or_else(|| {
+        format!("Set a {provider_id}/... model before testing Anthropic-compatible auth")
+    })?;
+
+    let pid = provider_id.to_string();
+    let settings_clone = settings.clone();
+    let model_for_request = model.clone();
+    handle.block_on(async {
+        let provider = claude_proxy_providers::create_provider(&pid, cfg, &settings_clone)
+            .await
+            .map_err(|e| format!("Provider init failed: {e}"))?;
+        let _stream = provider
+            .chat(MessagesRequest {
+                model: model_for_request,
+                system: None,
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text("ping".into()),
+                }],
+                max_tokens: Some(1),
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: false,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                metadata: None,
+                extra: Default::default(),
+            })
+            .await
+            .map_err(provider_check_error)?;
+        Ok(ProviderCheckOk {
+            message: format!("OK, auth verified with model {model}"),
+        })
+    })
+}
+
+fn provider_check_error(error: ProviderError) -> String {
+    let status = error.upstream_metadata().map(|metadata| metadata.status);
+    if error.is_authentication() || matches!(status, Some(401 | 403)) {
+        format!("authentication failed: {error}")
+    } else if matches!(
+        error.without_upstream_metadata(),
+        ProviderError::ModelNotFound(_)
+    ) {
+        format!("model not found during auth probe: {error}")
+    } else {
+        format!("chat probe failed: {error}")
+    }
+}
+
+fn provider_probe_model(
+    settings: &claude_proxy_config::Settings,
+    provider_id: &str,
+) -> Option<String> {
+    let prefix = format!("{provider_id}/");
+    let aliases = [
+        Some(&settings.model.default),
+        settings.model.reasoning.as_ref(),
+        settings.model.opus.as_ref(),
+        settings.model.sonnet.as_ref(),
+        settings.model.haiku.as_ref(),
+    ];
+    aliases
+        .into_iter()
+        .flatten()
+        .find_map(|alias| alias.name.strip_prefix(&prefix).map(str::to_string))
+        .or_else(|| {
+            settings.providers.get(provider_id).and_then(|cfg| {
+                (cfg.resolve_type(provider_id) == ProviderType::Anthropic)
+                    .then(|| "claude-3-5-haiku-20241022".to_string())
+            })
+        })
 }
 
 /// Start the GitHub OAuth device flow for a Copilot provider in the background.
@@ -1780,7 +1889,7 @@ fn poll_fetch(app: &mut App) {
                 };
                 app.overlay = Some(Overlay::Picker(PickerOverlay {
                     title: format!("Select model for {}", provider_name),
-                    items: models,
+                    items: model_picker_items(models),
                     selected: 0,
                     action,
                 }));
@@ -1788,9 +1897,13 @@ fn poll_fetch(app: &mut App) {
             }
             Err(err) => {
                 error!("Model fetch failed for provider={provider_name}: {err}");
-                app.overlay = None;
-                app.focus = Focus::Content;
-                app.show_toast(Toast::error(format!("Failed to fetch models: {err}")));
+                match pending_section {
+                    Some(section) => show_manual_model_input(app, &provider_name, section, ""),
+                    None => show_manual_default_model_input(app, &provider_name, ""),
+                }
+                app.show_toast(Toast::warning(format!(
+                    "Failed to fetch models; enter model manually: {err}"
+                )));
             }
         }
     }
@@ -2155,6 +2268,59 @@ fn set_env(env: &mut Map<String, Value>, key: &str, value: &str) {
 fn set_default_env(env: &mut Map<String, Value>, key: &str, value: &str) {
     env.entry(key.to_string())
         .or_insert_with(|| Value::String(value.trim().to_string()));
+}
+
+fn provider_model_ref(provider_id: &str, model: &str) -> String {
+    let model = model.trim();
+    let prefix = format!("{provider_id}/");
+    if model.starts_with(&prefix) {
+        model.to_string()
+    } else {
+        format!("{provider_id}/{model}")
+    }
+}
+
+fn model_picker_items(models: Vec<String>) -> Vec<String> {
+    let mut items: Vec<String> = models
+        .into_iter()
+        .filter(|model| !model.is_empty())
+        .collect();
+    if !items.iter().any(|item| item == CUSTOM_MODEL_ITEM) {
+        items.push(CUSTOM_MODEL_ITEM.to_string());
+    }
+    items
+}
+
+fn show_manual_model_input(
+    app: &mut App,
+    provider_id: &str,
+    section: EditableSection,
+    initial_model: &str,
+) {
+    app.overlay = Some(Overlay::Input(InputOverlay {
+        title: format!("Enter model for {provider_id}"),
+        prompt: "Model".into(),
+        value: initial_model.to_string(),
+        cursor: initial_model.len(),
+        action: InputAction::SetProviderModelField {
+            provider_id: provider_id.to_string(),
+            section,
+        },
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn show_manual_default_model_input(app: &mut App, provider_id: &str, initial_model: &str) {
+    app.overlay = Some(Overlay::Input(InputOverlay {
+        title: format!("Enter default model for {provider_id}"),
+        prompt: "Model".into(),
+        value: initial_model.to_string(),
+        cursor: initial_model.len(),
+        action: InputAction::SetModelDefault {
+            provider_id: provider_id.to_string(),
+        },
+    }));
+    app.focus = Focus::Overlay;
 }
 
 fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
@@ -3159,6 +3325,59 @@ mod tests {
         assert_eq!(
             app.settings.model.reasoning.as_ref().unwrap().name,
             "deepseek/deepseek-reasoner"
+        );
+    }
+
+    #[test]
+    fn model_picker_always_allows_manual_entry() {
+        let items = model_picker_items(vec!["claude-sonnet-4-20250514".into()]);
+        assert_eq!(items.last().map(String::as_str), Some(CUSTOM_MODEL_ITEM));
+
+        let existing = model_picker_items(vec![CUSTOM_MODEL_ITEM.into()]);
+        assert_eq!(
+            existing
+                .iter()
+                .filter(|item| item.as_str() == CUSTOM_MODEL_ITEM)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_model_ref_preserves_provider_prefix_only() {
+        assert_eq!(
+            provider_model_ref("deepseek", "deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            provider_model_ref("openrouter", "anthropic/claude-3.5-sonnet"),
+            "openrouter/anthropic/claude-3.5-sonnet"
+        );
+    }
+
+    #[test]
+    fn provider_probe_model_prefers_configured_provider_alias() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                api_key: "sk-test".into(),
+                base_url: "https://example.com".into(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::CustomAnthropic("custom".into())),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new("openai/gpt-4.1");
+        settings.model.sonnet = Some(ModelAliasConfig::new("custom/claude-custom"));
+
+        assert_eq!(
+            provider_probe_model(&settings, "custom").as_deref(),
+            Some("claude-custom")
         );
     }
 

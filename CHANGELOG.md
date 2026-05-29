@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.0.4 - 2026-05-29
+
+### Changed in v2.0.4
+
+- Improved TUI model selection for Anthropic-compatible and custom providers by always offering manual model entry and falling back to manual entry when dynamic model discovery fails.
+- Changed Anthropic-compatible provider tests to use a minimal chat probe with the configured provider model instead of relying on model-list auth verification.
+
 ## v2.0.3 - 2026-05-29
 
 ### Fixed in v2.0.3

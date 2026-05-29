@@ -274,6 +274,10 @@ pub enum InputAction {
     SetModelDefault {
         provider_id: String,
     },
+    SetProviderModelField {
+        provider_id: String,
+        section: EditableSection,
+    },
     EditProviderField {
         provider_id: String,
         field: ProviderField,
