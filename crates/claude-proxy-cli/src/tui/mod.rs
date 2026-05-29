@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use base64::{Engine as _, engine::general_purpose};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -41,7 +42,12 @@ const METRICS_FETCH_INTERVAL: Duration = Duration::from_secs(5);
 pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -51,6 +57,7 @@ pub fn run() -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
@@ -98,13 +105,17 @@ where
 
         // Poll events with timeout
         let timeout = TICK_RATE.saturating_sub(elapsed);
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    handle_key(&mut app, key);
+                }
+                Event::Paste(text) => handle_paste(&mut app, &text),
+                _ => {}
             }
-            handle_key(&mut app, key);
         }
 
         if app.should_quit {
@@ -187,6 +198,20 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
 
 fn is_ctrl_key(key: event::KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    let Some(Overlay::Input(input)) = app.overlay.as_mut() else {
+        return;
+    };
+
+    let pasted: String = text.chars().filter(|c| !c.is_control()).collect();
+    if pasted.is_empty() {
+        return;
+    }
+
+    input.value.insert_str(input.cursor, &pasted);
+    input.cursor += pasted.len();
 }
 
 fn apply_pending_input(app: &mut App) -> bool {
@@ -2810,6 +2835,34 @@ mod tests {
         assert!(app.overlay.is_none());
         assert_eq!(app.focus, Focus::Content);
         assert!(app.dirty);
+    }
+
+    #[test]
+    fn paste_inserts_into_input_overlay_at_cursor() {
+        let mut app = App::new(Settings::default());
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "API Key",
+                "API Key",
+                InputAction::EditProviderField {
+                    provider_id: "anthropic".into(),
+                    field: ProviderField::ApiKey,
+                    field_index: 0,
+                },
+            )
+            .with_value("sk--suffix"),
+        ));
+
+        if let Some(Overlay::Input(input)) = app.overlay.as_mut() {
+            input.cursor = 3;
+        }
+        handle_paste(&mut app, "pasted\r\n");
+
+        let Some(Overlay::Input(input)) = app.overlay else {
+            panic!("expected input overlay");
+        };
+        assert_eq!(input.value, "sk-pasted-suffix");
+        assert_eq!(input.cursor, "sk-pasted".len());
     }
 
     #[test]

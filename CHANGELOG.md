@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.0.1 - 2026-05-29
+
+### Fixed in v2.0.1
+
+- Fixed pasting into Windows TUI edit inputs, including provider API key/base URL/proxy fields, by enabling bracketed paste handling and inserting paste payloads into the active input overlay.
+
 ## v2.0.0 - 2026-05-28
 
 ### Fixed in v2.0.0
