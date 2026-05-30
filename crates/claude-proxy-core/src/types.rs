@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 
 /// Anthropic Messages API request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessagesRequest {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,6 +34,132 @@ pub struct MessagesRequest {
     /// Unknown/extra fields preserved and forwarded upstream.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct RawMessagesRequest {
+    model: String,
+    system: Option<SystemPrompt>,
+    messages: Vec<RawMessage>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    stop_sequences: Option<Vec<String>>,
+    #[serde(default)]
+    stream: bool,
+    tools: Option<Vec<Tool>>,
+    tool_choice: Option<Value>,
+    thinking: Option<ThinkingConfig>,
+    metadata: Option<Value>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct RawMessage {
+    role: String,
+    content: MessageContent,
+}
+
+impl<'de> Deserialize<'de> for MessagesRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawMessagesRequest::deserialize(deserializer)?;
+        normalize_messages_request(raw).map_err(de::Error::custom)
+    }
+}
+
+fn normalize_messages_request(raw: RawMessagesRequest) -> Result<MessagesRequest, String> {
+    let mut system = raw.system;
+    let mut messages = Vec::with_capacity(raw.messages.len());
+
+    for (index, raw_message) in raw.messages.into_iter().enumerate() {
+        match raw_message.role.as_str() {
+            "user" => messages.push(Message {
+                role: Role::User,
+                content: raw_message.content,
+            }),
+            "assistant" => messages.push(Message {
+                role: Role::Assistant,
+                content: raw_message.content,
+            }),
+            "system" => {
+                if let Some(inline_system) = system_prompt_from_message_content(raw_message.content)
+                {
+                    append_system_prompt(&mut system, inline_system);
+                }
+            }
+            other => {
+                return Err(format!(
+                    "messages[{index}].role: unknown variant `{other}`, expected `user`, `assistant`, or `system`"
+                ));
+            }
+        }
+    }
+
+    Ok(MessagesRequest {
+        model: raw.model,
+        system,
+        messages,
+        max_tokens: raw.max_tokens,
+        temperature: raw.temperature,
+        top_p: raw.top_p,
+        top_k: raw.top_k,
+        stop_sequences: raw.stop_sequences,
+        stream: raw.stream,
+        tools: raw.tools,
+        tool_choice: raw.tool_choice,
+        thinking: raw.thinking,
+        metadata: raw.metadata,
+        extra: raw.extra,
+    })
+}
+
+fn system_prompt_from_message_content(content: MessageContent) -> Option<SystemPrompt> {
+    match content {
+        MessageContent::Text(text) if text.is_empty() => None,
+        MessageContent::Text(text) => Some(SystemPrompt::Text(text)),
+        MessageContent::Blocks(blocks) if blocks.is_empty() => None,
+        MessageContent::Blocks(blocks) => Some(SystemPrompt::Blocks(blocks)),
+    }
+}
+
+fn append_system_prompt(system: &mut Option<SystemPrompt>, incoming: SystemPrompt) {
+    *system = Some(match (system.take(), incoming) {
+        (None, incoming) => incoming,
+        (Some(SystemPrompt::Text(mut existing)), SystemPrompt::Text(incoming)) => {
+            if existing.is_empty() {
+                SystemPrompt::Text(incoming)
+            } else if incoming.is_empty() {
+                SystemPrompt::Text(existing)
+            } else {
+                existing.push_str("\n\n");
+                existing.push_str(&incoming);
+                SystemPrompt::Text(existing)
+            }
+        }
+        (Some(SystemPrompt::Text(existing)), SystemPrompt::Blocks(mut incoming)) => {
+            let mut blocks = Vec::with_capacity(incoming.len() + usize::from(!existing.is_empty()));
+            if !existing.is_empty() {
+                blocks.push(Content::Text { text: existing });
+            }
+            blocks.append(&mut incoming);
+            SystemPrompt::Blocks(blocks)
+        }
+        (Some(SystemPrompt::Blocks(mut existing)), SystemPrompt::Text(incoming)) => {
+            if !incoming.is_empty() {
+                existing.push(Content::Text { text: incoming });
+            }
+            SystemPrompt::Blocks(existing)
+        }
+        (Some(SystemPrompt::Blocks(mut existing)), SystemPrompt::Blocks(mut incoming)) => {
+            existing.append(&mut incoming);
+            SystemPrompt::Blocks(existing)
+        }
+    });
 }
 
 /// System prompt: either a plain string or an array of content blocks.
@@ -764,6 +890,64 @@ mod tests {
         let parsed: MessagesRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.model, "claude-sonnet-4-20250514");
         assert!(parsed.stream);
+    }
+
+    #[test]
+    fn messages_request_normalizes_inline_system_message() {
+        let parsed: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "system": "Base instructions.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Use strict typing from now on."},
+                {"role": "assistant", "content": "Understood."}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[0].role, Role::User);
+        assert_eq!(parsed.messages[1].role, Role::Assistant);
+        assert!(matches!(
+            parsed.system,
+            Some(SystemPrompt::Text(text))
+                if text == "Base instructions.\n\nUse strict typing from now on."
+        ));
+    }
+
+    #[test]
+    fn messages_request_normalizes_inline_system_blocks() {
+        let parsed: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "system": "Base instructions.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Use strict typing from now on."}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        let Some(SystemPrompt::Blocks(blocks)) = parsed.system else {
+            panic!("expected merged system blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], Content::Text { text } if text == "Base instructions."));
+        assert!(
+            matches!(&blocks[1], Content::Text { text } if text == "Use strict typing from now on.")
+        );
+    }
+
+    #[test]
+    fn messages_request_rejects_unknown_message_role() {
+        let err = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "developer", "content": "Hi"}]
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `developer`"));
     }
 
     #[test]

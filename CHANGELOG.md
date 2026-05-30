@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.0.5 - 2026-05-30
+
+### Fixed in v2.0.5
+
+- Normalized Anthropic `messages[]` entries with `role: "system"` into the top-level `system` field so newer Claude Code clients no longer fail with deserialization 422/400 errors.
+
 ## v2.0.4 - 2026-05-29
 
 ### Changed in v2.0.4
