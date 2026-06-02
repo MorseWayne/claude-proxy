@@ -881,6 +881,15 @@ fn assistant_function_call_output_to_input_item(item: &Value) -> Option<Value> {
     ])))
 }
 
+pub(super) struct ChatGptWebSocketStreamStart {
+    pub(super) stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    pub(super) websocket_reused: bool,
+    pub(super) continuation_used: bool,
+    pub(super) continuation_disabled_reason: &'static str,
+    pub(super) request_body_bytes: usize,
+    pub(super) upstream_send_body_bytes: usize,
+}
+
 pub(super) async fn open_websocket_stream<F>(
     provider: &ChatGptProvider,
     body: Value,
@@ -889,10 +898,11 @@ pub(super) async fn open_websocket_stream<F>(
     stable_client_conversation_id: Option<&str>,
     request_id: u64,
     on_event: F,
-) -> Result<(BoxStream<'static, Result<SseEvent, ProviderError>>, bool), ChatGptWebSocketStartError>
+) -> Result<ChatGptWebSocketStreamStart, ChatGptWebSocketStartError>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
+    let request_body_bytes = serde_json::to_vec(&body).map_or(0, |bytes| bytes.len());
     let idle_timeout = websocket_idle_timeout(provider);
     let connection_key = websocket_connection_key(provider, token, &body);
     let (mut stream, reused, checked_out_connection_id) =
@@ -913,14 +923,17 @@ where
             stable_client_conversation_id,
             checked_out_connection_id,
         );
+    let upstream_send_body_bytes =
+        serde_json::to_vec(&continuation.send_body).map_or(0, |bytes| bytes.len());
+    let continuation_used = continuation.used;
+    let continuation_disabled_reason = continuation.disabled_reason.as_str();
     info!(
         transport = "websocket",
         continuation_key_present = continuation.key.is_some(),
         continuation_used = continuation.used,
         continuation_synthetic_fallback_used = continuation.synthetic_fallback_used,
         continuation_disabled_reason = continuation.disabled_reason.as_str(),
-        continuation_send_body_bytes =
-            serde_json::to_vec(&continuation.send_body).map_or(0, |bytes| bytes.len()),
+        continuation_send_body_bytes = upstream_send_body_bytes,
         continuation_websocket_reused = reused,
         websocket_connection_id = checked_out_connection_id.unwrap_or(0),
         prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
@@ -960,19 +973,69 @@ where
         ));
     }
 
-    let first_event = match read_next_json_event(&mut stream, idle_timeout, true).await {
-        Ok(event) => event,
-        Err(error) => {
+    let mut startup_events = Vec::new();
+    let first_event = loop {
+        match read_next_json_event(&mut stream, idle_timeout, true).await {
+            Ok(event) => {
+                if websocket_event_can_emit_downstream_sse(&event) {
+                    break event;
+                }
+                info!(
+                    request_id,
+                    transport = "websocket",
+                    event_type = event
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown"),
+                    websocket_prelude_events = startup_events.len() + 1,
+                    "ChatGPT websocket prelude upstream event received before downstream stream start"
+                );
+                startup_events.push(event);
+            }
+            Err(mut error) => {
+                if continuation_error_allows_sse_fallback(&continuation, &error.error) {
+                    provider
+                        .websocket_session
+                        .lock()
+                        .await
+                        .clear_volatile_state();
+                    info!(
+                        request_id,
+                        transport = "websocket",
+                        websocket_reused = reused,
+                        websocket_connection_id = checked_out_connection_id.unwrap_or(0),
+                        continuation_used = continuation.used,
+                        websocket_prelude_events = startup_events.len(),
+                        "ChatGPT websocket continuation response id was rejected"
+                    );
+                    close_or_release_websocket(stream).await;
+                    error.fallback_allowed = true;
+                    return Err(error);
+                }
+                provider
+                    .websocket_session
+                    .lock()
+                    .await
+                    .fail_continuation_for_connection(&continuation, checked_out_connection_id);
+                return Err(error);
+            }
+        }
+    };
+    let first_event_terminal = is_terminal_response_event(&first_event);
+    let (tx_event, rx_event) = mpsc::channel::<Result<Value, ProviderError>>(1600);
+    for startup_event in startup_events {
+        if tx_event.send(Ok(startup_event)).await.is_err() {
             provider
                 .websocket_session
                 .lock()
                 .await
                 .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-            return Err(error);
+            return Err(ChatGptWebSocketStartError::new(
+                response_consumer_dropped_error(),
+                false,
+            ));
         }
-    };
-    let first_event_terminal = is_terminal_response_event(&first_event);
-    let (tx_event, rx_event) = mpsc::channel::<Result<Value, ProviderError>>(1600);
+    }
     if tx_event.send(Ok(first_event.clone())).await.is_err() {
         provider
             .websocket_session
@@ -1117,7 +1180,14 @@ where
         marker_mode,
         on_event,
     );
-    Ok((Box::pin(AbortOnDropStream::new(stream, abort_tx)), reused))
+    Ok(ChatGptWebSocketStreamStart {
+        stream: Box::pin(AbortOnDropStream::new(stream, abort_tx)),
+        websocket_reused: reused,
+        continuation_used,
+        continuation_disabled_reason,
+        request_body_bytes,
+        upstream_send_body_bytes,
+    })
 }
 
 async fn checkout_connection(
@@ -1910,6 +1980,30 @@ fn parse_text_event(
     Ok(value)
 }
 
+fn websocket_event_can_emit_downstream_sse(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type.starts_with("response."))
+}
+
+fn continuation_error_allows_sse_fallback(
+    continuation: &ContinuationAttempt,
+    error: &ProviderError,
+) -> bool {
+    continuation.used && provider_error_is_previous_response_not_found(error)
+}
+
+fn provider_error_is_previous_response_not_found(error: &ProviderError) -> bool {
+    let message = error
+        .upstream_metadata()
+        .and_then(|metadata| metadata.message.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let lower = message.to_ascii_lowercase();
+    lower.contains("previous response") && lower.contains("not found")
+}
+
 fn websocket_http_fallback_allowed(status: StatusCode, body: &str) -> bool {
     if matches!(
         status,
@@ -2456,6 +2550,69 @@ mod tests {
         session.prune_expired_continuations();
 
         assert!(session.continuations.is_empty());
+    }
+
+    #[test]
+    fn continuation_stale_previous_response_error_allows_sse_fallback_only_when_used() {
+        let attempt = ContinuationAttempt {
+            key: None,
+            send_body: json!({}),
+            canonical_body: json!({}),
+            full_input: Vec::new(),
+            used: true,
+            synthetic_fallback_used: false,
+            update_on_success: true,
+            owns_busy: true,
+            generation: 0,
+            disabled_reason: ContinuationDisabledReason::None,
+        };
+        let error_event = json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Previous response with id 'resp-ws-1' not found."
+            }
+        });
+        let error = map_wrapped_websocket_error_event(&error_event, &error_event.to_string());
+
+        assert!(continuation_error_allows_sse_fallback(&attempt, &error));
+
+        let unused_attempt = ContinuationAttempt {
+            used: false,
+            ..attempt
+        };
+        assert!(!continuation_error_allows_sse_fallback(
+            &unused_attempt,
+            &error
+        ));
+    }
+
+    #[test]
+    fn continuation_error_detection_rejects_unrelated_invalid_request() {
+        let error_event = json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Unsupported parameter: store."
+            }
+        });
+        let error = map_wrapped_websocket_error_event(&error_event, &error_event.to_string());
+
+        assert!(!provider_error_is_previous_response_not_found(&error));
+    }
+
+    #[test]
+    fn websocket_downstream_sse_boundary_excludes_non_response_prelude_events() {
+        assert!(!websocket_event_can_emit_downstream_sse(&json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {}
+        })));
+        assert!(websocket_event_can_emit_downstream_sse(&json!({
+            "type": "response.created",
+            "response": {"id": "resp-1", "model": "gpt-5.5"}
+        })));
     }
 
     #[test]

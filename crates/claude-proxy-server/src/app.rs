@@ -44,6 +44,28 @@ pub struct RequestObservabilityEvent {
     pub max_event_gap_ms: u64,
     pub idle_gap_count: u64,
     pub event_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_reused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_used: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_disabled_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_fallback_used: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_error_status: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_error_message_class: Option<String>,
+    #[serde(default)]
+    pub request_body_bytes: u64,
+    #[serde(default)]
+    pub upstream_send_body_bytes: u64,
     pub prompt_too_long_retries: u64,
     pub prompt_too_long_original_body_bytes: u64,
     pub prompt_too_long_shrunk_body_bytes: u64,
@@ -795,6 +817,17 @@ mod tests {
                     max_event_gap_ms: 15,
                     idle_gap_count: 0,
                     event_count: 3,
+                    transport: Some("websocket".to_string()),
+                    websocket_reused: Some(true),
+                    continuation_used: Some(true),
+                    continuation_disabled_reason: Some("none".to_string()),
+                    continuation_fallback_used: Some(false),
+                    fallback_reason: None,
+                    upstream_error_status: None,
+                    upstream_error_code: None,
+                    upstream_error_message_class: None,
+                    request_body_bytes: 1_000,
+                    upstream_send_body_bytes: 120,
                     prompt_too_long_retries: 1,
                     prompt_too_long_original_body_bytes: 200,
                     prompt_too_long_shrunk_body_bytes: 120,
@@ -826,6 +859,17 @@ mod tests {
                     max_event_gap_ms: 0,
                     idle_gap_count: 1,
                     event_count: 0,
+                    transport: Some("sse".to_string()),
+                    websocket_reused: None,
+                    continuation_used: None,
+                    continuation_disabled_reason: None,
+                    continuation_fallback_used: Some(true),
+                    fallback_reason: Some("previous_response_not_found".to_string()),
+                    upstream_error_status: Some(400),
+                    upstream_error_code: Some("context_length_exceeded".to_string()),
+                    upstream_error_message_class: Some("context_length_exceeded".to_string()),
+                    request_body_bytes: 800_000,
+                    upstream_send_body_bytes: 800_000,
                     prompt_too_long_retries: 0,
                     prompt_too_long_original_body_bytes: 0,
                     prompt_too_long_shrunk_body_bytes: 0,
@@ -858,6 +902,24 @@ mod tests {
             1
         );
         assert_eq!(data["observability"]["recent"].as_array().unwrap().len(), 2);
+        assert_eq!(data["observability"]["recent"][0]["transport"], "websocket");
+        assert_eq!(
+            data["observability"]["recent"][0]["continuation_used"],
+            true
+        );
+        assert_eq!(
+            data["observability"]["recent"][0]["upstream_send_body_bytes"],
+            120
+        );
+        assert_eq!(data["observability"]["recent"][1]["transport"], "sse");
+        assert_eq!(
+            data["observability"]["recent"][1]["fallback_reason"],
+            "previous_response_not_found"
+        );
+        assert_eq!(
+            data["observability"]["recent"][1]["upstream_error_code"],
+            "context_length_exceeded"
+        );
         assert!(data["observability"]["stored"].is_null());
     }
 

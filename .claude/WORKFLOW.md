@@ -4,6 +4,39 @@
 
 ## Active（进行中）
 
+### WF-2026-06-02-002 — ChatGPT continuation/context/metrics follow-up
+Status: In Progress
+Level: 3
+Started: 2026-06-02
+Last updated: 2026-06-02
+Current phase: Validation P5
+
+Intent:
+- Improve ChatGPT/Codex reliability and observability after log/metrics review: extend stale continuation fallback, expose transport/continuation metrics dimensions, and make large-context failures trigger Claude Code compaction without proxy-side compression.
+
+Plan:
+- [done] P1 — Confirm minimal design and user-approved behavior boundaries.
+- [done] P2 — Extend WebSocket stale `previous_response_id` fallback after non-content prelude upstream events when no downstream item was emitted.
+- [done] P3 — Replace proxy-side large-context shrinking with an upstream-like `context_length_exceeded` response path that lets Claude Code compact itself.
+- [done] P4 — Add request observability / metrics dimensions for transport, continuation, fallback, and upstream error details.
+- [doing] P5 — Validate targeted behavior, commit, and refresh the code intelligence index where available.
+
+Current todo:
+- [ ] P5 — Validate targeted behavior, commit, and refresh the code intelligence index where available.
+
+Changes:
+- User agreed to continue with stale continuation fallback and metrics dimensions, but explicitly rejected proxy-side proactive compression; large-context handling should simulate upstream context-limit failure so Claude Code triggers its own compaction.
+- User selected the combined large-context policy: normalize real upstream `context_length_exceeded` errors and also locally simulate upstream-like context-limit failures only for clearly oversized requests.
+- Design spec written at `docs/superpowers/specs/2026-06-02-chatgpt-continuation-context-metrics-design.md`; independent spec review initially found missing replay/threshold/schema details, then approved after revision.
+- User asked whether the 700KiB local context-limit threshold was derived from model capabilities; scope now prefers provider/model `context_window` metadata and uses 700KiB only when capability data is unavailable.
+- P4 added provider request metadata events, server-side metadata merging, upstream error classification fields, and legacy-safe SQLite observability columns.
+
+Prerequisites:
+- None
+
+Resume next:
+- Continue P5 by running final fmt/check/tests, reviewing the diff scope, committing the implementation, and refreshing the code intelligence index if available.
+
 ### WF-2026-05-28-003 — v2.0 deep quality/performance audit
 Status: In Progress
 Level: 2
@@ -296,6 +329,19 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-06-02-001 — ChatGPT WebSocket continuation concurrency stability
+Status: Completed
+Completed: 2026-06-02
+Level: 3
+
+Intent:
+- Investigate recurring ChatGPT `Previous response with id ... not found` 400s under concurrent/continued Claude Code usage, review the proxy concurrency design, and improve stability/performance with narrow validated changes.
+
+Close summary:
+- Outcome: WebSocket startup now treats stale ChatGPT continuation `previous_response_id ... not found` errors as safe-to-replay only when a cached continuation was actually used; it clears volatile WebSocket/continuation state, closes the rejected connection, and lets Auto transport retry through SSE with the original full body.
+- Validation: CodeGraph impact checked `open_websocket_stream`, `prepare_continuation`, and related WebSocket state before edits. `cargo test -p claude-proxy-providers chatgpt_auto_transport_falls_back_to_sse_when_continuation_response_id_is_stale`, full `cargo test -p claude-proxy-providers` (268 tests), `cargo fmt --check`, and `cargo clippy -p claude-proxy-providers -- -D warnings` passed.
+- Gaps: GitNexus MCP tools/resources were not exposed in this session, so GitNexus detect_changes could not be run. No live upstream Claude Code soak test was run.
 
 ### WF-2026-05-27-007 — Release v1.3.5
 Status: Completed

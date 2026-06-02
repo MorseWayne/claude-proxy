@@ -17,7 +17,7 @@ const METRICS_MAINTENANCE_INTERVAL: std::time::Duration =
 
 enum MetricsWriteEvent {
     Usage(UsageEvent),
-    Observability(RequestObservabilityEvent),
+    Observability(Box<RequestObservabilityEvent>),
 }
 
 /// A single write event to be persisted.
@@ -107,6 +107,59 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_usage_events_diagnostic_columns(conn)
 }
 
+fn ensure_request_observability_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (name, definition) in [
+        ("transport", "transport TEXT"),
+        ("websocket_reused", "websocket_reused INTEGER"),
+        ("continuation_used", "continuation_used INTEGER"),
+        (
+            "continuation_disabled_reason",
+            "continuation_disabled_reason TEXT",
+        ),
+        (
+            "continuation_fallback_used",
+            "continuation_fallback_used INTEGER",
+        ),
+        ("fallback_reason", "fallback_reason TEXT"),
+        ("upstream_error_status", "upstream_error_status INTEGER"),
+        ("upstream_error_code", "upstream_error_code TEXT"),
+        (
+            "upstream_error_message_class",
+            "upstream_error_message_class TEXT",
+        ),
+        (
+            "request_body_bytes",
+            "request_body_bytes INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "upstream_send_body_bytes",
+            "upstream_send_body_bytes INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !request_observability_events_has_column(conn, name)? {
+            conn.execute(
+                &format!("ALTER TABLE request_observability_events ADD COLUMN {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn request_observability_events_has_column(
+    conn: &Connection,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(request_observability_events)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows.flatten() {
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS request_observability_events (
@@ -127,6 +180,17 @@ fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<(
             max_event_gap_ms INTEGER NOT NULL DEFAULT 0,
             idle_gap_count INTEGER NOT NULL DEFAULT 0,
             event_count INTEGER NOT NULL DEFAULT 0,
+            transport TEXT,
+            websocket_reused INTEGER,
+            continuation_used INTEGER,
+            continuation_disabled_reason TEXT,
+            continuation_fallback_used INTEGER,
+            fallback_reason TEXT,
+            upstream_error_status INTEGER,
+            upstream_error_code TEXT,
+            upstream_error_message_class TEXT,
+            request_body_bytes INTEGER NOT NULL DEFAULT 0,
+            upstream_send_body_bytes INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
@@ -140,7 +204,8 @@ fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<(
         CREATE INDEX IF NOT EXISTS idx_request_observability_events_provider ON request_observability_events(provider);
         CREATE INDEX IF NOT EXISTS idx_request_observability_events_model ON request_observability_events(model);
         CREATE INDEX IF NOT EXISTS idx_request_observability_events_created ON request_observability_events(created_at);",
-    )
+    )?;
+    ensure_request_observability_columns(conn)
 }
 
 fn initialize_metrics_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -334,10 +399,14 @@ impl MetricsStore {
                 request_id, provider, initiator, model, stream, is_error, terminal_reason,
                 total_latency_ms, provider_setup_ms, upstream_connect_ms, stream_duration_ms,
                 first_event_ms, last_event_gap_ms, max_event_gap_ms, idle_gap_count, event_count,
-                prompt_too_long_retries, prompt_too_long_original_body_bytes,
-                prompt_too_long_shrunk_body_bytes, prompt_too_long_dropped_items,
-                request_messages, request_content_blocks, request_tool_results, request_text_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                transport, websocket_reused, continuation_used, continuation_disabled_reason,
+                continuation_fallback_used, fallback_reason, upstream_error_status,
+                upstream_error_code, upstream_error_message_class, request_body_bytes,
+                upstream_send_body_bytes, prompt_too_long_retries,
+                prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
+                prompt_too_long_dropped_items, request_messages, request_content_blocks,
+                request_tool_results, request_text_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
             rusqlite::params![
                 ev.request_id,
                 ev.provider,
@@ -355,6 +424,17 @@ impl MetricsStore {
                 ev.max_event_gap_ms as i64,
                 ev.idle_gap_count as i64,
                 ev.event_count as i64,
+                ev.transport.as_deref(),
+                ev.websocket_reused.map(|value| value as i64),
+                ev.continuation_used.map(|value| value as i64),
+                ev.continuation_disabled_reason.as_deref(),
+                ev.continuation_fallback_used.map(|value| value as i64),
+                ev.fallback_reason.as_deref(),
+                ev.upstream_error_status.map(|value| value as i64),
+                ev.upstream_error_code.as_deref(),
+                ev.upstream_error_message_class.as_deref(),
+                ev.request_body_bytes as i64,
+                ev.upstream_send_body_bytes as i64,
                 ev.prompt_too_long_retries as i64,
                 ev.prompt_too_long_original_body_bytes as i64,
                 ev.prompt_too_long_shrunk_body_bytes as i64,
@@ -397,7 +477,7 @@ impl MetricsStore {
     pub fn record_observability(&self, event: RequestObservabilityEvent) {
         match self
             .write_tx
-            .try_send(MetricsWriteEvent::Observability(event))
+            .try_send(MetricsWriteEvent::Observability(Box::new(event)))
         {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -499,9 +579,13 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
         "SELECT request_id, provider, initiator, model, stream, is_error, terminal_reason,
                 total_latency_ms, provider_setup_ms, upstream_connect_ms, stream_duration_ms,
                 first_event_ms, last_event_gap_ms, max_event_gap_ms, idle_gap_count, event_count,
-                prompt_too_long_retries, prompt_too_long_original_body_bytes,
-                prompt_too_long_shrunk_body_bytes, prompt_too_long_dropped_items,
-                request_messages, request_content_blocks, request_tool_results, request_text_bytes
+                transport, websocket_reused, continuation_used, continuation_disabled_reason,
+                continuation_fallback_used, fallback_reason, upstream_error_status,
+                upstream_error_code, upstream_error_message_class, request_body_bytes,
+                upstream_send_body_bytes, prompt_too_long_retries,
+                prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
+                prompt_too_long_dropped_items, request_messages, request_content_blocks,
+                request_tool_results, request_text_bytes
          FROM request_observability_events
          ORDER BY id DESC
          LIMIT 20",
@@ -534,14 +618,25 @@ fn request_observability_from_row(
         max_event_gap_ms: row.get::<_, i64>(13)? as u64,
         idle_gap_count: row.get::<_, i64>(14)? as u64,
         event_count: row.get::<_, i64>(15)? as u64,
-        prompt_too_long_retries: row.get::<_, i64>(16)? as u64,
-        prompt_too_long_original_body_bytes: row.get::<_, i64>(17)? as u64,
-        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(18)? as u64,
-        prompt_too_long_dropped_items: row.get::<_, i64>(19)? as u64,
-        request_messages: row.get::<_, i64>(20)? as u64,
-        request_content_blocks: row.get::<_, i64>(21)? as u64,
-        request_tool_results: row.get::<_, i64>(22)? as u64,
-        request_text_bytes: row.get::<_, i64>(23)? as u64,
+        transport: row.get(16)?,
+        websocket_reused: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+        continuation_used: row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
+        continuation_disabled_reason: row.get(19)?,
+        continuation_fallback_used: row.get::<_, Option<i64>>(20)?.map(|value| value != 0),
+        fallback_reason: row.get(21)?,
+        upstream_error_status: row.get::<_, Option<i64>>(22)?.map(|value| value as u64),
+        upstream_error_code: row.get(23)?,
+        upstream_error_message_class: row.get(24)?,
+        request_body_bytes: row.get::<_, i64>(25)? as u64,
+        upstream_send_body_bytes: row.get::<_, i64>(26)? as u64,
+        prompt_too_long_retries: row.get::<_, i64>(27)? as u64,
+        prompt_too_long_original_body_bytes: row.get::<_, i64>(28)? as u64,
+        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(29)? as u64,
+        prompt_too_long_dropped_items: row.get::<_, i64>(30)? as u64,
+        request_messages: row.get::<_, i64>(31)? as u64,
+        request_content_blocks: row.get::<_, i64>(32)? as u64,
+        request_tool_results: row.get::<_, i64>(33)? as u64,
+        request_text_bytes: row.get::<_, i64>(34)? as u64,
     })
 }
 
@@ -825,6 +920,17 @@ mod tests {
             max_event_gap_ms: 45,
             idle_gap_count: 1,
             event_count: 4,
+            transport: Some("websocket".to_string()),
+            websocket_reused: Some(true),
+            continuation_used: Some(true),
+            continuation_disabled_reason: Some("none".to_string()),
+            continuation_fallback_used: Some(is_error),
+            fallback_reason: is_error.then(|| "previous_response_not_found".to_string()),
+            upstream_error_status: is_error.then_some(400),
+            upstream_error_code: is_error.then(|| "context_length_exceeded".to_string()),
+            upstream_error_message_class: is_error.then(|| "context_length_exceeded".to_string()),
+            request_body_bytes: 1_000,
+            upstream_send_body_bytes: 120,
             prompt_too_long_retries: 1,
             prompt_too_long_original_body_bytes: 200,
             prompt_too_long_shrunk_body_bytes: 120,
@@ -858,7 +964,81 @@ mod tests {
         assert_eq!(stored.recent[1].request_id, "second");
         assert_eq!(stored.recent[1].terminal_reason, "stream_error");
         assert_eq!(stored.recent[1].request_tool_results, 1);
+        assert_eq!(stored.recent[0].transport.as_deref(), Some("websocket"));
+        assert_eq!(stored.recent[0].websocket_reused, Some(true));
+        assert_eq!(stored.recent[0].continuation_used, Some(true));
+        assert_eq!(
+            stored.recent[0].continuation_disabled_reason.as_deref(),
+            Some("none")
+        );
+        assert_eq!(stored.recent[0].request_body_bytes, 1_000);
+        assert_eq!(stored.recent[0].upstream_send_body_bytes, 120);
+        assert_eq!(stored.recent[1].continuation_fallback_used, Some(true));
+        assert_eq!(
+            stored.recent[1].fallback_reason.as_deref(),
+            Some("previous_response_not_found")
+        );
+        assert_eq!(stored.recent[1].upstream_error_status, Some(400));
+        assert_eq!(
+            stored.recent[1].upstream_error_code.as_deref(),
+            Some("context_length_exceeded")
+        );
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_observability_schema_gets_new_columns_with_defaults() {
+        let path = temp_db_path("observability-legacy-schema");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE request_observability_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                initiator TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL DEFAULT 0,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                terminal_reason TEXT NOT NULL,
+                total_latency_ms INTEGER NOT NULL DEFAULT 0,
+                provider_setup_ms INTEGER NOT NULL DEFAULT 0,
+                upstream_connect_ms INTEGER NOT NULL DEFAULT 0,
+                stream_duration_ms INTEGER NOT NULL DEFAULT 0,
+                first_event_ms INTEGER,
+                last_event_gap_ms INTEGER NOT NULL DEFAULT 0,
+                max_event_gap_ms INTEGER NOT NULL DEFAULT 0,
+                idle_gap_count INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
+                prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
+                prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
+                prompt_too_long_dropped_items INTEGER NOT NULL DEFAULT 0,
+                request_messages INTEGER NOT NULL DEFAULT 0,
+                request_content_blocks INTEGER NOT NULL DEFAULT 0,
+                request_tool_results INTEGER NOT NULL DEFAULT 0,
+                request_text_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO request_observability_events (
+                request_id, provider, initiator, model, stream, is_error, terminal_reason,
+                total_latency_ms, upstream_connect_ms, event_count, request_messages
+            ) VALUES ('legacy', 'chatgpt', 'user', 'gpt-5.5', 1, 0, 'completed', 42, 7, 2, 1);",
+        )
+        .unwrap();
+
+        initialize_metrics_schema(&conn).unwrap();
+
+        assert!(request_observability_events_has_column(&conn, "transport").unwrap());
+        assert!(request_observability_events_has_column(&conn, "request_body_bytes").unwrap());
+        let stored = load_request_observability(&conn);
+        assert_eq!(stored.recent.len(), 1);
+        let event = &stored.recent[0];
+        assert_eq!(event.request_id, "legacy");
+        assert_eq!(event.transport, None);
+        assert_eq!(event.websocket_reused, None);
+        assert_eq!(event.request_body_bytes, 0);
+        assert_eq!(event.upstream_send_body_bytes, 0);
         let _ = std::fs::remove_file(path);
     }
 

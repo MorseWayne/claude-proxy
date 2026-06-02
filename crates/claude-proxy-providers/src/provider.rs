@@ -182,6 +182,26 @@ pub struct ProviderStreamMetadata {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequestMetadata {
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub websocket_reused: Option<bool>,
+    #[serde(default)]
+    pub continuation_used: Option<bool>,
+    #[serde(default)]
+    pub continuation_disabled_reason: Option<String>,
+    #[serde(default)]
+    pub continuation_fallback_used: Option<bool>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    #[serde(default)]
+    pub request_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub upstream_send_body_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRequestObserverEvent {
     pub event: ProviderRequestObserverEventKind,
@@ -195,6 +215,8 @@ pub struct ProviderRequestObserverEvent {
     pub dropped_items: u64,
     #[serde(default)]
     pub stream_metadata: Option<ProviderStreamMetadata>,
+    #[serde(default)]
+    pub request_metadata: Option<ProviderRequestMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +227,7 @@ pub enum ProviderRequestObserverEventKind {
     PromptTooLongRetryExhausted,
     PromptTooLongRetryUnshrinkable,
     StreamMetadata,
+    RequestMetadata,
 }
 
 pub type ProviderRequestObserver = Arc<dyn Fn(ProviderRequestObserverEvent) + Send + Sync>;

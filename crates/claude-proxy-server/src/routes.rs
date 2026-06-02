@@ -14,8 +14,9 @@ use claude_proxy_config::settings::{
 use claude_proxy_core::*;
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
-    Provider, ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
-    ProviderRequestObserverEventKind, ProviderUsageMetadata, UpstreamErrorMetadata,
+    Provider, ProviderError, ProviderRequestMetadata, ProviderRequestObserver,
+    ProviderRequestObserverEvent, ProviderRequestObserverEventKind, ProviderUsageMetadata,
+    UpstreamErrorMetadata,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -614,6 +615,7 @@ struct RequestObserverState {
     prompt_too_long_shrunk_body_bytes: u64,
     prompt_too_long_dropped_items: u64,
     stream_usage: TokenUsage,
+    request_metadata: ProviderRequestMetadata,
 }
 
 impl RequestObserverState {
@@ -643,7 +645,42 @@ impl RequestObserverState {
                     merge_provider_usage_metadata(usage, &mut self.stream_usage);
                 }
             }
+            ProviderRequestObserverEventKind::RequestMetadata => {
+                if let Some(metadata) = event.request_metadata.as_ref() {
+                    merge_provider_request_metadata(metadata, &mut self.request_metadata);
+                }
+            }
         }
+    }
+}
+
+fn merge_provider_request_metadata(
+    metadata: &ProviderRequestMetadata,
+    target: &mut ProviderRequestMetadata,
+) {
+    if metadata.transport.is_some() {
+        target.transport = metadata.transport.clone();
+    }
+    if metadata.websocket_reused.is_some() {
+        target.websocket_reused = metadata.websocket_reused;
+    }
+    if metadata.continuation_used.is_some() {
+        target.continuation_used = metadata.continuation_used;
+    }
+    if metadata.continuation_disabled_reason.is_some() {
+        target.continuation_disabled_reason = metadata.continuation_disabled_reason.clone();
+    }
+    if metadata.continuation_fallback_used.is_some() {
+        target.continuation_fallback_used = metadata.continuation_fallback_used;
+    }
+    if metadata.fallback_reason.is_some() {
+        target.fallback_reason = metadata.fallback_reason.clone();
+    }
+    if metadata.request_body_bytes.is_some() {
+        target.request_body_bytes = metadata.request_body_bytes;
+    }
+    if metadata.upstream_send_body_bytes.is_some() {
+        target.upstream_send_body_bytes = metadata.upstream_send_body_bytes;
     }
 }
 
@@ -695,6 +732,7 @@ fn build_observability_event(
     timing: ObservabilityTiming,
     is_error: bool,
     terminal_reason: &str,
+    error_metadata: Option<&UpstreamErrorMetadata>,
 ) -> RequestObservabilityEvent {
     let observer_state = context
         .observer_state
@@ -718,6 +756,23 @@ fn build_observability_event(
         max_event_gap_ms: timing.max_event_gap_ms,
         idle_gap_count: timing.idle_gap_count,
         event_count: timing.event_count,
+        transport: observer_state.request_metadata.transport,
+        websocket_reused: observer_state.request_metadata.websocket_reused,
+        continuation_used: observer_state.request_metadata.continuation_used,
+        continuation_disabled_reason: observer_state.request_metadata.continuation_disabled_reason,
+        continuation_fallback_used: observer_state.request_metadata.continuation_fallback_used,
+        fallback_reason: observer_state.request_metadata.fallback_reason,
+        upstream_error_status: error_metadata.map(|metadata| metadata.status as u64),
+        upstream_error_code: upstream_error_code(error_metadata),
+        upstream_error_message_class: upstream_error_message_class(error_metadata),
+        request_body_bytes: observer_state
+            .request_metadata
+            .request_body_bytes
+            .unwrap_or(0),
+        upstream_send_body_bytes: observer_state
+            .request_metadata
+            .upstream_send_body_bytes
+            .unwrap_or(0),
         prompt_too_long_retries: observer_state.prompt_too_long_retries,
         prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
         prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,
@@ -727,6 +782,54 @@ fn build_observability_event(
         request_tool_results: context.payload_stats.tool_results,
         request_text_bytes: context.payload_stats.text_bytes,
     }
+}
+
+fn upstream_error_code(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
+    let metadata = error_metadata?;
+    metadata
+        .body_preview
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .and_then(|value| {
+            ["/error/code", "/error/type", "/code", "/type"]
+                .iter()
+                .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+                .map(str::to_string)
+        })
+}
+
+fn upstream_error_message_class(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
+    let metadata = error_metadata?;
+    if let Some(code) = upstream_error_code(Some(metadata)) {
+        return Some(code);
+    }
+
+    let text = [
+        metadata.message.as_deref(),
+        metadata.body_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+    .to_ascii_lowercase();
+    if text.contains("previous response") && text.contains("not found") {
+        return Some("previous_response_not_found".to_string());
+    }
+    if text.contains("context_length_exceeded")
+        || text.contains("prompt is too long")
+        || text.contains("context window")
+    {
+        return Some("context_length_exceeded".to_string());
+    }
+    if text.contains("rate limit") || text.contains("too many requests") {
+        return Some("rate_limited".to_string());
+    }
+    if text.contains("overloaded") || text.contains("server_error") {
+        return Some("upstream_overloaded".to_string());
+    }
+
+    Some("other".to_string())
 }
 
 fn request_payload_stats(request: &MessagesRequest) -> RequestPayloadStats {
@@ -1221,6 +1324,7 @@ async fn stream_leader_response(
         let mut had_error = false;
         let mut terminal_reason = "completed";
         let mut last_error = None;
+        let mut last_error_metadata = None;
         let mut leader_tx_open = true;
         let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1289,6 +1393,7 @@ async fn stream_leader_response(
                             had_error = true;
                             terminal_reason = "stream_error";
                             last_error = Some(error_message.clone());
+                            last_error_metadata = e.upstream_metadata().cloned();
                             let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                             let error_event = stream_api_error_event(error_message);
                             if leader_tx_open {
@@ -1408,7 +1513,13 @@ async fn stream_leader_response(
         if let Some(context) = observability {
             metrics
                 .record_observability(
-                    build_observability_event(context, timing, had_error, terminal_reason),
+                    build_observability_event(
+                        context,
+                        timing,
+                        had_error,
+                        terminal_reason,
+                        last_error_metadata.as_ref(),
+                    ),
                     true,
                 )
                 .await;
@@ -1488,7 +1599,13 @@ async fn collect_leader_response(
                     state
                         .metrics
                         .record_observability(
-                            build_observability_event(context, timing, true, terminal_reason),
+                            build_observability_event(
+                                context,
+                                timing,
+                                true,
+                                terminal_reason,
+                                e.upstream_metadata(),
+                            ),
                             true,
                         )
                         .await;
@@ -1527,7 +1644,7 @@ async fn collect_leader_response(
         state
             .metrics
             .record_observability(
-                build_observability_event(context, timing, false, "completed"),
+                build_observability_event(context, timing, false, "completed", None),
                 true,
             )
             .await;
@@ -1581,6 +1698,7 @@ async fn handle_provider_error(
                     ObservabilityTiming::default(),
                     true,
                     "provider_error",
+                    error.upstream_metadata(),
                 ),
                 true,
             )
@@ -2903,6 +3021,45 @@ mod tests {
         assert_eq!(state.prompt_too_long_original_body_bytes, 300);
         assert_eq!(state.prompt_too_long_shrunk_body_bytes, 200);
         assert_eq!(state.prompt_too_long_dropped_items, 3);
+    }
+
+    #[test]
+    fn provider_request_observer_merges_request_metadata() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::RequestMetadata,
+            request_metadata: Some(ProviderRequestMetadata {
+                continuation_fallback_used: Some(true),
+                fallback_reason: Some("previous_response_not_found".to_string()),
+                ..ProviderRequestMetadata::default()
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::RequestMetadata,
+            request_metadata: Some(ProviderRequestMetadata {
+                transport: Some("sse".to_string()),
+                request_body_bytes: Some(1_000),
+                upstream_send_body_bytes: Some(800),
+                ..ProviderRequestMetadata::default()
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.request_metadata.transport.as_deref(), Some("sse"));
+        assert_eq!(
+            state.request_metadata.continuation_fallback_used,
+            Some(true)
+        );
+        assert_eq!(
+            state.request_metadata.fallback_reason.as_deref(),
+            Some("previous_response_not_found")
+        );
+        assert_eq!(state.request_metadata.request_body_bytes, Some(1_000));
+        assert_eq!(state.request_metadata.upstream_send_body_bytes, Some(800));
     }
 
     #[test]
