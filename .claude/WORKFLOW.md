@@ -16,8 +16,8 @@ Intent:
 
 Current todo:
 - [x] Establish clean baseline and validation commands.
-- [x] Identify concrete optimization targets from code metrics and GitNexus flows.
-- [x] Run GitNexus impact before editing any selected symbol.
+- [x] Identify concrete optimization targets from code metrics and code review.
+- [x] Review affected call paths before editing any selected symbol.
 - [x] Implement the first low-risk/high-value improvement and validate.
 - [x] Continue with the next optimization target from clippy/metric hotspots.
 - [x] Assess ChatGPT too-many-arguments refactor risk before editing.
@@ -71,7 +71,7 @@ Prerequisites:
 - Preserve existing uncommitted/user work; current repo status is clean at claude-proxy root.
 
 Resume next:
-- Review the uncommitted `responses.rs` + ledger diff. Next likely hotspots: `responses.rs::flush_message_parts`, `chatgpt.rs::send_responses_request_with_prompt_too_long_retry`, or `chatgpt/transport.rs::open_websocket_stream`, each with impact analysis first.
+- Review the uncommitted `responses.rs` + ledger diff. Next likely hotspots: `responses.rs::flush_message_parts`, `chatgpt.rs::send_responses_request_with_prompt_too_long_retry`, or `chatgpt/transport.rs::open_websocket_stream`; inspect affected call paths before editing.
 
 ### WF-2026-05-28-002 — ChatGPT request context efficiency follow-up
 Status: In Progress
@@ -85,9 +85,9 @@ Intent:
 
 Current todo:
 - [x] Analyze live ChatGPT payload logs and identify dominant inefficiencies.
-- [x] Run GitNexus impact for planned ChatGPT request path edits.
+- [x] Review affected ChatGPT request paths before editing.
 - [x] Implement stable synthetic conversation id fallback and request-id-aware payload stats.
-- [x] Validate with focused tests, `git diff --check`, and GitNexus detect_changes.
+- [x] Validate with focused tests and `git diff --check`.
 - [x] Add safe continuation fallback for synthetic session-id drift observed in live logs.
 
 Changes:
@@ -157,23 +157,23 @@ Current todo:
 - [x] Finalize design scope and implementation sequence before code changes.
 - [x] Review the written design spec and address any issues.
 - [x] Wait for user review of the committed design spec.
-- [x] Run GitNexus impact analysis before editing each target symbol.
+- [x] Review affected call paths before editing each target symbol.
 - [x] Implement Phase 1 foundation: model/request/cache/usage correctness plus focused tests.
 - [x] Validate Phase 1 with fmt and targeted provider tests before moving to WebSocket work.
 - [x] Review Phase 1 diff and apply any reviewer fixes before starting WebSocket work.
-- [x] Commit Phase 1 and refresh GitNexus index.
+- [x] Commit Phase 1.
 - [x] Implement Phase 2 WebSocket transport with SSE fallback.
 - [x] Review Phase 2 diff and address reviewer blockers.
 - [x] Final focused reviewer pass found no remaining blockers.
-- [x] Commit Phase 2 and refresh GitNexus metadata.
+- [x] Commit Phase 2.
 - [x] Plan Phase 3 continuation/delta-input support.
 - [x] Implement Phase 3 continuation/delta-input support.
 - [x] Validate/review Phase 3.
-- [x] Commit Phase 3 and refresh GitNexus metadata.
+- [x] Commit Phase 3.
 - [x] Decide whether to add non-blocking continuation hardening tests.
 - [x] Implement continuation hardening tests for busy overlap, abort invalidation, and function-call/tool-result delta.
 - [x] Validate continuation hardening tests.
-- [x] Commit continuation hardening tests and refresh GitNexus metadata.
+- [x] Commit continuation hardening tests.
 - [x] Remove untracked review report artifacts.
 - [x] Implement post-validation WebSocket startup fallback tuning: phase-aware diagnostics, short Auto cooldown, and lightweight WebSocket counters.
 - [x] Implement ChatGPT WebSocket environment proxy fallback with NO_PROXY bypass.
@@ -305,7 +305,7 @@ Level: 3
 Close summary:
 - Outcome: Committed ChatGPT/Codex reliability follow-up in `c880062`: WebSocket Auto fallback now remains replay-safe after non-content prelude events, large-context handling returns upstream-like `context_length_exceeded` instead of proxy-side compression, and request observability now records transport/continuation/fallback/upstream-error/body-byte dimensions with SQLite migration support.
 - Validation: Targeted ChatGPT context-limit and WebSocket fallback tests passed, `cargo test -p claude-proxy-providers --lib chatgpt_` passed, `cargo test -p claude-proxy-server --lib` passed, `cargo clippy -p claude-proxy-providers -p claude-proxy-server -- -D warnings` passed, `cargo fmt --all --check` passed, and `git diff --check` passed.
-- Gaps: `npx gitnexus detect-changes` and `npx gitnexus analyze` both failed with the GitNexus package error `Cannot destructure property 'package' of 'node.target' as it is null`; the index remains stale until GitNexus can be repaired. No live upstream Claude Code soak test was run.
+- Gaps: No live upstream Claude Code soak test was run. GitNexus refresh failed during closeout, and the project-level GitNexus requirement has since been removed by user request.
 
 Archived execution:
 - Intent: Improve ChatGPT/Codex reliability and observability after log/metrics review while letting Claude Code own compaction.
@@ -322,7 +322,6 @@ Archived execution:
 - Validation:
   - Focused provider/server tests, broad ChatGPT provider tests, server library tests, clippy, formatting, and diff whitespace checks passed before commit `c880062`.
 - Deferred / gaps:
-  - Repair GitNexus CLI/index refresh failure before relying on fresh GitNexus impact/detect-changes for this commit.
   - Optional live Claude Code soak test against ChatGPT/Codex upstream.
 
 ### WF-2026-06-02-001 — ChatGPT WebSocket continuation concurrency stability
