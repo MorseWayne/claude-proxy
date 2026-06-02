@@ -835,6 +835,23 @@ impl ChatGptProvider {
         self.websocket_stats
             .attempts
             .fetch_add(1, Ordering::Relaxed);
+        let websocket_prewarmed = if self.chatgpt_config.websocket_prewarm {
+            transport::prewarm_websocket(
+                self,
+                &body,
+                token,
+                stable_client_conversation_id.as_deref(),
+                request_id,
+            )
+            .await
+            .inspect_err(|_| {
+                self.websocket_stats
+                    .failures
+                    .fetch_add(1, Ordering::Relaxed);
+            })?
+        } else {
+            false
+        };
         let first_upstream_event_seen = Arc::new(AtomicBool::new(false));
         let thinking_diagnostics = Arc::new(ChatGptThinkingDiagnostics::default());
         let stream_started_at = Instant::now();
@@ -897,6 +914,7 @@ impl ChatGptProvider {
             compact_request,
             selected_transport = "websocket",
             websocket_reused = reused,
+            websocket_prewarmed,
             websocket_attempts = stats.attempts,
             websocket_successes = stats.successes,
             websocket_failures = stats.failures,
@@ -3988,6 +4006,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_prewarm_sends_generate_false_and_reuses_warm_response() {
+        let (endpoint, requests, handshakes) = websocket_sequence_server(vec![
+            vec![websocket_response_completed("warm-1")],
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed("resp-ws-1"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+        provider.chatgpt_config.websocket_prewarm = true;
+
+        let stream = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(101), chatgpt_test_token())
+            .await
+            .expect("websocket stream should start after prewarm");
+        let events = collect_stream_results(stream).await;
+        assert!(events.iter().all(Result::is_ok));
+
+        assert_eq!(handshakes.lock().unwrap().len(), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["type"], "response.create");
+        assert_eq!(requests[0]["generate"], false);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[0]["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(requests[1]["previous_response_id"], "warm-1");
+        assert_eq!(requests[1]["input"], json!([]));
+        assert!(requests[1].get("generate").is_none());
+    }
+
+    #[tokio::test]
     async fn chatgpt_websocket_continuation_sends_previous_response_id_and_delta_input() {
         let first_body = chatgpt_websocket_test_body();
         let second_delta = json!({"role": "user", "content": "next"});
@@ -4042,6 +4093,32 @@ mod tests {
         assert_eq!(requests[0]["input"].as_array().map(Vec::len), Some(1));
         assert_eq!(requests[1]["previous_response_id"], "resp-ws-1");
         assert_eq!(requests[1]["input"], json!([second_delta]));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_auto_transport_falls_back_to_sse_when_prewarm_fails_before_real_request() {
+        let (endpoint, websocket_requests, sse_requests) =
+            websocket_prewarm_failure_then_sse_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Auto;
+        provider.chatgpt_config.websocket_prewarm = true;
+
+        let stream = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(102), chatgpt_test_token())
+            .await
+            .expect("auto transport should fall back to SSE after prewarm failure");
+        let events = collect_stream_results(stream).await;
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(provider.effective_transport(), ChatGptTransport::Sse);
+
+        let websocket_requests = websocket_requests.lock().unwrap();
+        assert_eq!(websocket_requests.len(), 1);
+        assert_eq!(websocket_requests[0]["generate"], false);
+        let sse_requests = sse_requests.lock().await;
+        assert_eq!(sse_requests.len(), 1);
+        let sse_body: Value = serde_json::from_slice(&sse_requests[0].body).unwrap();
+        assert!(sse_body.get("previous_response_id").is_none());
+        assert!(sse_body.get("generate").is_none());
     }
 
     #[tokio::test]
@@ -5388,6 +5465,64 @@ mod tests {
         });
 
         (format!("http://{addr}/responses"), requests, handshakes)
+    }
+
+    async fn websocket_prewarm_failure_then_sse_server() -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        Arc<Mutex<Vec<CapturedHttpRequest>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let websocket_requests = Arc::new(StdMutex::new(Vec::new()));
+        let sse_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_websocket_requests = Arc::clone(&websocket_requests);
+        let captured_sse_requests = Arc::clone(&sse_requests);
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_websocket_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            websocket
+                .send(WsMessage::Text(
+                    websocket_response_failed("warm-failed").to_string().into(),
+                ))
+                .await
+                .unwrap();
+            let _ = websocket.close(None).await;
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let sse_request = read_http_request_allow_empty_body(&mut socket).await;
+            captured_sse_requests.lock().await.push(sse_request);
+            let response_body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                websocket_response_created("resp-sse-prewarm-fallback"),
+                websocket_response_completed("resp-sse-prewarm-fallback")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (
+            format!("http://{addr}/responses"),
+            websocket_requests,
+            sse_requests,
+        )
     }
 
     async fn websocket_stale_continuation_then_sse_server() -> (

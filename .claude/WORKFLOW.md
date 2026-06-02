@@ -297,6 +297,36 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-06-02-004 — Native Codex WebSocket prewarm for ChatGPT provider
+Status: Completed
+Completed: 2026-06-02
+Level: 3
+
+Close summary:
+- Outcome: Added default-off `chatgpt.websocket_prewarm` support for ChatGPT/Codex providers. When enabled, the WebSocket path sends a native Codex-style `generate=false` warmup request, stores the completed warmup response id in the existing continuation cache, and lets the first matching real request reuse it with `previous_response_id` and empty `input`.
+- Validation: Focused config/provider/prewarm/continuation tests passed, along with `cargo fmt --all --check`, `cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings`, and `git diff --check`.
+- Gaps: No live upstream Claude Code soak test was run; the option remains disabled by default.
+
+Archived execution:
+- Intent: Implement native Codex-style WebSocket prewarm for the ChatGPT/Codex provider so the first real WebSocket request can start closer to native Codex responsiveness.
+- Plan:
+  - [done] P1 — Review native Codex prewarm semantics and claude-proxy ChatGPT WebSocket lifecycle.
+  - [done] P2 — Add minimal config/state boundaries for enabling WebSocket prewarm without changing default unsafe paths.
+  - [done] P3 — Implement warmup request flow using Codex `generate=false` and safe fallback behavior.
+  - [done] P4 — Add focused tests for prewarm request shape, completion handling, fallback, and non-WebSocket modes.
+  - [done] P5 — Validate focused crates, update ledger checkpoint/closeout, and commit.
+- Key changes:
+  - Native Codex review confirmed warmup sends WebSocket `response.create` with `generate=false`, waits for `response.completed`, then reuses the warmup response id.
+  - The proxy now uses existing WebSocket session and continuation state to cache warmup response ids, ignores transport-only `generate` during canonical comparison, and permits empty delta input only for matching prewarm continuations.
+  - Auto transport treats prewarm failure before the real request as replay-safe and falls back to SSE without leaking `previous_response_id` or `generate` into the fallback body.
+- Validation:
+  - `cargo test -p claude-proxy-config`
+  - `cargo test -p claude-proxy-providers --lib chatgpt_`
+  - `cargo test -p claude-proxy-providers --lib continuation_`
+  - Focused WebSocket prewarm tests, formatting, clippy, and diff whitespace checks.
+- Deferred / gaps:
+  - Optional live upstream Claude Code soak test with `chatgpt.websocket_prewarm = true`.
+
 ### WF-2026-06-02-003 — Codex fast-mode parity for ChatGPT provider
 Status: Completed
 Completed: 2026-06-02
