@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.0.6 - 2026-06-02
+
+### Added in v2.0.6
+
+- Added ChatGPT/Codex Fast Mode support via `chatgpt.fast_mode`, sending Codex `service_tier = "priority"` when no explicit runtime or request-level service tier is configured.
+- Added an experimental, default-off `chatgpt.websocket_prewarm` option for native Codex-style WebSocket prewarm: the provider sends a `generate=false` warmup request, caches the completed warmup response id, and lets the first matching real WebSocket request reuse it with empty `input`.
+
+### Changed in v2.0.6
+
+- Exposed a ChatGPT-only `Codex Fast Mode` toggle in the TUI provider detail pane.
+- Preserved safe fallback behavior for ChatGPT Auto transport when WebSocket prewarm fails before a real response starts, falling back to SSE without leaking transport-only prewarm fields.
+
 ## v2.0.5 - 2026-05-30
 
 ### Fixed in v2.0.5
