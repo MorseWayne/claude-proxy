@@ -34,8 +34,8 @@ use app::{
 };
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
-    CopilotProviderConfig, ModelAliasConfig, ModelConfig, ModelReasoningEffort, ProviderConfig,
-    ProviderType,
+    ChatGptProviderConfig, CopilotProviderConfig, ModelAliasConfig, ModelConfig,
+    ModelReasoningEffort, ProviderConfig, ProviderType,
 };
 use tracing::{error, info};
 
@@ -441,6 +441,9 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
             KeyCode::Enter | KeyCode::Char('e') => {
                 start_editing(app);
             }
+            KeyCode::Char(' ') => {
+                toggle_selected_provider_fast_mode(app);
+            }
             KeyCode::Char('a') => {
                 add_provider(app);
             }
@@ -665,6 +668,11 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             } else {
                                 None
                             };
+                            let chatgpt = if provider_type == ProviderType::ChatGPT {
+                                Some(ChatGptProviderConfig::default())
+                            } else {
+                                None
+                            };
 
                             let is_oauth = !provider_type.needs_api_key();
 
@@ -677,7 +685,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                     proxy: String::new(),
                                     provider_type: Some(provider_type),
                                     copilot,
-                                    chatgpt: None,
+                                    chatgpt,
                                     runtime: Default::default(),
                                     reasoning_markers: Default::default(),
                                 },
@@ -801,6 +809,10 @@ fn request_quit(app: &mut App) {
 fn start_editing(app: &mut App) {
     // For provider page: edit the selected provider's field based on detail_idx
     if app.nav == NavItem::Providers {
+        if app.detail_idx == 5 && toggle_selected_provider_fast_mode(app) {
+            return;
+        }
+
         if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
             let id = id.clone();
             let pt = cfg.resolve_type(&id);
@@ -1252,6 +1264,41 @@ fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool 
             }
         }
     }
+}
+
+fn toggle_selected_provider_fast_mode(app: &mut App) -> bool {
+    let Some(id) = selected_chatgpt_provider_id(app) else {
+        return false;
+    };
+    toggle_chatgpt_fast_mode(app, &id)
+}
+
+fn selected_chatgpt_provider_id(app: &App) -> Option<String> {
+    let (id, cfg) = app.settings.providers.iter().nth(app.content_idx)?;
+    (cfg.resolve_type(id) == ProviderType::ChatGPT).then(|| id.clone())
+}
+
+fn toggle_chatgpt_fast_mode(app: &mut App, provider_id: &str) -> bool {
+    let Some(cfg) = app.settings.providers.get_mut(provider_id) else {
+        return false;
+    };
+    if cfg.resolve_type(provider_id) != ProviderType::ChatGPT {
+        return false;
+    }
+
+    let chatgpt = cfg
+        .chatgpt
+        .get_or_insert_with(ChatGptProviderConfig::default);
+    chatgpt.fast_mode = !chatgpt.fast_mode;
+    let enabled = chatgpt.fast_mode;
+
+    app.provider_statuses.remove(provider_id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Codex fast mode: {}",
+        if enabled { "ON" } else { "OFF" }
+    )));
+    true
 }
 
 fn handle_toggle(app: &mut App) {
@@ -3283,6 +3330,79 @@ mod tests {
                 .and_then(|cfg| cfg.provider_type.as_ref()),
             Some(ProviderType::Custom(id)) if id == "custom-2"
         ));
+    }
+
+    #[test]
+    fn chatgpt_provider_add_includes_default_chatgpt_config() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        let mut app = App::new(settings);
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("ChatGPT"))
+                .expect("chatgpt provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let chatgpt = app
+            .settings
+            .providers
+            .get("chatgpt")
+            .and_then(|cfg| cfg.chatgpt.as_ref())
+            .expect("chatgpt config");
+        assert!(!chatgpt.fast_mode);
+    }
+
+    #[test]
+    fn chatgpt_provider_fast_mode_toggles_from_detail_row() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".into(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut app = App::new(settings);
+        app.nav = NavItem::Providers;
+        app.focus = Focus::Content;
+        app.provider_focus = ProviderFocus::Detail;
+        app.detail_idx = 5;
+
+        assert_eq!(app.provider_detail_field_count(), 6);
+
+        handle_providers_key(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.settings
+                .providers
+                .get("chatgpt")
+                .and_then(|cfg| cfg.chatgpt.as_ref())
+                .is_some_and(|cfg| cfg.fast_mode)
+        );
+        assert!(app.dirty);
+
+        handle_providers_key(&mut app, KeyCode::Enter);
+        assert!(
+            !app.settings
+                .providers
+                .get("chatgpt")
+                .and_then(|cfg| cfg.chatgpt.as_ref())
+                .is_some_and(|cfg| cfg.fast_mode)
+        );
     }
 
     #[test]

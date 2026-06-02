@@ -63,6 +63,7 @@ const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
 const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
 const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 const CHATGPT_WEBSOCKET_STARTUP_FAILURE_COOLDOWN_SECS: u64 = 120;
+const CODEX_FAST_SERVICE_TIER: &str = "priority";
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -373,6 +374,7 @@ pub struct ChatGptProvider {
     request_headers: ChatGptRequestHeaders,
     request_policy: UpstreamRequestPolicy,
     runtime: ProviderRuntimeConfig,
+    chatgpt_config: ChatGptProviderConfig,
     proxy: Option<String>,
     extra_ca_certs: Vec<String>,
     transport: ChatGptTransport,
@@ -392,6 +394,7 @@ impl ChatGptProvider {
         let http_client = build_http_client(&config.proxy, settings)?;
         let auth = ChatGptAuth::new(http_client.clone()).await?;
         let chatgpt_config = config.chatgpt.clone().unwrap_or_default();
+        let transport = chatgpt_config.transport;
 
         Ok(Self {
             id: id.to_string(),
@@ -403,9 +406,10 @@ impl ChatGptProvider {
             request_headers: chatgpt_request_headers(&chatgpt_config)?,
             request_policy: chatgpt_upstream_request_policy(&config.runtime),
             runtime: config.runtime.clone(),
+            chatgpt_config,
             proxy: (!config.proxy.trim().is_empty()).then(|| config.proxy.clone()),
             extra_ca_certs: settings.http.extra_ca_certs.clone(),
-            transport: chatgpt_config.transport,
+            transport,
             websocket_sse_cooldown_until_secs: Arc::new(AtomicU64::new(0)),
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
@@ -430,6 +434,13 @@ impl ChatGptProvider {
 
     pub(super) fn websocket_sse_cooldown_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.websocket_sse_cooldown_until_secs)
+    }
+
+    fn codex_service_tier(&self) -> Option<&str> {
+        effective_codex_service_tier(
+            self.runtime.openai.service_tier.as_deref(),
+            self.chatgpt_config.fast_mode,
+        )
     }
 
     pub(super) fn activate_websocket_sse_cooldown(
@@ -1287,6 +1298,13 @@ fn chatgpt_sse_response_id(event: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn effective_codex_service_tier(
+    runtime_service_tier: Option<&str>,
+    fast_mode: bool,
+) -> Option<&str> {
+    runtime_service_tier.or(fast_mode.then_some(CODEX_FAST_SERVICE_TIER))
+}
+
 #[async_trait]
 impl Provider for ChatGptProvider {
     fn id(&self) -> &str {
@@ -1318,7 +1336,7 @@ impl Provider for ChatGptProvider {
             DEFAULT_CHATGPT_INSTRUCTIONS,
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
-                service_tier: self.runtime.openai.service_tier.as_deref(),
+                service_tier: self.codex_service_tier(),
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -2556,6 +2574,24 @@ mod tests {
                 unsafe { env::remove_var(self.key) };
             }
         }
+    }
+
+    #[test]
+    fn codex_fast_mode_uses_priority_service_tier() {
+        assert_eq!(effective_codex_service_tier(None, true), Some("priority"));
+    }
+
+    #[test]
+    fn codex_fast_mode_is_disabled_by_default() {
+        assert_eq!(effective_codex_service_tier(None, false), None);
+    }
+
+    #[test]
+    fn runtime_service_tier_overrides_codex_fast_mode() {
+        assert_eq!(
+            effective_codex_service_tier(Some("flex"), true),
+            Some("flex")
+        );
     }
 
     #[test]
@@ -5958,6 +5994,7 @@ mod tests {
             },
             request_policy: chatgpt_upstream_request_policy(&ProviderRuntimeConfig::default()),
             runtime: ProviderRuntimeConfig::default(),
+            chatgpt_config: ChatGptProviderConfig::default(),
             proxy: None,
             extra_ca_certs: Vec::new(),
             transport: ChatGptTransport::Sse,

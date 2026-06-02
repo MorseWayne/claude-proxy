@@ -297,6 +297,16 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-06-02-003 — Codex fast-mode parity for ChatGPT provider
+Status: Completed
+Completed: 2026-06-02
+Level: 3
+
+Close summary:
+- Outcome: Added first-class `chatgpt.fast_mode` configuration for ChatGPT/Codex providers. When enabled and no explicit `runtime.openai.service_tier` is set, ChatGPT requests send Codex `service_tier = "priority"`; request-level and runtime service-tier overrides remain higher priority. The TUI provider detail pane now exposes a ChatGPT-only `Codex Fast Mode` toggle, and newly added ChatGPT providers get default ChatGPT config.
+- Validation: CodeGraph comparison confirmed native Codex Fast Mode maps to `priority` and also uses WebSocket prewarm. `cargo fmt --check`, `cargo test -p claude-proxy-config`, `cargo test -p claude-proxy-providers chatgpt::tests::`, `cargo test -p claude-proxy-cli tui::tests::`, focused new fast-mode tests, and `cargo clippy -p claude-proxy-config -p claude-proxy-providers -p claude-proxy-cli -- -D warnings` passed.
+- Gaps: This reaches request-side service-tier parity but does not implement native Codex WebSocket prewarm (`generate=false`), so first-token latency may still differ from native Codex. No live upstream Claude Code soak test was run.
+
 ### WF-2026-06-02-002 — ChatGPT continuation/context/metrics follow-up
 Status: Completed
 Completed: 2026-06-02

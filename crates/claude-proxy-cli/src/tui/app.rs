@@ -546,7 +546,18 @@ impl App {
 
     /// Number of editable fields in the provider detail pane.
     pub fn provider_detail_field_count(&self) -> usize {
-        5 // Name, Compatibility, API Key, Base URL, Proxy
+        self.settings
+            .providers
+            .iter()
+            .nth(self.content_idx)
+            .map(|(id, cfg)| {
+                if cfg.resolve_type(id) == ProviderType::ChatGPT {
+                    6
+                } else {
+                    5
+                }
+            })
+            .unwrap_or(5)
     }
 
     pub fn clamp_content_idx(&mut self) {

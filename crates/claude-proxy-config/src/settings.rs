@@ -164,6 +164,9 @@ pub struct ChatGptProviderConfig {
     /// Transport used for ChatGPT Codex Responses streams.
     #[serde(default)]
     pub transport: ChatGptTransport,
+    /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 impl Default for ChatGptProviderConfig {
@@ -172,6 +175,7 @@ impl Default for ChatGptProviderConfig {
             originator: default_empty(),
             user_agent: default_empty(),
             transport: ChatGptTransport::default(),
+            fast_mode: false,
         }
     }
 }
@@ -1365,6 +1369,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 originator = "codex_cli"
 user_agent = "CodexCLI/1.2.3"
 transport = "websocket"
+fast_mode = true
 "#;
 
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
@@ -1374,10 +1379,12 @@ transport = "websocket"
         assert_eq!(chatgpt.originator, "codex_cli");
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
         assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
+        assert!(chatgpt.fast_mode);
         assert_eq!(
             ChatGptProviderConfig::default().transport,
             ChatGptTransport::Auto
         );
+        assert!(!ChatGptProviderConfig::default().fast_mode);
     }
 
     #[test]

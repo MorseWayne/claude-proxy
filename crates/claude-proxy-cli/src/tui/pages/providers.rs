@@ -136,8 +136,9 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         .min(app.settings.providers.len().saturating_sub(1));
     let (id, cfg) = app.settings.providers.iter().nth(idx).unwrap();
     let pt = cfg.resolve_type(id);
+    let is_chatgpt = pt == ProviderType::ChatGPT;
 
-    let rows = widgets::field_rows(inner, 9);
+    let rows = widgets::field_rows(inner, if is_chatgpt { 10 } else { 9 });
 
     widgets::render_field(
         f,
@@ -198,9 +199,25 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         false,
     );
 
+    let check_row = if is_chatgpt { 6 } else { 5 };
+    let status_row = if is_chatgpt { 7 } else { 6 };
+    let info_row = if is_chatgpt { 8 } else { 7 };
+    let hints_row = if is_chatgpt { 9 } else { 8 };
+
+    if is_chatgpt {
+        let fast_mode = cfg.chatgpt.as_ref().is_some_and(|c| c.fast_mode);
+        widgets::render_toggle(
+            f,
+            rows[5],
+            "Codex Fast Mode",
+            fast_mode,
+            detail_focused && app.detail_idx == 5,
+        );
+    }
+
     // Connectivity/auth check (read-only)
     let (check_status, _) = provider_status_detail(app, id, cfg);
-    widgets::render_field(f, rows[5], "Check", &check_status, false, false);
+    widgets::render_field(f, rows[check_row], "Check", &check_status, false, false);
 
     // Status (read-only)
     let is_default = app
@@ -214,7 +231,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "Not default".into()
     };
-    widgets::render_field(f, rows[6], "Status", &status, false, false);
+    widgets::render_field(f, rows[status_row], "Status", &status, false, false);
 
     // Copilot info (read-only)
     if pt == ProviderType::Copilot
@@ -224,7 +241,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             "oauth={} small={} warmup={}",
             cc.oauth_app, cc.small_model, cc.enable_warmup
         );
-        widgets::render_field(f, rows[7], "Copilot", &info, false, false);
+        widgets::render_field(f, rows[info_row], "Copilot", &info, false, false);
     }
 
     // Actions hint at bottom
@@ -265,6 +282,16 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             ));
             hints.push(Span::styled(" Re-auth", widgets::dim_style()));
         }
+        if is_chatgpt && app.detail_idx == 5 {
+            hints.push(Span::styled(
+                "  Space ",
+                Style::default()
+                    .fg(theme::BG_DARK)
+                    .bg(theme::ACCENT2)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            hints.push(Span::styled(" Toggle", widgets::dim_style()));
+        }
         hints
     } else {
         let mut hints = vec![Span::styled(
@@ -277,7 +304,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         }
         hints
     };
-    f.render_widget(Paragraph::new(Line::from(hints)), rows[8]);
+    f.render_widget(Paragraph::new(Line::from(hints)), rows[hints_row]);
 }
 
 fn provider_compatibility_label(provider_type: &ProviderType) -> &'static str {
