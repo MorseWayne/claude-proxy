@@ -239,7 +239,7 @@ Prerequisites:
 - User has asked to start/continue implementation from the approved spec.
 
 Resume next:
-- Commit the Pi 0.78.1 ChatGPT/Codex model catalog follow-up.
+- Commit release metadata for v2.0.7, merge/push main, then push tag `v2.0.7` to trigger GitHub release workflow.
 
 ### WF-2026-05-20-007 — ChatGPT/Codex compatibility follow-ups
 Status: Completed
