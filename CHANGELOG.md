@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Updated the ChatGPT/Codex model catalog to match Pi 0.78.1 `openai-codex` availability: `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark` remain selectable, while removed backend models `gpt-5.3-codex` and `gpt-5.2` are no longer offered.
+- Changed the ChatGPT provider fallback/default example model from `gpt-5.3-codex` to `gpt-5.5`.
+
 ## v2.0.6 - 2026-06-02
 
 ### Added in v2.0.6

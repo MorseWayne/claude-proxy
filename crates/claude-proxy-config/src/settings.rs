@@ -312,7 +312,7 @@ impl ProviderType {
     pub fn default_model_name(&self) -> &str {
         match self {
             ProviderType::Copilot => "gpt-5",
-            ProviderType::ChatGPT => "gpt-5.3-codex",
+            ProviderType::ChatGPT => "gpt-5.5",
             _ => "",
         }
     }

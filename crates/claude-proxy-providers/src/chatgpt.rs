@@ -2437,19 +2437,9 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
     },
     ChatGptModelSpec {
-        model_id: "gpt-5.3-codex",
-        context_window: 272_000,
-        image_input: false,
-    },
-    ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
         context_window: 128_000,
         image_input: false,
-    },
-    ChatGptModelSpec {
-        model_id: "gpt-5.2",
-        context_window: 272_000,
-        image_input: true,
     },
 ];
 
@@ -2999,15 +2989,15 @@ mod tests {
 
     #[test]
     fn chatgpt_request_size_warning_uses_model_context_metadata() {
-        let threshold = chatgpt_request_warning_threshold("gpt-5.3-codex").unwrap();
+        let threshold = chatgpt_request_warning_threshold("gpt-5.5").unwrap();
 
         assert_eq!(
             threshold,
             272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
         );
-        assert!(request_size_warning("gpt-5.3-codex", threshold - 1).is_none());
+        assert!(request_size_warning("gpt-5.5", threshold - 1).is_none());
         assert_eq!(
-            request_size_warning("gpt-5.3-codex", threshold),
+            request_size_warning("gpt-5.5", threshold),
             Some((threshold, threshold / CHATGPT_BYTES_PER_ESTIMATED_TOKEN))
         );
         assert!(request_size_warning("unknown-model", threshold).is_none());
@@ -3022,14 +3012,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec![
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-                "gpt-5.3-codex-spark",
-                "gpt-5.2",
-            ]
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",]
         );
 
         let gpt55 = models
@@ -3090,19 +3073,14 @@ mod tests {
             vec!["low", "medium", "high", "xhigh"]
         );
 
-        let codex = models
-            .iter()
-            .find(|model| model.model_id == "gpt-5.3-codex")
-            .expect("codex model");
-        assert_eq!(
-            codex.capabilities.modalities.input.image,
-            CapabilityState::Unsupported
-        );
-
         let spark = models
             .iter()
             .find(|model| model.model_id == "gpt-5.3-codex-spark")
             .expect("codex spark model");
+        assert_eq!(
+            spark.capabilities.modalities.input.image,
+            CapabilityState::Unsupported
+        );
         assert_eq!(spark.capabilities.limits.context_window, Some(128_000));
     }
 
@@ -3853,13 +3831,13 @@ mod tests {
 
     #[test]
     fn context_limit_preflight_threshold_uses_model_capability_then_fallback() {
-        let codex = chatgpt_context_limit_preflight_threshold("gpt-5.3-codex");
+        let gpt55 = chatgpt_context_limit_preflight_threshold("gpt-5.5");
         assert_eq!(
-            codex.body_bytes,
+            gpt55.body_bytes,
             272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
         );
-        assert_eq!(codex.source, "model_context_window");
-        assert_eq!(codex.context_window, Some(272_000));
+        assert_eq!(gpt55.source, "model_context_window");
+        assert_eq!(gpt55.context_window, Some(272_000));
 
         let spark = chatgpt_context_limit_preflight_threshold("gpt-5.3-codex-spark");
         assert_eq!(
