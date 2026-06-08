@@ -4,6 +4,37 @@
 
 ## Active（进行中）
 
+### WF-2026-06-08-003 — ChatGPT/Codex standalone tools conversion
+Status: In Progress
+Level: 3
+Started: 2026-06-08
+Last updated: 2026-06-08
+Current phase: Implementation boundary setup
+
+Intent:
+- Default-enable a thorough ChatGPT/Codex standalone/custom tools conversion while preserving config and per-tool fallback to function tools.
+
+Plan:
+- [done] P1 — Write and review standalone tools design spec.
+- [doing] P2 — Add default-on ChatGPT standalone tools config and conversion mode boundary.
+- [todo] P3 — Implement standalone/custom tool definition conversion with safe fallback.
+- [todo] P4 — Validate tool history, tool_choice, stream converter, and WebSocket continuation compatibility.
+- [todo] P5 — Run focused tests, GitNexus checks, and commit implementation.
+
+Current todo:
+- [ ] P2 — Add default-on ChatGPT standalone tools config and conversion mode boundary.
+
+Changes:
+- Wrote and reviewed design spec `docs/superpowers/specs/2026-06-08-chatgpt-codex-standalone-tools-design.md` from the approved default-on/thorough conversion direction.
+- Review gaps were addressed by adding a mapping confirmation protocol, continuation field contract, and mixed tool-choice behavior matrix.
+
+Prerequisites:
+- Do not change non-ChatGPT provider tool conversion behavior.
+- Keep `chatgpt.standalone_tools = false` as runtime rollback even though default is true.
+
+Resume next:
+- Run GitNexus impact analysis for config/body conversion symbols, then add default-on `chatgpt.standalone_tools` and conversion mode plumbing.
+
 ### WF-2026-05-28-003 — v2.0 deep quality/performance audit
 Status: In Progress
 Level: 2
