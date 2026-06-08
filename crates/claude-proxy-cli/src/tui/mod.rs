@@ -2671,6 +2671,22 @@ fn parse_observability_summary(value: Option<&Value>) -> ObservabilitySummary {
             .get("prompt_too_long_retries")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        continuation_saved_bytes: value
+            .get("continuation_saved_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        responses_lite_requests: value
+            .get("responses_lite_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        websocket_requests: value
+            .get("websocket_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        continuation_used_requests: value
+            .get("continuation_used_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     }
 }
 
@@ -3153,7 +3169,11 @@ mod tests {
                 "avg_upstream_connect_ms": 456,
                 "max_event_gap_ms": 789,
                 "idle_gap_count": 2,
-                "prompt_too_long_retries": 1
+                "prompt_too_long_retries": 1,
+                "continuation_saved_bytes": 1536,
+                "responses_lite_requests": 7,
+                "websocket_requests": 6,
+                "continuation_used_requests": 5
             },
             "stored": {
                 "summary": {
@@ -3163,7 +3183,11 @@ mod tests {
                     "avg_upstream_connect_ms": 567,
                     "max_event_gap_ms": 890,
                     "idle_gap_count": 3,
-                    "prompt_too_long_retries": 2
+                    "prompt_too_long_retries": 2,
+                    "continuation_saved_bytes": 4096,
+                    "responses_lite_requests": 70,
+                    "websocket_requests": 60,
+                    "continuation_used_requests": 50
                 }
             }
         })));
@@ -3176,9 +3200,41 @@ mod tests {
         assert_eq!(observability.summary.max_event_gap_ms, 789);
         assert_eq!(observability.summary.idle_gap_count, 2);
         assert_eq!(observability.summary.prompt_too_long_retries, 1);
+        assert_eq!(observability.summary.continuation_saved_bytes, 1536);
+        assert_eq!(observability.summary.responses_lite_requests, 7);
+        assert_eq!(observability.summary.websocket_requests, 6);
+        assert_eq!(observability.summary.continuation_used_requests, 5);
         let stored = observability.stored_summary.expect("stored summary");
         assert_eq!(stored.requests, 100);
         assert_eq!(stored.avg_total_latency_ms, 2345);
+        assert_eq!(stored.continuation_saved_bytes, 4096);
+        assert_eq!(stored.responses_lite_requests, 70);
+        assert_eq!(stored.websocket_requests, 60);
+        assert_eq!(stored.continuation_used_requests, 50);
+    }
+
+    #[test]
+    fn parse_metrics_contract_defaults_new_observability_fields_to_zero() {
+        let observability = parse_observability(Some(&json!({
+            "summary": {
+                "requests": 1
+            },
+            "stored": {
+                "summary": {
+                    "requests": 2
+                }
+            }
+        })));
+
+        assert_eq!(observability.summary.continuation_saved_bytes, 0);
+        assert_eq!(observability.summary.responses_lite_requests, 0);
+        assert_eq!(observability.summary.websocket_requests, 0);
+        assert_eq!(observability.summary.continuation_used_requests, 0);
+        let stored = observability.stored_summary.expect("stored summary");
+        assert_eq!(stored.continuation_saved_bytes, 0);
+        assert_eq!(stored.responses_lite_requests, 0);
+        assert_eq!(stored.websocket_requests, 0);
+        assert_eq!(stored.continuation_used_requests, 0);
     }
 
     #[test]

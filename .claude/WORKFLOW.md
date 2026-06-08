@@ -299,6 +299,32 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-06-08-002 — Responses Lite dashboard metrics follow-up
+Completed: 2026-06-08
+Level: 2
+
+Close summary:
+- Outcome: Added low-cardinality observability summary counters for Responses Lite, WebSocket transport, continuation-used requests, and continuation saved bytes in admin metrics and the TUI dashboard.
+- Validation: Passed focused server/TUI observability tests, `cargo fmt --all --check`, `git diff --check`, `cargo clippy -p claude-proxy-server -p claude-proxy-cli -- -D warnings`, and GitNexus detect_changes with expected HIGH impact on dashboard render/metrics parsing flows.
+- Gaps: None for the approved dashboard metrics slice.
+
+Archived execution:
+- Intent: Surface Responses Lite and continuation savings data already collected by the transport/observability layer through `/admin/metrics` and the TUI dashboard.
+- Plan:
+  - [done] P1 — Implement admin observability summary counters.
+  - [done] P2 — Implement TUI metrics parsing for new summary fields.
+  - [done] P3 — Render compact dashboard observability display.
+  - [done] P4 — Add focused parser/rendering/server persistence tests.
+  - [done] P5 — Validate, run impact/change checks, and commit.
+- Key changes:
+  - Admin observability summaries now aggregate Responses Lite, WebSocket, continuation-used, and continuation saved-byte totals for session and stored metrics.
+  - TUI parsing defaults missing new summary fields to zero for compatibility with older servers.
+  - Dashboard prefers stored observability totals when available and shows a compact `Resp Lite` row with WS, continuation, and saved-byte values.
+- Validation:
+  - Focused server/TUI observability tests, formatting, clippy, diff whitespace check, and GitNexus detect_changes.
+- Deferred / gaps:
+  - None.
+
 ### WF-2026-06-08-001 — Codex Responses Lite compatibility and observability follow-up
 Completed: 2026-06-08
 Level: 2

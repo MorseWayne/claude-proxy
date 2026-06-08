@@ -561,7 +561,10 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 COALESCE(MAX(max_event_gap_ms), 0),
                 COALESCE(SUM(idle_gap_count), 0),
                 COALESCE(SUM(prompt_too_long_retries), 0),
-                COALESCE(SUM(continuation_saved_bytes), 0)
+                COALESCE(SUM(continuation_saved_bytes), 0),
+                COALESCE(SUM(CASE WHEN responses_lite = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN transport = 'websocket' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN continuation_used = 1 THEN 1 ELSE 0 END), 0)
          FROM request_observability_events",
         [],
         |row| {
@@ -574,6 +577,9 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         },
     ) {
@@ -585,6 +591,9 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
         stored.summary.idle_gap_count = row.5 as u64;
         stored.summary.prompt_too_long_retries = row.6 as u64;
         stored.summary.continuation_saved_bytes = row.7 as u64;
+        stored.summary.responses_lite_requests = row.8 as u64;
+        stored.summary.websocket_requests = row.9 as u64;
+        stored.summary.continuation_used_requests = row.10 as u64;
         stored.summary.finalize();
     }
 
@@ -978,6 +987,9 @@ mod tests {
         assert_eq!(stored.summary.idle_gap_count, 2);
         assert_eq!(stored.summary.prompt_too_long_retries, 2);
         assert_eq!(stored.summary.continuation_saved_bytes, 1_760);
+        assert_eq!(stored.summary.responses_lite_requests, 2);
+        assert_eq!(stored.summary.websocket_requests, 2);
+        assert_eq!(stored.summary.continuation_used_requests, 2);
         assert_eq!(stored.recent.len(), 2);
         assert_eq!(stored.recent[0].request_id, "first");
         assert_eq!(stored.recent[1].request_id, "second");
@@ -1066,6 +1078,9 @@ mod tests {
         assert_eq!(event.upstream_send_body_bytes, 0);
         assert_eq!(event.continuation_saved_bytes, 0);
         assert_eq!(event.responses_lite, None);
+        assert_eq!(stored.summary.responses_lite_requests, 0);
+        assert_eq!(stored.summary.websocket_requests, 0);
+        assert_eq!(stored.summary.continuation_used_requests, 0);
         let _ = std::fs::remove_file(path);
     }
 

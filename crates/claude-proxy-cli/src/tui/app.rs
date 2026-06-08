@@ -399,6 +399,10 @@ pub struct ObservabilitySummary {
     pub max_event_gap_ms: u64,
     pub idle_gap_count: u64,
     pub prompt_too_long_retries: u64,
+    pub continuation_saved_bytes: u64,
+    pub responses_lite_requests: u64,
+    pub websocket_requests: u64,
+    pub continuation_used_requests: u64,
 }
 
 #[derive(Debug, Clone, Default)]

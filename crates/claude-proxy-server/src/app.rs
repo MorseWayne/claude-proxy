@@ -90,6 +90,9 @@ pub struct RequestObservabilitySummary {
     pub idle_gap_count: u64,
     pub prompt_too_long_retries: u64,
     pub continuation_saved_bytes: u64,
+    pub responses_lite_requests: u64,
+    pub websocket_requests: u64,
+    pub continuation_used_requests: u64,
 }
 
 impl RequestObservabilitySummary {
@@ -102,6 +105,15 @@ impl RequestObservabilitySummary {
         self.idle_gap_count += event.idle_gap_count;
         self.prompt_too_long_retries += event.prompt_too_long_retries;
         self.continuation_saved_bytes += event.continuation_saved_bytes;
+        if event.responses_lite == Some(true) {
+            self.responses_lite_requests += 1;
+        }
+        if event.transport.as_deref() == Some("websocket") {
+            self.websocket_requests += 1;
+        }
+        if event.continuation_used == Some(true) {
+            self.continuation_used_requests += 1;
+        }
     }
 
     pub(crate) fn finalize(&mut self) {
@@ -914,6 +926,15 @@ mod tests {
         assert_eq!(
             data["observability"]["summary"]["continuation_saved_bytes"],
             880
+        );
+        assert_eq!(
+            data["observability"]["summary"]["responses_lite_requests"],
+            1
+        );
+        assert_eq!(data["observability"]["summary"]["websocket_requests"], 1);
+        assert_eq!(
+            data["observability"]["summary"]["continuation_used_requests"],
+            1
         );
         assert_eq!(data["observability"]["recent"].as_array().unwrap().len(), 2);
         assert_eq!(data["observability"]["recent"][0]["transport"], "websocket");

@@ -58,7 +58,9 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let metrics_area = widgets::render_content_frame(f, top_cols[1], app, "Live Metrics");
     if let Some(ref metrics) = app.live_metrics {
         let avg_lat = format!("{}ms", metrics.avg_latency_ms);
-        let observability = observability_status(&metrics.observability.summary);
+        let observability_summary = preferred_observability_summary(&metrics.observability);
+        let observability = observability_status(observability_summary);
+        let observability_details = observability_details(observability_summary);
         let errors = combined_error_status(
             &metrics.diagnostics,
             metrics.stored.as_ref().map(|stored| &stored.diagnostics),
@@ -80,6 +82,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     ),
                     ("Avg Latency", &avg_lat),
                     ("Observe", &observability),
+                    ("Resp Lite", &observability_details),
                     ("Top Error", &errors),
                 ],
             );
@@ -92,6 +95,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     ("Errors", &format!("{}", metrics.errors_total)),
                     ("Avg Latency", &avg_lat),
                     ("Observe", &observability),
+                    ("Resp Lite", &observability_details),
                     ("Top Error", &errors),
                 ],
             );
@@ -245,6 +249,16 @@ fn render_model_usage(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), content_area);
 }
 
+fn preferred_observability_summary(
+    metrics: &super::super::app::ObservabilityMetrics,
+) -> &ObservabilitySummary {
+    metrics
+        .stored_summary
+        .as_ref()
+        .filter(|summary| summary.requests > 0)
+        .unwrap_or(&metrics.summary)
+}
+
 fn observability_status(summary: &ObservabilitySummary) -> String {
     if summary.requests == 0 {
         return "no samples".to_string();
@@ -252,6 +266,19 @@ fn observability_status(summary: &ObservabilitySummary) -> String {
     format!(
         "e2e {}ms · up {}ms · gap {}ms",
         summary.avg_total_latency_ms, summary.avg_upstream_connect_ms, summary.max_event_gap_ms
+    )
+}
+
+fn observability_details(summary: &ObservabilitySummary) -> String {
+    if summary.requests == 0 {
+        return "no samples".to_string();
+    }
+    format!(
+        "{} · WS {} · Cont {} · Saved {}",
+        format_number(summary.responses_lite_requests),
+        format_number(summary.websocket_requests),
+        format_number(summary.continuation_used_requests),
+        format_bytes(summary.continuation_saved_bytes)
     )
 }
 
@@ -639,6 +666,20 @@ fn format_number(n: u64) -> String {
     }
 }
 
+/// Format byte count with binary units for observability savings.
+fn format_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KiB", n as f64 / KIB)
+    } else {
+        format!("{:.1} MiB", n as f64 / MIB)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +726,44 @@ mod tests {
         assert_eq!(
             observability_status(&summary),
             "e2e 1200ms · up 300ms · gap 450ms"
+        );
+    }
+
+    #[test]
+    fn observability_details_formats_responses_lite_and_saved_bytes() {
+        let summary = ObservabilitySummary {
+            requests: 10,
+            responses_lite_requests: 7,
+            websocket_requests: 6,
+            continuation_used_requests: 5,
+            continuation_saved_bytes: 1536,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            observability_details(&summary),
+            "7 · WS 6 · Cont 5 · Saved 1.5 KiB"
+        );
+    }
+
+    #[test]
+    fn preferred_observability_summary_uses_stored_totals_when_available() {
+        let metrics = super::super::super::app::ObservabilityMetrics {
+            summary: ObservabilitySummary {
+                requests: 1,
+                continuation_saved_bytes: 512,
+                ..Default::default()
+            },
+            stored_summary: Some(ObservabilitySummary {
+                requests: 2,
+                continuation_saved_bytes: 2048,
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(
+            preferred_observability_summary(&metrics).continuation_saved_bytes,
+            2048
         );
     }
 }
