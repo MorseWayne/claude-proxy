@@ -19,22 +19,13 @@
   "tools": [
     {
       "description": "Run a shell command",
-      "name": "Bash",
-      "parameters": {
-        "properties": {
-          "command": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "command"
-        ],
-        "type": "object"
+      "format": {
+        "definition": "start: command\ncommand: /[\\s\\S]+/",
+        "syntax": "lark",
+        "type": "grammar"
       },
-      "type": "function"
+      "name": "Bash",
+      "type": "custom"
     }
   ]
 }

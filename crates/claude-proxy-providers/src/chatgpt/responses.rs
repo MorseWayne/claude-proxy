@@ -4,10 +4,21 @@ use claude_proxy_core::{MessagesRequest, SseEvent};
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct CodexRequestContext<'a> {
     pub installation_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
+    pub standalone_tools: bool,
+}
+
+impl Default for CodexRequestContext<'_> {
+    fn default() -> Self {
+        Self {
+            installation_id: None,
+            service_tier: None,
+            standalone_tools: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +85,11 @@ pub(super) fn build_body_with_context(
         crate::responses::ConversionContext {
             provider_id: Some("chatgpt"),
             model: None,
+            tool_conversion_mode: if context.standalone_tools {
+                crate::responses::ToolConversionMode::CodexStandalone
+            } else {
+                crate::responses::ToolConversionMode::Function
+            },
         },
     );
     if let Some(object) = body.as_object_mut() {

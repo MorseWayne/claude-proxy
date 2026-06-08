@@ -170,6 +170,9 @@ pub struct ChatGptProviderConfig {
     /// Enable Responses Lite transport markers for ChatGPT Codex requests.
     #[serde(default = "default_true")]
     pub responses_lite: bool,
+    /// Enable Codex-style standalone/custom tools for ChatGPT Codex requests.
+    #[serde(default = "default_true")]
+    pub standalone_tools: bool,
     /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
     #[serde(default)]
     pub fast_mode: bool,
@@ -183,6 +186,7 @@ impl Default for ChatGptProviderConfig {
             transport: ChatGptTransport::default(),
             websocket_prewarm: false,
             responses_lite: true,
+            standalone_tools: true,
             fast_mode: false,
         }
     }
@@ -1378,6 +1382,8 @@ originator = "codex_cli"
 user_agent = "CodexCLI/1.2.3"
 transport = "websocket"
 websocket_prewarm = true
+responses_lite = false
+standalone_tools = false
 fast_mode = true
 "#;
 
@@ -1389,7 +1395,8 @@ fast_mode = true
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
         assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
         assert!(chatgpt.websocket_prewarm);
-        assert!(chatgpt.responses_lite);
+        assert!(!chatgpt.responses_lite);
+        assert!(!chatgpt.standalone_tools);
         assert!(chatgpt.fast_mode);
         assert_eq!(
             ChatGptProviderConfig::default().transport,
@@ -1397,6 +1404,7 @@ fast_mode = true
         );
         assert!(!ChatGptProviderConfig::default().websocket_prewarm);
         assert!(ChatGptProviderConfig::default().responses_lite);
+        assert!(ChatGptProviderConfig::default().standalone_tools);
         assert!(!ChatGptProviderConfig::default().fast_mode);
     }
 

@@ -53,10 +53,24 @@ enum ResponsesMessagePart {
     Input(Value),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolConversionMode {
+    #[default]
+    Function,
+    CodexStandalone,
+}
+
+#[derive(Debug, Clone)]
+struct ToolConversionResult {
+    value: Value,
+    standalone: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConversionContext<'a> {
     pub provider_id: Option<&'a str>,
     pub model: Option<&'a ModelInfo>,
+    pub tool_conversion_mode: ToolConversionMode,
 }
 
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
@@ -139,11 +153,22 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
     if let Some(stop) = &req.stop_sequences {
         body["stop"] = json!(stop);
     }
+    let mut standalone_tool_names = HashSet::new();
     if let Some(tools) = &req.tools {
-        body["tools"] = json!(tools.iter().map(convert_tool).collect::<Vec<_>>());
+        let converted_tools = tools
+            .iter()
+            .map(|tool| {
+                let converted = convert_tool_with_mode(tool, context.tool_conversion_mode);
+                if converted.standalone {
+                    standalone_tool_names.insert(tool.name.clone());
+                }
+                converted.value
+            })
+            .collect::<Vec<_>>();
+        body["tools"] = json!(converted_tools);
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body["tool_choice"] = normalize_for_responses(tool_choice);
+        body["tool_choice"] = normalize_responses_tool_choice(tool_choice, &standalone_tool_names);
     }
     if let Some(reasoning) = convert_reasoning(req, context) {
         body["reasoning"] = reasoning;
@@ -853,7 +878,24 @@ fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> 
     }
 }
 
-fn convert_tool(tool: &Tool) -> Value {
+fn convert_tool_with_mode(tool: &Tool, mode: ToolConversionMode) -> ToolConversionResult {
+    if mode == ToolConversionMode::CodexStandalone
+        && tool.name == "Bash"
+        && tool_schema_has_string_property(&tool.input_schema, "command")
+    {
+        return ToolConversionResult {
+            value: convert_bash_freeform_tool(tool),
+            standalone: true,
+        };
+    }
+
+    ToolConversionResult {
+        value: convert_function_tool(tool),
+        standalone: false,
+    }
+}
+
+fn convert_function_tool(tool: &Tool) -> Value {
     let mut value = json!({
         "type": "function",
         "name": tool.name,
@@ -865,6 +907,46 @@ fn convert_tool(tool: &Tool) -> Value {
     }
 
     value
+}
+
+fn convert_bash_freeform_tool(tool: &Tool) -> Value {
+    json!({
+        "type": "custom",
+        "name": tool.name,
+        "description": tool.description.as_deref().unwrap_or(
+            "Run a shell command. This is a FREEFORM tool, so provide the shell command text directly; do not wrap it in JSON."
+        ),
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: command\ncommand: /[\\s\\S]+/"
+        }
+    })
+}
+
+fn tool_schema_has_string_property(schema: &Value, property: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.get(property))
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("string")
+}
+
+fn normalize_responses_tool_choice(
+    tool_choice: &Value,
+    standalone_tool_names: &HashSet<String>,
+) -> Value {
+    if tool_choice.get("type").and_then(Value::as_str) == Some("tool")
+        && tool_choice
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| standalone_tool_names.contains(name))
+    {
+        return json!("auto");
+    }
+
+    normalize_for_responses(tool_choice)
 }
 
 fn normalize_tool_schema(schema: &Value) -> Value {
@@ -1652,7 +1734,11 @@ impl ResponsesStreamConverter {
         events: &mut Vec<SseEvent>,
     ) {
         if self.custom_tool_input_open.insert(output_index) {
-            Self::push_function_arguments_delta(idx, "{\"input\":\"", events);
+            let prefix = match self.function_names.get(&output_index).map(String::as_str) {
+                Some("Bash") => "{\"command\":\"",
+                _ => "{\"input\":\"",
+            };
+            Self::push_function_arguments_delta(idx, prefix, events);
         }
         self.custom_tool_input_emitted.insert(output_index);
         Self::push_function_arguments_delta(idx, &json_string_fragment(delta), events);
@@ -1674,8 +1760,13 @@ impl ResponsesStreamConverter {
         let Some(input) = input else {
             return;
         };
-        let encoded = serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string());
-        Self::push_function_arguments_delta(idx, &format!("{{\"input\":{encoded}}}"), events);
+        let arguments = self
+            .function_names
+            .get(&output_index)
+            .map(String::as_str)
+            .map(|name| custom_tool_input_arguments(name, input))
+            .unwrap_or_else(|| custom_tool_input_arguments("", input));
+        Self::push_function_arguments_delta(idx, &arguments, events);
         self.custom_tool_input_emitted.insert(output_index);
     }
 
@@ -1688,7 +1779,11 @@ impl ResponsesStreamConverter {
         if !self.custom_tool_input_open.remove(&output_index) {
             return false;
         }
-        Self::push_function_arguments_delta(idx, "\"}", events);
+        let suffix = match self.function_names.get(&output_index).map(String::as_str) {
+            Some("Bash") => "\",\"description\":\"\"}",
+            _ => "\"}",
+        };
+        Self::push_function_arguments_delta(idx, suffix, events);
         self.custom_tool_input_emitted.insert(output_index);
         true
     }
@@ -2017,6 +2112,18 @@ fn is_responses_tool_call_type(item_type: Option<&str>) -> bool {
     matches!(item_type, Some("function_call") | Some("custom_tool_call"))
 }
 
+fn custom_tool_input_arguments(tool_name: &str, input: &str) -> String {
+    if tool_name == "Bash" {
+        if let Ok(value) = serde_json::from_str::<Value>(input)
+            && value.get("command").is_some()
+        {
+            return value.to_string();
+        }
+        return json!({"command": input, "description": ""}).to_string();
+    }
+    json!({"input": input}).to_string()
+}
+
 fn json_string_fragment(text: &str) -> String {
     let encoded = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     encoded
@@ -2197,7 +2304,11 @@ impl<'a> NonStreamingResponsesConverter<'a> {
         self.next_block_index += 1;
         let input = item["input"]
             .as_str()
-            .map(|input| json!({ "input": input }))
+            .map(|input| {
+                let name = item["name"].as_str().unwrap_or_default();
+                serde_json::from_str::<Value>(&custom_tool_input_arguments(name, input))
+                    .unwrap_or_else(|_| json!({}))
+            })
             .unwrap_or_else(|| json!({}));
         self.events.push(SseEvent {
             event: "content_block_start".to_string(),
@@ -3327,6 +3438,7 @@ mod tests {
             ConversionContext {
                 provider_id: Some("test"),
                 model: Some(&model),
+                ..ConversionContext::default()
             },
         );
 
@@ -4224,6 +4336,64 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_converter_maps_custom_bash_input_to_command() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_custom_bash", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_bash_1",
+                    "call_id": "call_bash_1",
+                    "name": "Bash"
+                }
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "delta": "git"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "delta": " status --short"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "input": "git status --short"
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"command": "git status --short", "description": ""})
+        );
+    }
+
+    #[test]
     fn test_non_streaming_response_maps_text_and_function() {
         let data = json!({
             "id": "resp_1",
@@ -4302,6 +4472,40 @@ mod tests {
             json!({"input": "print(\"hi\")\n"})
         );
         assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_bash_custom_tool_call_to_command() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_bash_1",
+                    "name": "Bash",
+                    "input": "git status --short"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_bash_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "Bash");
+        assert_eq!(
+            tool_block.data["content_block"]["input"],
+            json!({"command": "git status --short", "description": ""})
+        );
     }
 
     #[test]

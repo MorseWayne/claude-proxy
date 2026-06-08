@@ -1368,6 +1368,7 @@ impl Provider for ChatGptProvider {
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
                 service_tier: self.codex_service_tier(),
+                standalone_tools: self.chatgpt_config.standalone_tools,
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -3342,6 +3343,7 @@ mod tests {
             responses::CodexRequestContext {
                 installation_id: None,
                 service_tier: Some("flex"),
+                standalone_tools: true,
             },
         );
 
@@ -3562,6 +3564,7 @@ mod tests {
             responses::CodexRequestContext {
                 installation_id: Some("install-123"),
                 service_tier: Some("priority"),
+                standalone_tools: true,
             },
         );
 
@@ -3573,6 +3576,109 @@ mod tests {
             Some(&json!("install-123"))
         );
         assert_eq!(client_metadata.len(), 1);
+    }
+
+    #[test]
+    fn chatgpt_responses_body_converts_bash_to_custom_tool_by_default() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("List changed files.".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![
+                Tool {
+                    name: "Bash".to_string(),
+                    description: Some("Run a shell command".to_string()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }),
+                },
+                Tool {
+                    name: "Read".to_string(),
+                    description: Some("Read a file".to_string()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"]
+                    }),
+                },
+            ]),
+            tool_choice: Some(json!({"type": "tool", "name": "Bash"})),
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "Bash");
+        assert_eq!(body["tools"][0]["format"]["syntax"], "lark");
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(body["tools"][1]["name"], "Read");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn chatgpt_responses_body_can_disable_standalone_tools() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("List changed files.".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "Bash".to_string(),
+                description: Some("Run a shell command".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["command"]
+                }),
+            }]),
+            tool_choice: Some(json!({"type": "tool", "name": "Bash"})),
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                standalone_tools: false,
+                ..responses::CodexRequestContext::default()
+            },
+        );
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "Bash");
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "Bash"})
+        );
     }
 
     #[test]
@@ -3622,6 +3728,7 @@ mod tests {
             responses::CodexRequestContext {
                 installation_id: Some("install-fixture"),
                 service_tier: None,
+                standalone_tools: true,
             },
         );
 

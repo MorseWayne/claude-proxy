@@ -772,7 +772,10 @@ fn continuation_delta_with_inferred_assistant_prefix(
 
 fn is_assistant_output_prefix_candidate(item: &Value) -> bool {
     item.get("role").and_then(Value::as_str) == Some("assistant")
-        || item.get("type").and_then(Value::as_str) == Some("function_call")
+        || matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call" | "custom_tool_call")
+        )
 }
 
 fn continuation_key(
@@ -873,7 +876,7 @@ fn assistant_output_item_to_input_prefix_item(item: &Value) -> Option<Value> {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => assistant_message_output_to_input_item(item),
         Some("function_call") => assistant_function_call_output_to_input_item(item),
-        Some("custom_tool_call") => None,
+        Some("custom_tool_call") => assistant_custom_tool_call_output_to_input_item(item),
         Some(_) | None => None,
     }
 }
@@ -927,6 +930,21 @@ fn assistant_function_call_output_to_input_item(item: &Value) -> Option<Value> {
             "arguments".to_string(),
             Value::String(arguments.to_string()),
         ),
+    ])))
+}
+
+fn assistant_custom_tool_call_output_to_input_item(item: &Value) -> Option<Value> {
+    let call_id = item.get("call_id").and_then(Value::as_str)?;
+    let name = item.get("name").and_then(Value::as_str)?;
+    let input = item.get("input").and_then(Value::as_str)?;
+    Some(Value::Object(Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("custom_tool_call".to_string()),
+        ),
+        ("call_id".to_string(), Value::String(call_id.to_string())),
+        ("name".to_string(), Value::String(name.to_string())),
+        ("input".to_string(), Value::String(input.to_string())),
     ])))
 }
 
@@ -2614,13 +2632,19 @@ mod tests {
                         "call_id": "call-1",
                         "name": "Read",
                         "arguments": "{\"file\":\"a\"}"
+                    },
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call-2",
+                        "name": "Bash",
+                        "input": "git status --short"
                     }
                 ]
             }
         });
 
         let items = terminal_assistant_output_items(&event).expect("supported output items");
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0], json!({"role": "assistant", "content": "hello"}));
         assert_eq!(
             items[1],
@@ -2629,6 +2653,15 @@ mod tests {
                 "call_id": "call-1",
                 "name": "Read",
                 "arguments": "{\"file\":\"a\"}"
+            })
+        );
+        assert_eq!(
+            items[2],
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call-2",
+                "name": "Bash",
+                "input": "git status --short"
             })
         );
     }
@@ -2731,6 +2764,33 @@ mod tests {
         assert_eq!(
             delta,
             vec![json!({"type": "function_call_output", "call_id": "call-1", "output": "result"})]
+        );
+    }
+
+    #[test]
+    fn continuation_delta_keeps_tool_output_after_inferred_custom_tool_call() {
+        let cached = CachedContinuation {
+            canonical_body: json!({}),
+            full_input: vec![json!({"role": "user", "content": "first"})],
+            assistant_output_items: Vec::new(),
+            from_prewarm: false,
+            response_id: "resp-1".to_string(),
+            connection_id: 1,
+            updated_at: Instant::now(),
+        };
+        let full_input = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"type": "custom_tool_call", "call_id": "call-1", "name": "Bash", "input": "git status --short"}),
+            json!({"type": "custom_tool_call_output", "call_id": "call-1", "output": "result"}),
+        ];
+
+        let delta = continuation_delta(&cached, &full_input).expect("delta");
+
+        assert_eq!(
+            delta,
+            vec![
+                json!({"type": "custom_tool_call_output", "call_id": "call-1", "output": "result"})
+            ]
         );
     }
 

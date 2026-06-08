@@ -4,37 +4,6 @@
 
 ## Active（进行中）
 
-### WF-2026-06-08-003 — ChatGPT/Codex standalone tools conversion
-Status: In Progress
-Level: 3
-Started: 2026-06-08
-Last updated: 2026-06-08
-Current phase: Implementation boundary setup
-
-Intent:
-- Default-enable a thorough ChatGPT/Codex standalone/custom tools conversion while preserving config and per-tool fallback to function tools.
-
-Plan:
-- [done] P1 — Write and review standalone tools design spec.
-- [doing] P2 — Add default-on ChatGPT standalone tools config and conversion mode boundary.
-- [todo] P3 — Implement standalone/custom tool definition conversion with safe fallback.
-- [todo] P4 — Validate tool history, tool_choice, stream converter, and WebSocket continuation compatibility.
-- [todo] P5 — Run focused tests, GitNexus checks, and commit implementation.
-
-Current todo:
-- [ ] P2 — Add default-on ChatGPT standalone tools config and conversion mode boundary.
-
-Changes:
-- Wrote and reviewed design spec `docs/superpowers/specs/2026-06-08-chatgpt-codex-standalone-tools-design.md` from the approved default-on/thorough conversion direction.
-- Review gaps were addressed by adding a mapping confirmation protocol, continuation field contract, and mixed tool-choice behavior matrix.
-
-Prerequisites:
-- Do not change non-ChatGPT provider tool conversion behavior.
-- Keep `chatgpt.standalone_tools = false` as runtime rollback even though default is true.
-
-Resume next:
-- Run GitNexus impact analysis for config/body conversion symbols, then add default-on `chatgpt.standalone_tools` and conversion mode plumbing.
-
 ### WF-2026-05-28-003 — v2.0 deep quality/performance audit
 Status: In Progress
 Level: 2
@@ -329,6 +298,40 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-06-08-003 — ChatGPT/Codex standalone tools conversion
+Completed: 2026-06-08
+Level: 3
+
+Close summary:
+- Outcome: Added default-on ChatGPT/Codex standalone tools conversion with `chatgpt.standalone_tools` rollback, converts compatible `Bash` tool definitions to Responses `custom` freeform tools, preserves function fallback for structured/unknown tools, adapts custom Bash outputs back to Claude Code `command` input, and preserves custom tool calls in WebSocket continuation prefix handling.
+- Validation: Passed focused ChatGPT config/body/custom-tool/continuation/Responses conversion tests, `cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings`, `cargo fmt --all --check`, `git diff --check`, and GitNexus impact/detect_changes with expected CRITICAL risk on core Responses conversion paths.
+- Gaps: Only `Bash` has confirmed request-side `custom` conversion in this slice; other common structured tools intentionally fall back to function tools until field-preserving native schemas are proven.
+
+Archived execution:
+- Intent: Default-enable a thorough ChatGPT/Codex standalone/custom tools conversion while preserving config and per-tool fallback to function tools.
+- Plan:
+  - [done] P1 — Write and review standalone tools design spec.
+  - [done] P2 — Add default-on ChatGPT standalone tools config and conversion mode boundary.
+  - [done] P3 — Implement standalone/custom tool definition conversion with safe fallback.
+  - [done] P4 — Validate tool history, tool_choice, stream converter, and WebSocket continuation compatibility.
+  - [done] P5 — Run focused tests, GitNexus checks, and commit implementation.
+- Key changes:
+  - `chatgpt.standalone_tools` defaults to true and can be set false to restore the old function-tool request shape.
+  - ChatGPT/Codex conversion mode is scoped through `ConversionContext`; generic Responses conversion remains function-tool by default.
+  - `Bash` tools with a string `command` schema emit Responses `type: custom` with a Lark freeform grammar; `Read` and other structured tools remain function fallback.
+  - Stream and non-streaming converters map custom `Bash` input back to `{"command": ..., "description": ""}` while preserving generic `{"input": ...}` for unknown custom tools.
+  - WebSocket continuation now preserves supported `custom_tool_call` assistant output prefix items and can infer deltas after custom tool calls.
+- Validation:
+  - `cargo test -p claude-proxy-config chatgpt`
+  - `cargo test -p claude-proxy-providers --lib chatgpt_responses_body`
+  - `cargo test -p claude-proxy-providers --lib custom_tool`
+  - `cargo test -p claude-proxy-providers --lib continuation`
+  - `cargo test -p claude-proxy-providers --lib test_convert_to_responses`
+  - `cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings`
+  - `cargo fmt --all --check`, `git diff --check`, GitNexus impact/detect_changes.
+- Deferred / gaps:
+  - Expand native mappings for `Read`, `Edit`, `Write`, `Grep`, `WebFetch`, and other structured tools after confirmed request-side schemas exist.
 
 ### WF-2026-06-08-002 — Responses Lite dashboard metrics follow-up
 Completed: 2026-06-08
