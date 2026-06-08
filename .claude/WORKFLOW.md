@@ -4,6 +4,35 @@
 
 ## Active（进行中）
 
+### WF-2026-06-08-001 — Codex Responses Lite compatibility and observability follow-up
+Status: In Progress
+Level: 2
+Started: 2026-06-08
+Last updated: 2026-06-08
+Current phase: P1 — Finalize design/spec approval before implementation
+
+Intent:
+- Align ChatGPT/Codex transport with recent Codex Responses Lite protocol markers and add low-risk observability for payload savings/log analysis.
+
+Plan:
+- [doing] P1 — Finalize design/spec approval before implementation.
+- [todo] P2 — Implement Responses Lite HTTP/WebSocket markers and observer metadata.
+- [todo] P3 — Persist `responses_lite` and `continuation_saved_bytes` observability fields with compatible migrations.
+- [todo] P4 — Make file logs ANSI-free.
+- [todo] P5 — Validate focused tests, format/lint scope, update ledger, and commit.
+
+Current todo:
+- [ ] P1 — Finish spec review/user approval gate before coding.
+
+Changes:
+- Drafted design spec at `docs/superpowers/specs/2026-06-08-codex-responses-lite-observability-design.md` after user selected the conservative batch scope.
+
+Prerequisites:
+- User approval after spec review gate.
+
+Resume next:
+- Complete the design review gate, then begin P2 implementation if approved.
+
 ### WF-2026-05-28-003 — v2.0 deep quality/performance audit
 Status: In Progress
 Level: 2
