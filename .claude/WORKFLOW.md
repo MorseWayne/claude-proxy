@@ -4,35 +4,6 @@
 
 ## Active（进行中）
 
-### WF-2026-06-08-001 — Codex Responses Lite compatibility and observability follow-up
-Status: In Progress
-Level: 2
-Started: 2026-06-08
-Last updated: 2026-06-08
-Current phase: P1 — Finalize design/spec approval before implementation
-
-Intent:
-- Align ChatGPT/Codex transport with recent Codex Responses Lite protocol markers and add low-risk observability for payload savings/log analysis.
-
-Plan:
-- [doing] P1 — Finalize design/spec approval before implementation.
-- [todo] P2 — Implement Responses Lite HTTP/WebSocket markers and observer metadata.
-- [todo] P3 — Persist `responses_lite` and `continuation_saved_bytes` observability fields with compatible migrations.
-- [todo] P4 — Make file logs ANSI-free.
-- [todo] P5 — Validate focused tests, format/lint scope, update ledger, and commit.
-
-Current todo:
-- [ ] P1 — Finish spec review/user approval gate before coding.
-
-Changes:
-- Drafted design spec at `docs/superpowers/specs/2026-06-08-codex-responses-lite-observability-design.md` after user selected the conservative batch scope.
-
-Prerequisites:
-- User approval after spec review gate.
-
-Resume next:
-- Complete the design review gate, then begin P2 implementation if approved.
-
 ### WF-2026-05-28-003 — v2.0 deep quality/performance audit
 Status: In Progress
 Level: 2
@@ -327,6 +298,32 @@ Resume next:
 - [ ] 清理 provider-neutral Responses 抽取相关历史待办：当前 [responses.rs](crates/claude-proxy-providers/src/responses.rs) 已完成解耦，后续只需补测试或文档。
 
 ## Completed（已完成）
+
+### WF-2026-06-08-001 — Codex Responses Lite compatibility and observability follow-up
+Completed: 2026-06-08
+Level: 2
+
+Close summary:
+- Outcome: Added default-on ChatGPT/Codex Responses Lite transport markers for HTTP and WebSocket request payloads, persisted `responses_lite` plus `continuation_saved_bytes`, and made stderr ANSI conditional on terminal detection while file logs remain ANSI-free.
+- Validation: Passed focused config/provider/server/CLI tests, `cargo test -p claude-proxy-providers chatgpt_`, `cargo clippy -p claude-proxy-config -p claude-proxy-providers -p claude-proxy-server -p claude-proxy-cli -- -D warnings`, `cargo fmt --all --check`, `git diff --check`, and GitNexus detect_changes with expected CRITICAL observability/WebSocket blast radius.
+- Gaps: Full standalone tools conversion and dashboard/TUI surfacing are deferred follow-ups.
+
+Archived execution:
+- Intent: Align ChatGPT/Codex transport with recent Codex Responses Lite protocol markers and add low-risk observability for payload savings/log analysis.
+- Plan:
+  - [done] P1 — Finalize design/spec approval before implementation.
+  - [done] P2 — Implement Responses Lite HTTP/WebSocket markers and observer metadata.
+  - [done] P3 — Persist `responses_lite` and `continuation_saved_bytes` observability fields with compatible migrations.
+  - [done] P4 — Make file logs ANSI-free / avoid ANSI in non-terminal stderr.
+  - [done] P5 — Validate focused tests, format/lint scope, update ledger, and commit.
+- Key changes:
+  - User selected the conservative batch scope and approved the design spec `docs/superpowers/specs/2026-06-08-codex-responses-lite-observability-design.md`.
+  - `chatgpt.responses_lite` defaults to true and controls the HTTP `x-openai-internal-codex-responses-lite` header plus WebSocket `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite` marker.
+  - Request observability now carries and persists Responses Lite state and saturating continuation saved bytes.
+- Validation:
+  - Focused tests covered config parsing, HTTP header on/off, WebSocket metadata, observability summary/persistence/legacy migration, logging tests, provider ChatGPT subset, fmt, clippy, diff check, and GitNexus detect_changes.
+- Deferred / gaps:
+  - Responses Lite standalone tool conversion and UI/dashboard aggregation remain future work.
 
 ### WF-2026-06-02-004 — Native Codex WebSocket prewarm for ChatGPT provider
 Status: Completed

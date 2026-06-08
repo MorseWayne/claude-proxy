@@ -66,6 +66,10 @@ pub struct RequestObservabilityEvent {
     pub request_body_bytes: u64,
     #[serde(default)]
     pub upstream_send_body_bytes: u64,
+    #[serde(default)]
+    pub continuation_saved_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_lite: Option<bool>,
     pub prompt_too_long_retries: u64,
     pub prompt_too_long_original_body_bytes: u64,
     pub prompt_too_long_shrunk_body_bytes: u64,
@@ -85,6 +89,7 @@ pub struct RequestObservabilitySummary {
     pub max_event_gap_ms: u64,
     pub idle_gap_count: u64,
     pub prompt_too_long_retries: u64,
+    pub continuation_saved_bytes: u64,
 }
 
 impl RequestObservabilitySummary {
@@ -96,6 +101,7 @@ impl RequestObservabilitySummary {
         self.max_event_gap_ms = self.max_event_gap_ms.max(event.max_event_gap_ms);
         self.idle_gap_count += event.idle_gap_count;
         self.prompt_too_long_retries += event.prompt_too_long_retries;
+        self.continuation_saved_bytes += event.continuation_saved_bytes;
     }
 
     pub(crate) fn finalize(&mut self) {
@@ -828,6 +834,8 @@ mod tests {
                     upstream_error_message_class: None,
                     request_body_bytes: 1_000,
                     upstream_send_body_bytes: 120,
+                    continuation_saved_bytes: 880,
+                    responses_lite: Some(true),
                     prompt_too_long_retries: 1,
                     prompt_too_long_original_body_bytes: 200,
                     prompt_too_long_shrunk_body_bytes: 120,
@@ -870,6 +878,8 @@ mod tests {
                     upstream_error_message_class: Some("context_length_exceeded".to_string()),
                     request_body_bytes: 800_000,
                     upstream_send_body_bytes: 800_000,
+                    continuation_saved_bytes: 0,
+                    responses_lite: Some(false),
                     prompt_too_long_retries: 0,
                     prompt_too_long_original_body_bytes: 0,
                     prompt_too_long_shrunk_body_bytes: 0,
@@ -901,6 +911,10 @@ mod tests {
             data["observability"]["summary"]["prompt_too_long_retries"],
             1
         );
+        assert_eq!(
+            data["observability"]["summary"]["continuation_saved_bytes"],
+            880
+        );
         assert_eq!(data["observability"]["recent"].as_array().unwrap().len(), 2);
         assert_eq!(data["observability"]["recent"][0]["transport"], "websocket");
         assert_eq!(
@@ -911,6 +925,11 @@ mod tests {
             data["observability"]["recent"][0]["upstream_send_body_bytes"],
             120
         );
+        assert_eq!(
+            data["observability"]["recent"][0]["continuation_saved_bytes"],
+            880
+        );
+        assert_eq!(data["observability"]["recent"][0]["responses_lite"], true);
         assert_eq!(data["observability"]["recent"][1]["transport"], "sse");
         assert_eq!(
             data["observability"]["recent"][1]["fallback_reason"],

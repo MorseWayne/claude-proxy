@@ -187,6 +187,8 @@ pub struct ProviderRequestMetadata {
     #[serde(default)]
     pub transport: Option<String>,
     #[serde(default)]
+    pub responses_lite: Option<bool>,
+    #[serde(default)]
     pub websocket_reused: Option<bool>,
     #[serde(default)]
     pub continuation_used: Option<bool>,

@@ -167,6 +167,9 @@ pub struct ChatGptProviderConfig {
     /// Enable Codex WebSocket prewarm by sending a generate=false request before the first real turn.
     #[serde(default)]
     pub websocket_prewarm: bool,
+    /// Enable Responses Lite transport markers for ChatGPT Codex requests.
+    #[serde(default = "default_true")]
+    pub responses_lite: bool,
     /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
     #[serde(default)]
     pub fast_mode: bool,
@@ -179,6 +182,7 @@ impl Default for ChatGptProviderConfig {
             user_agent: default_empty(),
             transport: ChatGptTransport::default(),
             websocket_prewarm: false,
+            responses_lite: true,
             fast_mode: false,
         }
     }
@@ -1385,12 +1389,14 @@ fast_mode = true
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
         assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
         assert!(chatgpt.websocket_prewarm);
+        assert!(chatgpt.responses_lite);
         assert!(chatgpt.fast_mode);
         assert_eq!(
             ChatGptProviderConfig::default().transport,
             ChatGptTransport::Auto
         );
         assert!(!ChatGptProviderConfig::default().websocket_prewarm);
+        assert!(ChatGptProviderConfig::default().responses_lite);
         assert!(!ChatGptProviderConfig::default().fast_mode);
     }
 

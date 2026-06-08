@@ -661,6 +661,9 @@ fn merge_provider_request_metadata(
     if metadata.transport.is_some() {
         target.transport = metadata.transport.clone();
     }
+    if metadata.responses_lite.is_some() {
+        target.responses_lite = metadata.responses_lite;
+    }
     if metadata.websocket_reused.is_some() {
         target.websocket_reused = metadata.websocket_reused;
     }
@@ -739,6 +742,14 @@ fn build_observability_event(
         .lock()
         .map(|state| state.clone())
         .unwrap_or_default();
+    let request_body_bytes = observer_state
+        .request_metadata
+        .request_body_bytes
+        .unwrap_or(0);
+    let upstream_send_body_bytes = observer_state
+        .request_metadata
+        .upstream_send_body_bytes
+        .unwrap_or(0);
     RequestObservabilityEvent {
         request_id: context.request_id,
         provider: context.provider_id,
@@ -765,14 +776,10 @@ fn build_observability_event(
         upstream_error_status: error_metadata.map(|metadata| metadata.status as u64),
         upstream_error_code: upstream_error_code(error_metadata),
         upstream_error_message_class: upstream_error_message_class(error_metadata),
-        request_body_bytes: observer_state
-            .request_metadata
-            .request_body_bytes
-            .unwrap_or(0),
-        upstream_send_body_bytes: observer_state
-            .request_metadata
-            .upstream_send_body_bytes
-            .unwrap_or(0),
+        request_body_bytes,
+        upstream_send_body_bytes,
+        continuation_saved_bytes: request_body_bytes.saturating_sub(upstream_send_body_bytes),
+        responses_lite: observer_state.request_metadata.responses_lite,
         prompt_too_long_retries: observer_state.prompt_too_long_retries,
         prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
         prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,

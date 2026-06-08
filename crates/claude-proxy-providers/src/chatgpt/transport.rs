@@ -38,6 +38,8 @@ const CHATGPT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(60);
 const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
+const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -966,7 +968,10 @@ pub(super) async fn prewarm_websocket(
             }
         };
 
-    let request_text = match response_create_prewarm_request_text(continuation.send_body.clone()) {
+    let request_text = match response_create_prewarm_request_text(
+        continuation.send_body.clone(),
+        provider.responses_lite_enabled(),
+    ) {
         Ok(request_text) => request_text,
         Err(error) => {
             provider
@@ -1148,7 +1153,10 @@ where
         "ChatGPT websocket continuation decision"
     );
 
-    let request_text = match response_create_request_text(continuation.send_body.clone()) {
+    let request_text = match response_create_request_text(
+        continuation.send_body.clone(),
+        provider.responses_lite_enabled(),
+    ) {
         Ok(request_text) => request_text,
         Err(error) => {
             provider
@@ -2047,7 +2055,10 @@ fn map_websocket_connect_error(error: WsError) -> ChatGptWebSocketStartError {
     }
 }
 
-fn response_create_request_text(mut body: Value) -> Result<String, ChatGptWebSocketStartError> {
+fn response_create_request_text(
+    mut body: Value,
+    use_responses_lite: bool,
+) -> Result<String, ChatGptWebSocketStartError> {
     let object = body.as_object_mut().ok_or_else(|| {
         ChatGptWebSocketStartError::new(
             ProviderError::InvalidRequest(
@@ -2060,6 +2071,17 @@ fn response_create_request_text(mut body: Value) -> Result<String, ChatGptWebSoc
         "type".to_string(),
         Value::String("response.create".to_string()),
     );
+    if use_responses_lite {
+        let client_metadata = object
+            .entry("client_metadata")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(client_metadata) = client_metadata.as_object_mut() {
+            client_metadata.insert(
+                WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY.to_string(),
+                Value::String("true".to_string()),
+            );
+        }
+    }
     serde_json::to_string(&body).map_err(|error| {
         ChatGptWebSocketStartError::new(
             ProviderError::InvalidRequest(format!(
@@ -2072,6 +2094,7 @@ fn response_create_request_text(mut body: Value) -> Result<String, ChatGptWebSoc
 
 fn response_create_prewarm_request_text(
     mut body: Value,
+    use_responses_lite: bool,
 ) -> Result<String, ChatGptWebSocketStartError> {
     let object = body.as_object_mut().ok_or_else(|| {
         ChatGptWebSocketStartError::new(
@@ -2082,7 +2105,7 @@ fn response_create_prewarm_request_text(
         )
     })?;
     object.insert("generate".to_string(), Value::Bool(false));
-    response_create_request_text(body)
+    response_create_request_text(body, use_responses_lite)
 }
 
 async fn send_websocket_request(
@@ -2363,11 +2386,14 @@ mod tests {
 
     #[test]
     fn response_create_request_text_wraps_body_with_type() {
-        let text = response_create_request_text(json!({
-            "model": "gpt-5.3-codex",
-            "input": [],
-            "stream": true
-        }))
+        let text = response_create_request_text(
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": [],
+                "stream": true
+            }),
+            false,
+        )
         .expect("request text");
         let value: Value = serde_json::from_str(&text).unwrap();
 
@@ -2378,17 +2404,60 @@ mod tests {
 
     #[test]
     fn response_create_prewarm_request_text_wraps_body_with_generate_false() {
-        let text = response_create_prewarm_request_text(json!({
-            "model": "gpt-5.3-codex",
-            "input": [{"role": "user", "content": "hi"}],
-            "stream": true
-        }))
+        let text = response_create_prewarm_request_text(
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }),
+            false,
+        )
         .expect("request text");
         let value: Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["generate"], false);
         assert_eq!(value["input"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn response_create_request_text_adds_responses_lite_metadata_when_enabled() {
+        let text = response_create_request_text(
+            json!({
+                "model": "gpt-5.5",
+                "input": [],
+                "stream": true
+            }),
+            true,
+        )
+        .expect("request text");
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["type"], "response.create");
+        assert_eq!(
+            value["client_metadata"][WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY],
+            "true"
+        );
+    }
+
+    #[test]
+    fn response_create_request_text_preserves_existing_client_metadata() {
+        let text = response_create_request_text(
+            json!({
+                "model": "gpt-5.5",
+                "input": [],
+                "client_metadata": {"x-codex-window-id": "window-1"}
+            }),
+            true,
+        )
+        .expect("request text");
+        let value: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["client_metadata"]["x-codex-window-id"], "window-1");
+        assert_eq!(
+            value["client_metadata"][WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY],
+            "true"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -134,7 +134,7 @@ pub fn init_logging(log_config: &LogConfig, tui_mode: bool) -> anyhow::Result<()
     if !tui_mode && log_config.with_stdout {
         // Dual output: file + stderr
         let stderr_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(true)
+            .with_ansi(std::io::stderr().is_terminal())
             .with_target(false)
             .with_writer(std::io::stderr)
             .with_filter(build_filter(log_config));

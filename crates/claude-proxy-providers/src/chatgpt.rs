@@ -64,6 +64,8 @@ const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
 const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 const CHATGPT_WEBSOCKET_STARTUP_FAILURE_COOLDOWN_SECS: u64 = 120;
 const CODEX_FAST_SERVICE_TIER: &str = "priority";
+const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
+    "x-openai-internal-codex-responses-lite";
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -436,6 +438,10 @@ impl ChatGptProvider {
         Arc::clone(&self.websocket_sse_cooldown_until_secs)
     }
 
+    pub(super) fn responses_lite_enabled(&self) -> bool {
+        self.chatgpt_config.responses_lite
+    }
+
     fn codex_service_tier(&self) -> Option<&str> {
         effective_codex_service_tier(
             self.runtime.openai.service_tier.as_deref(),
@@ -532,6 +538,11 @@ impl ChatGptProvider {
             .header("thread-id", runtime_ids.thread_id)
             .header("x-codex-window-id", runtime_ids.window_id);
 
+        if self.responses_lite_enabled() {
+            request_builder =
+                request_builder.header(X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER, "true");
+        }
+
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
@@ -590,6 +601,7 @@ impl ChatGptProvider {
             _observer,
             ProviderRequestMetadata {
                 transport: Some("sse".to_string()),
+                responses_lite: Some(self.responses_lite_enabled()),
                 request_body_bytes: Some(body_bytes as u64),
                 upstream_send_body_bytes: Some(body_bytes as u64),
                 ..ProviderRequestMetadata::default()
@@ -884,6 +896,7 @@ impl ChatGptProvider {
             metadata_observer.as_ref(),
             ProviderRequestMetadata {
                 transport: Some("websocket".to_string()),
+                responses_lite: Some(self.responses_lite_enabled()),
                 websocket_reused: Some(websocket_start.websocket_reused),
                 continuation_used: Some(websocket_start.continuation_used),
                 continuation_disabled_reason: Some(
@@ -3940,8 +3953,43 @@ mod tests {
         assert!(headers.contains("session-id: session-test"));
         assert!(headers.contains("thread-id: thread-test"));
         assert!(headers.contains("x-codex-window-id: window-test"));
+        assert!(headers.contains("x-openai-internal-codex-responses-lite: true"));
         let request_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(request_body["model"], "gpt-5.3-codex");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_send_responses_request_omits_responses_lite_header_when_disabled() {
+        let (endpoint, requests) = capture_once_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.chatgpt_config.responses_lite = false;
+        let token = ChatGptToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account".to_string()),
+        };
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+
+        provider
+            .send_responses_request(
+                &body,
+                &token,
+                false,
+                1,
+                0,
+                ChatGptOutputTokenBudget::default(),
+            )
+            .await
+            .expect("request should succeed");
+
+        let requests = requests.lock().await;
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(!headers.contains("x-openai-internal-codex-responses-lite"));
     }
 
     #[tokio::test]
@@ -3971,6 +4019,10 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["type"], "response.create");
         assert_eq!(requests[0]["model"], "gpt-5.3-codex");
+        assert_eq!(
+            requests[0]["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
         let handshakes = handshakes.lock().unwrap();
         assert_eq!(handshakes.len(), 1);
         assert_eq!(

@@ -135,6 +135,11 @@ fn ensure_request_observability_columns(conn: &Connection) -> rusqlite::Result<(
             "upstream_send_body_bytes",
             "upstream_send_body_bytes INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "continuation_saved_bytes",
+            "continuation_saved_bytes INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("responses_lite", "responses_lite INTEGER"),
     ] {
         if !request_observability_events_has_column(conn, name)? {
             conn.execute(
@@ -191,6 +196,8 @@ fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<(
             upstream_error_message_class TEXT,
             request_body_bytes INTEGER NOT NULL DEFAULT 0,
             upstream_send_body_bytes INTEGER NOT NULL DEFAULT 0,
+            continuation_saved_bytes INTEGER NOT NULL DEFAULT 0,
+            responses_lite INTEGER,
             prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
@@ -402,11 +409,12 @@ impl MetricsStore {
                 transport, websocket_reused, continuation_used, continuation_disabled_reason,
                 continuation_fallback_used, fallback_reason, upstream_error_status,
                 upstream_error_code, upstream_error_message_class, request_body_bytes,
-                upstream_send_body_bytes, prompt_too_long_retries,
+                upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
+                prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
                 request_tool_results, request_text_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
             rusqlite::params![
                 ev.request_id,
                 ev.provider,
@@ -435,6 +443,8 @@ impl MetricsStore {
                 ev.upstream_error_message_class.as_deref(),
                 ev.request_body_bytes as i64,
                 ev.upstream_send_body_bytes as i64,
+                ev.continuation_saved_bytes as i64,
+                ev.responses_lite.map(|value| value as i64),
                 ev.prompt_too_long_retries as i64,
                 ev.prompt_too_long_original_body_bytes as i64,
                 ev.prompt_too_long_shrunk_body_bytes as i64,
@@ -550,7 +560,8 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 COALESCE(SUM(upstream_connect_ms), 0),
                 COALESCE(MAX(max_event_gap_ms), 0),
                 COALESCE(SUM(idle_gap_count), 0),
-                COALESCE(SUM(prompt_too_long_retries), 0)
+                COALESCE(SUM(prompt_too_long_retries), 0),
+                COALESCE(SUM(continuation_saved_bytes), 0)
          FROM request_observability_events",
         [],
         |row| {
@@ -562,6 +573,7 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         },
     ) {
@@ -572,6 +584,7 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
         stored.summary.max_event_gap_ms = row.4 as u64;
         stored.summary.idle_gap_count = row.5 as u64;
         stored.summary.prompt_too_long_retries = row.6 as u64;
+        stored.summary.continuation_saved_bytes = row.7 as u64;
         stored.summary.finalize();
     }
 
@@ -582,7 +595,8 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 transport, websocket_reused, continuation_used, continuation_disabled_reason,
                 continuation_fallback_used, fallback_reason, upstream_error_status,
                 upstream_error_code, upstream_error_message_class, request_body_bytes,
-                upstream_send_body_bytes, prompt_too_long_retries,
+                upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
+                prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
                 request_tool_results, request_text_bytes
@@ -629,14 +643,16 @@ fn request_observability_from_row(
         upstream_error_message_class: row.get(24)?,
         request_body_bytes: row.get::<_, i64>(25)? as u64,
         upstream_send_body_bytes: row.get::<_, i64>(26)? as u64,
-        prompt_too_long_retries: row.get::<_, i64>(27)? as u64,
-        prompt_too_long_original_body_bytes: row.get::<_, i64>(28)? as u64,
-        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(29)? as u64,
-        prompt_too_long_dropped_items: row.get::<_, i64>(30)? as u64,
-        request_messages: row.get::<_, i64>(31)? as u64,
-        request_content_blocks: row.get::<_, i64>(32)? as u64,
-        request_tool_results: row.get::<_, i64>(33)? as u64,
-        request_text_bytes: row.get::<_, i64>(34)? as u64,
+        continuation_saved_bytes: row.get::<_, i64>(27)? as u64,
+        responses_lite: row.get::<_, Option<i64>>(28)?.map(|value| value != 0),
+        prompt_too_long_retries: row.get::<_, i64>(29)? as u64,
+        prompt_too_long_original_body_bytes: row.get::<_, i64>(30)? as u64,
+        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(31)? as u64,
+        prompt_too_long_dropped_items: row.get::<_, i64>(32)? as u64,
+        request_messages: row.get::<_, i64>(33)? as u64,
+        request_content_blocks: row.get::<_, i64>(34)? as u64,
+        request_tool_results: row.get::<_, i64>(35)? as u64,
+        request_text_bytes: row.get::<_, i64>(36)? as u64,
     })
 }
 
@@ -931,6 +947,8 @@ mod tests {
             upstream_error_message_class: is_error.then(|| "context_length_exceeded".to_string()),
             request_body_bytes: 1_000,
             upstream_send_body_bytes: 120,
+            continuation_saved_bytes: 880,
+            responses_lite: Some(true),
             prompt_too_long_retries: 1,
             prompt_too_long_original_body_bytes: 200,
             prompt_too_long_shrunk_body_bytes: 120,
@@ -959,6 +977,7 @@ mod tests {
         assert_eq!(stored.summary.max_event_gap_ms, 45);
         assert_eq!(stored.summary.idle_gap_count, 2);
         assert_eq!(stored.summary.prompt_too_long_retries, 2);
+        assert_eq!(stored.summary.continuation_saved_bytes, 1_760);
         assert_eq!(stored.recent.len(), 2);
         assert_eq!(stored.recent[0].request_id, "first");
         assert_eq!(stored.recent[1].request_id, "second");
@@ -973,6 +992,8 @@ mod tests {
         );
         assert_eq!(stored.recent[0].request_body_bytes, 1_000);
         assert_eq!(stored.recent[0].upstream_send_body_bytes, 120);
+        assert_eq!(stored.recent[0].continuation_saved_bytes, 880);
+        assert_eq!(stored.recent[0].responses_lite, Some(true));
         assert_eq!(stored.recent[1].continuation_fallback_used, Some(true));
         assert_eq!(
             stored.recent[1].fallback_reason.as_deref(),
@@ -1031,6 +1052,10 @@ mod tests {
 
         assert!(request_observability_events_has_column(&conn, "transport").unwrap());
         assert!(request_observability_events_has_column(&conn, "request_body_bytes").unwrap());
+        assert!(
+            request_observability_events_has_column(&conn, "continuation_saved_bytes").unwrap()
+        );
+        assert!(request_observability_events_has_column(&conn, "responses_lite").unwrap());
         let stored = load_request_observability(&conn);
         assert_eq!(stored.recent.len(), 1);
         let event = &stored.recent[0];
@@ -1039,6 +1064,8 @@ mod tests {
         assert_eq!(event.websocket_reused, None);
         assert_eq!(event.request_body_bytes, 0);
         assert_eq!(event.upstream_send_body_bytes, 0);
+        assert_eq!(event.continuation_saved_bytes, 0);
+        assert_eq!(event.responses_lite, None);
         let _ = std::fs::remove_file(path);
     }
 
