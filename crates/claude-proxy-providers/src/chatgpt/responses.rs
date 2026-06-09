@@ -9,6 +9,7 @@ pub(super) struct CodexRequestContext<'a> {
     pub installation_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub standalone_tools: bool,
+    pub responses_lite: bool,
 }
 
 impl Default for CodexRequestContext<'_> {
@@ -17,6 +18,7 @@ impl Default for CodexRequestContext<'_> {
             installation_id: None,
             service_tier: None,
             standalone_tools: true,
+            responses_lite: false,
         }
     }
 }
@@ -96,9 +98,9 @@ pub(super) fn build_body_with_context(
         object.remove("stop");
         object.remove("max_output_tokens");
         object.insert("stream".to_string(), json!(true));
-        apply_codex_defaults(object);
+        apply_codex_defaults(object, context);
         apply_codex_request_options(object, request, context);
-        apply_codex_reasoning_defaults(object, request);
+        apply_codex_reasoning_defaults(object, request, context);
         let missing_instructions = object
             .get("instructions")
             .and_then(Value::as_str)
@@ -111,19 +113,23 @@ pub(super) fn build_body_with_context(
     body
 }
 
-fn apply_codex_defaults(body: &mut Map<String, Value>) {
+fn apply_codex_defaults(body: &mut Map<String, Value>, context: CodexRequestContext<'_>) {
     body.entry("tools".to_string()).or_insert_with(|| json!([]));
     body.entry("include".to_string())
         .or_insert_with(|| json!([]));
     body.entry("tool_choice".to_string())
         .or_insert_with(|| json!("auto"));
 
-    let has_tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
-    body.entry("parallel_tool_calls".to_string())
-        .or_insert_with(|| json!(has_tools));
+    if context.responses_lite {
+        body.insert("parallel_tool_calls".to_string(), json!(false));
+    } else {
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        body.entry("parallel_tool_calls".to_string())
+            .or_insert_with(|| json!(has_tools));
+    }
 }
 
 fn apply_codex_request_options(
@@ -143,6 +149,7 @@ fn apply_codex_request_options(
 
     if let Some(value) = request.extra.get("parallel_tool_calls")
         && value.is_boolean()
+        && (!context.responses_lite || value.as_bool() == Some(false))
     {
         body.insert("parallel_tool_calls".to_string(), value.clone());
     }
@@ -152,15 +159,45 @@ fn apply_codex_request_options(
     }
 }
 
-fn apply_codex_reasoning_defaults(body: &mut Map<String, Value>, request: &MessagesRequest) {
-    if request.extra.contains_key("reasoning") {
-        return;
+fn apply_codex_reasoning_defaults(
+    body: &mut Map<String, Value>,
+    request: &MessagesRequest,
+    context: CodexRequestContext<'_>,
+) {
+    let has_explicit_reasoning = request.extra.contains_key("reasoning");
+    if context.responses_lite {
+        body.entry("reasoning".to_string())
+            .or_insert_with(|| json!({}));
     }
-    let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) else {
+    let Some(reasoning) = body.get_mut("reasoning") else {
         return;
     };
-    if reasoning.get("summary").and_then(Value::as_str) == Some("detailed") {
+    if !reasoning.is_object() {
+        *reasoning = json!({});
+    }
+    let Some(reasoning) = reasoning.as_object_mut() else {
+        return;
+    };
+    if context.responses_lite {
+        reasoning.insert("context".to_string(), json!("all_turns"));
+    }
+    if !has_explicit_reasoning
+        && reasoning.get("summary").and_then(Value::as_str) == Some("detailed")
+    {
         reasoning.insert("summary".to_string(), json!("auto"));
+    }
+    let include = body
+        .entry("include".to_string())
+        .or_insert_with(|| json!([]));
+    if !include.is_array() {
+        *include = json!([]);
+    }
+    if let Some(include) = include.as_array_mut()
+        && !include
+            .iter()
+            .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
+    {
+        include.push(json!("reasoning.encrypted_content"));
     }
 }
 

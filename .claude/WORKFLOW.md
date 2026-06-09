@@ -299,6 +299,35 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-06-09-001 — Responses Lite capability-driven policy
+Completed: 2026-06-09
+Level: 3
+
+Close summary:
+- Outcome: Implemented model-capability-driven ChatGPT Responses Lite policy with `auto` / `on` / `off`, backward-compatible legacy bool parsing, per-model overrides, effective decision logging, and consistent HTTP/WebSocket/body observability decisions.
+- Validation: Passed `cargo fmt --all --check`, `git diff --check`, focused ChatGPT/config tests, and full `cargo test -p claude-proxy-config -p claude-proxy-providers --no-fail-fast`.
+- Gaps: GitNexus detect_changes reports CRITICAL because central ChatGPT request, WebSocket, and config paths changed; affected scope matches the intended implementation and is covered by focused/full provider tests.
+
+Archived execution:
+- Intent: Align claude-proxy Responses Lite behavior with Codex's model-capability policy instead of a provider-wide boolean.
+- Plan:
+  - [done] P1 — Review current implementation, uncommitted WIP, and GitNexus impact for touched symbols.
+  - [done] P2 — Implement configuration/model capability policy with backward-compatible `responses_lite` parsing.
+  - [done] P3 — Apply effective Lite decisions consistently to HTTP, WebSocket, request body, tools, and observability.
+  - [done] P4 — Add/adjust focused tests for auto/on/off, overrides, Lite contract, normal contract, and legacy config.
+  - [done] P5 — Validate, run GitNexus detect_changes, commit, and summarize.
+- Key changes:
+  - `chatgpt.responses_lite` now defaults to `auto`; old `true`/`false` map to forced `on`/`off`.
+  - ChatGPT model specs drive auto Lite decisions; `gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini` auto-enable Lite, while Spark/unknown models do not unless overridden.
+  - Effective decisions are threaded through SSE, WebSocket prewarm/stream, request body contract, logs, and provider request metadata.
+- Validation:
+  - `cargo test -p claude-proxy-config -p claude-proxy-providers --no-fail-fast`
+  - `cargo fmt --all --check`
+  - `git diff --check`
+  - GitNexus impact/detect_changes completed; CRITICAL risk is expected for central ChatGPT request/transport paths.
+- Deferred / gaps:
+  - Public core model capability schema was not extended because GitNexus impact on `QualityGateCapabilities` was CRITICAL; Responses Lite capability remains ChatGPT-provider scoped.
+
 ### WF-2026-06-08-003 — ChatGPT/Codex standalone tools conversion
 Completed: 2026-06-08
 Level: 3

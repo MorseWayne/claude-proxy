@@ -2,7 +2,9 @@
   "client_metadata": {
     "x-codex-installation-id": "install-fixture"
   },
-  "include": [],
+  "include": [
+    "reasoning.encrypted_content"
+  ],
   "input": [
     {
       "content": "List changed files.",
@@ -11,8 +13,11 @@
   ],
   "instructions": "Follow the user's instructions.",
   "model": "gpt-5.3-codex",
-  "parallel_tool_calls": true,
+  "parallel_tool_calls": false,
   "prompt_cache_key": "thread-fixture",
+  "reasoning": {
+    "context": "all_turns"
+  },
   "store": false,
   "stream": true,
   "tool_choice": "auto",

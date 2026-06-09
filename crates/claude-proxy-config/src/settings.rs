@@ -167,15 +167,18 @@ pub struct ChatGptProviderConfig {
     /// Enable Codex WebSocket prewarm by sending a generate=false request before the first real turn.
     #[serde(default)]
     pub websocket_prewarm: bool,
-    /// Enable Responses Lite transport markers for ChatGPT Codex requests.
-    #[serde(default = "default_true")]
-    pub responses_lite: bool,
+    /// Responses Lite policy for ChatGPT Codex requests.
+    #[serde(default)]
+    pub responses_lite: ResponsesLiteMode,
     /// Enable Codex-style standalone/custom tools for ChatGPT Codex requests.
     #[serde(default = "default_true")]
     pub standalone_tools: bool,
     /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
     #[serde(default)]
     pub fast_mode: bool,
+    /// Per-model capability overrides keyed by upstream model id.
+    #[serde(default)]
+    pub model_capabilities: HashMap<String, ChatGptModelCapabilityOverride>,
 }
 
 impl Default for ChatGptProviderConfig {
@@ -185,11 +188,36 @@ impl Default for ChatGptProviderConfig {
             user_agent: default_empty(),
             transport: ChatGptTransport::default(),
             websocket_prewarm: false,
-            responses_lite: true,
+            responses_lite: ResponsesLiteMode::Auto,
             standalone_tools: true,
             fast_mode: false,
+            model_capabilities: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesLiteMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl<'de> Deserialize<'de> for ResponsesLiteMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_responses_lite_mode(deserializer)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatGptModelCapabilityOverride {
+    #[serde(default)]
+    pub responses_lite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +240,55 @@ fn default_max_thinking_tokens() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_responses_lite_mode<'de, D>(deserializer: D) -> Result<ResponsesLiteMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = ResponsesLiteMode;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(r#"a boolean or one of "auto", "on", "off""#)
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(if value {
+                ResponsesLiteMode::On
+            } else {
+                ResponsesLiteMode::Off
+            })
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => Ok(ResponsesLiteMode::Auto),
+                "on" | "true" | "enabled" => Ok(ResponsesLiteMode::On),
+                "off" | "false" | "disabled" => Ok(ResponsesLiteMode::Off),
+                other => Err(E::custom(format!(
+                    "invalid responses_lite mode `{other}`, expected auto, on, or off"
+                ))),
+            }
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 /// Authentication method for a provider.
@@ -1395,7 +1472,7 @@ fast_mode = true
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
         assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
         assert!(chatgpt.websocket_prewarm);
-        assert!(!chatgpt.responses_lite);
+        assert_eq!(chatgpt.responses_lite, ResponsesLiteMode::Off);
         assert!(!chatgpt.standalone_tools);
         assert!(chatgpt.fast_mode);
         assert_eq!(
@@ -1403,9 +1480,76 @@ fast_mode = true
             ChatGptTransport::Auto
         );
         assert!(!ChatGptProviderConfig::default().websocket_prewarm);
-        assert!(ChatGptProviderConfig::default().responses_lite);
+        assert_eq!(
+            ChatGptProviderConfig::default().responses_lite,
+            ResponsesLiteMode::Auto
+        );
         assert!(ChatGptProviderConfig::default().standalone_tools);
         assert!(!ChatGptProviderConfig::default().fast_mode);
+    }
+
+    #[test]
+    fn chatgpt_provider_config_parses_responses_lite_modes_and_overrides() {
+        let toml = r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[providers.chatgpt.chatgpt]
+responses_lite = "on"
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.3-codex-spark"]
+responses_lite = false
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let chatgpt = settings.providers["chatgpt"].chatgpt.as_ref().unwrap();
+
+        assert_eq!(chatgpt.responses_lite, ResponsesLiteMode::On);
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].responses_lite,
+            Some(false)
+        );
+
+        let legacy_true = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+
+[providers.chatgpt.chatgpt]
+responses_lite = true
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_true.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .responses_lite,
+            ResponsesLiteMode::On
+        );
+
+        let legacy_false = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+
+[providers.chatgpt.chatgpt]
+responses_lite = false
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_false.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .responses_lite,
+            ResponsesLiteMode::Off
+        );
     }
 
     #[test]

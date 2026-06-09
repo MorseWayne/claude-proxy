@@ -27,8 +27,9 @@ use tokio_tungstenite::{
 use tracing::info;
 
 use super::{
-    ChatGptProvider, ChatGptToken, map_chatgpt_error_status_body_with_headers,
-    provider_error_is_chatgpt_server_error, rotate_chatgpt_runtime_ids_after_server_error,
+    ChatGptProvider, ChatGptToken, ResponsesLiteDecision,
+    map_chatgpt_error_status_body_with_headers, provider_error_is_chatgpt_server_error,
+    rotate_chatgpt_runtime_ids_after_server_error,
 };
 use crate::provider::ProviderError;
 
@@ -954,6 +955,7 @@ pub(super) async fn prewarm_websocket(
     token: &ChatGptToken,
     stable_client_conversation_id: Option<&str>,
     request_id: u64,
+    responses_lite: ResponsesLiteDecision,
 ) -> Result<bool, ChatGptWebSocketStartError> {
     let continuation = {
         provider
@@ -988,7 +990,7 @@ pub(super) async fn prewarm_websocket(
 
     let request_text = match response_create_prewarm_request_text(
         continuation.send_body.clone(),
-        provider.responses_lite_enabled(),
+        responses_lite.is_enabled(),
     ) {
         Ok(request_text) => request_text,
         Err(error) => {
@@ -1119,6 +1121,7 @@ pub(super) async fn open_websocket_stream<F>(
     marker_mode: ReasoningMarkerMode,
     stable_client_conversation_id: Option<&str>,
     request_id: u64,
+    responses_lite: ResponsesLiteDecision,
     on_event: F,
 ) -> Result<ChatGptWebSocketStreamStart, ChatGptWebSocketStartError>
 where
@@ -1173,7 +1176,7 @@ where
 
     let request_text = match response_create_request_text(
         continuation.send_body.clone(),
-        provider.responses_lite_enabled(),
+        responses_lite.is_enabled(),
     ) {
         Ok(request_text) => request_text,
         Err(error) => {

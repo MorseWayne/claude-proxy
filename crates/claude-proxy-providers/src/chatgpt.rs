@@ -21,6 +21,7 @@ use claude_proxy_config::{
     settings::{
         ChatGptProviderConfig, ChatGptTransport, DEFAULT_CHATGPT_ORIGINATOR,
         DEFAULT_CHATGPT_USER_AGENT, ProviderConfig, ProviderRuntimeConfig, ReasoningMarkerMode,
+        ResponsesLiteMode,
     },
 };
 use claude_proxy_core::*;
@@ -197,6 +198,53 @@ impl ChatGptWebSocketStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResponsesLiteDecision {
+    enabled: bool,
+    source: ResponsesLiteDecisionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesLiteDecisionSource {
+    ForcedOn,
+    ForcedOff,
+    OverrideEnabled,
+    OverrideDisabled,
+    ModelCapability,
+    UnknownModel,
+}
+
+impl ResponsesLiteDecision {
+    fn disabled(source: ResponsesLiteDecisionSource) -> Self {
+        Self {
+            enabled: false,
+            source,
+        }
+    }
+
+    fn enabled(source: ResponsesLiteDecisionSource) -> Self {
+        Self {
+            enabled: true,
+            source,
+        }
+    }
+
+    pub(super) fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    fn source_str(self) -> &'static str {
+        match self.source {
+            ResponsesLiteDecisionSource::ForcedOn => "forced_on",
+            ResponsesLiteDecisionSource::ForcedOff => "forced_off",
+            ResponsesLiteDecisionSource::OverrideEnabled => "override_enabled",
+            ResponsesLiteDecisionSource::OverrideDisabled => "override_disabled",
+            ResponsesLiteDecisionSource::ModelCapability => "model_capability",
+            ResponsesLiteDecisionSource::UnknownModel => "unknown_model",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChatGptPreparedRequest {
     body: Value,
@@ -205,6 +253,7 @@ struct ChatGptPreparedRequest {
     request_id: u64,
     output_token_budget: ChatGptOutputTokenBudget,
     stable_client_conversation_id: Option<String>,
+    responses_lite: ResponsesLiteDecision,
     observer: Option<ProviderRequestObserver>,
 }
 
@@ -438,8 +487,38 @@ impl ChatGptProvider {
         Arc::clone(&self.websocket_sse_cooldown_until_secs)
     }
 
-    pub(super) fn responses_lite_enabled(&self) -> bool {
-        self.chatgpt_config.responses_lite
+    pub(super) fn responses_lite_decision(&self, model: &str) -> ResponsesLiteDecision {
+        match self.chatgpt_config.responses_lite {
+            ResponsesLiteMode::On => {
+                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn)
+            }
+            ResponsesLiteMode::Off => {
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::ForcedOff)
+            }
+            ResponsesLiteMode::Auto => self.auto_responses_lite_decision(model),
+        }
+    }
+
+    fn auto_responses_lite_decision(&self, model: &str) -> ResponsesLiteDecision {
+        let normalized_model = normalize_chatgpt_model_id(model);
+        if let Some(override_value) = self
+            .chatgpt_config
+            .model_capabilities
+            .get(normalized_model)
+            .and_then(|capability| capability.responses_lite)
+        {
+            return if override_value {
+                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::OverrideEnabled)
+            } else {
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::OverrideDisabled)
+            };
+        }
+
+        if chatgpt_model_supports_responses_lite(normalized_model) {
+            ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ModelCapability)
+        } else {
+            ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel)
+        }
     }
 
     fn codex_service_tier(&self) -> Option<&str> {
@@ -491,6 +570,7 @@ impl ChatGptProvider {
         request_id: u64,
         prompt_too_long_attempt: usize,
         budget: ChatGptOutputTokenBudget,
+        responses_lite: ResponsesLiteDecision,
     ) -> Result<Response, ProviderError> {
         let body_bytes = json_len(body);
         let model = body
@@ -521,6 +601,8 @@ impl ChatGptProvider {
             requested_output_tokens_present = budget.requested.is_some(),
             effective_output_tokens = budget.effective.unwrap_or(0),
             effective_output_tokens_present = budget.effective.is_some(),
+            responses_lite = responses_lite.is_enabled(),
+            responses_lite_source = responses_lite.source_str(),
             endpoint = %self.endpoint,
             "ChatGPT upstream request started"
         );
@@ -538,7 +620,7 @@ impl ChatGptProvider {
             .header("thread-id", runtime_ids.thread_id)
             .header("x-codex-window-id", runtime_ids.window_id);
 
-        if self.responses_lite_enabled() {
+        if responses_lite.is_enabled() {
             request_builder =
                 request_builder.header(X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER, "true");
         }
@@ -589,6 +671,7 @@ impl ChatGptProvider {
         compact_request: bool,
         request_id: u64,
         budget: ChatGptOutputTokenBudget,
+        responses_lite: ResponsesLiteDecision,
         _observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         validate_chatgpt_tool_schema_budget(body)?;
@@ -601,7 +684,7 @@ impl ChatGptProvider {
             _observer,
             ProviderRequestMetadata {
                 transport: Some("sse".to_string()),
-                responses_lite: Some(self.responses_lite_enabled()),
+                responses_lite: Some(responses_lite.is_enabled()),
                 request_body_bytes: Some(body_bytes as u64),
                 upstream_send_body_bytes: Some(body_bytes as u64),
                 ..ProviderRequestMetadata::default()
@@ -630,7 +713,15 @@ impl ChatGptProvider {
             effective: body.get("max_output_tokens").and_then(Value::as_u64),
         };
         let response = self
-            .send_responses_request(body, token, compact_request, request_id, 0, current_budget)
+            .send_responses_request(
+                body,
+                token,
+                compact_request,
+                request_id,
+                0,
+                current_budget,
+                responses_lite,
+            )
             .await?;
         let status = response.status();
         if status.is_success() || status == StatusCode::UNAUTHORIZED {
@@ -744,6 +835,7 @@ impl ChatGptProvider {
             request_id,
             output_token_budget,
             observer,
+            responses_lite,
             ..
         } = prepared;
         let mut response = self
@@ -753,6 +845,7 @@ impl ChatGptProvider {
                 compact_request,
                 request_id,
                 output_token_budget,
+                responses_lite,
                 observer.as_ref(),
             )
             .await?;
@@ -773,6 +866,7 @@ impl ChatGptProvider {
                     compact_request,
                     request_id,
                     output_token_budget,
+                    responses_lite,
                     observer.as_ref(),
                 )
                 .await?;
@@ -842,6 +936,7 @@ impl ChatGptProvider {
             request_id,
             observer,
             stable_client_conversation_id,
+            responses_lite,
             ..
         } = prepared;
         self.websocket_stats
@@ -854,6 +949,7 @@ impl ChatGptProvider {
                 token,
                 stable_client_conversation_id.as_deref(),
                 request_id,
+                responses_lite,
             )
             .await
             .inspect_err(|_| {
@@ -884,6 +980,7 @@ impl ChatGptProvider {
             marker_mode,
             stable_client_conversation_id.as_deref(),
             request_id,
+            responses_lite,
             on_event,
         )
         .await
@@ -896,7 +993,7 @@ impl ChatGptProvider {
             metadata_observer.as_ref(),
             ProviderRequestMetadata {
                 transport: Some("websocket".to_string()),
-                responses_lite: Some(self.responses_lite_enabled()),
+                responses_lite: Some(responses_lite.is_enabled()),
                 websocket_reused: Some(websocket_start.websocket_reused),
                 continuation_used: Some(websocket_start.continuation_used),
                 continuation_disabled_reason: Some(
@@ -1362,6 +1459,7 @@ impl Provider for ChatGptProvider {
         let prompt_cache_key_source = responses::prompt_cache_key_source(&request);
         let stable_client_conversation_id =
             responses::stable_client_conversation_id_for_continuation(&request);
+        let responses_lite = self.responses_lite_decision(&request.model);
         let body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
@@ -1369,6 +1467,7 @@ impl Provider for ChatGptProvider {
                 installation_id: Some(&self.installation_id),
                 service_tier: self.codex_service_tier(),
                 standalone_tools: self.chatgpt_config.standalone_tools,
+                responses_lite: responses_lite.is_enabled(),
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -1380,6 +1479,8 @@ impl Provider for ChatGptProvider {
             prompt_cache_key_present = body.get("prompt_cache_key").is_some(),
             stable_client_conversation_id_present = stable_client_conversation_id.is_some(),
             synthetic_stable_client_conversation_id,
+            responses_lite = responses_lite.is_enabled(),
+            responses_lite_source = responses_lite.source_str(),
             "ChatGPT prompt cache key policy applied"
         );
         log_request_observability("chatgpt", "/responses", &body, Some(request_id));
@@ -1394,6 +1495,7 @@ impl Provider for ChatGptProvider {
                 request_id,
                 output_token_budget,
                 stable_client_conversation_id,
+                responses_lite,
                 observer,
             },
             token,
@@ -2096,6 +2198,17 @@ fn build_chatgpt_responses_body_with_context(
 }
 
 #[cfg(test)]
+fn build_chatgpt_responses_lite_body(request: &MessagesRequest) -> Value {
+    build_chatgpt_responses_body_with_codex_context(
+        request,
+        responses::CodexRequestContext {
+            responses_lite: true,
+            ..responses::CodexRequestContext::default()
+        },
+    )
+}
+
+#[cfg(test)]
 fn build_chatgpt_responses_body_with_codex_context(
     request: &MessagesRequest,
     context: responses::CodexRequestContext<'_>,
@@ -2432,6 +2545,7 @@ struct ChatGptModelSpec {
     model_id: &'static str,
     context_window: u32,
     image_input: bool,
+    responses_lite: bool,
 }
 
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
@@ -2439,21 +2553,25 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         model_id: "gpt-5.5",
         context_window: 272_000,
         image_input: true,
+        responses_lite: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4",
         context_window: 272_000,
         image_input: true,
+        responses_lite: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4-mini",
         context_window: 272_000,
         image_input: true,
+        responses_lite: true,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
         context_window: 128_000,
         image_input: false,
+        responses_lite: false,
     },
 ];
 
@@ -2471,6 +2589,16 @@ fn chatgpt_model_info(model_id: &str) -> Option<ModelInfo> {
         .copied()
         .find(|spec| spec.model_id == model_id)
         .map(chatgpt_model_info_from_spec)
+}
+
+fn normalize_chatgpt_model_id(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+fn chatgpt_model_supports_responses_lite(model_id: &str) -> bool {
+    CHATGPT_MODEL_SPECS
+        .iter()
+        .any(|spec| spec.model_id == model_id && spec.responses_lite)
 }
 
 fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
@@ -3017,6 +3145,63 @@ mod tests {
         assert!(request_size_warning("unknown-model", threshold).is_none());
     }
 
+    #[tokio::test]
+    async fn chatgpt_responses_lite_decision_uses_policy_and_capabilities() {
+        let provider = test_chatgpt_provider("http://127.0.0.1/responses".to_string()).await;
+
+        let gpt55 = provider.responses_lite_decision("gpt-5.5");
+        assert!(gpt55.is_enabled());
+        assert_eq!(gpt55.source_str(), "model_capability");
+
+        let routed_gpt55 = provider.responses_lite_decision("chatgpt/gpt-5.5");
+        assert!(routed_gpt55.is_enabled());
+        assert_eq!(routed_gpt55.source_str(), "model_capability");
+
+        let spark = provider.responses_lite_decision("gpt-5.3-codex-spark");
+        assert!(!spark.is_enabled());
+        assert_eq!(spark.source_str(), "unknown_model");
+
+        let unknown = provider.responses_lite_decision("unknown-model");
+        assert!(!unknown.is_enabled());
+        assert_eq!(unknown.source_str(), "unknown_model");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_responses_lite_decision_respects_forced_modes_and_overrides() {
+        let mut provider = test_chatgpt_provider("http://127.0.0.1/responses".to_string()).await;
+
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::On;
+        let forced_on = provider.responses_lite_decision("gpt-5.3-codex-spark");
+        assert!(forced_on.is_enabled());
+        assert_eq!(forced_on.source_str(), "forced_on");
+
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::Off;
+        let forced_off = provider.responses_lite_decision("gpt-5.5");
+        assert!(!forced_off.is_enabled());
+        assert_eq!(forced_off.source_str(), "forced_off");
+
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::Auto;
+        provider.chatgpt_config.model_capabilities.insert(
+            "gpt-5.3-codex-spark".to_string(),
+            claude_proxy_config::settings::ChatGptModelCapabilityOverride {
+                responses_lite: Some(true),
+            },
+        );
+        let override_enabled = provider.responses_lite_decision("gpt-5.3-codex-spark");
+        assert!(override_enabled.is_enabled());
+        assert_eq!(override_enabled.source_str(), "override_enabled");
+
+        provider.chatgpt_config.model_capabilities.insert(
+            "gpt-5.5".to_string(),
+            claude_proxy_config::settings::ChatGptModelCapabilityOverride {
+                responses_lite: Some(false),
+            },
+        );
+        let override_disabled = provider.responses_lite_decision("gpt-5.5");
+        assert!(!override_disabled.is_enabled());
+        assert_eq!(override_disabled.source_str(), "override_disabled");
+    }
+
     #[test]
     fn chatgpt_models_use_dedicated_codex_capability_contract() {
         let models = chatgpt_models();
@@ -3234,12 +3419,52 @@ mod tests {
             extra: Default::default(),
         };
 
-        let body = build_chatgpt_responses_body(&req);
+        let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["tools"], json!([]));
-        assert_eq!(body["include"], json!([]));
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"], json!({"context": "all_turns"}));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_keeps_non_lite_parallel_tool_defaults() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            tools: Some(vec![Tool {
+                name: "Read".to_string(),
+                description: None,
+                input_schema: json!({"type": "object", "properties": {}}),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                responses_lite: false,
+                ..responses::CodexRequestContext::default()
+            },
+        );
+
+        assert_eq!(body["include"], json!([]));
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
@@ -3344,6 +3569,7 @@ mod tests {
                 installation_id: None,
                 service_tier: Some("flex"),
                 standalone_tools: true,
+                responses_lite: true,
             },
         );
 
@@ -3565,6 +3791,7 @@ mod tests {
                 installation_id: Some("install-123"),
                 service_tier: Some("priority"),
                 standalone_tools: true,
+                responses_lite: true,
             },
         );
 
@@ -3729,6 +3956,7 @@ mod tests {
                 installation_id: Some("install-fixture"),
                 service_tier: None,
                 standalone_tools: true,
+                responses_lite: true,
             },
         );
 
@@ -3792,11 +4020,11 @@ mod tests {
             extra: Default::default(),
         };
 
-        let body = build_chatgpt_responses_body(&req);
+        let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "Read");
-        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(
             body["tools"][0]["parameters"],
             json!({
@@ -3877,10 +4105,82 @@ mod tests {
             extra,
         };
 
-        let body = build_chatgpt_responses_body(&req);
+        let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["reasoning"]["effort"], "xhigh");
         assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_forces_reasoning_context_for_explicit_reasoning() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "reasoning".to_string(),
+            json!({"effort": "high", "summary": "auto", "context": "previous_response"}),
+        );
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = build_chatgpt_responses_lite_body(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_keeps_non_lite_reasoning_context() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "reasoning".to_string(),
+            json!({"effort": "high", "summary": "auto", "context": "previous_response"}),
+        );
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = build_chatgpt_responses_body(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "previous_response");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[test]
@@ -3906,11 +4206,12 @@ mod tests {
         };
 
         let req = apply_openai_intent(req);
-        let body = build_chatgpt_responses_body(&req);
+        let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["model"], "gpt-5.4-mini");
         assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
         assert_eq!(body["reasoning"]["effort"], "none");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
         assert!(body["reasoning"].get("summary").is_none());
         assert!(body.get("max_output_tokens").is_none());
     }
@@ -4000,6 +4301,7 @@ mod tests {
                 false,
                 1,
                 ChatGptOutputTokenBudget::default(),
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel),
                 None,
             )
             .await
@@ -4045,6 +4347,7 @@ mod tests {
                     requested: Some(4096),
                     effective: body.get("max_output_tokens").and_then(Value::as_u64),
                 },
+                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn),
             )
             .await
             .expect("request should succeed");
@@ -4069,7 +4372,7 @@ mod tests {
     async fn chatgpt_send_responses_request_omits_responses_lite_header_when_disabled() {
         let (endpoint, requests) = capture_once_server().await;
         let mut provider = test_chatgpt_provider(endpoint).await;
-        provider.chatgpt_config.responses_lite = false;
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::Off;
         let token = ChatGptToken {
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
@@ -4090,6 +4393,7 @@ mod tests {
                 1,
                 0,
                 ChatGptOutputTokenBudget::default(),
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::ForcedOff),
             )
             .await
             .expect("request should succeed");
@@ -5220,6 +5524,7 @@ mod tests {
                 false,
                 1,
                 ChatGptOutputTokenBudget::default(),
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel),
                 None,
             )
             .await
@@ -5399,6 +5704,7 @@ mod tests {
             request_id,
             output_token_budget: ChatGptOutputTokenBudget::default(),
             stable_client_conversation_id: stable_client_conversation_id.map(ToOwned::to_owned),
+            responses_lite: ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn),
             observer: None,
         }
     }
