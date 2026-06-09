@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.0.8 - 2026-06-09
+
+### Added in v2.0.8
+
+- Added ChatGPT/Codex Responses Lite observability, persistence, and dashboard counters for Responses Lite requests, WebSocket usage, continuation usage, and continuation saved bytes.
+- Added default-on ChatGPT/Codex standalone Bash tool conversion with `chatgpt.standalone_tools` rollback support.
+
+### Changed in v2.0.8
+
+- Changed ChatGPT/Codex Responses Lite from a provider-wide boolean to a capability-driven `auto` / `on` / `off` policy with backward-compatible legacy bool parsing and per-model capability overrides.
+- Aligned Responses Lite request contracts with Codex behavior by applying Lite HTTP/WebSocket markers, `reasoning.context = "all_turns"`, and `parallel_tool_calls = false` only when the effective Lite decision is enabled.
+
 ## v2.0.7 - 2026-06-07
 
 ### Changed in v2.0.7
