@@ -601,6 +601,7 @@ impl ChatGptProvider {
             requested_output_tokens_present = budget.requested.is_some(),
             effective_output_tokens = budget.effective.unwrap_or(0),
             effective_output_tokens_present = budget.effective.is_some(),
+            final_reasoning = %chatgpt_reasoning_log_value(body),
             responses_lite = responses_lite.is_enabled(),
             responses_lite_source = responses_lite.source_str(),
             endpoint = %self.endpoint,
@@ -1243,6 +1244,12 @@ fn upstream_model_from_headers(headers: &HeaderMap) -> Option<String> {
         headers,
         &["openai-model", "x-openai-model", "x-model", "model"],
     )
+}
+
+fn chatgpt_reasoning_log_value(body: &Value) -> String {
+    body.get("reasoning")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn chatgpt_output_token_budget(
