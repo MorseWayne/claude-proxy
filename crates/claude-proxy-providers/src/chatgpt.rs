@@ -4091,7 +4091,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_responses_body_defaults_reasoning_summary_to_auto() {
+    fn chatgpt_responses_body_preserves_explicit_reasoning_effort_summary() {
         let mut extra = std::collections::HashMap::new();
         extra.insert("reasoning_effort".to_string(), json!("xhigh"));
         let req = MessagesRequest {
@@ -4117,6 +4117,39 @@ mod tests {
         let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_defaults_adaptive_reasoning_summary_to_auto() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("adaptive".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: Default::default(),
+        };
+
+        let body = build_chatgpt_responses_lite_body(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));

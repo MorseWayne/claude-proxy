@@ -165,6 +165,7 @@ fn apply_codex_reasoning_defaults(
     context: CodexRequestContext<'_>,
 ) {
     let has_explicit_reasoning = request.extra.contains_key("reasoning");
+    let has_explicit_reasoning_effort = request.extra.contains_key("reasoning_effort");
     if context.responses_lite {
         body.entry("reasoning".to_string())
             .or_insert_with(|| json!({}));
@@ -182,6 +183,7 @@ fn apply_codex_reasoning_defaults(
         reasoning.insert("context".to_string(), json!("all_turns"));
     }
     if !has_explicit_reasoning
+        && !has_explicit_reasoning_effort
         && reasoning.get("summary").and_then(Value::as_str) == Some("detailed")
     {
         reasoning.insert("summary".to_string(), json!("auto"));
