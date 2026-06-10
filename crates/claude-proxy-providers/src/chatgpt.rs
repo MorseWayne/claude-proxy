@@ -940,6 +940,7 @@ impl ChatGptProvider {
             responses_lite,
             ..
         } = prepared;
+        let final_reasoning = chatgpt_reasoning_log_value(&body);
         self.websocket_stats
             .attempts
             .fetch_add(1, Ordering::Relaxed);
@@ -1024,6 +1025,7 @@ impl ChatGptProvider {
             request_id,
             compact_request,
             selected_transport = "websocket",
+            final_reasoning = %final_reasoning,
             websocket_reused = reused,
             websocket_prewarmed,
             websocket_attempts = stats.attempts,
