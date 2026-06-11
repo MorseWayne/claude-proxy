@@ -265,6 +265,13 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 [providers.chatgpt.chatgpt]
 # originator = "codex_cli_rs"
 # user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
+
+# 可选：当 ChatGPT/Codex 上游模型能力变化时，先用配置覆盖，避免等待发版。
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.5"]
+context_window = 272000
+image_input = true
+reasoning_effort_levels = ["low", "medium", "high", "xhigh"]
+responses_lite = true
 ```
 
 #### 3. 设置默认模型和 Claude 模型别名

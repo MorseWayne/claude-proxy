@@ -19,9 +19,9 @@ use async_trait::async_trait;
 use claude_proxy_config::{
     Settings,
     settings::{
-        ChatGptProviderConfig, ChatGptTransport, DEFAULT_CHATGPT_ORIGINATOR,
-        DEFAULT_CHATGPT_USER_AGENT, ProviderConfig, ProviderRuntimeConfig, ReasoningMarkerMode,
-        ResponsesLiteMode,
+        ChatGptModelCapabilityOverride, ChatGptProviderConfig, ChatGptTransport,
+        DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT, ProviderConfig,
+        ProviderRuntimeConfig, ReasoningMarkerMode, ResponsesLiteMode,
     },
 };
 use claude_proxy_core::*;
@@ -582,6 +582,7 @@ impl ChatGptProvider {
             compact_request,
             prompt_too_long_attempt,
             model,
+            &self.chatgpt_config,
             body_bytes,
         );
         let started_at = Instant::now();
@@ -691,7 +692,7 @@ impl ChatGptProvider {
                 ..ProviderRequestMetadata::default()
             },
         );
-        let threshold = chatgpt_context_limit_preflight_threshold(model);
+        let threshold = chatgpt_context_limit_preflight_threshold(model, &self.chatgpt_config);
         if body_bytes >= threshold.body_bytes {
             warn!(
                 request_id,
@@ -1513,7 +1514,7 @@ impl Provider for ChatGptProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(chatgpt_models())
+        Ok(chatgpt_models(&self.chatgpt_config))
     }
 
     async fn rate_limit_snapshots(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {
@@ -2487,9 +2488,12 @@ struct ChatGptContextLimitPreflightThreshold {
     context_window: Option<u32>,
 }
 
-fn chatgpt_context_limit_preflight_threshold(model: &str) -> ChatGptContextLimitPreflightThreshold {
+fn chatgpt_context_limit_preflight_threshold(
+    model: &str,
+    config: &ChatGptProviderConfig,
+) -> ChatGptContextLimitPreflightThreshold {
     if let Some(context_window) =
-        chatgpt_model_info(model).and_then(|info| info.capabilities.limits.context_window)
+        chatgpt_model_info(model, config).and_then(|info| info.capabilities.limits.context_window)
     {
         return ChatGptContextLimitPreflightThreshold {
             body_bytes: (context_window as usize).saturating_mul(CHATGPT_BYTES_PER_ESTIMATED_TOKEN),
@@ -2505,8 +2509,8 @@ fn chatgpt_context_limit_preflight_threshold(model: &str) -> ChatGptContextLimit
     }
 }
 
-fn chatgpt_request_warning_threshold(model: &str) -> Option<usize> {
-    let context_window = chatgpt_model_info(model)?
+fn chatgpt_request_warning_threshold(model: &str, config: &ChatGptProviderConfig) -> Option<usize> {
+    let context_window = chatgpt_model_info(model, config)?
         .capabilities
         .limits
         .context_window? as usize;
@@ -2518,8 +2522,12 @@ fn chatgpt_request_warning_threshold(model: &str) -> Option<usize> {
     )
 }
 
-fn request_size_warning(model: &str, body_bytes: usize) -> Option<(usize, usize)> {
-    let threshold_bytes = chatgpt_request_warning_threshold(model)?;
+fn request_size_warning(
+    model: &str,
+    config: &ChatGptProviderConfig,
+    body_bytes: usize,
+) -> Option<(usize, usize)> {
+    let threshold_bytes = chatgpt_request_warning_threshold(model, config)?;
     (body_bytes >= threshold_bytes).then_some((
         threshold_bytes,
         body_bytes / CHATGPT_BYTES_PER_ESTIMATED_TOKEN,
@@ -2531,9 +2539,11 @@ fn warn_if_request_nears_context_window(
     compact_request: bool,
     prompt_too_long_attempt: usize,
     model: &str,
+    config: &ChatGptProviderConfig,
     body_bytes: usize,
 ) {
-    let Some((threshold_bytes, estimated_tokens)) = request_size_warning(model, body_bytes) else {
+    let Some((threshold_bytes, estimated_tokens)) = request_size_warning(model, config, body_bytes)
+    else {
         return;
     };
     warn!(
@@ -2584,20 +2594,51 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
 ];
 
-fn chatgpt_models() -> Vec<ModelInfo> {
-    CHATGPT_MODEL_SPECS
+fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
+    let mut models = CHATGPT_MODEL_SPECS
         .iter()
         .copied()
-        .map(chatgpt_model_info_from_spec)
-        .collect()
+        .map(|spec| {
+            let capability = config.model_capabilities.get(spec.model_id);
+            chatgpt_model_info_from_spec(spec, capability)
+        })
+        .collect::<Vec<_>>();
+
+    let builtin_ids = CHATGPT_MODEL_SPECS
+        .iter()
+        .map(|spec| spec.model_id)
+        .collect::<BTreeSet<_>>();
+    let mut configured_models = config
+        .model_capabilities
+        .iter()
+        .filter(|(model_id, _)| !builtin_ids.contains(model_id.as_str()))
+        .collect::<Vec<_>>();
+    configured_models.sort_by(|(left, _), (right, _)| left.cmp(right));
+    models.extend(
+        configured_models
+            .into_iter()
+            .map(|(model_id, capability)| chatgpt_model_info_from_capability(model_id, capability)),
+    );
+
+    models
 }
 
-fn chatgpt_model_info(model_id: &str) -> Option<ModelInfo> {
+fn chatgpt_model_info(model_id: &str, config: &ChatGptProviderConfig) -> Option<ModelInfo> {
+    let model_id = normalize_chatgpt_model_id(model_id);
     CHATGPT_MODEL_SPECS
         .iter()
         .copied()
         .find(|spec| spec.model_id == model_id)
-        .map(chatgpt_model_info_from_spec)
+        .map(|spec| {
+            let capability = config.model_capabilities.get(spec.model_id);
+            chatgpt_model_info_from_spec(spec, capability)
+        })
+        .or_else(|| {
+            config
+                .model_capabilities
+                .get(model_id)
+                .map(|capability| chatgpt_model_info_from_capability(model_id, capability))
+        })
 }
 
 fn normalize_chatgpt_model_id(model: &str) -> &str {
@@ -2610,14 +2651,69 @@ fn chatgpt_model_supports_responses_lite(model_id: &str) -> bool {
         .any(|spec| spec.model_id == model_id && spec.responses_lite)
 }
 
-fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
-    let reasoning_efforts = ["low", "medium", "high", "xhigh"]
-        .into_iter()
+fn chatgpt_model_info_from_spec(
+    spec: ChatGptModelSpec,
+    capability: Option<&ChatGptModelCapabilityOverride>,
+) -> ModelInfo {
+    let context_window = capability
+        .and_then(|capability| capability.context_window)
+        .unwrap_or(spec.context_window);
+    let image_input = capability
+        .and_then(|capability| capability.image_input)
+        .unwrap_or(spec.image_input);
+    let reasoning_efforts =
+        configured_reasoning_effort_levels(capability).unwrap_or_else(default_reasoning_efforts);
+
+    chatgpt_model_info_from_parts(
+        spec.model_id,
+        Some(context_window),
+        image_input,
+        reasoning_efforts,
+    )
+}
+
+fn chatgpt_model_info_from_capability(
+    model_id: &str,
+    capability: &ChatGptModelCapabilityOverride,
+) -> ModelInfo {
+    chatgpt_model_info_from_parts(
+        model_id,
+        capability.context_window,
+        capability.image_input.unwrap_or(false),
+        configured_reasoning_effort_levels(Some(capability))
+            .unwrap_or_else(default_reasoning_efforts),
+    )
+}
+
+fn configured_reasoning_effort_levels(
+    capability: Option<&ChatGptModelCapabilityOverride>,
+) -> Option<Vec<String>> {
+    let levels = capability?
+        .reasoning_effort_levels
+        .as_ref()?
+        .iter()
+        .map(|level| level.trim())
+        .filter(|level| !level.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    (!levels.is_empty()).then_some(levels)
+}
 
+fn default_reasoning_efforts() -> Vec<String> {
+    ["low", "medium", "high", "xhigh"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn chatgpt_model_info_from_parts(
+    model_id: &str,
+    context_window: Option<u32>,
+    image_input: bool,
+    reasoning_efforts: Vec<String>,
+) -> ModelInfo {
     ModelInfo {
-        model_id: spec.model_id.to_string(),
+        model_id: model_id.to_string(),
         vendor: Some("openai".to_string()),
         is_chat_default: None,
         capabilities: ModelCapabilities {
@@ -2629,7 +2725,7 @@ fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
             modalities: ModalityCapabilities {
                 input: InputModalities {
                     text: CapabilityState::Supported,
-                    image: CapabilityState::from_bool(Some(spec.image_input)),
+                    image: CapabilityState::from_bool(Some(image_input)),
                     document: CapabilityState::Unknown,
                     audio: CapabilityState::Unsupported,
                     video: CapabilityState::Unsupported,
@@ -2653,7 +2749,7 @@ fn chatgpt_model_info_from_spec(spec: ChatGptModelSpec) -> ModelInfo {
                 stop_sequences: CapabilityState::Unknown,
             },
             limits: ModelLimits {
-                context_window: Some(spec.context_window),
+                context_window,
                 max_output_tokens: None,
                 min_thinking_budget: None,
                 max_thinking_budget: None,
@@ -3140,18 +3236,19 @@ mod tests {
 
     #[test]
     fn chatgpt_request_size_warning_uses_model_context_metadata() {
-        let threshold = chatgpt_request_warning_threshold("gpt-5.5").unwrap();
+        let config = ChatGptProviderConfig::default();
+        let threshold = chatgpt_request_warning_threshold("gpt-5.5", &config).unwrap();
 
         assert_eq!(
             threshold,
             272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
         );
-        assert!(request_size_warning("gpt-5.5", threshold - 1).is_none());
+        assert!(request_size_warning("gpt-5.5", &config, threshold - 1).is_none());
         assert_eq!(
-            request_size_warning("gpt-5.5", threshold),
+            request_size_warning("gpt-5.5", &config, threshold),
             Some((threshold, threshold / CHATGPT_BYTES_PER_ESTIMATED_TOKEN))
         );
-        assert!(request_size_warning("unknown-model", threshold).is_none());
+        assert!(request_size_warning("unknown-model", &config, threshold).is_none());
     }
 
     #[tokio::test]
@@ -3194,6 +3291,7 @@ mod tests {
             "gpt-5.3-codex-spark".to_string(),
             claude_proxy_config::settings::ChatGptModelCapabilityOverride {
                 responses_lite: Some(true),
+                ..Default::default()
             },
         );
         let override_enabled = provider.responses_lite_decision("gpt-5.3-codex-spark");
@@ -3204,6 +3302,7 @@ mod tests {
             "gpt-5.5".to_string(),
             claude_proxy_config::settings::ChatGptModelCapabilityOverride {
                 responses_lite: Some(false),
+                ..Default::default()
             },
         );
         let override_disabled = provider.responses_lite_decision("gpt-5.5");
@@ -3213,7 +3312,7 @@ mod tests {
 
     #[test]
     fn chatgpt_models_use_dedicated_codex_capability_contract() {
-        let models = chatgpt_models();
+        let models = chatgpt_models(&ChatGptProviderConfig::default());
         let ids = models
             .iter()
             .map(|model| model.model_id.as_str())
@@ -3290,6 +3389,70 @@ mod tests {
             CapabilityState::Unsupported
         );
         assert_eq!(spark.capabilities.limits.context_window, Some(128_000));
+    }
+
+    #[test]
+    fn chatgpt_models_apply_configured_capability_overrides() {
+        let mut config = ChatGptProviderConfig::default();
+        config.model_capabilities.insert(
+            "gpt-5.5".to_string(),
+            ChatGptModelCapabilityOverride {
+                context_window: Some(400_000),
+                image_input: Some(false),
+                reasoning_effort_levels: Some(vec![
+                    "minimal".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+        config.model_capabilities.insert(
+            "gpt-5.6-codex".to_string(),
+            ChatGptModelCapabilityOverride {
+                context_window: Some(512_000),
+                image_input: Some(true),
+                reasoning_effort_levels: Some(vec!["low".to_string(), "ultra".to_string()]),
+                responses_lite: Some(true),
+            },
+        );
+
+        let models = chatgpt_models(&config);
+        let gpt55 = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.5")
+            .expect("overridden gpt-5.5 model");
+        assert_eq!(gpt55.capabilities.limits.context_window, Some(400_000));
+        assert_eq!(
+            gpt55.capabilities.modalities.input.image,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            gpt55.capabilities.limits.reasoning_effort_levels,
+            vec![
+                "minimal".to_string(),
+                "medium".to_string(),
+                "xhigh".to_string()
+            ]
+        );
+
+        let new_model = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-codex")
+            .expect("configured custom model");
+        assert_eq!(new_model.capabilities.limits.context_window, Some(512_000));
+        assert!(new_model.capabilities.modalities.input.image.is_supported());
+        assert_eq!(
+            new_model.capabilities.limits.reasoning_effort_levels,
+            vec!["low".to_string(), "ultra".to_string()]
+        );
+
+        let threshold = chatgpt_context_limit_preflight_threshold("chatgpt/gpt-5.6-codex", &config);
+        assert_eq!(
+            threshold.body_bytes,
+            512_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
+        );
+        assert_eq!(threshold.context_window, Some(512_000));
     }
 
     #[test]
@@ -4294,7 +4457,8 @@ mod tests {
 
     #[test]
     fn context_limit_preflight_threshold_uses_model_capability_then_fallback() {
-        let gpt55 = chatgpt_context_limit_preflight_threshold("gpt-5.5");
+        let config = ChatGptProviderConfig::default();
+        let gpt55 = chatgpt_context_limit_preflight_threshold("gpt-5.5", &config);
         assert_eq!(
             gpt55.body_bytes,
             272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
@@ -4302,7 +4466,7 @@ mod tests {
         assert_eq!(gpt55.source, "model_context_window");
         assert_eq!(gpt55.context_window, Some(272_000));
 
-        let spark = chatgpt_context_limit_preflight_threshold("gpt-5.3-codex-spark");
+        let spark = chatgpt_context_limit_preflight_threshold("gpt-5.3-codex-spark", &config);
         assert_eq!(
             spark.body_bytes,
             128_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
@@ -4310,7 +4474,7 @@ mod tests {
         assert_eq!(spark.source, "model_context_window");
         assert_eq!(spark.context_window, Some(128_000));
 
-        let unknown = chatgpt_context_limit_preflight_threshold("unknown-model");
+        let unknown = chatgpt_context_limit_preflight_threshold("unknown-model", &config);
         assert_eq!(
             unknown.body_bytes,
             CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES

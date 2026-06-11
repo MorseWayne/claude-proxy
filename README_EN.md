@@ -128,6 +128,13 @@ base_url = "https://chatgpt.com/backend-api/codex"
 # originator = "codex_cli_rs"
 # user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
 
+# Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.5"]
+context_window = 272000
+image_input = true
+reasoning_effort_levels = ["low", "medium", "high", "xhigh"]
+responses_lite = true
+
 [model]
 default = "openai/gpt-4.1"
 reasoning = "openai/o4-mini"                    # Optional, synced as ANTHROPIC_REASONING_MODEL

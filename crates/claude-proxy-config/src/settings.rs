@@ -218,6 +218,12 @@ impl<'de> Deserialize<'de> for ResponsesLiteMode {
 pub struct ChatGptModelCapabilityOverride {
     #[serde(default)]
     pub responses_lite: Option<bool>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub image_input: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1500,6 +1506,9 @@ responses_lite = "on"
 
 [providers.chatgpt.chatgpt.model_capabilities."gpt-5.3-codex-spark"]
 responses_lite = false
+context_window = 192000
+image_input = true
+reasoning_effort_levels = ["low", "high", "xhigh"]
 "#;
 
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
@@ -1509,6 +1518,20 @@ responses_lite = false
         assert_eq!(
             chatgpt.model_capabilities["gpt-5.3-codex-spark"].responses_lite,
             Some(false)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].context_window,
+            Some(192_000)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].image_input,
+            Some(true)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(["low".to_string(), "high".to_string(), "xhigh".to_string()].as_slice())
         );
 
         let legacy_true = Settings::from_toml(
