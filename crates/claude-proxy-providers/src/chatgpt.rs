@@ -1493,6 +1493,20 @@ impl Provider for ChatGptProvider {
             responses_lite_source = responses_lite.source_str(),
             "ChatGPT prompt cache key policy applied"
         );
+        notify_request_metadata_observer(
+            observer.as_ref(),
+            ProviderRequestMetadata {
+                prompt_cache_key_present: Some(body.get("prompt_cache_key").is_some()),
+                prompt_cache_key_source: Some(prompt_cache_key_source.as_str().to_string()),
+                stable_client_conversation_id_present: Some(
+                    stable_client_conversation_id.is_some(),
+                ),
+                synthetic_stable_client_conversation_id: Some(
+                    synthetic_stable_client_conversation_id,
+                ),
+                ..ProviderRequestMetadata::default()
+            },
+        );
         log_request_observability("chatgpt", "/responses", &body, Some(request_id));
         let compact_request = is_compact_request_body(&body);
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);

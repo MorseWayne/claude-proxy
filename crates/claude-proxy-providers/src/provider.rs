@@ -189,6 +189,14 @@ pub struct ProviderRequestMetadata {
     #[serde(default)]
     pub responses_lite: Option<bool>,
     #[serde(default)]
+    pub prompt_cache_key_present: Option<bool>,
+    #[serde(default)]
+    pub prompt_cache_key_source: Option<String>,
+    #[serde(default)]
+    pub stable_client_conversation_id_present: Option<bool>,
+    #[serde(default)]
+    pub synthetic_stable_client_conversation_id: Option<bool>,
+    #[serde(default)]
     pub websocket_reused: Option<bool>,
     #[serde(default)]
     pub continuation_used: Option<bool>,

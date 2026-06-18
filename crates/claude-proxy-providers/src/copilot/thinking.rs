@@ -55,6 +55,15 @@ pub(super) fn copilot_messages_effort(
     request: &MessagesRequest,
     model_info: Option<&ModelInfo>,
 ) -> Option<String> {
+    if request
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.r#type.as_deref())
+        == Some("disabled")
+    {
+        return None;
+    }
+
     let requested_effort = if let Some(effort) = request
         .extra
         .get("output_config")
@@ -292,5 +301,21 @@ mod tests {
             copilot_messages_effort(&request, Some(&model)).as_deref(),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn messages_effort_respects_disabled_thinking() {
+        let model = model();
+        let mut request = request(&model);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("disabled".to_string()),
+            budget_tokens: None,
+        });
+        request.extra = HashMap::from([(
+            "output_config".to_string(),
+            serde_json::json!({"effort": "high"}),
+        )]);
+
+        assert_eq!(copilot_messages_effort(&request, Some(&model)), None);
     }
 }

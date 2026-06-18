@@ -301,11 +301,18 @@ fn should_retry_result(
     policy: UpstreamRequestPolicy,
 ) -> bool {
     match response {
-        Ok(response) => should_retry_status(response.status(), policy),
+        Ok(response) => should_retry_response(response, policy),
         Err(ProviderError::Timeout) => policy.retry_timeout_errors,
         Err(ProviderError::Network(_)) => policy.retry_network_errors,
         Err(_) => false,
     }
+}
+
+fn should_retry_response(response: &reqwest::Response, policy: UpstreamRequestPolicy) -> bool {
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        return policy.retry_rate_limits && !is_non_retryable_rate_limit_response(response);
+    }
+    should_retry_status(response.status(), policy)
 }
 
 fn should_retry_status(status: StatusCode, policy: UpstreamRequestPolicy) -> bool {
@@ -320,6 +327,25 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status == StatusCode::CONFLICT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
+}
+
+fn is_non_retryable_rate_limit_response(response: &reqwest::Response) -> bool {
+    header_contains_any(
+        response.headers(),
+        &[
+            "x-openai-error-code",
+            "openai-error-code",
+            "x-ratelimit-reason",
+            "x-rate-limit-reason",
+        ],
+        &[
+            "insufficient_quota",
+            "billing",
+            "hard_limit",
+            "payment_required",
+            "quota_exceeded",
+        ],
+    )
 }
 
 fn is_retryable_overload_status(status: u16) -> bool {
@@ -354,25 +380,42 @@ fn retry_after_delay_from_now(value: &str, now: SystemTime) -> Option<Duration> 
     Some(delay.min(MAX_RETRY_AFTER_DELAY))
 }
 
-fn retry_after_seconds(value: &str) -> Option<u64> {
-    retry_after_delay_secs(value).map(|delay| delay.as_secs())
+fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+    retry_after_delay_from_headers(response.headers())
 }
 
-fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get("retry-after")
+fn retry_after_delay_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after-ms")
         .and_then(|v| v.to_str().ok())
-        .and_then(retry_after_delay_secs)
+        .and_then(retry_after_ms_delay)
+        .or_else(|| {
+            headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(retry_after_delay_secs)
+        })
+}
+
+fn retry_after_ms_delay(value: &str) -> Option<Duration> {
+    let ms = value.parse::<u64>().ok()?;
+    Some(Duration::from_millis(ms).min(MAX_RETRY_AFTER_DELAY))
+}
+
+fn retry_after_seconds_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    retry_after_delay_from_headers(headers).map(retry_after_duration_to_seconds)
+}
+
+fn retry_after_duration_to_seconds(delay: Duration) -> u64 {
+    if delay.is_zero() {
+        return 0;
+    }
+    delay.as_secs() + u64::from(delay.subsec_nanos() > 0)
 }
 
 pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(retry_after_seconds);
+    let retry_after = retry_after_seconds_from_headers(response.headers());
     let request_id = upstream_request_id_from_headers(response.headers());
     let safe_headers = safe_upstream_error_headers(response.headers());
     let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
@@ -409,10 +452,7 @@ pub fn upstream_error_metadata_from_parts(
 ) -> UpstreamErrorMetadata {
     UpstreamErrorMetadata {
         status,
-        retry_after: headers
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(retry_after_seconds),
+        retry_after: retry_after_seconds_from_headers(headers),
         request_id: upstream_request_id_from_headers(headers),
         message: Some(message),
         body_preview: upstream_error_body_preview(body),
@@ -442,7 +482,12 @@ fn safe_upstream_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<Upst
         "openai-request-id",
         "x-ms-request-id",
         "cf-ray",
+        "retry-after-ms",
         "retry-after",
+        "x-openai-error-code",
+        "openai-error-code",
+        "x-ratelimit-reason",
+        "x-rate-limit-reason",
         "x-ratelimit-limit-requests",
         "x-ratelimit-remaining-requests",
         "x-ratelimit-reset-requests",
@@ -462,6 +507,20 @@ fn safe_upstream_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<Upst
 
 fn header_value_from_any(headers: &reqwest::header::HeaderMap, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| header_value(headers, name))
+}
+
+fn header_contains_any(
+    headers: &reqwest::header::HeaderMap,
+    names: &[&str],
+    needles: &[&str],
+) -> bool {
+    names
+        .iter()
+        .filter_map(|name| header_value(headers, name))
+        .any(|value| {
+            let value = value.to_ascii_lowercase();
+            needles.iter().any(|needle| value.contains(needle))
+        })
 }
 
 fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
@@ -704,6 +763,11 @@ mod tests {
         assert_eq!(retry_after_delay_secs("1"), Some(Duration::from_secs(1)));
         assert_eq!(retry_after_delay_secs("60"), Some(MAX_RETRY_AFTER_DELAY));
         assert_eq!(retry_after_delay_secs("not-a-number"), None);
+        assert_eq!(
+            retry_after_ms_delay("1500"),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(retry_after_ms_delay("90000"), Some(MAX_RETRY_AFTER_DELAY));
     }
 
     #[test]
@@ -735,6 +799,60 @@ mod tests {
         assert!(!should_retry_result(
             &Err(ProviderError::InvalidRequest("bad request".to_string())),
             policy
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_ms_header_takes_precedence() {
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[("retry-after", "4"), ("retry-after-ms", "1500")],
+            r#"{"error":{"message":"slow down"}}"#,
+        )
+        .await;
+
+        assert_eq!(
+            retry_after_delay(&response),
+            Some(Duration::from_millis(1500))
+        );
+
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::RateLimited {
+                retry_after: Some(2)
+            }
+        ));
+        assert_eq!(error.upstream_metadata().unwrap().retry_after, Some(2));
+    }
+
+    #[tokio::test]
+    async fn quota_rate_limit_headers_are_not_retried() {
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[("x-openai-error-code", "insufficient_quota")],
+            r#"{"error":{"message":"quota exhausted"}}"#,
+        )
+        .await;
+
+        assert!(!should_retry_result(
+            &Ok(response),
+            UpstreamRequestPolicy::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_rate_limits_remain_retryable() {
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[("retry-after-ms", "250")],
+            r#"{"error":{"message":"slow down"}}"#,
+        )
+        .await;
+
+        assert!(should_retry_result(
+            &Ok(response),
+            UpstreamRequestPolicy::default()
         ));
     }
 

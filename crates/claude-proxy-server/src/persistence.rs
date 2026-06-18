@@ -140,6 +140,19 @@ fn ensure_request_observability_columns(conn: &Connection) -> rusqlite::Result<(
             "continuation_saved_bytes INTEGER NOT NULL DEFAULT 0",
         ),
         ("responses_lite", "responses_lite INTEGER"),
+        (
+            "prompt_cache_key_present",
+            "prompt_cache_key_present INTEGER",
+        ),
+        ("prompt_cache_key_source", "prompt_cache_key_source TEXT"),
+        (
+            "stable_client_conversation_id_present",
+            "stable_client_conversation_id_present INTEGER",
+        ),
+        (
+            "synthetic_stable_client_conversation_id",
+            "synthetic_stable_client_conversation_id INTEGER",
+        ),
     ] {
         if !request_observability_events_has_column(conn, name)? {
             conn.execute(
@@ -198,6 +211,10 @@ fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<(
             upstream_send_body_bytes INTEGER NOT NULL DEFAULT 0,
             continuation_saved_bytes INTEGER NOT NULL DEFAULT 0,
             responses_lite INTEGER,
+            prompt_cache_key_present INTEGER,
+            prompt_cache_key_source TEXT,
+            stable_client_conversation_id_present INTEGER,
+            synthetic_stable_client_conversation_id INTEGER,
             prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
@@ -410,11 +427,13 @@ impl MetricsStore {
                 continuation_fallback_used, fallback_reason, upstream_error_status,
                 upstream_error_code, upstream_error_message_class, request_body_bytes,
                 upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
+                prompt_cache_key_present, prompt_cache_key_source,
+                stable_client_conversation_id_present, synthetic_stable_client_conversation_id,
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
                 request_tool_results, request_text_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
             rusqlite::params![
                 ev.request_id,
                 ev.provider,
@@ -445,6 +464,12 @@ impl MetricsStore {
                 ev.upstream_send_body_bytes as i64,
                 ev.continuation_saved_bytes as i64,
                 ev.responses_lite.map(|value| value as i64),
+                ev.prompt_cache_key_present.map(|value| value as i64),
+                ev.prompt_cache_key_source.as_deref(),
+                ev.stable_client_conversation_id_present
+                    .map(|value| value as i64),
+                ev.synthetic_stable_client_conversation_id
+                    .map(|value| value as i64),
                 ev.prompt_too_long_retries as i64,
                 ev.prompt_too_long_original_body_bytes as i64,
                 ev.prompt_too_long_shrunk_body_bytes as i64,
@@ -605,6 +630,8 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 continuation_fallback_used, fallback_reason, upstream_error_status,
                 upstream_error_code, upstream_error_message_class, request_body_bytes,
                 upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
+                prompt_cache_key_present, prompt_cache_key_source,
+                stable_client_conversation_id_present, synthetic_stable_client_conversation_id,
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
@@ -654,14 +681,22 @@ fn request_observability_from_row(
         upstream_send_body_bytes: row.get::<_, i64>(26)? as u64,
         continuation_saved_bytes: row.get::<_, i64>(27)? as u64,
         responses_lite: row.get::<_, Option<i64>>(28)?.map(|value| value != 0),
-        prompt_too_long_retries: row.get::<_, i64>(29)? as u64,
-        prompt_too_long_original_body_bytes: row.get::<_, i64>(30)? as u64,
-        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(31)? as u64,
-        prompt_too_long_dropped_items: row.get::<_, i64>(32)? as u64,
-        request_messages: row.get::<_, i64>(33)? as u64,
-        request_content_blocks: row.get::<_, i64>(34)? as u64,
-        request_tool_results: row.get::<_, i64>(35)? as u64,
-        request_text_bytes: row.get::<_, i64>(36)? as u64,
+        prompt_cache_key_present: row.get::<_, Option<i64>>(29)?.map(|value| value != 0),
+        prompt_cache_key_source: row.get(30)?,
+        stable_client_conversation_id_present: row
+            .get::<_, Option<i64>>(31)?
+            .map(|value| value != 0),
+        synthetic_stable_client_conversation_id: row
+            .get::<_, Option<i64>>(32)?
+            .map(|value| value != 0),
+        prompt_too_long_retries: row.get::<_, i64>(33)? as u64,
+        prompt_too_long_original_body_bytes: row.get::<_, i64>(34)? as u64,
+        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(35)? as u64,
+        prompt_too_long_dropped_items: row.get::<_, i64>(36)? as u64,
+        request_messages: row.get::<_, i64>(37)? as u64,
+        request_content_blocks: row.get::<_, i64>(38)? as u64,
+        request_tool_results: row.get::<_, i64>(39)? as u64,
+        request_text_bytes: row.get::<_, i64>(40)? as u64,
     })
 }
 
@@ -958,6 +993,10 @@ mod tests {
             upstream_send_body_bytes: 120,
             continuation_saved_bytes: 880,
             responses_lite: Some(true),
+            prompt_cache_key_present: Some(true),
+            prompt_cache_key_source: Some("client".to_string()),
+            stable_client_conversation_id_present: Some(true),
+            synthetic_stable_client_conversation_id: Some(false),
             prompt_too_long_retries: 1,
             prompt_too_long_original_body_bytes: 200,
             prompt_too_long_shrunk_body_bytes: 120,
@@ -1006,6 +1045,19 @@ mod tests {
         assert_eq!(stored.recent[0].upstream_send_body_bytes, 120);
         assert_eq!(stored.recent[0].continuation_saved_bytes, 880);
         assert_eq!(stored.recent[0].responses_lite, Some(true));
+        assert_eq!(stored.recent[0].prompt_cache_key_present, Some(true));
+        assert_eq!(
+            stored.recent[0].prompt_cache_key_source.as_deref(),
+            Some("client")
+        );
+        assert_eq!(
+            stored.recent[0].stable_client_conversation_id_present,
+            Some(true)
+        );
+        assert_eq!(
+            stored.recent[0].synthetic_stable_client_conversation_id,
+            Some(false)
+        );
         assert_eq!(stored.recent[1].continuation_fallback_used, Some(true));
         assert_eq!(
             stored.recent[1].fallback_reason.as_deref(),
@@ -1068,6 +1120,24 @@ mod tests {
             request_observability_events_has_column(&conn, "continuation_saved_bytes").unwrap()
         );
         assert!(request_observability_events_has_column(&conn, "responses_lite").unwrap());
+        assert!(
+            request_observability_events_has_column(&conn, "prompt_cache_key_present").unwrap()
+        );
+        assert!(request_observability_events_has_column(&conn, "prompt_cache_key_source").unwrap());
+        assert!(
+            request_observability_events_has_column(
+                &conn,
+                "stable_client_conversation_id_present",
+            )
+            .unwrap()
+        );
+        assert!(
+            request_observability_events_has_column(
+                &conn,
+                "synthetic_stable_client_conversation_id",
+            )
+            .unwrap()
+        );
         let stored = load_request_observability(&conn);
         assert_eq!(stored.recent.len(), 1);
         let event = &stored.recent[0];
@@ -1078,6 +1148,10 @@ mod tests {
         assert_eq!(event.upstream_send_body_bytes, 0);
         assert_eq!(event.continuation_saved_bytes, 0);
         assert_eq!(event.responses_lite, None);
+        assert_eq!(event.prompt_cache_key_present, None);
+        assert_eq!(event.prompt_cache_key_source, None);
+        assert_eq!(event.stable_client_conversation_id_present, None);
+        assert_eq!(event.synthetic_stable_client_conversation_id, None);
         assert_eq!(stored.summary.responses_lite_requests, 0);
         assert_eq!(stored.summary.websocket_requests, 0);
         assert_eq!(stored.summary.continuation_used_requests, 0);

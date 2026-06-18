@@ -664,6 +664,20 @@ fn merge_provider_request_metadata(
     if metadata.responses_lite.is_some() {
         target.responses_lite = metadata.responses_lite;
     }
+    if metadata.prompt_cache_key_present.is_some() {
+        target.prompt_cache_key_present = metadata.prompt_cache_key_present;
+    }
+    if metadata.prompt_cache_key_source.is_some() {
+        target.prompt_cache_key_source = metadata.prompt_cache_key_source.clone();
+    }
+    if metadata.stable_client_conversation_id_present.is_some() {
+        target.stable_client_conversation_id_present =
+            metadata.stable_client_conversation_id_present;
+    }
+    if metadata.synthetic_stable_client_conversation_id.is_some() {
+        target.synthetic_stable_client_conversation_id =
+            metadata.synthetic_stable_client_conversation_id;
+    }
     if metadata.websocket_reused.is_some() {
         target.websocket_reused = metadata.websocket_reused;
     }
@@ -780,6 +794,14 @@ fn build_observability_event(
         upstream_send_body_bytes,
         continuation_saved_bytes: request_body_bytes.saturating_sub(upstream_send_body_bytes),
         responses_lite: observer_state.request_metadata.responses_lite,
+        prompt_cache_key_present: observer_state.request_metadata.prompt_cache_key_present,
+        prompt_cache_key_source: observer_state.request_metadata.prompt_cache_key_source,
+        stable_client_conversation_id_present: observer_state
+            .request_metadata
+            .stable_client_conversation_id_present,
+        synthetic_stable_client_conversation_id: observer_state
+            .request_metadata
+            .synthetic_stable_client_conversation_id,
         prompt_too_long_retries: observer_state.prompt_too_long_retries,
         prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
         prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,
@@ -3050,6 +3072,10 @@ mod tests {
                 transport: Some("sse".to_string()),
                 request_body_bytes: Some(1_000),
                 upstream_send_body_bytes: Some(800),
+                prompt_cache_key_present: Some(true),
+                prompt_cache_key_source: Some("client".to_string()),
+                stable_client_conversation_id_present: Some(true),
+                synthetic_stable_client_conversation_id: Some(false),
                 ..ProviderRequestMetadata::default()
             }),
             ..ProviderRequestObserverEvent::default()
@@ -3067,6 +3093,21 @@ mod tests {
         );
         assert_eq!(state.request_metadata.request_body_bytes, Some(1_000));
         assert_eq!(state.request_metadata.upstream_send_body_bytes, Some(800));
+        assert_eq!(state.request_metadata.prompt_cache_key_present, Some(true));
+        assert_eq!(
+            state.request_metadata.prompt_cache_key_source.as_deref(),
+            Some("client")
+        );
+        assert_eq!(
+            state.request_metadata.stable_client_conversation_id_present,
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .request_metadata
+                .synthetic_stable_client_conversation_id,
+            Some(false)
+        );
     }
 
     #[test]

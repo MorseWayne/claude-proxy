@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.9 - 2026-06-18
+
+### Added in v2.0.9
+
+- Added ChatGPT/Codex prompt-cache and stable-conversation-id observability fields, persisted in request observability history without storing raw cache keys or conversation IDs.
+- Added upstream `retry-after-ms` support for OpenAI-compatible retry delays and upstream error metadata.
+
+### Changed in v2.0.9
+
+- Updated Codex-family OpenAI-compatible model metadata to advertise a 272k context window instead of the GPT-5 default.
+- Treat OpenAI Chat Completions and Responses streams that end before a terminal finish event as upstream network failures instead of successful truncated streams.
+- Avoid retrying quota, billing, hard-limit, and payment-related 429 responses while preserving retries for ordinary transient rate limits.
+- Respect Copilot `thinking.type = "disabled"` by omitting thinking metadata even when an extra output effort hint is present.
+
 ## v2.0.8 - 2026-06-09
 
 ### Added in v2.0.8

@@ -168,6 +168,16 @@ pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
             }
         }
 
+        if converter.started && !converter.stopped && !saw_done {
+            let _ = tx
+                .send(Err(ProviderError::Network(
+                    "upstream OpenAI-compatible stream ended before a terminal finish event"
+                        .to_string(),
+                )))
+                .await;
+            return;
+        }
+
         for event in converter.finish() {
             if tx.send(Ok(event)).await.is_err() {
                 break;
@@ -1052,6 +1062,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_openai_errors_on_clean_eof_without_terminal_event() {
+        let body = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_openai_response(response);
+        let mut saw_truncated_error = false;
+
+        while let Some(item) = stream.next().await {
+            if let Err(ProviderError::Network(message)) = item
+                && message.contains("ended before a terminal finish event")
+            {
+                saw_truncated_error = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_truncated_error,
+            "clean EOF before finish_reason or [DONE] must produce an error"
+        );
+    }
+
+    #[tokio::test]
     async fn test_stream_openai_observer_sees_late_usage_chunk() {
         let body = concat!(
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
@@ -1626,6 +1658,30 @@ mod tests {
             let _ = socket.read(&mut request).await.unwrap();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn response_from_body(content_type: &str, body: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();

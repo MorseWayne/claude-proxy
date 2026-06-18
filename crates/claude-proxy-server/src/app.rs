@@ -70,6 +70,14 @@ pub struct RequestObservabilityEvent {
     pub continuation_saved_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_lite: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_client_conversation_id_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic_stable_client_conversation_id: Option<bool>,
     pub prompt_too_long_retries: u64,
     pub prompt_too_long_original_body_bytes: u64,
     pub prompt_too_long_shrunk_body_bytes: u64,
@@ -848,6 +856,10 @@ mod tests {
                     upstream_send_body_bytes: 120,
                     continuation_saved_bytes: 880,
                     responses_lite: Some(true),
+                    prompt_cache_key_present: Some(true),
+                    prompt_cache_key_source: Some("client".to_string()),
+                    stable_client_conversation_id_present: Some(true),
+                    synthetic_stable_client_conversation_id: Some(false),
                     prompt_too_long_retries: 1,
                     prompt_too_long_original_body_bytes: 200,
                     prompt_too_long_shrunk_body_bytes: 120,
@@ -892,6 +904,10 @@ mod tests {
                     upstream_send_body_bytes: 800_000,
                     continuation_saved_bytes: 0,
                     responses_lite: Some(false),
+                    prompt_cache_key_present: None,
+                    prompt_cache_key_source: None,
+                    stable_client_conversation_id_present: None,
+                    synthetic_stable_client_conversation_id: None,
                     prompt_too_long_retries: 0,
                     prompt_too_long_original_body_bytes: 0,
                     prompt_too_long_shrunk_body_bytes: 0,

@@ -1191,6 +1191,16 @@ where
             }
         }
 
+        if converter.started && !converter.stopped && !saw_done {
+            let _ = tx
+                .send(Err(ProviderError::Network(
+                    "upstream Responses API stream ended before a terminal response event"
+                        .to_string(),
+                )))
+                .await;
+            return;
+        }
+
         if !converter.started {
             let _ = tx
                 .send(Err(malformed_responses_stream_error(
@@ -2621,6 +2631,31 @@ mod tests {
         }
 
         assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_errors_on_clean_eof_without_terminal_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut saw_truncated_error = false;
+
+        while let Some(item) = stream.next().await {
+            if let Err(ProviderError::Network(message)) = item
+                && message.contains("ended before a terminal response event")
+            {
+                saw_truncated_error = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_truncated_error,
+            "clean EOF before response.completed/failed/incomplete or [DONE] must produce an error"
+        );
     }
 
     #[tokio::test]

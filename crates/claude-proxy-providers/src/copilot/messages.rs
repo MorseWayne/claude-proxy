@@ -143,17 +143,26 @@ fn merge_message_content(left: &mut MessageContent, right: MessageContent) {
 }
 
 fn normalize_thinking(body: &mut Map<String, Value>, effort: Option<&str>) {
-    let needs_output_effort = if let Some(Value::Object(thinking)) = body.get_mut("thinking") {
-        match thinking.get("type").and_then(Value::as_str) {
-            Some("enabled") | Some("adaptive") => {
+    let thinking_type = body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let needs_output_effort = match thinking_type.as_deref() {
+        Some("enabled") | Some("adaptive") => {
+            if let Some(Value::Object(thinking)) = body.get_mut("thinking") {
                 thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
                 thinking.remove("budget_tokens");
-                true
             }
-            _ => false,
+            true
         }
-    } else {
-        false
+        Some("disabled") => {
+            body.remove("thinking");
+            false
+        }
+        _ => false,
     };
 
     if needs_output_effort {
@@ -328,5 +337,23 @@ mod tests {
         assert!(body.get("tool_streaming").is_none());
         assert!(body.get("metadata").is_none());
         assert!(body.get("extra").is_none());
+    }
+
+    #[test]
+    fn prepares_copilot_messages_omits_disabled_thinking() {
+        let mut request = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_string()),
+        }]);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("disabled".to_string()),
+            budget_tokens: None,
+        });
+
+        let (body, stats) = prepare_messages_request(&mut request, None).expect("body");
+
+        assert!(!stats.changed());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
     }
 }

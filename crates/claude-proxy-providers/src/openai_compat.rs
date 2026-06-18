@@ -237,6 +237,28 @@ fn is_codex_model(model: &str) -> bool {
     model.contains("codex")
 }
 
+fn context_window_for_model(model_id: &str) -> Option<u32> {
+    if is_codex_model(model_id) {
+        // Codex-family upstreams currently reject prompts above this observed backend limit,
+        // even when adjacent GPT-5 metadata advertises a larger public context window.
+        Some(272_000)
+    } else if model_id.starts_with("gpt-5") {
+        Some(400_000)
+    } else {
+        None
+    }
+}
+
+fn max_output_tokens_for_model(model_id: &str) -> Option<u32> {
+    if model_id.starts_with("gpt-5.5") {
+        Some(128_000)
+    } else if model_id.contains("mini") {
+        Some(16_384)
+    } else {
+        None
+    }
+}
+
 fn supported_endpoints_for(model: &str) -> Vec<String> {
     if supports_responses(model) {
         if is_codex_model(model) {
@@ -280,18 +302,8 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 ..Default::default()
             },
             limits: ModelLimits {
-                max_output_tokens: if model_id.starts_with("gpt-5.5") {
-                    Some(128_000)
-                } else if model_id.contains("mini") {
-                    Some(16_384)
-                } else {
-                    None
-                },
-                context_window: if model_id.starts_with("gpt-5") {
-                    Some(400_000)
-                } else {
-                    None
-                },
+                max_output_tokens: max_output_tokens_for_model(model_id),
+                context_window: context_window_for_model(model_id),
                 reasoning_effort_levels: reasoning_efforts,
                 ..Default::default()
             },
@@ -786,6 +798,7 @@ mod tests {
         let info = openai_model_info("gpt-5.3-codex");
 
         assert!(prefers_responses("gpt-5.3-codex"));
+        assert_eq!(info.capabilities.limits.context_window, Some(272_000));
         assert_eq!(
             info.capabilities.endpoints.supported_paths(),
             vec!["/responses"]
