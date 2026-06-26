@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.0.10 - 2026-06-26
+
+### Fixed in v2.0.10
+
+- Disabled ChatGPT/Codex Responses Lite by default for `gpt-5.5` so requests no longer send the unsupported internal Responses Lite header unless explicitly forced by configuration.
+
 ## v2.0.9 - 2026-06-18
 
 ### Added in v2.0.9

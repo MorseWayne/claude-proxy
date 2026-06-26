@@ -2586,7 +2586,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         model_id: "gpt-5.5",
         context_window: 272_000,
         image_input: true,
-        responses_lite: true,
+        responses_lite: false,
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4",
@@ -3270,12 +3270,16 @@ mod tests {
         let provider = test_chatgpt_provider("http://127.0.0.1/responses".to_string()).await;
 
         let gpt55 = provider.responses_lite_decision("gpt-5.5");
-        assert!(gpt55.is_enabled());
-        assert_eq!(gpt55.source_str(), "model_capability");
+        assert!(!gpt55.is_enabled());
+        assert_eq!(gpt55.source_str(), "unknown_model");
 
         let routed_gpt55 = provider.responses_lite_decision("chatgpt/gpt-5.5");
-        assert!(routed_gpt55.is_enabled());
-        assert_eq!(routed_gpt55.source_str(), "model_capability");
+        assert!(!routed_gpt55.is_enabled());
+        assert_eq!(routed_gpt55.source_str(), "unknown_model");
+
+        let gpt54 = provider.responses_lite_decision("gpt-5.4");
+        assert!(gpt54.is_enabled());
+        assert_eq!(gpt54.source_str(), "model_capability");
 
         let spark = provider.responses_lite_decision("gpt-5.3-codex-spark");
         assert!(!spark.is_enabled());
