@@ -883,10 +883,12 @@ fn start_editing(app: &mut App) {
                 String::new(),
                 "default".to_string(),
                 "none".to_string(),
+                "minimal".to_string(),
                 "low".to_string(),
                 "medium".to_string(),
                 "high".to_string(),
                 "xhigh".to_string(),
+                "max".to_string(),
             ];
             let current = model_reasoning_effort_value(&app.settings.model, &section);
             let selected = items.iter().position(|item| item == &current).unwrap_or(0);
@@ -1093,10 +1095,12 @@ fn parse_model_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
         "" => None,
         "default" => Some(ModelReasoningEffort::Auto),
         "none" => Some(ModelReasoningEffort::Disabled),
+        "minimal" => Some(ModelReasoningEffort::Minimal),
         "low" => Some(ModelReasoningEffort::Low),
         "medium" => Some(ModelReasoningEffort::Medium),
         "high" => Some(ModelReasoningEffort::High),
         "xhigh" => Some(ModelReasoningEffort::XHigh),
+        "max" => Some(ModelReasoningEffort::Max),
         _ => None,
     }
 }
@@ -3309,6 +3313,18 @@ mod tests {
         );
         assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");
         assert_eq!(capabilities[0].1.supported_parameters[1], "tools");
+    }
+
+    #[test]
+    fn model_reasoning_effort_picker_parses_new_effort_levels() {
+        assert_eq!(
+            parse_model_reasoning_effort("minimal"),
+            Some(ModelReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            parse_model_reasoning_effort("max"),
+            Some(ModelReasoningEffort::Max)
+        );
     }
 
     #[test]

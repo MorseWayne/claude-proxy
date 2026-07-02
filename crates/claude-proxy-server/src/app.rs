@@ -220,6 +220,8 @@ impl RequestObservabilityMetrics {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
 }
@@ -239,6 +241,8 @@ pub struct UsageMetrics {
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
 }
@@ -255,6 +259,7 @@ impl UsageMetrics {
         self.requests += 1;
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
+        self.reasoning_output_tokens += usage.reasoning_output_tokens;
         self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
         self.cache_read_input_tokens += usage.cache_read_input_tokens;
     }
@@ -700,6 +705,7 @@ mod tests {
             requests: 1,
             input_tokens: 100,
             output_tokens: 25,
+            reasoning_output_tokens: 10,
             cache_creation_input_tokens: 40,
             cache_read_input_tokens: 60,
         };
@@ -713,6 +719,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 11,
             output_tokens: 7,
+            reasoning_output_tokens: 4,
             cache_creation_input_tokens: 3,
             cache_read_input_tokens: 2,
         };
@@ -734,6 +741,7 @@ mod tests {
         assert_eq!(data["models"]["gpt-5.5"]["requests"], 1);
         assert_eq!(data["models"]["gpt-5.5"]["input_tokens"], 11);
         assert_eq!(data["providers"]["chatgpt"]["output_tokens"], 7);
+        assert_eq!(data["providers"]["chatgpt"]["reasoning_output_tokens"], 4);
         assert_eq!(
             data["initiators"]["agent"]["cache_creation_input_tokens"],
             3
@@ -780,6 +788,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 2,
             output_tokens: 3,
+            reasoning_output_tokens: 1,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
@@ -818,6 +827,7 @@ mod tests {
         assert_eq!(data["models"]["gpt-4.1"]["requests"], 32);
         assert_eq!(data["providers"]["openai"]["input_tokens"], 64);
         assert_eq!(data["initiators"]["user"]["output_tokens"], 96);
+        assert_eq!(data["initiators"]["user"]["reasoning_output_tokens"], 32);
     }
 
     #[tokio::test]

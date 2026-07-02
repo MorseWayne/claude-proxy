@@ -37,6 +37,7 @@ struct OpenAiChunk {
 struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    reasoning_tokens: u32,
 }
 
 #[derive(Debug)]
@@ -759,6 +760,11 @@ fn parse_openai_chunk(text: &str) -> Option<OpenAiChunk> {
     let usage = data.get("usage").map(|u| OpenAiUsage {
         prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        reasoning_tokens: u
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .or_else(|| u.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
     });
 
     Some(OpenAiChunk {
@@ -780,6 +786,7 @@ fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, chunk: &Op
     let usage = chunk.usage.as_ref().map(|usage| ProviderUsageMetadata {
         input_tokens: usage.prompt_tokens as u64,
         output_tokens: usage.completion_tokens as u64,
+        reasoning_output_tokens: usage.reasoning_tokens as u64,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
     });
@@ -1088,7 +1095,7 @@ mod tests {
         let body = concat!(
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n",
             "data: [DONE]\n\n",
         );
         let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
@@ -1118,6 +1125,7 @@ mod tests {
             .expect("late usage metadata should be observed");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.reasoning_output_tokens, 1);
     }
 
     #[test]
@@ -1546,6 +1554,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 11,
                 completion_tokens: 3,
+                reasoning_tokens: 0,
             }),
         });
 

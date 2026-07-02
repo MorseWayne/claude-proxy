@@ -270,9 +270,11 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 [providers.chatgpt.chatgpt.model_capabilities."gpt-5.5"]
 context_window = 272000
 image_input = true
-reasoning_effort_levels = ["low", "medium", "high", "xhigh"]
+reasoning_effort_levels = ["minimal", "low", "medium", "high", "xhigh", "max"]
 responses_lite = true
 ```
+
+`xhigh` 会继续兼容旧配置；新版 Codex/ChatGPT 上游支持原生 `max` 时，可以在模型能力或别名 `reasoning_effort` 中显式使用 `max`。
 
 #### 3. 设置默认模型和 Claude 模型别名
 

@@ -132,7 +132,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 [providers.chatgpt.chatgpt.model_capabilities."gpt-5.5"]
 context_window = 272000
 image_input = true
-reasoning_effort_levels = ["low", "medium", "high", "xhigh"]
+reasoning_effort_levels = ["minimal", "low", "medium", "high", "xhigh", "max"]
 responses_lite = true
 
 [model]
@@ -172,6 +172,8 @@ with_stdout = true                      # Also emit to stderr (foreground server
 raw_api_payloads = false                # Log raw request payloads
 raw_sse_events = false                  # Log raw SSE events
 ```
+
+`xhigh` remains supported for older configs; when newer Codex/ChatGPT upstreams advertise native `max`, you can use `max` in model capabilities or alias `reasoning_effort`.
 
 ### Model Routing
 

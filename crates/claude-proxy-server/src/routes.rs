@@ -2272,6 +2272,13 @@ fn update_usage_snapshot(u: &Value, usage: &mut TokenUsage) {
         usage.output_tokens = usage.output_tokens.max(v);
     }
     if let Some(v) = u
+        .get("reasoning_output_tokens")
+        .or_else(|| u.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        usage.reasoning_output_tokens = usage.reasoning_output_tokens.max(v);
+    }
+    if let Some(v) = u
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
     {
@@ -2291,6 +2298,9 @@ fn merge_observer_usage(state: &Arc<StdMutex<RequestObserverState>>, usage: &mut
 fn merge_provider_usage_metadata(provider_usage: &ProviderUsageMetadata, usage: &mut TokenUsage) {
     usage.input_tokens = usage.input_tokens.max(provider_usage.input_tokens);
     usage.output_tokens = usage.output_tokens.max(provider_usage.output_tokens);
+    usage.reasoning_output_tokens = usage
+        .reasoning_output_tokens
+        .max(provider_usage.reasoning_output_tokens);
     usage.cache_creation_input_tokens = usage
         .cache_creation_input_tokens
         .max(provider_usage.cache_creation_input_tokens);
@@ -2302,6 +2312,9 @@ fn merge_provider_usage_metadata(provider_usage: &ProviderUsageMetadata, usage: 
 fn merge_usage_snapshot(snapshot: &TokenUsage, usage: &mut TokenUsage) {
     usage.input_tokens = usage.input_tokens.max(snapshot.input_tokens);
     usage.output_tokens = usage.output_tokens.max(snapshot.output_tokens);
+    usage.reasoning_output_tokens = usage
+        .reasoning_output_tokens
+        .max(snapshot.reasoning_output_tokens);
     usage.cache_creation_input_tokens = usage
         .cache_creation_input_tokens
         .max(snapshot.cache_creation_input_tokens);
@@ -2483,6 +2496,21 @@ mod tests {
                 .get("reasoning_effort")
                 .and_then(Value::as_str),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn alias_reasoning_effort_accepts_max_request_value() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::Max));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("max")
         );
     }
 
@@ -3121,6 +3149,7 @@ mod tests {
                 usage: Some(ProviderUsageMetadata {
                     input_tokens: 42,
                     output_tokens: 9,
+                    reasoning_output_tokens: 4,
                     cache_creation_input_tokens: 3,
                     cache_read_input_tokens: 5,
                 }),
@@ -3134,6 +3163,7 @@ mod tests {
         let mut usage = TokenUsage {
             input_tokens: 1,
             output_tokens: 2,
+            reasoning_output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
@@ -3141,6 +3171,7 @@ mod tests {
 
         assert_eq!(usage.input_tokens, 42);
         assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.reasoning_output_tokens, 4);
         assert_eq!(usage.cache_creation_input_tokens, 3);
         assert_eq!(usage.cache_read_input_tokens, 5);
     }
@@ -3165,7 +3196,8 @@ mod tests {
                 "type": "message_delta",
                 "usage": {
                     "input_tokens": 12,
-                    "output_tokens": 7
+                    "output_tokens": 7,
+                    "reasoning_output_tokens": 3
                 }
             }),
             &mut usage,
@@ -3183,6 +3215,7 @@ mod tests {
 
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.reasoning_output_tokens, 3);
     }
 
     #[test]

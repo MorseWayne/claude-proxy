@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 
 use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
+    is_non_retryable_rate_limit_error_body, is_non_retryable_rate_limit_headers,
     map_upstream_response, read_upstream_response_text, send_upstream_request_with_policy,
     upstream_error_metadata_from_parts,
 };
@@ -2360,6 +2361,12 @@ fn map_chatgpt_error_status_body_with_headers(
             StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
             StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
             StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
+            StatusCode::TOO_MANY_REQUESTS
+                if is_non_retryable_rate_limit_headers(headers)
+                    || is_non_retryable_rate_limit_error_body(&body) =>
+            {
+                ProviderError::InvalidRequest(message)
+            }
             StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimited {
                 retry_after: metadata.retry_after,
             },
@@ -2714,7 +2721,7 @@ fn configured_reasoning_effort_levels(
 }
 
 fn default_reasoning_efforts() -> Vec<String> {
-    ["low", "medium", "high", "xhigh"]
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -3395,7 +3402,7 @@ mod tests {
         );
         assert_eq!(
             gpt55.capabilities.limits.reasoning_effort_levels,
-            vec!["low", "medium", "high", "xhigh"]
+            vec!["minimal", "low", "medium", "high", "xhigh", "max"]
         );
 
         let spark = models
@@ -5864,6 +5871,75 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn chatgpt_quota_body_rate_limit_maps_to_invalid_request() {
+        let body = r#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#;
+        let error = map_chatgpt_error_status_body(StatusCode::TOO_MANY_REQUESTS, body.to_string());
+
+        match error.without_upstream_metadata() {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "quota exhausted");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let metadata = error.upstream_metadata().unwrap();
+        assert_eq!(metadata.status, 429);
+        assert_eq!(metadata.body_preview.as_deref(), Some(body));
+    }
+
+    #[test]
+    fn chatgpt_quota_header_rate_limit_maps_to_invalid_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        headers.insert("x-request-id", "req_quota".parse().unwrap());
+        headers.insert("x-ratelimit-reason", "billing".parse().unwrap());
+        let body = r#"{"error":{"message":"billing issue"}}"#;
+        let error = map_chatgpt_error_status_body_with_headers(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            body.to_string(),
+        );
+
+        match error.without_upstream_metadata() {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "billing issue");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let metadata = error.upstream_metadata().unwrap();
+        assert_eq!(metadata.retry_after, Some(2));
+        assert_eq!(metadata.request_id.as_deref(), Some("req_quota"));
+        assert!(
+            metadata
+                .headers
+                .iter()
+                .any(|header| { header.name == "x-ratelimit-reason" && header.value == "billing" })
+        );
+    }
+
+    #[test]
+    fn chatgpt_ordinary_rate_limit_remains_rate_limited() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "4".parse().unwrap());
+        let body = r#"{"error":{"message":"slow down"}}"#;
+        let error = map_chatgpt_error_status_body_with_headers(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            body.to_string(),
+        );
+
+        match error.without_upstream_metadata() {
+            ProviderError::RateLimited { retry_after } => {
+                assert_eq!(*retry_after, Some(4));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        assert_eq!(error.upstream_metadata().unwrap().retry_after, Some(4));
     }
 
     #[test]

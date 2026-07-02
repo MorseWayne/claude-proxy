@@ -294,7 +294,7 @@ fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     render_hint(
         f,
         rows_area[5],
-        "Model: provider_id/model_name. Reasoning: unset | default | none | low | medium | high | xhigh",
+        "Model: provider_id/model_name. Reasoning: unset | default | none | minimal | low | medium | high | xhigh | max",
     );
 }
 

@@ -496,6 +496,8 @@ pub enum ModelReasoningEffort {
     Auto,
     #[serde(rename = "none")]
     Disabled,
+    #[serde(rename = "minimal")]
+    Minimal,
     #[serde(rename = "low")]
     Low,
     #[serde(rename = "medium")]
@@ -504,6 +506,8 @@ pub enum ModelReasoningEffort {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+    #[serde(rename = "max")]
+    Max,
 }
 
 impl ModelReasoningEffort {
@@ -511,10 +515,12 @@ impl ModelReasoningEffort {
         match self {
             ModelReasoningEffort::Auto => None,
             ModelReasoningEffort::Disabled => Some("none"),
+            ModelReasoningEffort::Minimal => Some("minimal"),
             ModelReasoningEffort::Low => Some("low"),
             ModelReasoningEffort::Medium => Some("medium"),
             ModelReasoningEffort::High => Some("high"),
             ModelReasoningEffort::XHigh => Some("xhigh"),
+            ModelReasoningEffort::Max => Some("max"),
         }
     }
 
@@ -522,10 +528,12 @@ impl ModelReasoningEffort {
         match self {
             ModelReasoningEffort::Auto => "default",
             ModelReasoningEffort::Disabled => "none",
+            ModelReasoningEffort::Minimal => "minimal",
             ModelReasoningEffort::Low => "low",
             ModelReasoningEffort::Medium => "medium",
             ModelReasoningEffort::High => "high",
             ModelReasoningEffort::XHigh => "xhigh",
+            ModelReasoningEffort::Max => "max",
         }
     }
 }
@@ -1295,7 +1303,7 @@ reasoning = { name = "openai/gpt-5", reasoning_markers = "sanitize_only" }
         let toml = r#"
 [model]
 default = "openai/gpt-4.1"
-reasoning = { name = "openai/gpt-5", reasoning_effort = "high" }
+reasoning = { name = "openai/gpt-5", reasoning_effort = "max" }
 
 [model.opus]
 name = "anthropic/claude-opus-4-20250514"
@@ -1312,7 +1320,7 @@ reasoning_effort = "default"
                 .reasoning
                 .as_ref()
                 .and_then(|alias| alias.reasoning_effort),
-            Some(ModelReasoningEffort::High)
+            Some(ModelReasoningEffort::Max)
         );
         assert_eq!(
             settings.model.opus_name(),

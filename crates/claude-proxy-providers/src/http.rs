@@ -25,7 +25,7 @@ use claude_proxy_config::settings::{
 use futures::StreamExt;
 use reqwest::{
     RequestBuilder, StatusCode,
-    header::{HeaderName, HeaderValue},
+    header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -41,6 +41,21 @@ const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(5);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_SUCCESS_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+const NON_RETRYABLE_RATE_LIMIT_VALUES: &[&str] = &[
+    "insufficient_quota",
+    "billing",
+    "hard_limit",
+    "payment_required",
+    "quota_exceeded",
+];
+const NON_RETRYABLE_RATE_LIMIT_BODY_POINTERS: &[&str] = &[
+    "/error/code",
+    "/error/type",
+    "/error/reason",
+    "/code",
+    "/type",
+    "/reason",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamRequestPolicy {
@@ -310,7 +325,8 @@ fn should_retry_result(
 
 fn should_retry_response(response: &reqwest::Response, policy: UpstreamRequestPolicy) -> bool {
     if response.status() == StatusCode::TOO_MANY_REQUESTS {
-        return policy.retry_rate_limits && !is_non_retryable_rate_limit_response(response);
+        return policy.retry_rate_limits
+            && !is_non_retryable_rate_limit_headers(response.headers());
     }
     should_retry_status(response.status(), policy)
 }
@@ -329,23 +345,35 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn is_non_retryable_rate_limit_response(response: &reqwest::Response) -> bool {
+pub(crate) fn is_non_retryable_rate_limit_headers(headers: &HeaderMap) -> bool {
     header_contains_any(
-        response.headers(),
+        headers,
         &[
             "x-openai-error-code",
             "openai-error-code",
             "x-ratelimit-reason",
             "x-rate-limit-reason",
         ],
-        &[
-            "insufficient_quota",
-            "billing",
-            "hard_limit",
-            "payment_required",
-            "quota_exceeded",
-        ],
+        NON_RETRYABLE_RATE_LIMIT_VALUES,
     )
+}
+
+pub(crate) fn is_non_retryable_rate_limit_error_body(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            NON_RETRYABLE_RATE_LIMIT_BODY_POINTERS
+                .iter()
+                .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+                .any(value_contains_non_retryable_rate_limit)
+        })
+}
+
+fn value_contains_non_retryable_rate_limit(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    NON_RETRYABLE_RATE_LIMIT_VALUES
+        .iter()
+        .any(|needle| value.contains(needle))
 }
 
 fn is_retryable_overload_status(status: u16) -> bool {
@@ -415,11 +443,15 @@ fn retry_after_duration_to_seconds(delay: Duration) -> u64 {
 
 pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
+    let non_retryable_rate_limit_headers =
+        status == 429 && is_non_retryable_rate_limit_headers(response.headers());
     let retry_after = retry_after_seconds_from_headers(response.headers());
     let request_id = upstream_request_id_from_headers(response.headers());
     let safe_headers = safe_upstream_error_headers(response.headers());
     let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let message = extract_upstream_error_message(&body);
+    let non_retryable_rate_limit =
+        non_retryable_rate_limit_headers || is_non_retryable_rate_limit_error_body(&body);
     let metadata = UpstreamErrorMetadata {
         status,
         retry_after,
@@ -434,6 +466,7 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         401 => ProviderError::Authentication(message),
         404 => ProviderError::ModelNotFound(message),
         413 => ProviderError::RequestTooLarge(message),
+        429 if non_retryable_rate_limit => ProviderError::InvalidRequest(message),
         429 => ProviderError::RateLimited { retry_after },
         status if is_retryable_overload_status(status) => ProviderError::Overloaded {
             message,
@@ -839,6 +872,48 @@ mod tests {
             &Ok(response),
             UpstreamRequestPolicy::default()
         ));
+    }
+
+    #[tokio::test]
+    async fn quota_rate_limit_bodies_map_to_invalid_request() {
+        let bodies = [
+            r#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#,
+            r#"{"error":{"type":"billing_error","message":"billing issue"}}"#,
+            r#"{"error":{"reason":"hard_limit_reached","message":"hard limit"}}"#,
+            r#"{"code":"payment_required","message":"payment required"}"#,
+            r#"{"type":"quota_exceeded","message":"quota exceeded"}"#,
+            r#"{"reason":"insufficient_quota","message":"quota reason"}"#,
+        ];
+
+        for body in bodies {
+            let response = response_with_status_headers_and_body(
+                "429 Too Many Requests",
+                &[
+                    ("retry-after", "3"),
+                    ("x-request-id", "req_quota"),
+                    ("x-ratelimit-remaining-requests", "0"),
+                ],
+                body,
+            )
+            .await;
+
+            let error = map_upstream_response(response).await;
+            match error.without_upstream_metadata() {
+                ProviderError::InvalidRequest(message) => {
+                    assert!(!message.is_empty());
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+
+            let metadata = error.upstream_metadata().unwrap();
+            assert_eq!(metadata.status, 429);
+            assert_eq!(metadata.retry_after, Some(3));
+            assert_eq!(metadata.request_id.as_deref(), Some("req_quota"));
+            assert_eq!(metadata.body_preview.as_deref(), Some(body));
+            assert!(metadata.headers.iter().any(|header| {
+                header.name == "x-ratelimit-remaining-requests" && header.value == "0"
+            }));
+        }
     }
 
     #[tokio::test]

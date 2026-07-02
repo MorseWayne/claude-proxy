@@ -27,6 +27,7 @@ struct UsageEvent {
     model: String,
     input_tokens: i64,
     output_tokens: i64,
+    reasoning_output_tokens: i64,
     cache_creation_input_tokens: i64,
     cache_read_input_tokens: i64,
     is_error: i64,
@@ -57,6 +58,12 @@ fn ensure_usage_events_diagnostic_columns(conn: &Connection) -> rusqlite::Result
     if !usage_events_has_column(conn, "error_kind")? {
         conn.execute(
             "ALTER TABLE usage_events ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !usage_events_has_column(conn, "reasoning_output_tokens")? {
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN reasoning_output_tokens INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -91,6 +98,7 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
             model TEXT NOT NULL,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
             is_error INTEGER NOT NULL DEFAULT 0,
@@ -401,15 +409,16 @@ impl MetricsStore {
             MetricsWriteEvent::Usage(ev) => tx.execute(
                 "INSERT INTO usage_events (
                     provider, initiator, model, input_tokens, output_tokens,
-                    cache_creation_input_tokens, cache_read_input_tokens, is_error, latency_ms,
-                    terminal_reason, error_kind
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    reasoning_output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                    is_error, latency_ms, terminal_reason, error_kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     ev.provider,
                     ev.initiator,
                     ev.model,
                     ev.input_tokens,
                     ev.output_tokens,
+                    ev.reasoning_output_tokens,
                     ev.cache_creation_input_tokens,
                     ev.cache_read_input_tokens,
                     ev.is_error,
@@ -491,6 +500,7 @@ impl MetricsStore {
             model: record.model.to_string(),
             input_tokens: record.usage.input_tokens as i64,
             output_tokens: record.usage.output_tokens as i64,
+            reasoning_output_tokens: record.usage.reasoning_output_tokens as i64,
             cache_creation_input_tokens: record.usage.cache_creation_input_tokens as i64,
             cache_read_input_tokens: record.usage.cache_read_input_tokens as i64,
             is_error: record.is_error as i64,
@@ -710,6 +720,7 @@ fn load_usage_metrics(
                 COUNT(*) as requests,
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(reasoning_output_tokens), 0),
                 COALESCE(SUM(cache_creation_input_tokens), 0),
                 COALESCE(SUM(cache_read_input_tokens), 0)
          FROM usage_events
@@ -724,6 +735,7 @@ fn load_usage_metrics(
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
     {
@@ -734,8 +746,9 @@ fn load_usage_metrics(
                     requests: row.1 as u64,
                     input_tokens: row.2 as u64,
                     output_tokens: row.3 as u64,
-                    cache_creation_input_tokens: row.4 as u64,
-                    cache_read_input_tokens: row.5 as u64,
+                    reasoning_output_tokens: row.4 as u64,
+                    cache_creation_input_tokens: row.5 as u64,
+                    cache_read_input_tokens: row.6 as u64,
                 },
             );
         }
@@ -904,6 +917,7 @@ mod tests {
             usage: &TokenUsage {
                 input_tokens: 11,
                 output_tokens: 7,
+                reasoning_output_tokens: 4,
                 cache_creation_input_tokens: 3,
                 cache_read_input_tokens: 2,
             },
@@ -919,6 +933,7 @@ mod tests {
             usage: &TokenUsage {
                 input_tokens: 5,
                 output_tokens: 13,
+                reasoning_output_tokens: 8,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 1,
             },
@@ -935,6 +950,7 @@ mod tests {
         assert_eq!(totals.errors_total, 1);
         assert_eq!(totals.model_metrics["gpt-5.5"].input_tokens, 11);
         assert_eq!(totals.model_metrics["gpt-4.1"].output_tokens, 13);
+        assert_eq!(totals.model_metrics["gpt-4.1"].reasoning_output_tokens, 8);
         assert_eq!(
             totals.provider_metrics["chatgpt"].cache_creation_input_tokens,
             3

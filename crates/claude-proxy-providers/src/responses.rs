@@ -1339,9 +1339,20 @@ fn provider_usage_from_responses_usage(usage: &Value) -> ProviderUsageMetadata {
     ProviderUsageMetadata {
         input_tokens: input_tokens.saturating_sub(cached_input_tokens),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        reasoning_output_tokens: responses_reasoning_output_tokens(usage),
         cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
         cache_read_input_tokens: cached_input_tokens,
     }
+}
+
+fn responses_reasoning_output_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .or_else(|| usage.get("reasoning_output_tokens"))
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn responses_cached_input_tokens(usage: &Value) -> u64 {
@@ -2689,12 +2700,14 @@ mod tests {
             "input_tokens": 100,
             "output_tokens": 20,
             "total_tokens": 120,
-            "input_tokens_details": {"cached_tokens": 30}
+            "input_tokens_details": {"cached_tokens": 30},
+            "output_tokens_details": {"reasoning_tokens": 8}
         }));
 
         assert_eq!(usage.input_tokens, 70);
         assert_eq!(usage.cache_read_input_tokens, 30);
         assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_output_tokens, 8);
         assert_eq!(
             usage.input_tokens + usage.cache_read_input_tokens + usage.output_tokens,
             120
@@ -2711,6 +2724,7 @@ mod tests {
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.reasoning_output_tokens, 0);
     }
 
     #[test]
@@ -2829,6 +2843,31 @@ mod tests {
         assert_eq!(
             tool_input_delta_json(&events),
             json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_custom_tool_output_item_done_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_custom_tool_output_item_done.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(
+            tool_block.data["content_block"]["id"],
+            "call_custom_fixture_done_1"
+        );
+        assert_eq!(tool_block.data["content_block"]["name"], "exec");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"input": "echo ready"})
         );
         assert_eq!(stop_reason(&events), "tool_use");
     }
@@ -3400,7 +3439,7 @@ mod tests {
             (2048, "low"),
             (8192, "medium"),
             (16_384, "high"),
-            (16_385, "xhigh"),
+            (16_385, "max"),
         ] {
             let req = MessagesRequest {
                 model: "gpt-5".to_string(),

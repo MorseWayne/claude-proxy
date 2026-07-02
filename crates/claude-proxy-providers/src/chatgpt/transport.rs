@@ -1652,10 +1652,11 @@ async fn connect_websocket(
     let resolved_proxy = resolve_websocket_proxy(provider.proxy.as_deref(), &url)?;
     let proxy_source = resolved_proxy.source;
     let proxy_enabled = resolved_proxy.url.is_some();
+    let connect_timeout = websocket_connect_timeout(provider);
 
-    let (stream, response) = tokio::time::timeout(CHATGPT_WEBSOCKET_CONNECT_TIMEOUT, async {
+    let (stream, response) = tokio::time::timeout(connect_timeout, async {
         if let Some(proxy) = resolved_proxy.url.as_deref() {
-            let socket = connect_proxy_tunnel(proxy, &url).await?;
+            let socket = connect_proxy_tunnel(proxy, &url, connect_timeout).await?;
             client_async_tls_with_config(request, socket, None, connector)
                 .await
                 .map_err(map_websocket_connect_error)
@@ -1866,6 +1867,7 @@ fn websocket_tls_connector(
 async fn connect_proxy_tunnel(
     proxy: &str,
     target_url: &Url,
+    connect_timeout: Duration,
 ) -> Result<TcpStream, ChatGptWebSocketStartError> {
     let proxy_url = Url::parse(proxy).map_err(|error| {
         ChatGptWebSocketStartError::with_phase(
@@ -1920,7 +1922,7 @@ async fn connect_proxy_tunnel(
     })?;
     let target_authority = format!("{target_host}:{target_port}");
     let mut socket = tokio::time::timeout(
-        CHATGPT_WEBSOCKET_CONNECT_TIMEOUT,
+        connect_timeout,
         TcpStream::connect((proxy_host, proxy_port)),
     )
     .await
@@ -1954,29 +1956,26 @@ async fn connect_proxy_tunnel(
     }
     request.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
 
-    tokio::time::timeout(
-        CHATGPT_WEBSOCKET_CONNECT_TIMEOUT,
-        socket.write_all(request.as_bytes()),
-    )
-    .await
-    .map_err(|_| {
-        ChatGptWebSocketStartError::with_phase(
-            ProviderError::Timeout,
-            true,
-            ChatGptWebSocketPhase::ProxyConnect,
-        )
-    })?
-    .map_err(|error| {
-        ChatGptWebSocketStartError::with_phase(
-            ProviderError::Network(format!(
-                "failed to write ChatGPT websocket proxy CONNECT: {error}"
-            )),
-            true,
-            ChatGptWebSocketPhase::ProxyConnect,
-        )
-    })?;
+    tokio::time::timeout(connect_timeout, socket.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| {
+            ChatGptWebSocketStartError::with_phase(
+                ProviderError::Timeout,
+                true,
+                ChatGptWebSocketPhase::ProxyConnect,
+            )
+        })?
+        .map_err(|error| {
+            ChatGptWebSocketStartError::with_phase(
+                ProviderError::Network(format!(
+                    "failed to write ChatGPT websocket proxy CONNECT: {error}"
+                )),
+                true,
+                ChatGptWebSocketPhase::ProxyConnect,
+            )
+        })?;
 
-    let response = read_proxy_connect_response(&mut socket).await?;
+    let response = read_proxy_connect_response(&mut socket, connect_timeout).await?;
     let status = parse_proxy_connect_status(&response).ok_or_else(|| {
         ChatGptWebSocketStartError::with_phase(
             ProviderError::Network("invalid ChatGPT websocket proxy CONNECT response".to_string()),
@@ -1999,29 +1998,29 @@ async fn connect_proxy_tunnel(
 
 async fn read_proxy_connect_response(
     socket: &mut TcpStream,
+    connect_timeout: Duration,
 ) -> Result<Vec<u8>, ChatGptWebSocketStartError> {
     let mut response = Vec::new();
     let mut buffer = [0_u8; 512];
     loop {
-        let read =
-            tokio::time::timeout(CHATGPT_WEBSOCKET_CONNECT_TIMEOUT, socket.read(&mut buffer))
-                .await
-                .map_err(|_| {
-                    ChatGptWebSocketStartError::with_phase(
-                        ProviderError::Timeout,
-                        true,
-                        ChatGptWebSocketPhase::ProxyConnect,
-                    )
-                })?
-                .map_err(|error| {
-                    ChatGptWebSocketStartError::with_phase(
-                        ProviderError::Network(format!(
-                            "failed to read ChatGPT websocket proxy CONNECT response: {error}"
-                        )),
-                        true,
-                        ChatGptWebSocketPhase::ProxyConnect,
-                    )
-                })?;
+        let read = tokio::time::timeout(connect_timeout, socket.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                ChatGptWebSocketStartError::with_phase(
+                    ProviderError::Timeout,
+                    true,
+                    ChatGptWebSocketPhase::ProxyConnect,
+                )
+            })?
+            .map_err(|error| {
+                ChatGptWebSocketStartError::with_phase(
+                    ProviderError::Network(format!(
+                        "failed to read ChatGPT websocket proxy CONNECT response: {error}"
+                    )),
+                    true,
+                    ChatGptWebSocketPhase::ProxyConnect,
+                )
+            })?;
         if read == 0 {
             break;
         }
@@ -2392,6 +2391,20 @@ fn websocket_idle_timeout(provider: &ChatGptProvider) -> Duration {
         .unwrap_or(CHATGPT_WEBSOCKET_IDLE_TIMEOUT)
 }
 
+fn websocket_connect_timeout(provider: &ChatGptProvider) -> Duration {
+    websocket_connect_timeout_for_runtime(&provider.runtime)
+}
+
+fn websocket_connect_timeout_for_runtime(
+    runtime: &claude_proxy_config::settings::ProviderRuntimeConfig,
+) -> Duration {
+    runtime
+        .request
+        .attempt_timeout_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(CHATGPT_WEBSOCKET_CONNECT_TIMEOUT)
+}
+
 async fn close_or_release_websocket(mut stream: ChatGptWsStream) {
     let _ = tokio::time::timeout(Duration::from_secs(1), stream.close(None)).await;
 }
@@ -2403,7 +2416,30 @@ fn response_consumer_dropped_error() -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_proxy_config::settings::{ProviderRequestConfig, ProviderRuntimeConfig};
     use serde_json::json;
+
+    #[test]
+    fn websocket_connect_timeout_uses_runtime_attempt_timeout_override() {
+        let default_runtime = ProviderRuntimeConfig::default();
+        assert_eq!(
+            websocket_connect_timeout_for_runtime(&default_runtime),
+            CHATGPT_WEBSOCKET_CONNECT_TIMEOUT
+        );
+
+        let runtime = ProviderRuntimeConfig {
+            request: ProviderRequestConfig {
+                attempt_timeout_seconds: Some(45),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            websocket_connect_timeout_for_runtime(&runtime),
+            Duration::from_secs(45)
+        );
+    }
 
     #[test]
     fn response_create_request_text_wraps_body_with_type() {

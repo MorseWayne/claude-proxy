@@ -2,7 +2,7 @@ use claude_proxy_core::*;
 use serde_json::{Value, json};
 use tracing::{Level, debug, enabled, info};
 
-const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn intent(req: &MessagesRequest) -> Option<&str> {
     req.metadata
@@ -128,6 +128,7 @@ pub(crate) fn thinking_budget_to_reasoning_effort(budget_tokens: u32, model: &st
         0..=2048 => "low",
         2049..=8192 => "medium",
         8193..=16384 => "high",
+        _ if supports_reasoning_effort(model, "max") => "max",
         _ if supports_reasoning_effort(model, "xhigh") => "xhigh",
         _ => "high",
     }
@@ -189,7 +190,9 @@ fn apply_reasoning_effort(request: &mut MessagesRequest, intent: Option<&str>) {
 }
 
 pub(crate) fn highest_reasoning_effort(model: &str) -> Option<&'static str> {
-    if supports_reasoning_effort(model, "xhigh") {
+    if supports_reasoning_effort(model, "max") {
+        Some("max")
+    } else if supports_reasoning_effort(model, "xhigh") {
         Some("xhigh")
     } else if supports_reasoning_effort(model, "high") {
         Some("high")
@@ -311,7 +314,9 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 tool_search: ToolSearchCapability::unsupported(),
                 prompt_cache: PromptCacheCapability::basic(),
                 max_effort: CapabilityState::from_bool(
-                    supports_reasoning_effort(model_id, "xhigh").then_some(true),
+                    (supports_reasoning_effort(model_id, "max")
+                        || supports_reasoning_effort(model_id, "xhigh"))
+                    .then_some(true),
                 ),
                 structured_outputs: CapabilityState::Supported,
                 fast_mode: CapabilityState::Supported,
@@ -764,7 +769,7 @@ mod tests {
         );
         assert_eq!(
             info.capabilities.limits.reasoning_effort_levels,
-            vec!["low", "medium", "high", "xhigh"]
+            vec!["minimal", "low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             info.capabilities.quality.tool_search.state,
@@ -1106,7 +1111,7 @@ mod tests {
             (2048, "low"),
             (8192, "medium"),
             (16_384, "high"),
-            (16_385, "xhigh"),
+            (16_385, "max"),
         ] {
             let req = MessagesRequest {
                 model: "gpt-5.5".to_string(),
@@ -1226,7 +1231,7 @@ mod tests {
 
         assert_eq!(
             req.extra.get("reasoning_effort").and_then(Value::as_str),
-            Some("xhigh")
+            Some("max")
         );
     }
 }
