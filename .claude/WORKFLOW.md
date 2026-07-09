@@ -299,6 +299,39 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-07-09-002 — ChatGPT SSE zstd request compression
+
+Completed: 2026-07-09
+Level: 2
+
+Close summary:
+
+- Outcome: Added zstd request-body compression for ChatGPT/Codex SSE requests; compressed requests send `Content-Encoding: zstd`, while compression errors fall back to plain JSON. WebSocket behavior is unchanged.
+- Validation: Passed `cargo test -p claude-proxy-providers --lib chatgpt_`, `cargo test -p claude-proxy-providers --lib`, `cargo fmt --all --check`, `cargo clippy -p claude-proxy-providers --lib -- -D warnings -A clippy::too_many_arguments`, `git diff --check`, and GitNexus detect_changes CRITICAL with expected central ChatGPT SSE/fallback scope.
+- Gaps: No config toggle was added; add one only if a real upstream/proxy rejects `Content-Encoding: zstd`.
+
+Archived execution:
+
+- Intent: Add zstd request-body compression for ChatGPT/Codex SSE requests without changing WebSocket behavior.
+- Plan:
+  - [done] P1 — Review ChatGPT SSE send path and GitNexus impact.
+  - [done] P2 — Implement compressed body preparation with safe uncompressed fallback.
+  - [done] P3 — Add focused tests for Content-Encoding/body bytes and fallback metadata.
+  - [done] P4 — Validate, run GitNexus detect_changes, commit, and summarize.
+- Key changes:
+  - Added `zstd` dependency and a small SSE request-body helper using compression level 3.
+  - Switched ChatGPT SSE send path from `RequestBuilder::json` to pre-encoded body bytes so `Content-Encoding: zstd` can be set.
+  - Updated SSE/fallback tests to decode captured zstd bodies and assert the header is present.
+- Validation:
+  - `cargo test -p claude-proxy-providers --lib chatgpt_`
+  - `cargo test -p claude-proxy-providers --lib`
+  - `cargo fmt --all --check`
+  - `cargo clippy -p claude-proxy-providers --lib -- -D warnings -A clippy::too_many_arguments`
+  - `git diff --check`
+  - GitNexus impact/detect_changes completed; CRITICAL risk is expected for central ChatGPT request transport.
+- Deferred / gaps:
+  - Full workspace clippy remains blocked by pre-existing ChatGPT `too_many_arguments` warnings in `WF-2026-05-28-003`.
+
 ### WF-2026-07-09-001 — Pi/proxy compatibility sweep
 Completed: 2026-07-09
 Level: 3

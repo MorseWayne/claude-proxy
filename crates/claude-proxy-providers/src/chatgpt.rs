@@ -62,6 +62,7 @@ const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
 const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
 const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
+const CHATGPT_SSE_REQUEST_ZSTD_LEVEL: i32 = 3;
 const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 const CHATGPT_WEBSOCKET_STARTUP_FAILURE_COOLDOWN_SECS: u64 = 120;
 const CODEX_FAST_SERVICE_TIER: &str = "priority";
@@ -140,6 +141,13 @@ struct CachedRateLimits {
 struct ChatGptOutputTokenBudget {
     requested: Option<u64>,
     effective: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ChatGptSseRequestBody {
+    bytes: Vec<u8>,
+    original_len: usize,
+    content_encoding: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -572,7 +580,10 @@ impl ChatGptProvider {
         budget: ChatGptOutputTokenBudget,
         responses_lite: ResponsesLiteDecision,
     ) -> Result<Response, ProviderError> {
-        let body_bytes = json_len(body);
+        let request_body = prepare_chatgpt_sse_request_body(body)?;
+        let body_bytes = request_body.original_len;
+        let body_wire_bytes = request_body.bytes.len();
+        let body_content_encoding = request_body.content_encoding.unwrap_or("identity");
         let model = body
             .get("model")
             .and_then(serde_json::Value::as_str)
@@ -594,6 +605,8 @@ impl ChatGptProvider {
             prompt_too_long_attempt,
             model,
             body_bytes,
+            body_wire_bytes,
+            body_content_encoding,
             upstream_request_id = %client_request_id,
             session_id = %runtime_ids.session_id,
             thread_id = %runtime_ids.thread_id,
@@ -630,11 +643,16 @@ impl ChatGptProvider {
         if let Some(account_id) = token.account_id.as_deref() {
             request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
         }
+        if let Some(content_encoding) = request_body.content_encoding {
+            request_builder = request_builder.header("Content-Encoding", content_encoding);
+        }
 
         let request_builder = apply_runtime_request_config(request_builder, &self.runtime)?;
-        let result =
-            send_upstream_request_with_policy(request_builder.json(body), self.request_policy)
-                .await;
+        let result = send_upstream_request_with_policy(
+            request_builder.body(request_body.bytes),
+            self.request_policy,
+        )
+        .await;
 
         match &result {
             Ok(response) => {
@@ -2501,6 +2519,40 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
+fn prepare_chatgpt_sse_request_body(body: &Value) -> Result<ChatGptSseRequestBody, ProviderError> {
+    let json_bytes = serde_json::to_vec(body).map_err(|error| {
+        ProviderError::InvalidRequest(format!("invalid ChatGPT request body: {error}"))
+    })?;
+    Ok(chatgpt_sse_request_body_from_json(json_bytes, |bytes| {
+        zstd::bulk::compress(bytes, CHATGPT_SSE_REQUEST_ZSTD_LEVEL)
+    }))
+}
+
+fn chatgpt_sse_request_body_from_json<E>(
+    json_bytes: Vec<u8>,
+    compress: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+) -> ChatGptSseRequestBody
+where
+    E: std::fmt::Display,
+{
+    let original_len = json_bytes.len();
+    match compress(&json_bytes) {
+        Ok(bytes) => ChatGptSseRequestBody {
+            bytes,
+            original_len,
+            content_encoding: Some("zstd"),
+        },
+        Err(error) => {
+            warn!(error = %error, "ChatGPT SSE request zstd compression failed; sending JSON body");
+            ChatGptSseRequestBody {
+                bytes: json_bytes,
+                original_len,
+                content_encoding: None,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatGptContextLimitPreflightThreshold {
     body_bytes: usize,
@@ -3237,6 +3289,29 @@ mod tests {
         assert_ne!(rotated.session_id, "session-test");
         assert_ne!(rotated.thread_id, "thread-test");
         assert_ne!(rotated.window_id, "window-test");
+    }
+
+    #[test]
+    fn chatgpt_sse_request_body_uses_zstd_when_available() {
+        let json_bytes = br#"{"model":"gpt-5.5","stream":true}"#.to_vec();
+        let body = chatgpt_sse_request_body_from_json(json_bytes.clone(), |bytes| {
+            zstd::bulk::compress(bytes, CHATGPT_SSE_REQUEST_ZSTD_LEVEL)
+        });
+
+        assert_eq!(body.content_encoding, Some("zstd"));
+        assert_eq!(body.original_len, json_bytes.len());
+        let decoded = zstd::stream::decode_all(body.bytes.as_slice()).unwrap();
+        assert_eq!(decoded, json_bytes);
+    }
+
+    #[test]
+    fn chatgpt_sse_request_body_falls_back_when_zstd_fails() {
+        let json_bytes = br#"{"model":"gpt-5.5","stream":true}"#.to_vec();
+        let body = chatgpt_sse_request_body_from_json(json_bytes.clone(), |_| Err("boom"));
+
+        assert_eq!(body.content_encoding, None);
+        assert_eq!(body.original_len, json_bytes.len());
+        assert_eq!(body.bytes, json_bytes);
     }
 
     #[tokio::test]
@@ -4587,6 +4662,7 @@ mod tests {
         let headers = requests[0].headers.to_ascii_lowercase();
         assert!(headers.contains("accept: text/event-stream"));
         assert!(headers.contains("authorization: bearer access"));
+        assert!(headers.contains("content-encoding: zstd"));
         assert!(headers.contains("chatgpt-account-id: account"));
         assert!(headers.contains("x-client-request-id: "));
         assert!(!headers.contains("x-client-request-id: thread-test"));
@@ -4594,7 +4670,7 @@ mod tests {
         assert!(headers.contains("thread-id: thread-test"));
         assert!(headers.contains("x-codex-window-id: window-test"));
         assert!(headers.contains("x-openai-internal-codex-responses-lite: true"));
-        let request_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let request_body = request_body_json(&requests[0]);
         assert_eq!(request_body["model"], "gpt-5.3-codex");
     }
 
@@ -4787,7 +4863,7 @@ mod tests {
         assert_eq!(websocket_requests[0]["generate"], false);
         let sse_requests = sse_requests.lock().await;
         assert_eq!(sse_requests.len(), 1);
-        let sse_body: Value = serde_json::from_slice(&sse_requests[0].body).unwrap();
+        let sse_body = request_body_json(&sse_requests[0]);
         assert!(sse_body.get("previous_response_id").is_none());
         assert!(sse_body.get("generate").is_none());
     }
@@ -4877,7 +4953,7 @@ mod tests {
 
         let sse_requests = sse_requests.lock().await;
         assert_eq!(sse_requests.len(), 1);
-        let sse_body: Value = serde_json::from_slice(&sse_requests[0].body).unwrap();
+        let sse_body = request_body_json(&sse_requests[0]);
         assert!(sse_body.get("previous_response_id").is_none());
         assert_eq!(sse_body["input"].as_array().map(Vec::len), Some(3));
 
@@ -6892,6 +6968,19 @@ mod tests {
         body: Vec<u8>,
     }
 
+    fn request_body_json(request: &CapturedHttpRequest) -> Value {
+        let body = if request
+            .headers
+            .to_ascii_lowercase()
+            .contains("content-encoding: zstd")
+        {
+            zstd::stream::decode_all(request.body.as_slice()).unwrap()
+        } else {
+            request.body.clone()
+        };
+        serde_json::from_slice(&body).unwrap()
+    }
+
     async fn capture_once_server() -> (String, Arc<Mutex<Vec<CapturedHttpRequest>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6922,11 +7011,11 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let body = read_http_request_body(&mut socket).await;
+            let request = read_http_request(&mut socket).await;
             captured_requests
                 .lock()
                 .await
-                .push(serde_json::from_slice(&body).unwrap());
+                .push(request_body_json(&request));
 
             let response_body =
                 r#"{"error":{"code":"context_length_exceeded","message":"context limit"}}"#;
@@ -6938,24 +7027,6 @@ mod tests {
         });
 
         (format!("http://{addr}/responses"), requests)
-    }
-
-    async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some((body_start, content_length)) = http_body_start_and_len(&buffer)
-                && buffer.len() >= body_start + content_length
-            {
-                return buffer[body_start..body_start + content_length].to_vec();
-            }
-        }
-        Vec::new()
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> CapturedHttpRequest {
