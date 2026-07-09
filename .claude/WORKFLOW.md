@@ -299,6 +299,36 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-07-09-003 — ChatGPT reasoning display parity
+Completed: 2026-07-09
+Level: 2
+
+Close summary:
+- Outcome: ChatGPT Responses reasoning summary/text stream events now render as Claude-compatible thinking deltas, including final `.done`/summary-part forms; non-streaming reasoning prefers explicit reasoning text over summary when available.
+- Validation: Passed focused reasoning tests, Responses tests, full provider lib tests, formatting, clippy, diff check, and GitNexus detect_changes HIGH with expected central Responses stream scope.
+- Gaps: No Anthropic thinking signature is synthesized; ChatGPT has no valid Anthropic signature to preserve.
+
+Archived execution:
+- Intent: Make ChatGPT upstream reasoning/thinking content display correctly in Claude Code instead of hiding it or emitting malformed thinking blocks.
+- Plan:
+  - [done] P1 — Review GitNexus impact and implement the smallest Responses stream/non-stream conversion fix.
+  - [done] P2 — Add focused regression tests for ChatGPT reasoning summary/text display.
+  - [done] P3 — Validate provider tests, formatting, diff checks, and GitNexus detect_changes.
+  - [done] P4 — Commit the verified fix.
+- Key changes:
+  - GitNexus impact before editing: `ResponsesStreamConverter::process_event` CRITICAL and `NonStreamingResponsesConverter::convert_reasoning_item` HIGH; scope stayed limited to reasoning display mapping plus tests.
+  - Added reasoning stream delta buffers to dedupe `.done` final text and keep ChatGPT reasoning summary/text visible as thinking deltas without faking signatures.
+- Validation:
+  - `cargo test -p claude-proxy-providers --lib reasoning`
+  - `cargo test -p claude-proxy-providers --lib responses`
+  - `cargo test -p claude-proxy-providers --lib`
+  - `cargo fmt --all --check`
+  - `cargo clippy -p claude-proxy-providers --lib -- -D warnings -A clippy::too_many_arguments`
+  - `git diff --check`
+  - GitNexus detect_changes: HIGH, expected for central Responses stream conversion.
+- Deferred / gaps:
+  - None beyond not synthesizing invalid Anthropic signatures.
+
 ### WF-2026-07-09-002 — ChatGPT SSE zstd request compression
 
 Completed: 2026-07-09

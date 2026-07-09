@@ -1441,6 +1441,7 @@ struct ResponsesStreamConverter {
     output_blocks: HashMap<(u64, u64), u32>,
     reasoning_text: ReasoningTextSplitter,
     reasoning_text_key: Option<(u64, u64)>,
+    reasoning_delta_buffers: HashMap<(bool, u64, u64), String>,
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
@@ -1508,12 +1509,24 @@ impl ResponsesStreamConverter {
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
-                self.flush_reasoning_text(&mut events);
                 let delta = event["delta"].as_str().unwrap_or_default();
-                if !delta.is_empty() {
-                    let idx = self.ensure_thinking_block(&mut events);
-                    events.push(content_delta(idx, "thinking_delta", "thinking", delta));
-                }
+                self.emit_reasoning_stream_text(event_type, event, delta, false, &mut events);
+            }
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_stream_text(event_type, event, text, true, &mut events);
+            }
+            "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["part"]["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_stream_text(
+                    event_type,
+                    event,
+                    text,
+                    event_type.ends_with(".done"),
+                    &mut events,
+                );
             }
             "response.function_call_arguments.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
@@ -1638,6 +1651,58 @@ impl ResponsesStreamConverter {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn emit_reasoning_stream_text(
+        &mut self,
+        event_type: &str,
+        event: &Value,
+        text: &str,
+        final_text: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.flush_reasoning_text(events);
+        let key = reasoning_stream_key(event_type, event);
+        let previous = self
+            .reasoning_delta_buffers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let delta = if final_text {
+            if previous.is_empty() {
+                text
+            } else {
+                text.strip_prefix(&previous).unwrap_or_default()
+            }
+        } else {
+            text
+        };
+        if delta.is_empty() {
+            return;
+        }
+
+        if previous.is_empty()
+            && key.0
+            && matches!(self.open_block, Some(OpenBlock::Thinking(_)))
+            && self
+                .reasoning_delta_buffers
+                .keys()
+                .any(|(is_summary, _, _)| *is_summary)
+        {
+            self.emit_thinking_content("\n", events);
+        }
+        self.emit_thinking_content(delta, events);
+
+        let buffer = self.reasoning_delta_buffers.entry(key).or_default();
+        if final_text {
+            *buffer = text.to_string();
+        } else {
+            buffer.push_str(text);
         }
     }
 
@@ -2154,6 +2219,16 @@ fn json_string_fragment(text: &str) -> String {
         .to_string()
 }
 
+fn reasoning_stream_key(event_type: &str, event: &Value) -> (bool, u64, u64) {
+    let is_summary = event_type.contains("reasoning_summary");
+    let output_index = event["output_index"].as_u64().unwrap_or(0);
+    let text_index = event["summary_index"]
+        .as_u64()
+        .or_else(|| event["content_index"].as_u64())
+        .unwrap_or(0);
+    (is_summary, output_index, text_index)
+}
+
 fn content_delta(index: u32, delta_type: &str, key: &str, value: &str) -> SseEvent {
     SseEvent {
         event: "content_block_delta".to_string(),
@@ -2348,6 +2423,13 @@ impl<'a> NonStreamingResponsesConverter<'a> {
     }
 
     fn convert_reasoning_item(&mut self, item: &Value) {
+        if let Some(text) = item["text"].as_str()
+            && !text.is_empty()
+        {
+            self.add_thinking_block(text);
+            return;
+        }
+
         let mut summaries = Vec::new();
         if let Some(summary) = item["summary"].as_array() {
             for part in summary {
@@ -4047,6 +4129,8 @@ mod tests {
         })));
         events.extend(converter.process_event(&json!({
             "type": "response.reasoning_text.delta",
+            "output_index": 0,
+            "content_index": 0,
             "delta": "typed thought"
         })));
 
@@ -4054,6 +4138,69 @@ mod tests {
             text_and_thinking_deltas(&events),
             vec![("thinking_delta".to_string(), "typed thought".to_string())]
         );
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_reasoning_summary_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "checked constraints"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
+    }
+
+    #[test]
+    fn test_stream_converter_deduplicates_reasoning_summary_done_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "checked"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "checked constraints"
+        })));
+
+        assert_eq!(thinking_deltas(&events).join(""), "checked constraints");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_reasoning_summary_part_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": "part summary"}
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["part summary"]);
     }
 
     #[test]
@@ -4661,6 +4808,25 @@ mod tests {
         assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
         assert_eq!(text_deltas(&events), vec!["I can’t help with that."]);
         assert_eq!(stop.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_non_streaming_response_prefers_reasoning_text_over_summary() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "text": "full reasoning text",
+                "summary": [{"type": "summary_text", "text": "summary text"}]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+
+        assert_eq!(thinking_deltas(&events), vec!["full reasoning text"]);
     }
 
     #[test]
