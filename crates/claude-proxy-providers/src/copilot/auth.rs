@@ -62,6 +62,7 @@ enum AccessTokenResponse {
         #[serde(rename = "error_description")]
         #[allow(dead_code)]
         error_description: Option<String>,
+        interval: Option<u64>,
     },
 }
 
@@ -252,7 +253,7 @@ impl CopilotAuth {
 
     async fn poll_for_token(&self, dc: &DeviceCodeResponse) -> Result<String, ProviderError> {
         let client = &self.http_client;
-        let poll_interval = Duration::from_secs(dc.interval.max(POLL_INTERVAL_SECS));
+        let mut poll_interval = Duration::from_secs(dc.interval.max(POLL_INTERVAL_SECS));
 
         for attempt in 0..MAX_POLL_ATTEMPTS {
             sleep(poll_interval).await;
@@ -284,7 +285,9 @@ impl CopilotAuth {
                     info!("GitHub OAuth device flow completed successfully");
                     return Ok(access_token);
                 }
-                AccessTokenResponse::Error { error, .. } => {
+                AccessTokenResponse::Error {
+                    error, interval, ..
+                } => {
                     if error == "authorization_pending" {
                         info!(
                             "Waiting for authorization... (attempt {}/{})",
@@ -294,7 +297,7 @@ impl CopilotAuth {
                         continue;
                     }
                     if error == "slow_down" {
-                        sleep(Duration::from_secs(5)).await;
+                        poll_interval = slow_down_poll_interval(poll_interval, interval);
                         continue;
                     }
                     if error == "expired_token" {
@@ -483,6 +486,13 @@ impl CopilotAuth {
     }
 }
 
+fn slow_down_poll_interval(current: Duration, server_interval: Option<u64>) -> Duration {
+    server_interval
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| current + Duration::from_secs(5))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +547,21 @@ mod tests {
             Some("valid")
         );
         assert_eq!(expired.current_unexpired_copilot_token().await, None);
+    }
+
+    #[test]
+    fn slow_down_poll_interval_uses_server_interval_or_rfc_increment() {
+        assert_eq!(
+            slow_down_poll_interval(Duration::from_secs(5), Some(9)),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            slow_down_poll_interval(Duration::from_secs(5), None),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            slow_down_poll_interval(Duration::from_secs(5), Some(0)),
+            Duration::from_secs(10)
+        );
     }
 }

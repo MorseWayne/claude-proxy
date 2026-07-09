@@ -55,7 +55,6 @@ use tracing::{info, warn};
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
-const CHATGPT_SSE_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
 const CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES: usize = 700 * 1024;
@@ -1842,7 +1841,7 @@ fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, Provide
 fn chatgpt_upstream_request_policy(runtime: &ProviderRuntimeConfig) -> UpstreamRequestPolicy {
     UpstreamRequestPolicy {
         max_attempts: CHATGPT_SEND_MAX_ATTEMPTS,
-        attempt_timeout: Some(CHATGPT_SSE_RESPONSE_HEADER_TIMEOUT),
+        attempt_timeout: None,
         retry_rate_limits: false,
         ..UpstreamRequestPolicy::default()
     }
@@ -3481,11 +3480,11 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_request_policy_caps_first_response_wait() {
+    fn chatgpt_request_policy_uses_http_client_timeout_by_default() {
         let policy = chatgpt_upstream_request_policy(&ProviderRuntimeConfig::default());
 
         assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(policy.attempt_timeout, None);
         assert!(!policy.retry_rate_limits);
     }
 

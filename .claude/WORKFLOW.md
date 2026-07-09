@@ -299,6 +299,36 @@ Resume next:
 
 ## Completed（已完成）
 
+### WF-2026-07-09-001 — Pi/proxy compatibility sweep
+Completed: 2026-07-09
+Level: 3
+
+Close summary:
+- Outcome: Fast-forwarded sibling Pi to `86afffe0` / `v0.80.3`, reviewed Pi `v0.79.x`/`v0.80.x` and peer proxy changes, then applied two minimal compatibility fixes: ChatGPT SSE now uses the configured HTTP/read timeout by default, and Copilot OAuth `slow_down` honors server-provided polling intervals.
+- Validation: Passed `cargo fmt --all --check`, `cargo test -p claude-proxy-providers --lib`, `cargo clippy -p claude-proxy-providers --lib -- -D warnings -A clippy::too_many_arguments`, `git diff --check`, and GitNexus detect_changes LOW. Full `cargo clippy -- -D warnings` still fails on pre-existing ChatGPT `too_many_arguments` debt tracked in `WF-2026-05-28-003`.
+- Gaps: No zstd request compression, reasoning-usage accounting, or model catalog change was added because claude-proxy already has config overrides and the remaining Pi/peer changes are not required for compatibility.
+
+Archived execution:
+- Intent: Update Pi/Codex context, survey peer proxy changes, and make only clearly needed claude-proxy compatibility adjustments.
+- Plan:
+  - [done] P1 — Update local Pi repo and extract relevant release/source changes since the last claude-proxy sync baseline.
+  - [done] P2 — Survey other open-source Claude/OpenAI proxy tools for recent compatibility improvements.
+  - [done] P3 — Compare findings with claude-proxy ChatGPT/Codex implementation and choose the smallest needed adaptation set.
+  - [done] P4 — Implement selected adaptations with GitNexus impact checks before symbol edits.
+  - [done] P5 — Validate, run GitNexus detect_changes, commit, and summarize.
+- Key changes:
+  - Pi findings: configurable Codex SSE header wait, WebSocket connection-limit reconnect, zstd SSE body compression, OAuth polling fixes, model catalog refresh, and reasoning usage metadata.
+  - Peer findings: Claude Code Router focused on NO_PROXY/proxy pass-through; LiteLLM on streaming error/header passthrough and Responses bridge hardening; new-api on Codex field passthrough and Chat/Responses compatibility.
+  - Applied ChatGPT fixed-header-timeout removal and Copilot OAuth `slow_down` interval handling; skipped broader transport/compression/model metadata work as unnecessary.
+- Validation:
+  - `cargo fmt --all --check`
+  - `cargo test -p claude-proxy-providers --lib`
+  - `cargo clippy -p claude-proxy-providers --lib -- -D warnings -A clippy::too_many_arguments`
+  - `git diff --check`
+  - GitNexus impact/detect_changes completed; final detect_changes risk LOW with no affected processes.
+- Deferred / gaps:
+  - Full workspace clippy remains blocked by pre-existing ChatGPT `too_many_arguments` warnings in `WF-2026-05-28-003`.
+
 ### WF-2026-06-09-001 — Responses Lite capability-driven policy
 Completed: 2026-06-09
 Level: 3
