@@ -167,11 +167,18 @@ struct ChatGptRemoteModel {
     visibility: Option<String>,
     #[serde(default)]
     priority: i32,
+    #[serde(default)]
+    service_tiers: Option<Vec<ChatGptRemoteServiceTier>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatGptRemoteReasoningLevel {
     effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptRemoteServiceTier {
+    id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +187,7 @@ struct ChatGptCatalogModel {
     responses_lite: bool,
     visibility: Option<String>,
     priority: i32,
+    service_tiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -720,11 +728,36 @@ impl ChatGptProvider {
         }
     }
 
-    fn codex_service_tier(&self) -> Option<&str> {
-        effective_codex_service_tier(
+    fn codex_service_tier(&self, model: &str) -> Option<&str> {
+        let requested = effective_codex_service_tier(
             self.runtime.openai.service_tier.as_deref(),
             self.chatgpt_config.fast_mode,
-        )
+        )?;
+        let model = normalize_chatgpt_model_id(model);
+        let remote_support = self
+            .remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned")
+            .get(model)
+            .and_then(|model| model.service_tiers.as_ref())
+            .map(|tiers| tiers.iter().any(|tier| tier == requested));
+        let supported = remote_support.or_else(|| {
+            CHATGPT_MODEL_SPECS
+                .iter()
+                .find(|spec| spec.model_id == model)
+                .map(|spec| spec.service_tiers.contains(&requested))
+        });
+
+        if supported == Some(false) {
+            warn!(
+                model,
+                service_tier = requested,
+                "configured ChatGPT service tier is unsupported by model catalog; omitting"
+            );
+            None
+        } else {
+            Some(requested)
+        }
     }
 
     fn model_info(&self, model: &str) -> Option<ModelInfo> {
@@ -1906,7 +1939,7 @@ impl Provider for ChatGptProvider {
             DEFAULT_CHATGPT_INSTRUCTIONS,
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
-                service_tier: self.codex_service_tier(),
+                service_tier: self.codex_service_tier(&request.model),
                 standalone_tools: self.chatgpt_config.standalone_tools,
                 responses_lite: responses_lite.is_enabled(),
                 model: model_context,
@@ -3205,6 +3238,7 @@ struct ChatGptModelSpec {
     image_input: bool,
     responses_lite: bool,
     reasoning_efforts: &'static [&'static str],
+    service_tiers: &'static [&'static str],
 }
 
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
@@ -3214,6 +3248,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-terra",
@@ -3221,6 +3256,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-luna",
@@ -3228,6 +3264,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+        service_tiers: &["priority"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.5",
@@ -3235,6 +3272,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: false,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        service_tiers: &["priority"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4",
@@ -3242,6 +3280,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        service_tiers: &["priority"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4-mini",
@@ -3249,6 +3288,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        service_tiers: &[],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
@@ -3256,6 +3296,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         image_input: false,
         responses_lite: false,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        service_tiers: &[],
     },
 ];
 
@@ -3334,6 +3375,13 @@ fn chatgpt_catalog_model_from_remote(
     let responses_lite = capability
         .and_then(|capability| capability.responses_lite)
         .unwrap_or(model.use_responses_lite);
+    let service_tiers = model.service_tiers.map(|tiers| {
+        tiers
+            .into_iter()
+            .map(|tier| tier.id.trim().to_string())
+            .filter(|tier| !tier.is_empty())
+            .collect()
+    });
 
     ChatGptCatalogModel {
         info: chatgpt_model_info_from_parts(
@@ -3345,6 +3393,7 @@ fn chatgpt_catalog_model_from_remote(
         responses_lite,
         visibility: model.visibility,
         priority: model.priority,
+        service_tiers,
     }
 }
 
@@ -3709,6 +3758,19 @@ mod tests {
         assert_eq!(
             effective_codex_service_tier(Some("flex"), true),
             Some("flex")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_service_tier_filters_known_unsupported_models() {
+        let mut provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
+        provider.chatgpt_config.fast_mode = true;
+
+        assert_eq!(provider.codex_service_tier("gpt-5.6-sol"), Some("priority"));
+        assert_eq!(provider.codex_service_tier("gpt-5.4-mini"), None);
+        assert_eq!(
+            provider.codex_service_tier("custom-model"),
+            Some("priority")
         );
     }
 
@@ -4460,6 +4522,25 @@ mod tests {
         assert!(!catalog.responses_lite);
         assert_eq!(catalog.visibility.as_deref(), Some("list"));
         assert_eq!(catalog.priority, 1);
+    }
+
+    #[test]
+    fn remote_chatgpt_catalog_preserves_service_tier_capability_state() {
+        let catalog = |service_tiers: Option<Value>| {
+            let mut value = json!({"slug": "gpt-test"});
+            if let Some(service_tiers) = service_tiers {
+                value["service_tiers"] = service_tiers;
+            }
+            let remote: ChatGptRemoteModel = serde_json::from_value(value).unwrap();
+            chatgpt_catalog_model_from_remote(remote, &ChatGptProviderConfig::default())
+        };
+
+        assert_eq!(catalog(None).service_tiers, None);
+        assert_eq!(catalog(Some(json!([]))).service_tiers, Some(Vec::new()));
+        assert_eq!(
+            catalog(Some(json!([{"id": "priority", "name": "Fast"}]))).service_tiers,
+            Some(vec!["priority".to_string()])
+        );
     }
 
     #[test]
@@ -6434,7 +6515,10 @@ mod tests {
         let mut provider = test_chatgpt_provider(endpoint).await;
         provider.transport = ChatGptTransport::Websocket;
 
-        for (request_id, body) in [(14, chatgpt_websocket_test_body()), (15, second_body)] {
+        for (index, (request_id, body)) in [(14, chatgpt_websocket_test_body()), (15, second_body)]
+            .into_iter()
+            .enumerate()
+        {
             let stream = provider
                 .chat_prepared_with_token(
                     chatgpt_test_prepared_request_with_body(
@@ -6447,7 +6531,11 @@ mod tests {
                 .await
                 .expect("websocket stream should start");
             let events = collect_stream_results(stream).await;
-            assert!(events.iter().all(Result::is_ok));
+            if index == 0 {
+                assert!(events.iter().any(Result::is_err));
+            } else {
+                assert!(events.iter().all(Result::is_ok));
+            }
         }
 
         let requests = requests.lock().unwrap();

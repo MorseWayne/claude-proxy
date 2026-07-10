@@ -1131,11 +1131,11 @@ where
                             continue;
                         }
                         if let Some(value) = parse_sse_json(&event) {
+                            on_event(&value);
                             if let Some(error) = responses_error_event(&value) {
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
-                            on_event(&value);
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -1152,11 +1152,11 @@ where
                         if is_sse_done(&event) {
                             saw_done = true;
                         } else if let Some(value) = parse_sse_json(&event) {
+                            on_event(&value);
                             if let Some(error) = responses_error_event(&value) {
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
-                            on_event(&value);
                             for event in converter.process_event(&value) {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return;
@@ -1179,11 +1179,11 @@ where
             && !is_sse_done(&event)
             && let Some(value) = parse_sse_json(&event)
         {
+            on_event(&value);
             if let Some(error) = responses_error_event(&value) {
                 let _ = tx.send(Err(error)).await;
                 return;
             }
-            on_event(&value);
             for event in converter.process_event(&value) {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -1245,11 +1245,11 @@ where
                 }
             };
 
+            on_event(&value);
             if let Some(error) = responses_error_event(&value) {
                 let _ = tx.send(Err(error)).await;
                 return;
             }
-            on_event(&value);
             for event in converter.process_event(&value) {
                 if tx.send(Ok(event)).await.is_err() {
                     return;
@@ -1279,18 +1279,58 @@ fn parse_sse_json(text: &str) -> Option<Value> {
 }
 
 fn responses_error_event(value: &Value) -> Option<ProviderError> {
-    (value.get("type").and_then(Value::as_str) == Some("error")).then(|| {
-        let status = value
-            .get("status")
-            .or_else(|| value.get("status_code"))
-            .and_then(Value::as_u64)
-            .and_then(|status| u16::try_from(status).ok())
-            .unwrap_or(200);
-        ProviderError::UpstreamError {
-            status,
-            body: value.to_string(),
+    match value.get("type").and_then(Value::as_str) {
+        Some("error") => {
+            let status = value
+                .get("status")
+                .or_else(|| value.get("status_code"))
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .unwrap_or(200);
+            Some(ProviderError::UpstreamError {
+                status,
+                body: value.to_string(),
+            })
         }
-    })
+        Some("response.failed") => Some(responses_failed_error(value)),
+        _ => None,
+    }
+}
+
+fn responses_failed_error(value: &Value) -> ProviderError {
+    let response = value.get("response").unwrap_or(value);
+    let error = response.get("error").unwrap_or(response);
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if code.is_empty() {
+                "Responses API request failed".to_string()
+            } else {
+                format!("Responses API request failed ({code})")
+            }
+        });
+
+    match code {
+        "context_length_exceeded" => ProviderError::RequestTooLarge(message),
+        "invalid_prompt" | "bio_policy" | "cyber_policy" | "insufficient_quota"
+        | "usage_not_included" => ProviderError::InvalidRequest(message),
+        "rate_limit_exceeded" => ProviderError::RateLimited { retry_after: None },
+        "server_error" | "server_is_overloaded" | "slow_down" => ProviderError::Overloaded {
+            message,
+            retry_after: None,
+        },
+        _ => ProviderError::UpstreamError {
+            status: 200,
+            body: value.to_string(),
+        },
+    }
 }
 
 pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, event: &Value) {
@@ -1431,6 +1471,129 @@ enum OpenBlock {
     Thinking(u32),
 }
 
+/// Removes the empty HTML comment that Codex may use as a separator between
+/// reasoning summary parts. The marker can be split across arbitrary SSE
+/// deltas, so only a possible standalone marker at the start of a line is
+/// buffered. Normal summary text continues to stream immediately.
+struct ReasoningSummaryFilter {
+    at_line_start: bool,
+    candidate: String,
+}
+
+impl Default for ReasoningSummaryFilter {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+            candidate: String::new(),
+        }
+    }
+}
+
+impl ReasoningSummaryFilter {
+    fn push(&mut self, text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+
+        for ch in text.chars() {
+            if !self.at_line_start {
+                output.push(ch);
+                if ch == '\n' {
+                    self.at_line_start = true;
+                }
+                continue;
+            }
+
+            self.candidate.push(ch);
+            if ch == '\n' {
+                if !is_blank_reasoning_summary_comment_line(&self.candidate) {
+                    output.push_str(&self.candidate);
+                }
+                self.candidate.clear();
+            } else if !could_be_blank_reasoning_summary_comment_line(&self.candidate) {
+                output.push_str(&self.candidate);
+                self.candidate.clear();
+                self.at_line_start = false;
+            }
+        }
+
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let candidate = std::mem::take(&mut self.candidate);
+        self.at_line_start = true;
+
+        if candidate.trim().is_empty()
+            || is_blank_reasoning_summary_comment_line(&candidate)
+            || is_incomplete_blank_reasoning_summary_comment(&candidate)
+        {
+            String::new()
+        } else {
+            candidate
+        }
+    }
+}
+
+fn is_blank_reasoning_summary_comment_line(line: &str) -> bool {
+    let line = line.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+    let Some(inner) = line
+        .strip_prefix("<!--")
+        .and_then(|line| line.strip_suffix("-->"))
+    else {
+        return false;
+    };
+
+    inner.chars().all(|ch| matches!(ch, ' ' | '\t'))
+}
+
+fn could_be_blank_reasoning_summary_comment_line(candidate: &str) -> bool {
+    let candidate = candidate.trim_start_matches([' ', '\t']);
+    if candidate.is_empty() || "<!--".starts_with(candidate) {
+        return true;
+    }
+
+    let Some(after_open) = candidate.strip_prefix("<!--") else {
+        return false;
+    };
+    let after_open = after_open.trim_start_matches([' ', '\t']);
+    if after_open.is_empty() || "-->".starts_with(after_open) {
+        return true;
+    }
+
+    let Some(after_close) = after_open.strip_prefix("-->") else {
+        return false;
+    };
+    after_close
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\r'))
+}
+
+fn is_incomplete_blank_reasoning_summary_comment(candidate: &str) -> bool {
+    candidate
+        .trim_start_matches([' ', '\t'])
+        .starts_with("<!--")
+        && could_be_blank_reasoning_summary_comment_line(candidate)
+}
+
+fn strip_blank_reasoning_summary_comment_lines(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut removed = false;
+
+    for line in text.split_inclusive('\n') {
+        if is_blank_reasoning_summary_comment_line(line) {
+            removed = true;
+        } else {
+            output.push_str(line);
+        }
+    }
+
+    if removed {
+        output.truncate(output.trim_end().len());
+        output
+    } else {
+        text.to_string()
+    }
+}
+
 #[derive(Default)]
 struct ResponsesStreamConverter {
     message_id: String,
@@ -1442,6 +1605,8 @@ struct ResponsesStreamConverter {
     reasoning_text: ReasoningTextSplitter,
     reasoning_text_key: Option<(u64, u64)>,
     reasoning_delta_buffers: HashMap<(bool, u64, u64), String>,
+    reasoning_summary_filters: HashMap<(u64, u64), ReasoningSummaryFilter>,
+    reasoning_summary_emitted: HashSet<(u64, u64)>,
     function_blocks: HashMap<u64, u32>,
     function_names: HashMap<u64, String>,
     function_call_ids: HashMap<u64, String>,
@@ -1507,12 +1672,22 @@ impl ResponsesStreamConverter {
                     self.emit_text_stream(output_index, content_index, delta, &mut events);
                 }
             }
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            "response.reasoning_summary_text.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                self.emit_reasoning_summary_stream_text(event, delta, false, &mut events);
+            }
+            "response.reasoning_summary_text.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_summary_stream_text(event, text, true, &mut events);
+            }
+            "response.reasoning_text.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 self.emit_reasoning_stream_text(event_type, event, delta, false, &mut events);
             }
-            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+            "response.reasoning_text.done" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
                 let text = event["text"].as_str().unwrap_or_default();
                 self.emit_reasoning_stream_text(event_type, event, text, true, &mut events);
@@ -1520,8 +1695,7 @@ impl ResponsesStreamConverter {
             "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
                 let text = event["part"]["text"].as_str().unwrap_or_default();
-                self.emit_reasoning_stream_text(
-                    event_type,
+                self.emit_reasoning_summary_stream_text(
                     event,
                     text,
                     event_type.ends_with(".done"),
@@ -1704,6 +1878,76 @@ impl ResponsesStreamConverter {
         } else {
             buffer.push_str(text);
         }
+    }
+
+    fn emit_reasoning_summary_stream_text(
+        &mut self,
+        event: &Value,
+        text: &str,
+        final_text: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if text.is_empty() && !final_text {
+            return;
+        }
+
+        self.flush_reasoning_text(events);
+        let key = reasoning_stream_key("response.reasoning_summary_text.delta", event);
+        let previous = self
+            .reasoning_delta_buffers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let raw_delta = if final_text {
+            if previous.is_empty() {
+                text
+            } else {
+                text.strip_prefix(&previous).unwrap_or_default()
+            }
+        } else {
+            text
+        };
+
+        let filter_key = (key.1, key.2);
+        let mut delta = {
+            let filter = self
+                .reasoning_summary_filters
+                .entry(filter_key)
+                .or_default();
+            let mut delta = filter.push(raw_delta);
+            if final_text {
+                delta.push_str(&filter.finish());
+            }
+            delta
+        };
+        if final_text {
+            self.reasoning_summary_filters.remove(&filter_key);
+        }
+
+        if !text.is_empty() {
+            let buffer = self.reasoning_delta_buffers.entry(key).or_default();
+            if final_text {
+                *buffer = text.to_string();
+            } else {
+                buffer.push_str(text);
+            }
+        }
+
+        if delta.is_empty() {
+            return;
+        }
+
+        if !self.reasoning_summary_emitted.contains(&filter_key)
+            && matches!(self.open_block, Some(OpenBlock::Thinking(_)))
+            && self
+                .reasoning_summary_emitted
+                .iter()
+                .any(|summary_key| *summary_key != filter_key)
+        {
+            delta.insert(0, '\n');
+        }
+        self.emit_thinking_content(&delta, events);
+        self.reasoning_summary_emitted.insert(filter_key);
     }
 
     fn emit_text_delta(
@@ -2434,7 +2678,10 @@ impl<'a> NonStreamingResponsesConverter<'a> {
         if let Some(summary) = item["summary"].as_array() {
             for part in summary {
                 if let Some(text) = part["text"].as_str() {
-                    summaries.push(text);
+                    let text = strip_blank_reasoning_summary_comment_lines(text);
+                    if !text.is_empty() {
+                        summaries.push(text);
+                    }
                 }
             }
         }
@@ -2638,6 +2885,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_response_surfaces_failed_policy_as_invalid_request() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-5.6-sol\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"status\":\"failed\",\"error\":{\"code\":\"bio_policy\",\"message\":\"biological safety policy\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+
+        stream
+            .next()
+            .await
+            .expect("created event")
+            .expect("created event should start the message");
+        let error = stream
+            .next()
+            .await
+            .expect("failed event")
+            .expect_err("response.failed should fail the stream");
+
+        match error.without_upstream_metadata() {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "biological safety policy");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn response_failed_event_classifies_known_error_codes() {
+        let cases = [
+            ("context_length_exceeded", "request_too_large"),
+            ("invalid_prompt", "invalid_request"),
+            ("bio_policy", "invalid_request"),
+            ("cyber_policy", "invalid_request"),
+            ("insufficient_quota", "invalid_request"),
+            ("usage_not_included", "invalid_request"),
+            ("rate_limit_exceeded", "rate_limited"),
+            ("server_error", "overloaded"),
+            ("server_is_overloaded", "overloaded"),
+            ("slow_down", "overloaded"),
+        ];
+
+        for (code, expected) in cases {
+            let event = json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": code, "message": "upstream failure"}
+                }
+            });
+            let error = responses_error_event(&event).expect("response.failed error");
+            let actual = match error.without_upstream_metadata() {
+                ProviderError::RequestTooLarge(_) => "request_too_large",
+                ProviderError::InvalidRequest(_) => "invalid_request",
+                ProviderError::RateLimited { .. } => "rate_limited",
+                ProviderError::Overloaded { .. } => "overloaded",
+                other => panic!("unexpected error for {code}: {other}"),
+            };
+            assert_eq!(actual, expected, "error code {code}");
+        }
+    }
+
+    #[test]
+    fn response_failed_event_preserves_unknown_error_payload() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "new_failure", "message": "new failure shape"}
+            }
+        });
+
+        let error = responses_error_event(&event).expect("response.failed error");
+        match error.without_upstream_metadata() {
+            ProviderError::UpstreamError { status, body } => {
+                assert_eq!(*status, 200);
+                assert!(body.contains("new_failure"));
+                assert!(body.contains("new failure shape"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_stream_response_reports_malformed_http_200_body() {
         let response =
             response_from_body("text/html", "<html><title>login required</title></html>").await;
@@ -2774,6 +3105,32 @@ mod tests {
 
         let observed = observed.lock().unwrap();
         assert!(observed.iter().any(|kind| kind == "codex.rate_limits"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_observer_sees_failed_event_before_error() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"failed\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = std::sync::Arc::clone(&observed);
+        let mut stream = stream_responses_response_with_observer(response, move |event| {
+            observed_for_hook
+                .lock()
+                .unwrap()
+                .push(event["type"].clone());
+        });
+
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().any(|kind| kind == "response.failed"));
     }
 
     #[test]
@@ -4160,6 +4517,127 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_converter_drops_split_blank_comment_from_reasoning_summary() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        for delta in ["**Planning**\n\n<!--", " -->", "\n"] {
+            events.extend(converter.process_event(&json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": delta
+            })));
+        }
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "**Planning**\n\n<!-- -->\n"
+        })));
+
+        let thinking = thinking_deltas(&events).join("");
+        assert_eq!(thinking, "**Planning**\n\n");
+        assert!(!thinking.contains("<!--"));
+        assert!(!thinking.contains("-->"));
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_non_placeholder_summary_comments() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "Keep <!-- --> inline\n<!-- note -->\n"
+        })));
+
+        assert_eq!(
+            thinking_deltas(&events).join(""),
+            "Keep <!-- --> inline\n<!-- note -->\n"
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_blank_comment_in_raw_reasoning_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "<!-- -->"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["<!-- -->"]);
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_incomplete_non_marker_summary_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "<"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "<"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["<"]);
+    }
+
+    #[test]
+    fn test_stream_converter_does_not_separate_after_marker_only_summary_part() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": "<!-- -->"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 1,
+            "delta": "next summary"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["next summary"]);
+    }
+
+    #[test]
     fn test_stream_converter_deduplicates_reasoning_summary_done_text() {
         let mut converter = ResponsesStreamConverter::new();
         let mut events = Vec::new();
@@ -4808,6 +5286,30 @@ mod tests {
         assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
         assert_eq!(text_deltas(&events), vec!["I can’t help with that."]);
         assert_eq!(stop.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_non_streaming_response_drops_blank_summary_comment_lines() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "**Planning**\n\n<!-- -->"},
+                    {"type": "summary_text", "text": "Keep <!-- --> inline"}
+                ]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+
+        assert_eq!(
+            thinking_deltas(&events).join(""),
+            "**Planning**\nKeep <!-- --> inline"
+        );
     }
 
     #[test]
