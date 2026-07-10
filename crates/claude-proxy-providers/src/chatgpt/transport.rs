@@ -1114,19 +1114,29 @@ pub(super) struct ChatGptWebSocketStreamStart {
     pub(super) upstream_send_body_bytes: usize,
 }
 
+pub(super) struct ChatGptWebSocketRequestContext<'a> {
+    pub(super) marker_mode: ReasoningMarkerMode,
+    pub(super) stable_client_conversation_id: Option<&'a str>,
+    pub(super) request_id: u64,
+    pub(super) responses_lite: ResponsesLiteDecision,
+}
+
 pub(super) async fn open_websocket_stream<F>(
     provider: &ChatGptProvider,
     body: Value,
     token: &ChatGptToken,
-    marker_mode: ReasoningMarkerMode,
-    stable_client_conversation_id: Option<&str>,
-    request_id: u64,
-    responses_lite: ResponsesLiteDecision,
+    context: ChatGptWebSocketRequestContext<'_>,
     on_event: F,
 ) -> Result<ChatGptWebSocketStreamStart, ChatGptWebSocketStartError>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
+    let ChatGptWebSocketRequestContext {
+        marker_mode,
+        stable_client_conversation_id,
+        request_id,
+        responses_lite,
+    } = context;
     let request_body_bytes = serde_json::to_vec(&body).map_or(0, |bytes| bytes.len());
     let idle_timeout = websocket_idle_timeout(provider);
     let connection_key = websocket_connection_key(provider, token, &body);

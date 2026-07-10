@@ -188,6 +188,14 @@ struct ChatGptOutputTokenBudget {
     effective: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChatGptSseRequestContext {
+    compact_request: bool,
+    request_id: u64,
+    budget: ChatGptOutputTokenBudget,
+    responses_lite: ResponsesLiteDecision,
+}
+
 #[derive(Debug)]
 struct ChatGptSseRequestBody {
     bytes: Vec<u8>,
@@ -931,12 +939,15 @@ impl ChatGptProvider {
         &self,
         body: &Value,
         token: &ChatGptToken,
-        compact_request: bool,
-        request_id: u64,
+        context: ChatGptSseRequestContext,
         prompt_too_long_attempt: usize,
-        budget: ChatGptOutputTokenBudget,
-        responses_lite: ResponsesLiteDecision,
     ) -> Result<Response, ProviderError> {
+        let ChatGptSseRequestContext {
+            compact_request,
+            request_id,
+            budget,
+            responses_lite,
+        } = context;
         let request_body = prepare_chatgpt_sse_request_body(body)?;
         let body_bytes = request_body.original_len;
         let body_wire_bytes = request_body.bytes.len();
@@ -1048,10 +1059,7 @@ impl ChatGptProvider {
         &self,
         body: &mut Value,
         token: &ChatGptToken,
-        compact_request: bool,
-        request_id: u64,
-        budget: ChatGptOutputTokenBudget,
-        responses_lite: ResponsesLiteDecision,
+        context: ChatGptSseRequestContext,
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         validate_chatgpt_tool_schema_budget(body)?;
@@ -1060,32 +1068,32 @@ impl ChatGptProvider {
             observer,
             ProviderRequestMetadata {
                 transport: Some("sse".to_string()),
-                responses_lite: Some(responses_lite.is_enabled()),
+                responses_lite: Some(context.responses_lite.is_enabled()),
                 request_body_bytes: Some(body_bytes as u64),
                 upstream_send_body_bytes: Some(body_bytes as u64),
                 ..ProviderRequestMetadata::default()
             },
         );
         let current_budget = ChatGptOutputTokenBudget {
-            requested: budget.requested,
+            requested: context.budget.requested,
             effective: body.get("max_output_tokens").and_then(Value::as_u64),
         };
         let response = self
             .send_responses_request(
                 body,
                 token,
-                compact_request,
-                request_id,
+                ChatGptSseRequestContext {
+                    budget: current_budget,
+                    ..context
+                },
                 0,
-                current_budget,
-                responses_lite,
             )
             .await?;
         let status = response.status();
         if status.is_success() || status == StatusCode::UNAUTHORIZED {
-            if compact_request {
+            if context.compact_request {
                 info!(
-                    request_id,
+                    request_id = context.request_id,
                     status = status.as_u16(),
                     prompt_too_long_retry_triggered = false,
                     prompt_too_long_retries = 0,
@@ -1210,10 +1218,12 @@ impl ChatGptProvider {
             .send_responses_request_with_prompt_too_long_retry(
                 &mut body,
                 &token,
-                compact_request,
-                request_id,
-                output_token_budget,
-                responses_lite,
+                ChatGptSseRequestContext {
+                    compact_request,
+                    request_id,
+                    budget: output_token_budget,
+                    responses_lite,
+                },
                 observer.as_ref(),
             )
             .await?;
@@ -1231,10 +1241,12 @@ impl ChatGptProvider {
                 .send_responses_request_with_prompt_too_long_retry(
                     &mut body,
                     &refreshed,
-                    compact_request,
-                    request_id,
-                    output_token_budget,
-                    responses_lite,
+                    ChatGptSseRequestContext {
+                        compact_request,
+                        request_id,
+                        budget: output_token_budget,
+                        responses_lite,
+                    },
                     observer.as_ref(),
                 )
                 .await?;
@@ -1355,10 +1367,12 @@ impl ChatGptProvider {
             self,
             body,
             token,
-            marker_mode,
-            stable_client_conversation_id.as_deref(),
-            request_id,
-            responses_lite,
+            transport::ChatGptWebSocketRequestContext {
+                marker_mode,
+                stable_client_conversation_id: stable_client_conversation_id.as_deref(),
+                request_id,
+                responses_lite,
+            },
             on_event,
         )
         .await
@@ -3279,7 +3293,7 @@ fn append_configured_chatgpt_models<'a>(
         .iter()
         .filter(|(model_id, _)| !known_ids.contains(model_id.as_str()))
         .collect::<Vec<_>>();
-    configured_models.sort_by(|(left, _), (right, _)| left.cmp(right));
+    configured_models.sort_by_key(|(model_id, _)| *model_id);
     models.extend(
         configured_models
             .into_iter()
@@ -5761,14 +5775,18 @@ mod tests {
             .send_responses_request(
                 &body,
                 &token,
-                false,
-                1,
-                0,
-                ChatGptOutputTokenBudget {
-                    requested: Some(4096),
-                    effective: body.get("max_output_tokens").and_then(Value::as_u64),
+                ChatGptSseRequestContext {
+                    compact_request: false,
+                    request_id: 1,
+                    budget: ChatGptOutputTokenBudget {
+                        requested: Some(4096),
+                        effective: body.get("max_output_tokens").and_then(Value::as_u64),
+                    },
+                    responses_lite: ResponsesLiteDecision::enabled(
+                        ResponsesLiteDecisionSource::ForcedOn,
+                    ),
                 },
-                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn),
+                0,
             )
             .await
             .expect("request should succeed");
@@ -5811,11 +5829,15 @@ mod tests {
             .send_responses_request(
                 &body,
                 &token,
-                false,
-                1,
+                ChatGptSseRequestContext {
+                    compact_request: false,
+                    request_id: 1,
+                    budget: ChatGptOutputTokenBudget::default(),
+                    responses_lite: ResponsesLiteDecision::disabled(
+                        ResponsesLiteDecisionSource::ForcedOff,
+                    ),
+                },
                 0,
-                ChatGptOutputTokenBudget::default(),
-                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::ForcedOff),
             )
             .await
             .expect("request should succeed");
@@ -7004,10 +7026,14 @@ mod tests {
             .send_responses_request_with_prompt_too_long_retry(
                 &mut body,
                 &token,
-                false,
-                1,
-                ChatGptOutputTokenBudget::default(),
-                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel),
+                ChatGptSseRequestContext {
+                    compact_request: false,
+                    request_id: 1,
+                    budget: ChatGptOutputTokenBudget::default(),
+                    responses_lite: ResponsesLiteDecision::disabled(
+                        ResponsesLiteDecisionSource::UnknownModel,
+                    ),
+                },
                 None,
             )
             .await
