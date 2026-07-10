@@ -12,6 +12,7 @@ use claude_proxy_config::settings::{
     ModelReasoningEffort, ProviderType, REASONING_MARKER_MODE_EXTRA_KEY, ReasoningMarkerMode,
 };
 use claude_proxy_core::*;
+use claude_proxy_providers::chatgpt::{CLAUDE_CODE_CONTEXT_1M_BETA, VIRTUAL_CONTEXT_1M_EXTRA_KEY};
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
     Provider, ProviderError, ProviderRequestMetadata, ProviderRequestObserver,
@@ -66,6 +67,28 @@ fn attach_client_session_metadata(
     request
         .extra
         .insert("client_session_id".to_string(), json!(session_id));
+    request
+}
+
+fn attach_virtual_context_metadata(
+    mut request: MessagesRequest,
+    headers: &HeaderMap,
+) -> MessagesRequest {
+    let virtual_context = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|betas| {
+            betas
+                .split(',')
+                .map(str::trim)
+                .any(|beta| beta == CLAUDE_CODE_CONTEXT_1M_BETA)
+        });
+    if virtual_context {
+        request
+            .extra
+            .insert(VIRTUAL_CONTEXT_1M_EXTRA_KEY.to_string(), Value::Bool(true));
+    }
     request
 }
 
@@ -158,7 +181,10 @@ pub async fn messages(
         }
     }
 
-    let request = attach_client_session_metadata(request, &headers);
+    let request = attach_virtual_context_metadata(
+        attach_client_session_metadata(request, &headers),
+        &headers,
+    );
 
     // Concurrency limiting
     let request_permit = match acquire_request_permit(&state, start).await {
@@ -699,6 +725,33 @@ fn merge_provider_request_metadata(
     if metadata.upstream_send_body_bytes.is_some() {
         target.upstream_send_body_bytes = metadata.upstream_send_body_bytes;
     }
+    if metadata.virtual_context_1m.is_some() {
+        target.virtual_context_1m = metadata.virtual_context_1m;
+    }
+    if metadata.context_estimated_tokens.is_some() {
+        target.context_estimated_tokens = metadata.context_estimated_tokens;
+    }
+    if metadata.context_safe_input_limit.is_some() {
+        target.context_safe_input_limit = metadata.context_safe_input_limit;
+    }
+    if metadata.context_model_window.is_some() {
+        target.context_model_window = metadata.context_model_window;
+    }
+    if metadata.context_estimator_source.is_some() {
+        target.context_estimator_source = metadata.context_estimator_source.clone();
+    }
+    if metadata.context_compact_kind.is_some() {
+        target.context_compact_kind = metadata.context_compact_kind.clone();
+    }
+    if metadata.context_compressible_history.is_some() {
+        target.context_compressible_history = metadata.context_compressible_history;
+    }
+    if metadata.context_local_blocked.is_some() {
+        target.context_local_blocked = metadata.context_local_blocked;
+    }
+    if metadata.context_upstream_overflow.is_some() {
+        target.context_upstream_overflow = metadata.context_upstream_overflow;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -802,6 +855,15 @@ fn build_observability_event(
         synthetic_stable_client_conversation_id: observer_state
             .request_metadata
             .synthetic_stable_client_conversation_id,
+        virtual_context_1m: observer_state.request_metadata.virtual_context_1m,
+        context_estimated_tokens: observer_state.request_metadata.context_estimated_tokens,
+        context_safe_input_limit: observer_state.request_metadata.context_safe_input_limit,
+        context_model_window: observer_state.request_metadata.context_model_window,
+        context_estimator_source: observer_state.request_metadata.context_estimator_source,
+        context_compact_kind: observer_state.request_metadata.context_compact_kind,
+        context_compressible_history: observer_state.request_metadata.context_compressible_history,
+        context_local_blocked: observer_state.request_metadata.context_local_blocked,
+        context_upstream_overflow: observer_state.request_metadata.context_upstream_overflow,
         prompt_too_long_retries: observer_state.prompt_too_long_retries,
         prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
         prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,
@@ -1001,6 +1063,9 @@ async fn resolve_upstream_request(
 
     let mut request = request.clone();
     request.model = upstream_model.clone();
+    if provider_type != ProviderType::ChatGPT {
+        request.extra.remove(VIRTUAL_CONTEXT_1M_EXTRA_KEY);
+    }
     apply_alias_reasoning_effort(&mut request, resolved_model.reasoning_effort);
     apply_reasoning_marker_mode(&mut request, &provider_type, reasoning_marker_mode);
 
@@ -2633,6 +2698,53 @@ mod tests {
     }
 
     #[test]
+    fn claude_context_beta_header_marks_virtual_one_million_request() {
+        let request = request_with_system(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("other-beta, context-1m-2025-08-07"),
+        );
+
+        let request = attach_virtual_context_metadata(request, &headers);
+
+        assert_eq!(
+            request.extra.get(VIRTUAL_CONTEXT_1M_EXTRA_KEY),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_context_marker_is_scoped_to_chatgpt_provider() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert(VIRTUAL_CONTEXT_1M_EXTRA_KEY.to_string(), Value::Bool(true));
+
+        let chatgpt = resolve_upstream_request(
+            &AppState::new(settings_with_provider(ProviderType::ChatGPT), None),
+            &request,
+        )
+        .await;
+        assert_eq!(
+            chatgpt.request.extra.get(VIRTUAL_CONTEXT_1M_EXTRA_KEY),
+            Some(&Value::Bool(true))
+        );
+
+        let openai = resolve_upstream_request(
+            &AppState::new(settings_with_provider(ProviderType::OpenAI), None),
+            &request,
+        )
+        .await;
+        assert!(
+            !openai
+                .request
+                .extra
+                .contains_key(VIRTUAL_CONTEXT_1M_EXTRA_KEY)
+        );
+    }
+
+    #[test]
     fn chatgpt_subagent_marker_resolves_agent_initiator() {
         let settings = settings_with_provider(ProviderType::ChatGPT);
         let request = request_with_system(Some(SystemPrompt::Text(
@@ -3090,6 +3202,7 @@ mod tests {
             request_metadata: Some(ProviderRequestMetadata {
                 continuation_fallback_used: Some(true),
                 fallback_reason: Some("previous_response_not_found".to_string()),
+                context_upstream_overflow: Some(true),
                 ..ProviderRequestMetadata::default()
             }),
             ..ProviderRequestObserverEvent::default()
@@ -3104,6 +3217,14 @@ mod tests {
                 prompt_cache_key_source: Some("client".to_string()),
                 stable_client_conversation_id_present: Some(true),
                 synthetic_stable_client_conversation_id: Some(false),
+                virtual_context_1m: Some(true),
+                context_estimated_tokens: Some(340_000),
+                context_safe_input_limit: Some(339_000),
+                context_model_window: Some(372_000),
+                context_estimator_source: Some("full_rough".to_string()),
+                context_compact_kind: Some("none".to_string()),
+                context_compressible_history: Some(true),
+                context_local_blocked: Some(true),
                 ..ProviderRequestMetadata::default()
             }),
             ..ProviderRequestObserverEvent::default()
@@ -3136,6 +3257,13 @@ mod tests {
                 .synthetic_stable_client_conversation_id,
             Some(false)
         );
+        assert_eq!(state.request_metadata.virtual_context_1m, Some(true));
+        assert_eq!(
+            state.request_metadata.context_estimated_tokens,
+            Some(340_000)
+        );
+        assert_eq!(state.request_metadata.context_local_blocked, Some(true));
+        assert_eq!(state.request_metadata.context_upstream_overflow, Some(true));
     }
 
     #[test]

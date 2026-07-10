@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use claude_proxy_config::Settings;
@@ -327,7 +327,7 @@ pub enum EditableSection {
 /// Result of a background model fetch.
 pub struct FetchResult {
     pub provider_id: String,
-    pub models: Result<Vec<String>, String>,
+    pub models: Result<Vec<claude_proxy_core::ModelInfo>, String>,
 }
 
 /// Result of a background provider health check.
@@ -403,6 +403,9 @@ pub struct ObservabilitySummary {
     pub responses_lite_requests: u64,
     pub websocket_requests: u64,
     pub continuation_used_requests: u64,
+    pub virtual_context_requests: u64,
+    pub context_local_blocks: u64,
+    pub context_upstream_overflows: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -475,6 +478,12 @@ pub struct App {
     pub fetch_rx: Option<std::sync::mpsc::Receiver<FetchResult>>,
     /// When fetching models for Model page editing — which field to set.
     pub pending_model_section: Option<EditableSection>,
+    /// When fetching model capabilities — which reasoning field to edit.
+    pub pending_reasoning_section: Option<EditableSection>,
+    /// Reasoning effort levels advertised by fetched provider model catalogs.
+    pub model_reasoning_efforts: HashMap<String, Vec<String>>,
+    /// Providers whose model catalogs have been fetched successfully in this TUI session.
+    pub model_capabilities_loaded: HashSet<String>,
     /// Tokio runtime handle for async provider calls from background threads.
     pub tokio_handle: Option<tokio::runtime::Handle>,
     /// Live metrics fetched from the running server.
@@ -514,6 +523,9 @@ impl App {
             tick: 0,
             fetch_rx: None,
             pending_model_section: None,
+            pending_reasoning_section: None,
+            model_reasoning_efforts: HashMap::new(),
+            model_capabilities_loaded: HashSet::new(),
             tokio_handle: tokio::runtime::Handle::try_current().ok(),
             live_metrics: None,
             metrics_rx: None,
@@ -556,7 +568,7 @@ impl App {
             .nth(self.content_idx)
             .map(|(id, cfg)| {
                 if cfg.resolve_type(id) == ProviderType::ChatGPT {
-                    6
+                    7
                 } else {
                     5
                 }

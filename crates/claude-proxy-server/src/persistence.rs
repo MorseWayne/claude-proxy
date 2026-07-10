@@ -161,6 +161,27 @@ fn ensure_request_observability_columns(conn: &Connection) -> rusqlite::Result<(
             "synthetic_stable_client_conversation_id",
             "synthetic_stable_client_conversation_id INTEGER",
         ),
+        ("virtual_context_1m", "virtual_context_1m INTEGER"),
+        (
+            "context_estimated_tokens",
+            "context_estimated_tokens INTEGER",
+        ),
+        (
+            "context_safe_input_limit",
+            "context_safe_input_limit INTEGER",
+        ),
+        ("context_model_window", "context_model_window INTEGER"),
+        ("context_estimator_source", "context_estimator_source TEXT"),
+        ("context_compact_kind", "context_compact_kind TEXT"),
+        (
+            "context_compressible_history",
+            "context_compressible_history INTEGER",
+        ),
+        ("context_local_blocked", "context_local_blocked INTEGER"),
+        (
+            "context_upstream_overflow",
+            "context_upstream_overflow INTEGER",
+        ),
     ] {
         if !request_observability_events_has_column(conn, name)? {
             conn.execute(
@@ -223,6 +244,15 @@ fn rebuild_request_observability_schema(conn: &Connection) -> rusqlite::Result<(
             prompt_cache_key_source TEXT,
             stable_client_conversation_id_present INTEGER,
             synthetic_stable_client_conversation_id INTEGER,
+            virtual_context_1m INTEGER,
+            context_estimated_tokens INTEGER,
+            context_safe_input_limit INTEGER,
+            context_model_window INTEGER,
+            context_estimator_source TEXT,
+            context_compact_kind TEXT,
+            context_compressible_history INTEGER,
+            context_local_blocked INTEGER,
+            context_upstream_overflow INTEGER,
             prompt_too_long_retries INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_original_body_bytes INTEGER NOT NULL DEFAULT 0,
             prompt_too_long_shrunk_body_bytes INTEGER NOT NULL DEFAULT 0,
@@ -438,11 +468,14 @@ impl MetricsStore {
                 upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
                 prompt_cache_key_present, prompt_cache_key_source,
                 stable_client_conversation_id_present, synthetic_stable_client_conversation_id,
+                virtual_context_1m, context_estimated_tokens, context_safe_input_limit,
+                context_model_window, context_estimator_source, context_compact_kind,
+                context_compressible_history, context_local_blocked, context_upstream_overflow,
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
                 request_tool_results, request_text_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50)",
             rusqlite::params![
                 ev.request_id,
                 ev.provider,
@@ -479,6 +512,15 @@ impl MetricsStore {
                     .map(|value| value as i64),
                 ev.synthetic_stable_client_conversation_id
                     .map(|value| value as i64),
+                ev.virtual_context_1m.map(|value| value as i64),
+                ev.context_estimated_tokens.map(|value| value as i64),
+                ev.context_safe_input_limit.map(|value| value as i64),
+                ev.context_model_window.map(|value| value as i64),
+                ev.context_estimator_source.as_deref(),
+                ev.context_compact_kind.as_deref(),
+                ev.context_compressible_history.map(|value| value as i64),
+                ev.context_local_blocked.map(|value| value as i64),
+                ev.context_upstream_overflow.map(|value| value as i64),
                 ev.prompt_too_long_retries as i64,
                 ev.prompt_too_long_original_body_bytes as i64,
                 ev.prompt_too_long_shrunk_body_bytes as i64,
@@ -599,7 +641,10 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 COALESCE(SUM(continuation_saved_bytes), 0),
                 COALESCE(SUM(CASE WHEN responses_lite = 1 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN transport = 'websocket' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN continuation_used = 1 THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN continuation_used = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN virtual_context_1m = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN context_local_blocked = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN context_upstream_overflow = 1 THEN 1 ELSE 0 END), 0)
          FROM request_observability_events",
         [],
         |row| {
@@ -615,6 +660,9 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
                 row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
             ))
         },
     ) {
@@ -629,6 +677,9 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
         stored.summary.responses_lite_requests = row.8 as u64;
         stored.summary.websocket_requests = row.9 as u64;
         stored.summary.continuation_used_requests = row.10 as u64;
+        stored.summary.virtual_context_requests = row.11 as u64;
+        stored.summary.context_local_blocks = row.12 as u64;
+        stored.summary.context_upstream_overflows = row.13 as u64;
         stored.summary.finalize();
     }
 
@@ -642,6 +693,9 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 upstream_send_body_bytes, continuation_saved_bytes, responses_lite,
                 prompt_cache_key_present, prompt_cache_key_source,
                 stable_client_conversation_id_present, synthetic_stable_client_conversation_id,
+                virtual_context_1m, context_estimated_tokens, context_safe_input_limit,
+                context_model_window, context_estimator_source, context_compact_kind,
+                context_compressible_history, context_local_blocked, context_upstream_overflow,
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
@@ -699,14 +753,23 @@ fn request_observability_from_row(
         synthetic_stable_client_conversation_id: row
             .get::<_, Option<i64>>(32)?
             .map(|value| value != 0),
-        prompt_too_long_retries: row.get::<_, i64>(33)? as u64,
-        prompt_too_long_original_body_bytes: row.get::<_, i64>(34)? as u64,
-        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(35)? as u64,
-        prompt_too_long_dropped_items: row.get::<_, i64>(36)? as u64,
-        request_messages: row.get::<_, i64>(37)? as u64,
-        request_content_blocks: row.get::<_, i64>(38)? as u64,
-        request_tool_results: row.get::<_, i64>(39)? as u64,
-        request_text_bytes: row.get::<_, i64>(40)? as u64,
+        virtual_context_1m: row.get::<_, Option<i64>>(33)?.map(|value| value != 0),
+        context_estimated_tokens: row.get::<_, Option<i64>>(34)?.map(|value| value as u64),
+        context_safe_input_limit: row.get::<_, Option<i64>>(35)?.map(|value| value as u64),
+        context_model_window: row.get::<_, Option<i64>>(36)?.map(|value| value as u64),
+        context_estimator_source: row.get(37)?,
+        context_compact_kind: row.get(38)?,
+        context_compressible_history: row.get::<_, Option<i64>>(39)?.map(|value| value != 0),
+        context_local_blocked: row.get::<_, Option<i64>>(40)?.map(|value| value != 0),
+        context_upstream_overflow: row.get::<_, Option<i64>>(41)?.map(|value| value != 0),
+        prompt_too_long_retries: row.get::<_, i64>(42)? as u64,
+        prompt_too_long_original_body_bytes: row.get::<_, i64>(43)? as u64,
+        prompt_too_long_shrunk_body_bytes: row.get::<_, i64>(44)? as u64,
+        prompt_too_long_dropped_items: row.get::<_, i64>(45)? as u64,
+        request_messages: row.get::<_, i64>(46)? as u64,
+        request_content_blocks: row.get::<_, i64>(47)? as u64,
+        request_tool_results: row.get::<_, i64>(48)? as u64,
+        request_text_bytes: row.get::<_, i64>(49)? as u64,
     })
 }
 
@@ -1013,6 +1076,15 @@ mod tests {
             prompt_cache_key_source: Some("client".to_string()),
             stable_client_conversation_id_present: Some(true),
             synthetic_stable_client_conversation_id: Some(false),
+            virtual_context_1m: Some(true),
+            context_estimated_tokens: Some(300_000),
+            context_safe_input_limit: Some(339_000),
+            context_model_window: Some(372_000),
+            context_estimator_source: Some("full_rough".to_string()),
+            context_compact_kind: Some("none".to_string()),
+            context_compressible_history: Some(true),
+            context_local_blocked: Some(is_error),
+            context_upstream_overflow: Some(is_error),
             prompt_too_long_retries: 1,
             prompt_too_long_original_body_bytes: 200,
             prompt_too_long_shrunk_body_bytes: 120,
@@ -1045,6 +1117,9 @@ mod tests {
         assert_eq!(stored.summary.responses_lite_requests, 2);
         assert_eq!(stored.summary.websocket_requests, 2);
         assert_eq!(stored.summary.continuation_used_requests, 2);
+        assert_eq!(stored.summary.virtual_context_requests, 2);
+        assert_eq!(stored.summary.context_local_blocks, 1);
+        assert_eq!(stored.summary.context_upstream_overflows, 1);
         assert_eq!(stored.recent.len(), 2);
         assert_eq!(stored.recent[0].request_id, "first");
         assert_eq!(stored.recent[1].request_id, "second");
@@ -1074,6 +1149,16 @@ mod tests {
             stored.recent[0].synthetic_stable_client_conversation_id,
             Some(false)
         );
+        assert_eq!(stored.recent[0].virtual_context_1m, Some(true));
+        assert_eq!(stored.recent[0].context_estimated_tokens, Some(300_000));
+        assert_eq!(stored.recent[0].context_safe_input_limit, Some(339_000));
+        assert_eq!(stored.recent[0].context_model_window, Some(372_000));
+        assert_eq!(
+            stored.recent[0].context_estimator_source.as_deref(),
+            Some("full_rough")
+        );
+        assert_eq!(stored.recent[1].context_local_blocked, Some(true));
+        assert_eq!(stored.recent[1].context_upstream_overflow, Some(true));
         assert_eq!(stored.recent[1].continuation_fallback_used, Some(true));
         assert_eq!(
             stored.recent[1].fallback_reason.as_deref(),
@@ -1154,6 +1239,14 @@ mod tests {
             )
             .unwrap()
         );
+        assert!(request_observability_events_has_column(&conn, "virtual_context_1m").unwrap());
+        assert!(
+            request_observability_events_has_column(&conn, "context_estimated_tokens").unwrap()
+        );
+        assert!(request_observability_events_has_column(&conn, "context_local_blocked").unwrap());
+        assert!(
+            request_observability_events_has_column(&conn, "context_upstream_overflow").unwrap()
+        );
         let stored = load_request_observability(&conn);
         assert_eq!(stored.recent.len(), 1);
         let event = &stored.recent[0];
@@ -1168,9 +1261,16 @@ mod tests {
         assert_eq!(event.prompt_cache_key_source, None);
         assert_eq!(event.stable_client_conversation_id_present, None);
         assert_eq!(event.synthetic_stable_client_conversation_id, None);
+        assert_eq!(event.virtual_context_1m, None);
+        assert_eq!(event.context_estimated_tokens, None);
+        assert_eq!(event.context_local_blocked, None);
+        assert_eq!(event.context_upstream_overflow, None);
         assert_eq!(stored.summary.responses_lite_requests, 0);
         assert_eq!(stored.summary.websocket_requests, 0);
         assert_eq!(stored.summary.continuation_used_requests, 0);
+        assert_eq!(stored.summary.virtual_context_requests, 0);
+        assert_eq!(stored.summary.context_local_blocks, 0);
+        assert_eq!(stored.summary.context_upstream_overflows, 0);
         let _ = std::fs::remove_file(path);
     }
 

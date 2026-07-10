@@ -4,7 +4,7 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use claude_proxy_config::settings::{ProviderConfig, ProviderType};
+use claude_proxy_config::settings::{ModelReasoningEffort, ProviderConfig, ProviderType};
 use colored::Colorize;
 
 mod logging;
@@ -376,6 +376,9 @@ async fn handle_provider(action: ProviderAction) {
                     reasoning_markers: Default::default(),
                 },
             );
+            if !replaced && provider_type == ProviderType::ChatGPT {
+                settings.model.apply_chatgpt_56_defaults(&provider_id);
+            }
 
             save_settings(&settings);
             let action = if replaced { "updated" } else { "added" };
@@ -435,6 +438,10 @@ async fn handle_provider(action: ProviderAction) {
                         let model_name = &model_names[selection];
                         let model_ref = format!("{provider_id}/{model_name}");
                         settings.model.default.name = model_ref.clone();
+                        if provider_type == ProviderType::ChatGPT {
+                            settings.model.default.reasoning_effort =
+                                Some(ModelReasoningEffort::High);
+                        }
                         save_settings(&settings);
                         println!("  → Default model: {}", model_ref.cyan());
                         return;
@@ -460,6 +467,9 @@ async fn handle_provider(action: ProviderAction) {
                 format!("{provider_id}/{model_name}")
             };
             settings.model.default.name = model_ref.clone();
+            if provider_type == ProviderType::ChatGPT {
+                settings.model.default.reasoning_effort = Some(ModelReasoningEffort::High);
+            }
             save_settings(&settings);
             println!("  → Default model: {}", model_ref.cyan());
         }
@@ -541,6 +551,9 @@ async fn handle_provider(action: ProviderAction) {
                 .unwrap_or_else(|| "default".to_string());
             let model_ref = format!("{id}/{model_name}");
             settings.model.default.name = model_ref.clone();
+            if settings.providers[&id].resolve_type(&id) == ProviderType::ChatGPT {
+                settings.model.default.reasoning_effort = Some(ModelReasoningEffort::High);
+            }
             save_settings(&settings);
             println!(
                 "{} Default model set to \"{}\"",

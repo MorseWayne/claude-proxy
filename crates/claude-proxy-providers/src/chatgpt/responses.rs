@@ -1,6 +1,6 @@
 use crate::provider::ProviderError;
 use claude_proxy_config::settings::ReasoningMarkerMode;
-use claude_proxy_core::{MessagesRequest, SseEvent};
+use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
@@ -10,6 +10,8 @@ pub(super) struct CodexRequestContext<'a> {
     pub service_tier: Option<&'a str>,
     pub standalone_tools: bool,
     pub responses_lite: bool,
+    pub model: Option<&'a ModelInfo>,
+    pub additional_instructions: Option<&'a str>,
 }
 
 impl Default for CodexRequestContext<'_> {
@@ -19,6 +21,8 @@ impl Default for CodexRequestContext<'_> {
             service_tier: None,
             standalone_tools: true,
             responses_lite: false,
+            model: None,
+            additional_instructions: None,
         }
     }
 }
@@ -86,7 +90,7 @@ pub(super) fn build_body_with_context(
         request,
         crate::responses::ConversionContext {
             provider_id: Some("chatgpt"),
-            model: None,
+            model: context.model,
             tool_conversion_mode: if context.standalone_tools {
                 crate::responses::ToolConversionMode::CodexStandalone
             } else {
@@ -107,6 +111,22 @@ pub(super) fn build_body_with_context(
             .is_none_or(str::is_empty);
         if missing_instructions {
             object.insert("instructions".to_string(), json!(default_instructions));
+        }
+        if let Some(additional) = context
+            .additional_instructions
+            .map(str::trim)
+            .filter(|instructions| !instructions.is_empty())
+        {
+            let existing = object
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let instructions = if existing.is_empty() {
+                additional.to_string()
+            } else {
+                format!("{existing}\n\n{additional}")
+            };
+            object.insert("instructions".to_string(), json!(instructions));
         }
         apply_codex_metadata(object, request, context);
     }
@@ -146,6 +166,21 @@ fn apply_codex_request_options(
             .and_then(Value::as_str)
             .or(context.service_tier),
     );
+
+    insert_trimmed_string(
+        body,
+        "safety_identifier",
+        request
+            .extra
+            .get("safety_identifier")
+            .and_then(Value::as_str),
+    );
+
+    if let Some(value) = request.extra.get("prompt_cache_options")
+        && value.is_object()
+    {
+        body.insert("prompt_cache_options".to_string(), value.clone());
+    }
 
     if let Some(value) = request.extra.get("parallel_tool_calls")
         && value.is_boolean()

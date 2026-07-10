@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use tracing::{Level, debug, enabled, info};
 
 const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+const GPT_56_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
 fn intent(req: &MessagesRequest) -> Option<&str> {
     req.metadata
@@ -158,7 +159,12 @@ fn fast_model_for(intent: &str, model: &str) -> Option<&'static str> {
     if !matches!(intent, "fast" | "quick_reply" | "summarization") {
         return None;
     }
-    if model.starts_with("gpt-5.5") || model.starts_with("gpt-5.4") || model.starts_with("gpt-5") {
+    if model.starts_with("gpt-5.6") {
+        Some("gpt-5.6-luna")
+    } else if model.starts_with("gpt-5.5")
+        || model.starts_with("gpt-5.4")
+        || model.starts_with("gpt-5")
+    {
         Some("gpt-5.4-mini")
     } else {
         None
@@ -221,7 +227,9 @@ pub(crate) fn supports_reasoning_summary(model: &str) -> bool {
 }
 
 fn model_reasoning_efforts(model: &str) -> Vec<&'static str> {
-    if is_reasoning_model(model) || model.starts_with("gpt-5") {
+    if is_gpt_56_model(model) {
+        GPT_56_REASONING_EFFORTS.to_vec()
+    } else if is_reasoning_model(model) || model.starts_with("gpt-5") {
         REASONING_EFFORTS.to_vec()
     } else {
         Vec::new()
@@ -240,11 +248,17 @@ fn is_codex_model(model: &str) -> bool {
     model.contains("codex")
 }
 
+fn is_gpt_56_model(model: &str) -> bool {
+    model.starts_with("gpt-5.6")
+}
+
 fn context_window_for_model(model_id: &str) -> Option<u32> {
     if is_codex_model(model_id) {
         // Codex-family upstreams currently reject prompts above this observed backend limit,
         // even when adjacent GPT-5 metadata advertises a larger public context window.
         Some(272_000)
+    } else if is_gpt_56_model(model_id) {
+        Some(1_050_000)
     } else if model_id.starts_with("gpt-5") {
         Some(400_000)
     } else {
@@ -253,7 +267,7 @@ fn context_window_for_model(model_id: &str) -> Option<u32> {
 }
 
 fn max_output_tokens_for_model(model_id: &str) -> Option<u32> {
-    if model_id.starts_with("gpt-5.5") {
+    if is_gpt_56_model(model_id) || model_id.starts_with("gpt-5.5") {
         Some(128_000)
     } else if model_id.contains("mini") {
         Some(16_384)
@@ -292,7 +306,24 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
         is_chat_default: None,
         capabilities: ModelCapabilities {
             endpoints: EndpointCapabilities::from_paths(&supported_endpoints),
-            modalities: ModalityCapabilities::default(),
+            modalities: if is_gpt_56_model(model_id) {
+                ModalityCapabilities {
+                    input: InputModalities {
+                        text: CapabilityState::Supported,
+                        image: CapabilityState::Supported,
+                        document: CapabilityState::Unknown,
+                        audio: CapabilityState::Unsupported,
+                        video: CapabilityState::Unsupported,
+                    },
+                    output: OutputModalities {
+                        text: CapabilityState::Supported,
+                        image: CapabilityState::Unsupported,
+                        audio: CapabilityState::Unsupported,
+                    },
+                }
+            } else {
+                ModalityCapabilities::default()
+            },
             features: FeatureCapabilities {
                 streaming: CapabilityState::Supported,
                 system_prompt: CapabilityState::Supported,
@@ -323,12 +354,12 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 token_counting: TokenCountingCapability::rough(),
                 ..Default::default()
             },
-            supported_parameters: openai_supported_parameters(supports_reasoning),
+            supported_parameters: openai_supported_parameters(model_id, supports_reasoning),
         },
     }
 }
 
-fn openai_supported_parameters(supports_reasoning: bool) -> Vec<String> {
+fn openai_supported_parameters(model_id: &str, supports_reasoning: bool) -> Vec<String> {
     let mut parameters = vec![
         "system".to_string(),
         "messages".to_string(),
@@ -342,6 +373,21 @@ fn openai_supported_parameters(supports_reasoning: bool) -> Vec<String> {
     ];
     if supports_reasoning {
         parameters.push("thinking".to_string());
+        parameters.push("reasoning_effort".to_string());
+    }
+    if is_gpt_56_model(model_id) {
+        parameters.extend(
+            [
+                "prompt_cache_key",
+                "prompt_cache_options",
+                "safety_identifier",
+                "service_tier",
+                "parallel_tool_calls",
+                "verbosity",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
     parameters
 }
@@ -457,34 +503,64 @@ pub(crate) fn request_observability(body: &Value) -> RequestObservability {
     }
 }
 
-const COMPACT_REQUEST_MARKERS: &[&str] = &[
-    "Your task is to create a detailed summary",
+const COMPACT_SUMMARY_REQUEST_MARKERS: &[&str] = &["Your task is to create a detailed summary"];
+
+const COMPACT_CONTINUATION_MARKERS: &[&str] = &[
     "This session is being continued from a previous conversation",
     "This is a compacted conversation",
     "This is a continuation from a previous conversation",
     "conversation that ran out of context",
 ];
 
-pub(crate) fn is_compact_request_body(body: &Value) -> bool {
-    ["instructions", "input", "messages"]
-        .iter()
-        .filter_map(|field| body.get(*field))
-        .any(value_contains_compact_marker)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CompactRequestKind {
+    #[default]
+    None,
+    SummaryGeneration,
+    CompactedContinuation,
 }
 
-fn value_contains_compact_marker(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text_contains_compact_marker(text),
-        Value::Array(items) => items.iter().any(value_contains_compact_marker),
-        Value::Object(map) => map.values().any(value_contains_compact_marker),
-        _ => false,
+impl CompactRequestKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SummaryGeneration => "summary_generation",
+            Self::CompactedContinuation => "compacted_continuation",
+        }
     }
 }
 
-fn text_contains_compact_marker(text: &str) -> bool {
-    COMPACT_REQUEST_MARKERS
+#[cfg(test)]
+pub(crate) fn is_compact_request_body(body: &Value) -> bool {
+    classify_compact_request_body(body) != CompactRequestKind::None
+}
+
+pub(crate) fn classify_compact_request_body(body: &Value) -> CompactRequestKind {
+    let fields = ["instructions", "input", "messages"]
         .iter()
-        .any(|marker| text.contains(marker))
+        .filter_map(|field| body.get(*field));
+    for value in fields {
+        if value_contains_marker(value, COMPACT_SUMMARY_REQUEST_MARKERS) {
+            return CompactRequestKind::SummaryGeneration;
+        }
+        if value_contains_marker(value, COMPACT_CONTINUATION_MARKERS) {
+            return CompactRequestKind::CompactedContinuation;
+        }
+    }
+    CompactRequestKind::None
+}
+
+fn value_contains_marker(value: &Value, markers: &[&str]) -> bool {
+    match value {
+        Value::String(text) => markers.iter().any(|marker| text.contains(marker)),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_marker(item, markers)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| value_contains_marker(item, markers)),
+        _ => false,
+    }
 }
 
 fn history_payload_budget_bytes_for_stats(model: &str) -> usize {
@@ -787,6 +863,40 @@ mod tests {
     }
 
     #[test]
+    fn gpt_56_family_uses_public_api_capabilities() {
+        for model_id in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let info = openai_model_info(model_id);
+
+            assert_eq!(info.capabilities.limits.context_window, Some(1_050_000));
+            assert_eq!(info.capabilities.limits.max_output_tokens, Some(128_000));
+            assert_eq!(
+                info.capabilities.limits.reasoning_effort_levels,
+                vec!["none", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert!(info.capabilities.modalities.input.text.is_supported());
+            assert!(info.capabilities.modalities.input.image.is_supported());
+            assert_eq!(
+                info.capabilities.endpoints.supported_paths(),
+                vec!["/chat/completions", "/responses"]
+            );
+            for parameter in [
+                "reasoning_effort",
+                "prompt_cache_options",
+                "safety_identifier",
+                "service_tier",
+                "verbosity",
+            ] {
+                assert!(
+                    info.capabilities
+                        .supported_parameters
+                        .contains(&parameter.to_string()),
+                    "missing {parameter} for {model_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn non_reasoning_model_keeps_chat_completions() {
         let info = openai_model_info("gpt-4.1");
 
@@ -1007,6 +1117,34 @@ mod tests {
         let req = apply_openai_intent(req);
 
         assert_eq!(req.model, "gpt-5.4-mini");
+        assert_eq!(
+            req.extra.get("reasoning_effort").and_then(Value::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn gpt_56_fast_intent_selects_luna() {
+        let mut req = MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({"intent": "fast"})),
+            extra: Default::default(),
+        };
+
+        req = apply_openai_intent(req);
+
+        assert_eq!(req.model, "gpt-5.6-luna");
         assert_eq!(
             req.extra.get("reasoning_effort").and_then(Value::as_str),
             Some("none")

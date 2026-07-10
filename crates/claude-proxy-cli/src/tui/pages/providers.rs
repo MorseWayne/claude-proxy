@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
 };
 
-use claude_proxy_config::settings::{ProviderConfig, ProviderType};
+use claude_proxy_config::settings::{ClaudeCodeContextMode, ProviderConfig, ProviderType};
 
 use super::super::app::{App, Focus, ProviderCheckStatus, ProviderFocus};
 use super::super::{theme, widgets};
@@ -138,7 +138,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     let pt = cfg.resolve_type(id);
     let is_chatgpt = pt == ProviderType::ChatGPT;
 
-    let rows = widgets::field_rows(inner, if is_chatgpt { 10 } else { 9 });
+    let rows = widgets::field_rows(inner, if is_chatgpt { 11 } else { 9 });
 
     widgets::render_field(
         f,
@@ -199,10 +199,10 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         false,
     );
 
-    let check_row = if is_chatgpt { 6 } else { 5 };
-    let status_row = if is_chatgpt { 7 } else { 6 };
-    let info_row = if is_chatgpt { 8 } else { 7 };
-    let hints_row = if is_chatgpt { 9 } else { 8 };
+    let check_row = if is_chatgpt { 7 } else { 5 };
+    let status_row = if is_chatgpt { 8 } else { 6 };
+    let info_row = if is_chatgpt { 9 } else { 7 };
+    let hints_row = if is_chatgpt { 10 } else { 8 };
 
     if is_chatgpt {
         let fast_mode = cfg.chatgpt.as_ref().is_some_and(|c| c.fast_mode);
@@ -212,6 +212,23 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             "Codex Fast Mode",
             fast_mode,
             detail_focused && app.detail_idx == 5,
+        );
+        let context_mode = cfg
+            .chatgpt
+            .as_ref()
+            .map(|config| config.claude_code_context)
+            .unwrap_or_default();
+        let context_label = match context_mode {
+            ClaudeCodeContextMode::Auto => "AUTO · virtual 1M when upstream >200K",
+            ClaudeCodeContextMode::Standard => "OFF · use upstream window",
+        };
+        widgets::render_field(
+            f,
+            rows[6],
+            "Claude Context",
+            context_label,
+            detail_focused && app.detail_idx == 6,
+            false,
         );
     }
 
@@ -282,7 +299,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             ));
             hints.push(Span::styled(" Re-auth", widgets::dim_style()));
         }
-        if is_chatgpt && app.detail_idx == 5 {
+        if is_chatgpt && matches!(app.detail_idx, 5 | 6) {
             hints.push(Span::styled(
                 "  Space ",
                 Style::default()

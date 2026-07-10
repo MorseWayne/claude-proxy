@@ -291,11 +291,41 @@ fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     .column_spacing(2);
     f.render_widget(table, rows_area[0].union(rows_area[4]));
 
-    render_hint(
-        f,
-        rows_area[5],
-        "Model: provider_id/model_name. Reasoning: unset | default | none | minimal | low | medium | high | xhigh | max",
-    );
+    let hint = aliases
+        .get(app.content_idx)
+        .and_then(|(_, model, _)| claude_context_projection_hint(app, model))
+        .unwrap_or_else(|| {
+            "Reasoning keeps unset/default; selectable efforts follow the selected model's advertised capabilities".to_string()
+        });
+    render_hint(f, rows_area[5], &hint);
+}
+
+fn claude_context_projection_hint(app: &App, model_ref: &str) -> Option<String> {
+    let projected =
+        claude_proxy_providers::chatgpt::claude_code_projected_model(&app.settings, model_ref);
+    if !projected.ends_with("[1m]") {
+        return None;
+    }
+    let (provider_id, model_id) = model_ref.split_once('/')?;
+    let window = claude_proxy_providers::chatgpt::configured_chatgpt_context_window(
+        &app.settings,
+        provider_id,
+        model_id,
+    )?;
+    Some(format!(
+        "Claude Code 1M → upstream {} · compact signal {} · summary limit {}",
+        format_context_tokens(window),
+        format_context_tokens(window.saturating_sub(33_000)),
+        format_context_tokens(window.saturating_sub(20_000)),
+    ))
+}
+
+fn format_context_tokens(tokens: u32) -> String {
+    if tokens.is_multiple_of(1_000) {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn cell_style(is_selected: bool) -> Style {

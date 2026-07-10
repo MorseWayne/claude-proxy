@@ -212,6 +212,24 @@ pub struct ProviderRequestMetadata {
     pub request_body_bytes: Option<u64>,
     #[serde(default)]
     pub upstream_send_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub virtual_context_1m: Option<bool>,
+    #[serde(default)]
+    pub context_estimated_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_safe_input_limit: Option<u64>,
+    #[serde(default)]
+    pub context_model_window: Option<u64>,
+    #[serde(default)]
+    pub context_estimator_source: Option<String>,
+    #[serde(default)]
+    pub context_compact_kind: Option<String>,
+    #[serde(default)]
+    pub context_compressible_history: Option<bool>,
+    #[serde(default)]
+    pub context_local_blocked: Option<bool>,
+    #[serde(default)]
+    pub context_upstream_overflow: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

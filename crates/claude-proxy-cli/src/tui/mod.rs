@@ -22,7 +22,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use serde_json::{Map, Value};
 
-use claude_proxy_core::{Message, MessageContent, MessagesRequest, Role};
+use claude_proxy_core::{Message, MessageContent, MessagesRequest, ModelInfo, Role};
 use claude_proxy_providers::provider::ProviderError;
 
 use app::{
@@ -34,8 +34,8 @@ use app::{
 };
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{
-    ChatGptProviderConfig, CopilotProviderConfig, ModelAliasConfig, ModelConfig,
-    ModelReasoningEffort, ProviderConfig, ProviderType,
+    ChatGptProviderConfig, ClaudeCodeContextMode, CopilotProviderConfig, ModelAliasConfig,
+    ModelConfig, ModelReasoningEffort, ProviderConfig, ProviderType,
 };
 use tracing::{error, info};
 
@@ -442,7 +442,7 @@ fn handle_providers_key(app: &mut App, code: KeyCode) {
                 start_editing(app);
             }
             KeyCode::Char(' ') => {
-                toggle_selected_provider_fast_mode(app);
+                toggle_selected_chatgpt_setting(app);
             }
             KeyCode::Char('a') => {
                 add_provider(app);
@@ -585,26 +585,12 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                         PickerAction::PickProviderForModel { section } => {
                             // Step 1 complete: fetch models for the selected provider
                             app.pending_model_section = Some(section);
-                            // Show loading
                             app.overlay = Some(Overlay::Loading(LoadingOverlay {
                                 title: format!("Fetching models from {selected}"),
                                 message: "Please wait...".into(),
                                 spinner_tick: app.tick,
                             }));
-                            // Spawn fetch via provider (handles all auth types)
-                            let settings = app.settings.clone();
-                            let handle = app.tokio_handle.clone();
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            app.fetch_rx = Some(rx);
-                            let pid = selected;
-                            std::thread::spawn(move || {
-                                let models =
-                                    fetch_models_via_provider(&pid, &settings, handle.as_ref());
-                                let _ = tx.send(FetchResult {
-                                    provider_id: pid,
-                                    models,
-                                });
-                            });
+                            start_model_fetch(app, selected);
                         }
                         PickerAction::SetModelField {
                             provider_id,
@@ -675,6 +661,7 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                             };
 
                             let is_oauth = !provider_type.needs_api_key();
+                            let is_chatgpt = provider_type == ProviderType::ChatGPT;
 
                             let replaced = app.settings.providers.contains_key(&id);
                             app.settings.providers.insert(
@@ -690,6 +677,9 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                     reasoning_markers: Default::default(),
                                 },
                             );
+                            if !replaced && is_chatgpt {
+                                app.settings.model.apply_chatgpt_56_defaults(&id);
+                            }
                             app.mark_dirty();
                             app.content_idx = app
                                 .settings
@@ -723,6 +713,8 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                 app.overlay = None;
                 app.focus = Focus::Content;
                 app.fetch_rx = None;
+                app.pending_model_section = None;
+                app.pending_reasoning_section = None;
                 app.show_toast(Toast::info("Cancelled"));
             }
         }
@@ -809,7 +801,7 @@ fn request_quit(app: &mut App) {
 fn start_editing(app: &mut App) {
     // For provider page: edit the selected provider's field based on detail_idx
     if app.nav == NavItem::Providers {
-        if app.detail_idx == 5 && toggle_selected_provider_fast_mode(app) {
+        if toggle_selected_chatgpt_setting(app) {
             return;
         }
 
@@ -879,26 +871,27 @@ fn start_editing(app: &mut App) {
             return;
         };
         if app.detail_idx == 1 {
-            let items = vec![
-                String::new(),
-                "default".to_string(),
-                "none".to_string(),
-                "minimal".to_string(),
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-                "max".to_string(),
-            ];
-            let current = model_reasoning_effort_value(&app.settings.model, &section);
-            let selected = items.iter().position(|item| item == &current).unwrap_or(0);
-            app.overlay = Some(Overlay::Picker(PickerOverlay {
-                title: "Select Reasoning Effort".into(),
-                items,
-                selected,
-                action: PickerAction::SetModelReasoningEffort { section },
-            }));
-            app.focus = Focus::Overlay;
+            let provider_to_fetch = model_ref_for_reasoning_section(&app.settings.model, &section)
+                .and_then(|model_ref| {
+                    let (provider_id, _) = model_ref.split_once('/')?;
+                    (advertised_reasoning_effort_levels(app, model_ref).is_none()
+                        && !app.model_capabilities_loaded.contains(provider_id)
+                        && app.settings.providers.contains_key(provider_id))
+                    .then(|| provider_id.to_string())
+                });
+
+            if let Some(provider_id) = provider_to_fetch {
+                app.pending_reasoning_section = Some(section);
+                app.overlay = Some(Overlay::Loading(LoadingOverlay {
+                    title: format!("Fetching capabilities from {provider_id}"),
+                    message: "Please wait...".into(),
+                    spinner_tick: app.tick,
+                }));
+                app.focus = Focus::Overlay;
+                start_model_fetch(app, provider_id);
+            } else {
+                show_reasoning_effort_picker(app, section);
+            }
             return;
         }
         let providers: Vec<String> = app.settings.providers.keys().cloned().collect();
@@ -1086,6 +1079,124 @@ fn model_reasoning_effort_value(model: &ModelConfig, section: &EditableSection) 
         .to_string()
 }
 
+fn reasoning_effort_picker_items(app: &App, section: &EditableSection) -> Vec<String> {
+    let mut items = vec![String::new()];
+    let levels = model_ref_for_reasoning_section(&app.settings.model, section)
+        .and_then(|model_ref| advertised_reasoning_effort_levels(app, model_ref))
+        .unwrap_or_else(|| {
+            [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        });
+
+    for level in levels {
+        let level = level.trim().to_ascii_lowercase();
+        if !level.is_empty()
+            && parse_model_reasoning_effort(&level).is_some()
+            && !items.contains(&level)
+        {
+            items.push(level);
+        }
+    }
+    items
+}
+
+fn show_reasoning_effort_picker(app: &mut App, section: EditableSection) {
+    let model_ref =
+        model_ref_for_reasoning_section(&app.settings.model, &section).map(str::to_string);
+    let items = reasoning_effort_picker_items(app, &section);
+    let current = model_reasoning_effort_value(&app.settings.model, &section);
+    let selected = items.iter().position(|item| item == &current).unwrap_or(0);
+    app.overlay = Some(Overlay::Picker(PickerOverlay {
+        title: model_ref.as_deref().map_or_else(
+            || "Select Reasoning Effort".to_string(),
+            |model_ref| format!("Select Reasoning Effort — {model_ref}"),
+        ),
+        items,
+        selected,
+        action: PickerAction::SetModelReasoningEffort { section },
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn model_ref_for_reasoning_section<'a>(
+    model: &'a ModelConfig,
+    section: &EditableSection,
+) -> Option<&'a str> {
+    match section {
+        EditableSection::ModelDefaultReasoningEffort => Some(model.default.name.as_str()),
+        EditableSection::ModelReasoningReasoningEffort => {
+            model.reasoning.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelOpusReasoningEffort => {
+            model.opus.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelSonnetReasoningEffort => {
+            model.sonnet.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelHaikuReasoningEffort => {
+            model.haiku.as_ref().map(|alias| alias.name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn advertised_reasoning_effort_levels(app: &App, model_ref: &str) -> Option<Vec<String>> {
+    let provider_and_model = model_ref.split_once('/');
+    let chatgpt_provider = provider_and_model.and_then(|(provider_id, model_id)| {
+        let provider = app.settings.providers.get(provider_id)?;
+        (provider.resolve_type(provider_id) == ProviderType::ChatGPT)
+            .then_some((provider, model_id))
+    });
+
+    if let Some(levels) = chatgpt_provider
+        .and_then(|(provider, model_id)| {
+            provider
+                .chatgpt
+                .as_ref()
+                .and_then(|config| config.model_capabilities.get(model_id))
+        })
+        .and_then(|capability| capability.reasoning_effort_levels.clone())
+    {
+        return Some(levels);
+    }
+
+    if let Some(levels) = app.model_reasoning_efforts.get(model_ref) {
+        return Some(levels.clone());
+    }
+
+    if let Some(capability) = app.live_metrics.as_ref().and_then(|metrics| {
+        metrics
+            .model_capabilities
+            .iter()
+            .find(|(name, _)| name == model_ref)
+            .map(|(_, capability)| capability)
+    }) {
+        return Some(capability.reasoning_effort_levels.clone());
+    }
+
+    let (_, model_id) = chatgpt_provider?;
+
+    match model_id {
+        "gpt-5.6-sol" | "gpt-5.6-terra" => Some(
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        "gpt-5.6-luna" => Some(
+            ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn display_reasoning_effort_value(value: &str) -> &str {
     if value.is_empty() { "unset" } else { value }
 }
@@ -1101,6 +1212,7 @@ fn parse_model_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
         "high" => Some(ModelReasoningEffort::High),
         "xhigh" => Some(ModelReasoningEffort::XHigh),
         "max" => Some(ModelReasoningEffort::Max),
+        "ultra" => Some(ModelReasoningEffort::Ultra),
         _ => None,
     }
 }
@@ -1275,6 +1387,42 @@ fn toggle_selected_provider_fast_mode(app: &mut App) -> bool {
         return false;
     };
     toggle_chatgpt_fast_mode(app, &id)
+}
+
+fn toggle_selected_chatgpt_setting(app: &mut App) -> bool {
+    match app.detail_idx {
+        5 => toggle_selected_provider_fast_mode(app),
+        6 => toggle_selected_provider_context_mode(app),
+        _ => false,
+    }
+}
+
+fn toggle_selected_provider_context_mode(app: &mut App) -> bool {
+    let Some(id) = selected_chatgpt_provider_id(app) else {
+        return false;
+    };
+    let Some(cfg) = app.settings.providers.get_mut(&id) else {
+        return false;
+    };
+    let chatgpt = cfg
+        .chatgpt
+        .get_or_insert_with(ChatGptProviderConfig::default);
+    chatgpt.claude_code_context = match chatgpt.claude_code_context {
+        ClaudeCodeContextMode::Auto => ClaudeCodeContextMode::Standard,
+        ClaudeCodeContextMode::Standard => ClaudeCodeContextMode::Auto,
+    };
+    let mode = chatgpt.claude_code_context;
+
+    app.provider_statuses.remove(&id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Claude Code context projection: {}",
+        match mode {
+            ClaudeCodeContextMode::Auto => "AUTO",
+            ClaudeCodeContextMode::Standard => "OFF",
+        }
+    )));
+    true
 }
 
 fn selected_chatgpt_provider_id(app: &App) -> Option<String> {
@@ -1567,7 +1715,7 @@ fn fetch_models_via_provider(
     provider_id: &str,
     settings: &claude_proxy_config::Settings,
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ModelInfo>, String> {
     let Some(cfg) = settings.providers.get(provider_id) else {
         return Err("Provider not found in config".into());
     };
@@ -1581,7 +1729,7 @@ fn fetch_models_via_provider(
 
     let pid = provider_id.to_string();
     let settings_clone = settings.clone();
-    let result: Result<Vec<String>, String> = handle.block_on(async {
+    let result: Result<Vec<ModelInfo>, String> = handle.block_on(async {
         let provider = claude_proxy_providers::create_provider(&pid, cfg, &settings_clone)
             .await
             .map_err(|e| {
@@ -1594,8 +1742,7 @@ fn fetch_models_via_provider(
             format!("list_models failed: {e}")
         })?;
 
-        let names: Vec<String> = models.into_iter().map(|m| m.model_id).collect();
-        Ok(names)
+        Ok(models)
     });
 
     match &result {
@@ -1604,6 +1751,20 @@ fn fetch_models_via_provider(
     }
 
     result
+}
+
+fn start_model_fetch(app: &mut App, provider_id: String) {
+    let settings = app.settings.clone();
+    let handle = app.tokio_handle.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.fetch_rx = Some(rx);
+    std::thread::spawn(move || {
+        let models = fetch_models_via_provider(&provider_id, &settings, handle.as_ref());
+        let _ = tx.send(FetchResult {
+            provider_id,
+            models,
+        });
+    });
 }
 
 fn check_anthropic_provider_via_chat(
@@ -1926,9 +2087,24 @@ fn poll_fetch(app: &mut App) {
     {
         app.fetch_rx = None;
         let pending_section = app.pending_model_section.take();
+        let pending_reasoning_section = app.pending_reasoning_section.take();
         let provider_name = result.provider_id.clone();
         match result.models {
             Ok(models) => {
+                app.model_capabilities_loaded
+                    .insert(result.provider_id.clone());
+                for model in &models {
+                    app.model_reasoning_efforts.insert(
+                        provider_model_ref(&result.provider_id, &model.model_id),
+                        model.capabilities.limits.reasoning_effort_levels.clone(),
+                    );
+                }
+
+                if let Some(section) = pending_reasoning_section {
+                    show_reasoning_effort_picker(app, section);
+                    return;
+                }
+
                 let action = match pending_section {
                     Some(section) => PickerAction::SetModelField {
                         provider_id: result.provider_id,
@@ -1940,7 +2116,9 @@ fn poll_fetch(app: &mut App) {
                 };
                 app.overlay = Some(Overlay::Picker(PickerOverlay {
                     title: format!("Select model for {}", provider_name),
-                    items: model_picker_items(models),
+                    items: model_picker_items(
+                        models.into_iter().map(|model| model.model_id).collect(),
+                    ),
                     selected: 0,
                     action,
                 }));
@@ -1948,9 +2126,17 @@ fn poll_fetch(app: &mut App) {
             }
             Err(err) => {
                 error!("Model fetch failed for provider={provider_name}: {err}");
-                match pending_section {
-                    Some(section) => show_manual_model_input(app, &provider_name, section, ""),
-                    None => show_manual_default_model_input(app, &provider_name, ""),
+                if let Some(section) = pending_reasoning_section {
+                    show_reasoning_effort_picker(app, section);
+                    app.show_toast(Toast::warning(format!(
+                        "Failed to fetch model capabilities; showing compatible values: {err}"
+                    )));
+                    return;
+                } else {
+                    match pending_section {
+                        Some(section) => show_manual_model_input(app, &provider_name, section, ""),
+                        None => show_manual_default_model_input(app, &provider_name, ""),
+                    }
                 }
                 app.show_toast(Toast::warning(format!(
                     "Failed to fetch models; enter model manually: {err}"
@@ -2268,27 +2454,36 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
     set_default_env(env, "ENABLE_TOOL_SEARCH", "true");
     env.remove("ANTHROPIC_AUTH_TOKEN");
-    set_env(env, "ANTHROPIC_MODEL", &settings.model.default.name);
-    set_optional_env(
-        env,
-        "ANTHROPIC_REASONING_MODEL",
-        settings.model.reasoning_name(),
+    let default_model = claude_proxy_providers::chatgpt::claude_code_projected_model(
+        settings,
+        &settings.model.default.name,
     );
-    set_optional_env(
-        env,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        settings.model.haiku_name(),
-    );
+    let reasoning_model = settings
+        .model
+        .reasoning_name()
+        .map(|model| claude_proxy_providers::chatgpt::claude_code_projected_model(settings, model));
+    let haiku_model = settings
+        .model
+        .haiku_name()
+        .map(|model| claude_proxy_providers::chatgpt::claude_code_projected_model(settings, model));
+    let sonnet_model = settings
+        .model
+        .sonnet_name()
+        .map(|model| claude_proxy_providers::chatgpt::claude_code_projected_model(settings, model));
+    let opus_model = settings
+        .model
+        .opus_name()
+        .map(|model| claude_proxy_providers::chatgpt::claude_code_projected_model(settings, model));
+
+    set_env(env, "ANTHROPIC_MODEL", &default_model);
+    set_optional_env(env, "ANTHROPIC_REASONING_MODEL", reasoning_model.as_deref());
+    set_optional_env(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", haiku_model.as_deref());
     set_optional_env(
         env,
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        settings.model.sonnet_name(),
+        sonnet_model.as_deref(),
     );
-    set_optional_env(
-        env,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        settings.model.opus_name(),
-    );
+    set_optional_env(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", opus_model.as_deref());
     env.remove("ANTHROPIC_SMALL_FAST_MODEL");
 }
 
@@ -2691,6 +2886,18 @@ fn parse_observability_summary(value: Option<&Value>) -> ObservabilitySummary {
             .get("continuation_used_requests")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        virtual_context_requests: value
+            .get("virtual_context_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        context_local_blocks: value
+            .get("context_local_blocks")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        context_upstream_overflows: value
+            .get("context_upstream_overflows")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     }
 }
 
@@ -2874,6 +3081,59 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(value["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn claude_code_env_sync_projects_each_eligible_chatgpt_alias_to_one_million() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("chatgpt/gpt-5.6-sol"),
+                reasoning: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-terra")),
+                opus: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-luna")),
+                sonnet: Some(ModelAliasConfig::new("chatgpt/gpt-5.5")),
+                haiku: Some(ModelAliasConfig::new("chatgpt/gpt-5.3-codex-spark")),
+            },
+            ..Settings::default()
+        };
+        settings.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: Some(ChatGptProviderConfig::default()),
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut value = json!({});
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().unwrap();
+        assert_eq!(env["ANTHROPIC_MODEL"], "chatgpt/gpt-5.6-sol[1m]");
+        assert_eq!(
+            env["ANTHROPIC_REASONING_MODEL"],
+            "chatgpt/gpt-5.6-terra[1m]"
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "chatgpt/gpt-5.6-luna[1m]"
+        );
+        assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "chatgpt/gpt-5.5[1m]");
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "chatgpt/gpt-5.3-codex-spark"
+        );
+
+        settings.providers.get_mut("chatgpt").unwrap().chatgpt = Some(ChatGptProviderConfig {
+            claude_code_context: ClaudeCodeContextMode::Standard,
+            ..ChatGptProviderConfig::default()
+        });
+        apply_claude_code_env(&mut value, &settings);
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "chatgpt/gpt-5.6-sol");
     }
 
     #[test]
@@ -3177,7 +3437,10 @@ mod tests {
                 "continuation_saved_bytes": 1536,
                 "responses_lite_requests": 7,
                 "websocket_requests": 6,
-                "continuation_used_requests": 5
+                "continuation_used_requests": 5,
+                "virtual_context_requests": 4,
+                "context_local_blocks": 3,
+                "context_upstream_overflows": 2
             },
             "stored": {
                 "summary": {
@@ -3191,7 +3454,10 @@ mod tests {
                     "continuation_saved_bytes": 4096,
                     "responses_lite_requests": 70,
                     "websocket_requests": 60,
-                    "continuation_used_requests": 50
+                    "continuation_used_requests": 50,
+                    "virtual_context_requests": 40,
+                    "context_local_blocks": 30,
+                    "context_upstream_overflows": 20
                 }
             }
         })));
@@ -3208,6 +3474,9 @@ mod tests {
         assert_eq!(observability.summary.responses_lite_requests, 7);
         assert_eq!(observability.summary.websocket_requests, 6);
         assert_eq!(observability.summary.continuation_used_requests, 5);
+        assert_eq!(observability.summary.virtual_context_requests, 4);
+        assert_eq!(observability.summary.context_local_blocks, 3);
+        assert_eq!(observability.summary.context_upstream_overflows, 2);
         let stored = observability.stored_summary.expect("stored summary");
         assert_eq!(stored.requests, 100);
         assert_eq!(stored.avg_total_latency_ms, 2345);
@@ -3215,6 +3484,9 @@ mod tests {
         assert_eq!(stored.responses_lite_requests, 70);
         assert_eq!(stored.websocket_requests, 60);
         assert_eq!(stored.continuation_used_requests, 50);
+        assert_eq!(stored.virtual_context_requests, 40);
+        assert_eq!(stored.context_local_blocks, 30);
+        assert_eq!(stored.context_upstream_overflows, 20);
     }
 
     #[test]
@@ -3234,11 +3506,17 @@ mod tests {
         assert_eq!(observability.summary.responses_lite_requests, 0);
         assert_eq!(observability.summary.websocket_requests, 0);
         assert_eq!(observability.summary.continuation_used_requests, 0);
+        assert_eq!(observability.summary.virtual_context_requests, 0);
+        assert_eq!(observability.summary.context_local_blocks, 0);
+        assert_eq!(observability.summary.context_upstream_overflows, 0);
         let stored = observability.stored_summary.expect("stored summary");
         assert_eq!(stored.continuation_saved_bytes, 0);
         assert_eq!(stored.responses_lite_requests, 0);
         assert_eq!(stored.websocket_requests, 0);
         assert_eq!(stored.continuation_used_requests, 0);
+        assert_eq!(stored.virtual_context_requests, 0);
+        assert_eq!(stored.context_local_blocks, 0);
+        assert_eq!(stored.context_upstream_overflows, 0);
     }
 
     #[test]
@@ -3325,6 +3603,142 @@ mod tests {
             parse_model_reasoning_effort("max"),
             Some(ModelReasoningEffort::Max)
         );
+        assert_eq!(
+            parse_model_reasoning_effort("ultra"),
+            Some(ModelReasoningEffort::Ultra)
+        );
+    }
+
+    fn app_with_chatgpt_default(model_id: &str) -> App {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: Some(ChatGptProviderConfig::default()),
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new(format!("chatgpt/{model_id}"));
+        App::new(settings)
+    }
+
+    #[test]
+    fn reasoning_effort_picker_filters_chatgpt_56_by_model() {
+        let mut app = app_with_chatgpt_default("gpt-5.6-luna");
+        app.settings.model.default.reasoning_effort = Some(ModelReasoningEffort::Minimal);
+
+        let luna =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(luna, vec!["", "low", "medium", "high", "xhigh", "max"]);
+        assert!(!luna.contains(&"none".to_string()));
+        assert!(!luna.contains(&"minimal".to_string()));
+        assert!(!luna.contains(&"ultra".to_string()));
+
+        app.settings.model.default.name = "chatgpt/gpt-5.6-sol".to_string();
+        let sol =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(sol.last().map(String::as_str), Some("ultra"));
+        assert!(!sol.contains(&"none".to_string()));
+        assert!(!sol.contains(&"minimal".to_string()));
+    }
+
+    #[test]
+    fn reasoning_effort_picker_prefers_config_then_live_capabilities() {
+        let mut app = app_with_chatgpt_default("gpt-5.6-luna");
+        app.live_metrics = Some(LiveMetrics {
+            model_capabilities: vec![(
+                "chatgpt/gpt-5.6-luna".to_string(),
+                ModelCapability {
+                    reasoning_effort_levels: vec!["medium".to_string(), "high".to_string()],
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        });
+
+        let live =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(live, vec!["", "medium", "high"]);
+
+        app.settings
+            .providers
+            .get_mut("chatgpt")
+            .and_then(|provider| provider.chatgpt.as_mut())
+            .unwrap()
+            .model_capabilities
+            .insert(
+                "gpt-5.6-luna".to_string(),
+                claude_proxy_config::settings::ChatGptModelCapabilityOverride {
+                    reasoning_effort_levels: Some(vec!["low".to_string(), "high".to_string()]),
+                    ..Default::default()
+                },
+            );
+        let configured =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(configured, vec!["", "low", "high"]);
+    }
+
+    #[test]
+    fn reasoning_effort_picker_uses_cached_capabilities_for_any_provider() {
+        let mut app = App::new(Settings::default());
+        app.settings.model.default.name = "copilot/model-x".to_string();
+        app.model_reasoning_efforts.insert(
+            "copilot/model-x".to_string(),
+            vec!["medium".to_string(), "high".to_string()],
+        );
+
+        let supported =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(supported, vec!["", "medium", "high"]);
+
+        app.model_reasoning_efforts
+            .insert("copilot/model-x".to_string(), Vec::new());
+        let unsupported =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(unsupported, vec![""]);
+    }
+
+    #[test]
+    fn fetched_model_catalog_populates_generic_reasoning_capabilities() {
+        let mut app = App::new(Settings::default());
+        app.settings.model.default.name = "copilot/model-x".to_string();
+        app.pending_reasoning_section = Some(EditableSection::ModelDefaultReasoningEffort);
+
+        let mut model = ModelInfo {
+            model_id: "model-x".to_string(),
+            vendor: None,
+            is_chat_default: None,
+            capabilities: Default::default(),
+        };
+        model.capabilities.limits.reasoning_effort_levels =
+            vec!["low".to_string(), "medium".to_string()];
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(FetchResult {
+            provider_id: "copilot".to_string(),
+            models: Ok(vec![model]),
+        })
+        .unwrap();
+        app.fetch_rx = Some(rx);
+
+        poll_fetch(&mut app);
+
+        assert!(app.model_capabilities_loaded.contains("copilot"));
+        assert_eq!(
+            app.model_reasoning_efforts.get("copilot/model-x"),
+            Some(&vec!["low".to_string(), "medium".to_string()])
+        );
+        let Overlay::Picker(picker) = app.overlay.as_ref().expect("reasoning picker") else {
+            panic!("expected reasoning picker");
+        };
+        assert_eq!(picker.items, vec!["", "low", "medium"]);
     }
 
     #[test]
@@ -3430,6 +3844,19 @@ mod tests {
             .and_then(|cfg| cfg.chatgpt.as_ref())
             .expect("chatgpt config");
         assert!(!chatgpt.fast_mode);
+        assert_eq!(app.settings.model.default.name, "chatgpt/gpt-5.6-sol");
+        assert_eq!(
+            app.settings.model.default.reasoning_effort,
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(
+            app.settings.model.sonnet_name(),
+            Some("chatgpt/gpt-5.6-terra")
+        );
+        assert_eq!(
+            app.settings.model.haiku_name(),
+            Some("chatgpt/gpt-5.6-luna")
+        );
     }
 
     #[test]
@@ -3455,7 +3882,7 @@ mod tests {
         app.provider_focus = ProviderFocus::Detail;
         app.detail_idx = 5;
 
-        assert_eq!(app.provider_detail_field_count(), 6);
+        assert_eq!(app.provider_detail_field_count(), 7);
 
         handle_providers_key(&mut app, KeyCode::Char(' '));
         assert!(
@@ -3474,6 +3901,50 @@ mod tests {
                 .get("chatgpt")
                 .and_then(|cfg| cfg.chatgpt.as_ref())
                 .is_some_and(|cfg| cfg.fast_mode)
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_context_projection_toggles_from_detail_row() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".into(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut app = App::new(settings);
+        app.nav = NavItem::Providers;
+        app.focus = Focus::Content;
+        app.provider_focus = ProviderFocus::Detail;
+        app.detail_idx = 6;
+
+        handle_providers_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.settings.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .claude_code_context,
+            ClaudeCodeContextMode::Standard
+        );
+
+        handle_providers_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.settings.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .claude_code_context,
+            ClaudeCodeContextMode::Auto
         );
     }
 

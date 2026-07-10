@@ -78,6 +78,24 @@ pub struct RequestObservabilityEvent {
     pub stable_client_conversation_id_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic_stable_client_conversation_id: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_context_1m: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimated_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_safe_input_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_model_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_estimator_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compact_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compressible_history: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_local_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_upstream_overflow: Option<bool>,
     pub prompt_too_long_retries: u64,
     pub prompt_too_long_original_body_bytes: u64,
     pub prompt_too_long_shrunk_body_bytes: u64,
@@ -101,6 +119,9 @@ pub struct RequestObservabilitySummary {
     pub responses_lite_requests: u64,
     pub websocket_requests: u64,
     pub continuation_used_requests: u64,
+    pub virtual_context_requests: u64,
+    pub context_local_blocks: u64,
+    pub context_upstream_overflows: u64,
 }
 
 impl RequestObservabilitySummary {
@@ -121,6 +142,15 @@ impl RequestObservabilitySummary {
         }
         if event.continuation_used == Some(true) {
             self.continuation_used_requests += 1;
+        }
+        if event.virtual_context_1m == Some(true) {
+            self.virtual_context_requests += 1;
+        }
+        if event.context_local_blocked == Some(true) {
+            self.context_local_blocks += 1;
+        }
+        if event.context_upstream_overflow == Some(true) {
+            self.context_upstream_overflows += 1;
         }
     }
 
@@ -870,6 +900,15 @@ mod tests {
                     prompt_cache_key_source: Some("client".to_string()),
                     stable_client_conversation_id_present: Some(true),
                     synthetic_stable_client_conversation_id: Some(false),
+                    virtual_context_1m: Some(true),
+                    context_estimated_tokens: Some(300_000),
+                    context_safe_input_limit: Some(339_000),
+                    context_model_window: Some(372_000),
+                    context_estimator_source: Some("full_rough".to_string()),
+                    context_compact_kind: Some("none".to_string()),
+                    context_compressible_history: Some(true),
+                    context_local_blocked: Some(false),
+                    context_upstream_overflow: Some(false),
                     prompt_too_long_retries: 1,
                     prompt_too_long_original_body_bytes: 200,
                     prompt_too_long_shrunk_body_bytes: 120,
@@ -918,6 +957,15 @@ mod tests {
                     prompt_cache_key_source: None,
                     stable_client_conversation_id_present: None,
                     synthetic_stable_client_conversation_id: None,
+                    virtual_context_1m: Some(true),
+                    context_estimated_tokens: Some(340_000),
+                    context_safe_input_limit: Some(339_000),
+                    context_model_window: Some(372_000),
+                    context_estimator_source: Some("usage_plus_delta".to_string()),
+                    context_compact_kind: Some("none".to_string()),
+                    context_compressible_history: Some(true),
+                    context_local_blocked: Some(true),
+                    context_upstream_overflow: Some(true),
                     prompt_too_long_retries: 0,
                     prompt_too_long_original_body_bytes: 0,
                     prompt_too_long_shrunk_body_bytes: 0,
@@ -945,6 +993,15 @@ mod tests {
         );
         assert_eq!(data["observability"]["summary"]["max_event_gap_ms"], 15);
         assert_eq!(data["observability"]["summary"]["idle_gap_count"], 1);
+        assert_eq!(
+            data["observability"]["summary"]["virtual_context_requests"],
+            2
+        );
+        assert_eq!(data["observability"]["summary"]["context_local_blocks"], 1);
+        assert_eq!(
+            data["observability"]["summary"]["context_upstream_overflows"],
+            1
+        );
         assert_eq!(
             data["observability"]["summary"]["prompt_too_long_retries"],
             1

@@ -4,15 +4,16 @@
 //! opencode uses for ChatGPT Pro/Plus authentication.
 
 mod auth;
+pub mod capability_cache;
 mod responses;
 mod transport;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 #[cfg(not(test))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -20,8 +21,9 @@ use claude_proxy_config::{
     Settings,
     settings::{
         ChatGptModelCapabilityOverride, ChatGptProviderConfig, ChatGptTransport,
-        DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT, ProviderConfig,
-        ProviderRuntimeConfig, ReasoningMarkerMode, ResponsesLiteMode,
+        ClaudeCodeContextMode, DEFAULT_CHATGPT_ORIGINATOR, DEFAULT_CHATGPT_USER_AGENT,
+        ProviderConfig, ProviderRuntimeConfig, ProviderType, ReasoningMarkerMode,
+        ResponsesLiteMode,
     },
 };
 use claude_proxy_core::*;
@@ -38,12 +40,12 @@ use tokio::sync::Mutex;
 use crate::http::{
     UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
     is_non_retryable_rate_limit_error_body, is_non_retryable_rate_limit_headers,
-    map_upstream_response, read_upstream_response_text, send_upstream_request_with_policy,
-    upstream_error_metadata_from_parts,
+    map_upstream_response, read_upstream_response_json, read_upstream_response_text,
+    send_upstream_request_with_policy, upstream_error_metadata_from_parts,
 };
 use crate::openai_compat::{
-    apply_openai_intent, is_compact_request_body, log_compact_request_observability,
-    log_request_observability,
+    CompactRequestKind, apply_openai_intent, classify_compact_request_body,
+    log_compact_request_observability, log_request_observability,
 };
 use crate::provider::{
     Provider, ProviderError, ProviderRequestMetadata, ProviderRequestObserver,
@@ -57,17 +59,23 @@ const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
 const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
-const CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES: usize = 700 * 1024;
 const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
 const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
 const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
 const CHATGPT_SSE_REQUEST_ZSTD_LEVEL: i32 = 3;
+pub const CLAUDE_CODE_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+pub const VIRTUAL_CONTEXT_1M_EXTRA_KEY: &str = "_claude_proxy_virtual_context_1m";
+pub const CLAUDE_CODE_DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
+const CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE: u32 = 20_000;
+const CLAUDE_CODE_AUTO_COMPACT_BUFFER: u32 = 13_000;
+const CHATGPT_MEDIA_ESTIMATED_TOKENS: u64 = 2_000;
 const CHATGPT_WEBSOCKET_SERVER_ERROR_COOLDOWN_SECS: u64 = 120;
 const CHATGPT_WEBSOCKET_STARTUP_FAILURE_COOLDOWN_SECS: u64 = 120;
 const CODEX_FAST_SERVICE_TIER: &str = "priority";
 const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
     "x-openai-internal-codex-responses-lite";
+const PROACTIVE_MULTI_AGENT_INSTRUCTIONS: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 
 #[derive(Debug, Deserialize)]
 struct UsagePayload {
@@ -135,6 +143,43 @@ struct CreditsPayload {
 struct CachedRateLimits {
     snapshots: Vec<RateLimitSnapshot>,
     fetched_at: Option<Instant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptModelsPayload {
+    models: Vec<ChatGptRemoteModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptRemoteModel {
+    slug: String,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<ChatGptRemoteReasoningLevel>,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    use_responses_lite: bool,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    priority: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatGptRemoteReasoningLevel {
+    effort: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChatGptCatalogModel {
+    info: ModelInfo,
+    responses_lite: bool,
+    visibility: Option<String>,
+    priority: i32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -263,6 +308,57 @@ struct ChatGptPreparedRequest {
     stable_client_conversation_id: Option<String>,
     responses_lite: ResponsesLiteDecision,
     observer: Option<ProviderRequestObserver>,
+    pending_context_usage: Option<PendingContextUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ContextUsageKey {
+    provider_id: String,
+    account_hash: String,
+    model: String,
+    stable_client_conversation_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContextUsageBaseline {
+    static_body: Value,
+    context_items: Vec<Value>,
+    total_tokens: u64,
+    updated_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContextUsage {
+    key: ContextUsageKey,
+    static_body: Value,
+    full_input: Vec<Value>,
+    compact_kind: CompactRequestKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextEstimatorSource {
+    UsagePlusDelta,
+    FullRough,
+}
+
+impl ContextEstimatorSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UsagePlusDelta => "usage_plus_delta",
+            Self::FullRough => "full_rough",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VirtualContextEstimate {
+    estimated_tokens: u64,
+    safe_input_limit: u32,
+    model_context_window: u32,
+    estimator_source: ContextEstimatorSource,
+    compact_kind: CompactRequestKind,
+    compressible_history: bool,
+    pending_usage: Option<PendingContextUsage>,
 }
 
 struct ChatGptUpstreamEventContext {
@@ -273,6 +369,7 @@ struct ChatGptUpstreamEventContext {
     thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
     stream_started_at: Instant,
     observer: Option<ProviderRequestObserver>,
+    pending_context_usage: Option<PendingContextUsage>,
 }
 
 struct ChatGptUpstreamEventHandlerState {
@@ -287,6 +384,8 @@ struct ChatGptUpstreamEventHandlerState {
     provider_id: String,
     runtime_ids: Arc<RwLock<ChatGptRuntimeIds>>,
     websocket_sse_cooldown_until_secs: Arc<AtomicU64>,
+    context_usage: Arc<StdMutex<HashMap<ContextUsageKey, ContextUsageBaseline>>>,
+    pending_context_usage: Option<PendingContextUsage>,
 }
 
 impl ChatGptUpstreamEventHandlerState {
@@ -300,7 +399,69 @@ impl ChatGptUpstreamEventHandlerState {
         self.record_reasoning_delta(event_type, event);
         self.cache_stream_rate_limit(event);
         self.notify_observer(event);
+        self.record_upstream_context_overflow(event);
+        self.record_context_usage(event);
         self.log_terminal_event(event);
+    }
+
+    fn record_context_usage(&self, event: &Value) {
+        let Some(pending) = self.pending_context_usage.as_ref() else {
+            return;
+        };
+        let event_type = event.get("type").and_then(Value::as_str);
+        if !matches!(
+            event_type,
+            Some("response.completed" | "response.incomplete")
+        ) {
+            return;
+        }
+        let response = event.get("response").unwrap_or(event);
+        let Some(input_tokens) = response
+            .pointer("/usage/input_tokens")
+            .and_then(Value::as_u64)
+        else {
+            return;
+        };
+        let output_tokens = response
+            .pointer("/usage/output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        let mut cache = self
+            .context_usage
+            .lock()
+            .expect("ChatGPT context usage cache lock poisoned");
+        if pending.compact_kind == CompactRequestKind::SummaryGeneration {
+            cache.remove(&pending.key);
+            return;
+        }
+        let mut context_items = pending.full_input.clone();
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            context_items.extend(output.iter().cloned());
+        }
+        cache.insert(
+            pending.key.clone(),
+            ContextUsageBaseline {
+                static_body: pending.static_body.clone(),
+                context_items,
+                total_tokens: input_tokens.saturating_add(output_tokens),
+                updated_at: Instant::now(),
+            },
+        );
+    }
+
+    fn record_upstream_context_overflow(&self, event: &Value) {
+        let body = event.to_string();
+        if !is_prompt_too_long_error(StatusCode::OK, &body) {
+            return;
+        }
+        notify_request_metadata_observer(
+            self.observer.as_ref(),
+            ProviderRequestMetadata {
+                context_upstream_overflow: Some(true),
+                ..ProviderRequestMetadata::default()
+            },
+        );
     }
 
     fn log_first_event(&self, event_type: &str) {
@@ -425,8 +586,10 @@ pub use auth::{ChatGptAuth, ChatGptToken, DeviceCodeInfo};
 
 pub struct ChatGptProvider {
     id: String,
+    base_url: String,
     http_client: Client,
     endpoint: String,
+    models_endpoint: String,
     usage_endpoint: String,
     installation_id: String,
     runtime_ids: Arc<RwLock<ChatGptRuntimeIds>>,
@@ -441,7 +604,9 @@ pub struct ChatGptProvider {
     websocket_stats: ChatGptWebSocketStats,
     websocket_session: Arc<Mutex<transport::ChatGptWebSocketSession>>,
     auth: Arc<ChatGptAuth>,
+    remote_models: Arc<RwLock<HashMap<String, ChatGptCatalogModel>>>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
+    context_usage: Arc<StdMutex<HashMap<ContextUsageKey, ContextUsageBaseline>>>,
 }
 
 impl ChatGptProvider {
@@ -454,11 +619,14 @@ impl ChatGptProvider {
         let auth = ChatGptAuth::new(http_client.clone()).await?;
         let chatgpt_config = config.chatgpt.clone().unwrap_or_default();
         let transport = chatgpt_config.transport;
+        let base_url = normalized_codex_base_url(&config.base_url);
 
         Ok(Self {
             id: id.to_string(),
+            base_url,
             http_client,
             endpoint: codex_responses_endpoint(&config.base_url),
+            models_endpoint: codex_models_endpoint(&config.base_url),
             usage_endpoint: codex_usage_endpoint(&config.base_url),
             installation_id: chatgpt_installation_id(),
             runtime_ids: Arc::new(RwLock::new(ChatGptRuntimeIds::new())),
@@ -473,10 +641,12 @@ impl ChatGptProvider {
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
             auth,
+            remote_models: Arc::new(RwLock::new(HashMap::new())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
             })),
+            context_usage: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -522,6 +692,19 @@ impl ChatGptProvider {
             };
         }
 
+        if let Some(model) = self
+            .remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned")
+            .get(normalized_model)
+        {
+            return if model.responses_lite {
+                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ModelCapability)
+            } else {
+                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel)
+            };
+        }
+
         if chatgpt_model_supports_responses_lite(normalized_model) {
             ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ModelCapability)
         } else {
@@ -534,6 +717,180 @@ impl ChatGptProvider {
             self.runtime.openai.service_tier.as_deref(),
             self.chatgpt_config.fast_mode,
         )
+    }
+
+    fn model_info(&self, model: &str) -> Option<ModelInfo> {
+        let model = normalize_chatgpt_model_id(model);
+        self.remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned")
+            .get(model)
+            .map(|model| model.info.clone())
+            .or_else(|| chatgpt_model_info(model, &self.chatgpt_config))
+    }
+
+    fn virtual_context_estimate(
+        &self,
+        body: &Value,
+        token: &ChatGptToken,
+        stable_client_conversation_id: Option<&str>,
+        model_context_window: u32,
+        compact_kind: CompactRequestKind,
+    ) -> VirtualContextEstimate {
+        let static_body = context_static_body(body);
+        let full_input = body
+            .get("input")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let compressible_history = compact_kind == CompactRequestKind::CompactedContinuation
+            || input_has_compressible_history(&full_input);
+        let key = stable_client_conversation_id
+            .zip(capability_cache::account_hash(token.account_id.as_deref()))
+            .map(
+                |(stable_client_conversation_id, account_hash)| ContextUsageKey {
+                    provider_id: self.id.clone(),
+                    account_hash,
+                    model: body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    stable_client_conversation_id: stable_client_conversation_id.to_string(),
+                },
+            );
+
+        let mut source = ContextEstimatorSource::FullRough;
+        let mut estimated_tokens = estimate_context_value_tokens(body);
+        if let Some(key) = key.as_ref() {
+            let mut cache = self
+                .context_usage
+                .lock()
+                .expect("ChatGPT context usage cache lock poisoned");
+            cache.retain(|_, baseline| baseline.updated_at.elapsed() <= Duration::from_secs(3600));
+            if compact_kind != CompactRequestKind::None {
+                cache.remove(key);
+            } else if let Some(baseline) = cache.get(key)
+                && baseline.static_body == static_body
+                && full_input.starts_with(&baseline.context_items)
+            {
+                estimated_tokens = baseline.total_tokens.saturating_add(
+                    full_input[baseline.context_items.len()..]
+                        .iter()
+                        .map(estimate_context_value_tokens)
+                        .sum(),
+                );
+                source = ContextEstimatorSource::UsagePlusDelta;
+            }
+        }
+
+        let reserve = match compact_kind {
+            CompactRequestKind::SummaryGeneration => CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE,
+            CompactRequestKind::CompactedContinuation => {
+                CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE + CLAUDE_CODE_AUTO_COMPACT_BUFFER
+            }
+            CompactRequestKind::None if compressible_history => {
+                CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE + CLAUDE_CODE_AUTO_COMPACT_BUFFER
+            }
+            CompactRequestKind::None => CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE,
+        };
+        let safe_input_limit = model_context_window.saturating_sub(reserve);
+        let pending_usage = key.map(|key| PendingContextUsage {
+            key,
+            static_body,
+            full_input,
+            compact_kind,
+        });
+        VirtualContextEstimate {
+            estimated_tokens,
+            safe_input_limit,
+            model_context_window,
+            estimator_source: source,
+            compact_kind,
+            compressible_history,
+            pending_usage,
+        }
+    }
+
+    async fn fetch_remote_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let token = self.auth.get_existing_token().await?;
+        let client_version =
+            local_codex_cli_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let mut request_builder = self
+            .http_client
+            .get(&self.models_endpoint)
+            .query(&[("client_version", client_version.as_str())])
+            .bearer_auth(&token.access_token)
+            .header("Accept", "application/json")
+            .header("originator", self.request_headers.originator.clone())
+            .header("User-Agent", self.request_headers.user_agent.clone());
+        if let Some(account_id) = token.account_id.as_deref() {
+            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        }
+
+        let request_builder = apply_runtime_request_config(request_builder, &self.runtime)?;
+        let response =
+            send_upstream_request_with_policy(request_builder, self.request_policy).await?;
+        if !response.status().is_success() {
+            return Err(map_upstream_response(response).await);
+        }
+        let payload: ChatGptModelsPayload =
+            read_upstream_response_json(response, "invalid ChatGPT models response").await?;
+        if payload.models.is_empty() {
+            return Err(ProviderError::UpstreamError {
+                status: 502,
+                body: "ChatGPT models response contained no models".to_string(),
+            });
+        }
+
+        let mut catalog = payload
+            .models
+            .into_iter()
+            .map(|model| chatgpt_catalog_model_from_remote(model, &self.chatgpt_config))
+            .collect::<Vec<_>>();
+        catalog.sort_by_key(|model| model.priority);
+
+        let mut cached = HashMap::with_capacity(catalog.len());
+        for model in &catalog {
+            cached.insert(model.info.model_id.clone(), model.clone());
+        }
+        *self
+            .remote_models
+            .write()
+            .expect("ChatGPT remote models lock poisoned") = cached;
+
+        let mut visible = catalog
+            .iter()
+            .filter(|model| {
+                model
+                    .visibility
+                    .as_deref()
+                    .is_none_or(|visibility| visibility.eq_ignore_ascii_case("list"))
+            })
+            .map(|model| model.info.clone())
+            .collect::<Vec<_>>();
+        append_configured_chatgpt_models(
+            &mut visible,
+            &self.chatgpt_config,
+            catalog.iter().map(|model| model.info.model_id.as_str()),
+        );
+        if let Some(model) = visible.first_mut() {
+            model.is_chat_default = Some(true);
+        }
+        if let Some(account_hash) = capability_cache::account_hash(token.account_id.as_deref()) {
+            let cached_models = catalog
+                .iter()
+                .map(|model| model.info.clone())
+                .chain(visible.iter().cloned())
+                .collect::<Vec<_>>();
+            capability_cache::store_model_capabilities(
+                &self.id,
+                &self.base_url,
+                &account_hash,
+                &cached_models,
+            );
+        }
+        Ok(visible)
     }
 
     pub(super) fn activate_websocket_sse_cooldown(
@@ -588,12 +945,15 @@ impl ChatGptProvider {
             .get("model")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
+        let model_context_window = self
+            .model_info(model)
+            .and_then(|info| info.capabilities.limits.context_window);
         warn_if_request_nears_context_window(
             request_id,
             compact_request,
             prompt_too_long_attempt,
             model,
-            &self.chatgpt_config,
+            model_context_window,
             body_bytes,
         );
         let started_at = Instant::now();
@@ -692,16 +1052,12 @@ impl ChatGptProvider {
         request_id: u64,
         budget: ChatGptOutputTokenBudget,
         responses_lite: ResponsesLiteDecision,
-        _observer: Option<&ProviderRequestObserver>,
+        observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         validate_chatgpt_tool_schema_budget(body)?;
         let body_bytes = json_len(body);
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
         notify_request_metadata_observer(
-            _observer,
+            observer,
             ProviderRequestMetadata {
                 transport: Some("sse".to_string()),
                 responses_lite: Some(responses_lite.is_enabled()),
@@ -710,24 +1066,6 @@ impl ChatGptProvider {
                 ..ProviderRequestMetadata::default()
             },
         );
-        let threshold = chatgpt_context_limit_preflight_threshold(model, &self.chatgpt_config);
-        if body_bytes >= threshold.body_bytes {
-            warn!(
-                request_id,
-                compact_request,
-                model,
-                body_bytes,
-                threshold_bytes = threshold.body_bytes,
-                threshold_source = threshold.source,
-                model_context_window = threshold.context_window.unwrap_or(0),
-                "ChatGPT request exceeded local context-limit preflight threshold"
-            );
-            return Err(simulated_chatgpt_context_limit_error(
-                body_bytes,
-                threshold.body_bytes,
-            ));
-        }
-
         let current_budget = ChatGptOutputTokenBudget {
             requested: budget.requested,
             effective: body.get("max_output_tokens").and_then(Value::as_u64),
@@ -763,6 +1101,15 @@ impl ChatGptProvider {
 
         let headers = response.headers().clone();
         let error_body = read_upstream_response_text(response).await?;
+        if is_prompt_too_long_error(status, &error_body) {
+            notify_request_metadata_observer(
+                observer,
+                ProviderRequestMetadata {
+                    context_upstream_overflow: Some(true),
+                    ..ProviderRequestMetadata::default()
+                },
+            );
+        }
         Err(map_chatgpt_error_status_body_with_headers(
             status, &headers, error_body,
         ))
@@ -856,6 +1203,7 @@ impl ChatGptProvider {
             output_token_budget,
             observer,
             responses_lite,
+            pending_context_usage,
             ..
         } = prepared;
         let mut response = self
@@ -900,7 +1248,14 @@ impl ChatGptProvider {
         }
 
         Ok(self
-            .stream_sse_response(response, marker_mode, request_id, compact_request, observer)
+            .stream_sse_response(
+                response,
+                marker_mode,
+                request_id,
+                compact_request,
+                observer,
+                pending_context_usage,
+            )
             .await)
     }
 
@@ -957,6 +1312,7 @@ impl ChatGptProvider {
             observer,
             stable_client_conversation_id,
             responses_lite,
+            pending_context_usage,
             ..
         } = prepared;
         let final_reasoning = chatgpt_reasoning_log_value(&body);
@@ -993,6 +1349,7 @@ impl ChatGptProvider {
             thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
+            pending_context_usage,
         });
         let websocket_start = transport::open_websocket_stream(
             self,
@@ -1073,6 +1430,7 @@ impl ChatGptProvider {
         request_id: u64,
         compact_request: bool,
         observer: Option<ProviderRequestObserver>,
+        pending_context_usage: Option<PendingContextUsage>,
     ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
@@ -1095,6 +1453,7 @@ impl ChatGptProvider {
             thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
+            pending_context_usage,
         });
         let stream = responses::stream_response_with_marker_mode(response, marker_mode, on_event);
         wrap_chatgpt_stream_logging(
@@ -1120,6 +1479,7 @@ impl ChatGptProvider {
             thinking_diagnostics,
             stream_started_at,
             observer,
+            pending_context_usage,
         } = context;
         let state = ChatGptUpstreamEventHandlerState {
             request_id,
@@ -1133,6 +1493,8 @@ impl ChatGptProvider {
             provider_id: self.id.clone(),
             runtime_ids: self.runtime_ids_handle(),
             websocket_sse_cooldown_until_secs: self.websocket_sse_cooldown_handle(),
+            context_usage: Arc::clone(&self.context_usage),
+            pending_context_usage,
         };
         move |event| state.handle(event)
     }
@@ -1476,11 +1838,48 @@ impl Provider for ChatGptProvider {
 
     async fn chat_with_observer(
         &self,
-        request: MessagesRequest,
+        mut request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_existing_token().await?;
-        let request = apply_openai_intent(request);
+        let virtual_context_requested = request
+            .extra
+            .remove(VIRTUAL_CONTEXT_1M_EXTRA_KEY)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let mut request = apply_openai_intent(request);
+        let requested_ultra = normalize_chatgpt_56_reasoning(&mut request);
+        let model_info = self.model_info(&request.model);
+        let model_context = model_info
+            .as_ref()
+            .filter(|model| model.model_id.starts_with("gpt-5.6"));
+        let ultra_supported = model_info.as_ref().is_some_and(|model| {
+            model
+                .capabilities
+                .limits
+                .reasoning_effort_levels
+                .iter()
+                .any(|effort| effort == "ultra")
+        });
+        let proactive_multi_agent = if requested_ultra
+            && ultra_supported
+            && request_has_delegation_tool(&request)
+        {
+            Some(PROACTIVE_MULTI_AGENT_INSTRUCTIONS)
+        } else {
+            if requested_ultra && !ultra_supported {
+                warn!(
+                    model = %request.model,
+                    "ChatGPT ultra effort is unavailable for this model; sending max effort"
+                );
+            } else if requested_ultra {
+                warn!(
+                    model = %request.model,
+                    "ChatGPT ultra effort requested without a delegation tool; sending max effort without proactive multi-agent instructions"
+                );
+            }
+            None
+        };
         let (request, synthetic_stable_client_conversation_id) =
             ensure_chatgpt_stable_client_conversation_id(request);
         let marker_mode = marker_mode_from_request(&request);
@@ -1496,6 +1895,8 @@ impl Provider for ChatGptProvider {
                 service_tier: self.codex_service_tier(),
                 standalone_tools: self.chatgpt_config.standalone_tools,
                 responses_lite: responses_lite.is_enabled(),
+                model: model_context,
+                additional_instructions: proactive_multi_agent,
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -1526,8 +1927,83 @@ impl Provider for ChatGptProvider {
             },
         );
         log_request_observability("chatgpt", "/responses", &body, Some(request_id));
-        let compact_request = is_compact_request_body(&body);
+        let compact_kind = classify_compact_request_body(&body);
+        let compact_request = compact_kind != CompactRequestKind::None;
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
+
+        let virtual_context = virtual_context_requested
+            && model_info
+                .as_ref()
+                .and_then(|model| model.capabilities.limits.context_window)
+                .is_some_and(|window| window > CLAUDE_CODE_DEFAULT_CONTEXT_WINDOW);
+        let context_estimate = virtual_context.then(|| {
+            self.virtual_context_estimate(
+                &body,
+                &token,
+                stable_client_conversation_id.as_deref(),
+                model_info
+                    .as_ref()
+                    .and_then(|model| model.capabilities.limits.context_window)
+                    .expect("virtual context requires a known context window"),
+                compact_kind,
+            )
+        });
+        notify_request_metadata_observer(
+            observer.as_ref(),
+            ProviderRequestMetadata {
+                virtual_context_1m: Some(virtual_context),
+                context_estimated_tokens: context_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.estimated_tokens),
+                context_safe_input_limit: context_estimate
+                    .as_ref()
+                    .map(|estimate| u64::from(estimate.safe_input_limit)),
+                context_model_window: context_estimate
+                    .as_ref()
+                    .map(|estimate| u64::from(estimate.model_context_window)),
+                context_estimator_source: context_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.estimator_source.as_str().to_string()),
+                context_compact_kind: context_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.compact_kind.as_str().to_string()),
+                context_compressible_history: context_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.compressible_history),
+                context_local_blocked: context_estimate.as_ref().map(|estimate| {
+                    estimate.estimated_tokens > u64::from(estimate.safe_input_limit)
+                }),
+                ..ProviderRequestMetadata::default()
+            },
+        );
+        if let Some(estimate) = context_estimate.as_ref() {
+            info!(
+                request_id,
+                model = %request.model,
+                virtual_context_1m = true,
+                estimated_tokens = estimate.estimated_tokens,
+                safe_input_limit = estimate.safe_input_limit,
+                model_context_window = estimate.model_context_window,
+                estimator_source = estimate.estimator_source.as_str(),
+                compact_kind = ?estimate.compact_kind,
+                compressible_history = estimate.compressible_history,
+                "ChatGPT virtual context preflight evaluated"
+            );
+            if let Some(error) = virtual_context_limit_error(estimate) {
+                warn!(
+                    request_id,
+                    model = %request.model,
+                    estimated_tokens = estimate.estimated_tokens,
+                    safe_input_limit = estimate.safe_input_limit,
+                    model_context_window = estimate.model_context_window,
+                    estimator_source = estimate.estimator_source.as_str(),
+                    compact_kind = ?estimate.compact_kind,
+                    compressible_history = estimate.compressible_history,
+                    "ChatGPT virtual context request blocked before upstream send"
+                );
+                return Err(error);
+            }
+        }
 
         self.chat_prepared_with_token(
             ChatGptPreparedRequest {
@@ -1539,6 +2015,7 @@ impl Provider for ChatGptProvider {
                 stable_client_conversation_id,
                 responses_lite,
                 observer,
+                pending_context_usage: context_estimate.and_then(|estimate| estimate.pending_usage),
             },
             token,
         )
@@ -1546,7 +2023,18 @@ impl Provider for ChatGptProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(chatgpt_models(&self.chatgpt_config))
+        match self.fetch_remote_models().await {
+            Ok(models) => Ok(models),
+            Err(error) => {
+                warn!(
+                    provider = %self.id,
+                    endpoint = %self.models_endpoint,
+                    %error,
+                    "ChatGPT online model catalog unavailable; using built-in fallback"
+                );
+                Ok(chatgpt_models(&self.chatgpt_config))
+            }
+        }
     }
 
     async fn rate_limit_snapshots(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {
@@ -1874,6 +2362,12 @@ fn codex_responses_endpoint(base_url: &str) -> String {
     } else {
         format!("{base}/responses")
     }
+}
+
+fn codex_models_endpoint(base_url: &str) -> String {
+    let base = normalized_codex_base_url(base_url);
+    let base = base.strip_suffix("/responses").unwrap_or(&base);
+    format!("{base}/models")
 }
 
 fn codex_usage_endpoint(base_url: &str) -> String {
@@ -2312,6 +2806,11 @@ fn hex_prefix(bytes: &[u8], len: usize) -> String {
 }
 
 fn is_prompt_too_long_error(status: StatusCode, body: &str) -> bool {
+    let message = chatgpt_error_message_from_body(body);
+    if looks_like_output_limit_error(&message) {
+        return false;
+    }
+
     if serde_json::from_str::<Value>(body).is_ok_and(|value| {
         value
             .pointer("/error/code")
@@ -2339,25 +2838,6 @@ fn map_chatgpt_error_status_body(status: StatusCode, body: String) -> ProviderEr
     map_chatgpt_error_status_body_with_headers(status, &HeaderMap::new(), body)
 }
 
-fn simulated_chatgpt_context_limit_error(
-    body_bytes: usize,
-    threshold_bytes: usize,
-) -> ProviderError {
-    let body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "invalid_request_error",
-            "code": "context_length_exceeded",
-            "param": "input",
-            "message": format!(
-                "The input exceeds the model context window (serialized request body is {body_bytes} bytes; local preflight threshold is {threshold_bytes} bytes)."
-            )
-        }
-    })
-    .to_string();
-    map_chatgpt_error_status_body_with_headers(StatusCode::BAD_REQUEST, &HeaderMap::new(), body)
-}
-
 fn map_chatgpt_error_status_body_with_headers(
     status: StatusCode,
     headers: &HeaderMap,
@@ -2367,11 +2847,19 @@ fn map_chatgpt_error_status_body_with_headers(
     if let Some(output_limit_message) = chatgpt_output_limit_error_message(status, &message) {
         message = output_limit_message;
     }
+    let prompt_too_long = is_prompt_too_long_error(status, &body);
+    if prompt_too_long
+        && !message
+            .to_ascii_lowercase()
+            .starts_with("prompt is too long")
+    {
+        message = format!("Prompt is too long: {message}");
+    }
 
     let metadata =
         upstream_error_metadata_from_parts(status.as_u16(), headers, &body, message.clone());
-    let error = if is_prompt_too_long_error(status, &body) {
-        ProviderError::RequestTooLarge(message)
+    let error = if prompt_too_long {
+        ProviderError::InvalidRequest(message)
     } else {
         match status {
             StatusCode::BAD_REQUEST => ProviderError::InvalidRequest(message),
@@ -2519,6 +3007,77 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
+fn context_static_body(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        for key in [
+            "input",
+            "max_output_tokens",
+            "previous_response_id",
+            "prompt_cache_key",
+            "stream",
+        ] {
+            object.remove(key);
+        }
+    }
+    body
+}
+
+fn input_has_compressible_history(input: &[Value]) -> bool {
+    input.iter().any(|item| {
+        item.get("role").and_then(Value::as_str) == Some("assistant")
+            || matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            )
+    })
+}
+
+fn estimate_context_value_tokens(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Bool(_) => 0,
+        Value::Number(_) => 1,
+        Value::String(text) => {
+            if text.starts_with("data:") && text.contains(";base64,") {
+                CHATGPT_MEDIA_ESTIMATED_TOKENS
+            } else {
+                (text.chars().count() as u64).div_ceil(4)
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_context_value_tokens)
+            .sum::<u64>()
+            .saturating_add(items.len() as u64),
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("image" | "input_image" | "document" | "input_file")
+            ) {
+                return CHATGPT_MEDIA_ESTIMATED_TOKENS;
+            }
+            object.iter().fold(0u64, |total, (key, value)| {
+                total
+                    .saturating_add((key.chars().count() as u64).div_ceil(4))
+                    .saturating_add(estimate_context_value_tokens(value))
+                    .saturating_add(1)
+            })
+        }
+    }
+}
+
+fn virtual_context_limit_error(estimate: &VirtualContextEstimate) -> Option<ProviderError> {
+    (estimate.estimated_tokens > u64::from(estimate.safe_input_limit)).then(|| {
+        ProviderError::InvalidRequest(format!(
+            "Prompt is too long: {} tokens > {} maximum safe input (model context window: {}; local estimate based on {})",
+            estimate.estimated_tokens,
+            estimate.safe_input_limit,
+            estimate.model_context_window,
+            estimate.estimator_source.as_str(),
+        ))
+    })
+}
+
 fn prepare_chatgpt_sse_request_body(body: &Value) -> Result<ChatGptSseRequestBody, ProviderError> {
     let json_bytes = serde_json::to_vec(body).map_err(|error| {
         ProviderError::InvalidRequest(format!("invalid ChatGPT request body: {error}"))
@@ -2553,39 +3112,17 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChatGptContextLimitPreflightThreshold {
-    body_bytes: usize,
-    source: &'static str,
-    context_window: Option<u32>,
-}
-
-fn chatgpt_context_limit_preflight_threshold(
-    model: &str,
-    config: &ChatGptProviderConfig,
-) -> ChatGptContextLimitPreflightThreshold {
-    if let Some(context_window) =
-        chatgpt_model_info(model, config).and_then(|info| info.capabilities.limits.context_window)
-    {
-        return ChatGptContextLimitPreflightThreshold {
-            body_bytes: (context_window as usize).saturating_mul(CHATGPT_BYTES_PER_ESTIMATED_TOKEN),
-            source: "model_context_window",
-            context_window: Some(context_window),
-        };
-    }
-
-    ChatGptContextLimitPreflightThreshold {
-        body_bytes: CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES,
-        source: "fallback_body_bytes",
-        context_window: None,
-    }
-}
-
+#[cfg(test)]
 fn chatgpt_request_warning_threshold(model: &str, config: &ChatGptProviderConfig) -> Option<usize> {
     let context_window = chatgpt_model_info(model, config)?
         .capabilities
         .limits
-        .context_window? as usize;
+        .context_window?;
+    chatgpt_request_warning_threshold_for_window(context_window)
+}
+
+fn chatgpt_request_warning_threshold_for_window(context_window: u32) -> Option<usize> {
+    let context_window = context_window as usize;
     Some(
         context_window
             .saturating_mul(CHATGPT_REQUEST_WARNING_RATIO)
@@ -2594,6 +3131,7 @@ fn chatgpt_request_warning_threshold(model: &str, config: &ChatGptProviderConfig
     )
 }
 
+#[cfg(test)]
 fn request_size_warning(
     model: &str,
     config: &ChatGptProviderConfig,
@@ -2606,15 +3144,30 @@ fn request_size_warning(
     ))
 }
 
+fn request_size_warning_for_window(
+    context_window: u32,
+    body_bytes: usize,
+) -> Option<(usize, usize)> {
+    let threshold_bytes = chatgpt_request_warning_threshold_for_window(context_window)?;
+    (body_bytes >= threshold_bytes).then_some((
+        threshold_bytes,
+        body_bytes / CHATGPT_BYTES_PER_ESTIMATED_TOKEN,
+    ))
+}
+
 fn warn_if_request_nears_context_window(
     request_id: u64,
     compact_request: bool,
     prompt_too_long_attempt: usize,
     model: &str,
-    config: &ChatGptProviderConfig,
+    context_window: Option<u32>,
     body_bytes: usize,
 ) {
-    let Some((threshold_bytes, estimated_tokens)) = request_size_warning(model, config, body_bytes)
+    let Some(context_window) = context_window else {
+        return;
+    };
+    let Some((threshold_bytes, estimated_tokens)) =
+        request_size_warning_for_window(context_window, body_bytes)
     else {
         return;
     };
@@ -2637,32 +3190,58 @@ struct ChatGptModelSpec {
     context_window: u32,
     image_input: bool,
     responses_lite: bool,
+    reasoning_efforts: &'static [&'static str],
 }
 
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
+    ChatGptModelSpec {
+        model_id: "gpt-5.6-sol",
+        context_window: 372_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.6-terra",
+        context_window: 372_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-5.6-luna",
+        context_window: 372_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+    },
     ChatGptModelSpec {
         model_id: "gpt-5.5",
         context_window: 272_000,
         image_input: true,
         responses_lite: false,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4",
         context_window: 272_000,
         image_input: true,
         responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.4-mini",
         context_window: 272_000,
         image_input: true,
         responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
     },
     ChatGptModelSpec {
         model_id: "gpt-5.3-codex-spark",
         context_window: 128_000,
         image_input: false,
         responses_lite: false,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
     },
 ];
 
@@ -2676,14 +3255,29 @@ fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
         })
         .collect::<Vec<_>>();
 
-    let builtin_ids = CHATGPT_MODEL_SPECS
-        .iter()
-        .map(|spec| spec.model_id)
-        .collect::<BTreeSet<_>>();
+    append_configured_chatgpt_models(
+        &mut models,
+        config,
+        CHATGPT_MODEL_SPECS.iter().map(|spec| spec.model_id),
+    );
+
+    if let Some(model) = models.first_mut() {
+        model.is_chat_default = Some(true);
+    }
+
+    models
+}
+
+fn append_configured_chatgpt_models<'a>(
+    models: &mut Vec<ModelInfo>,
+    config: &ChatGptProviderConfig,
+    known_ids: impl IntoIterator<Item = &'a str>,
+) {
+    let known_ids = known_ids.into_iter().collect::<BTreeSet<_>>();
     let mut configured_models = config
         .model_capabilities
         .iter()
-        .filter(|(model_id, _)| !builtin_ids.contains(model_id.as_str()))
+        .filter(|(model_id, _)| !known_ids.contains(model_id.as_str()))
         .collect::<Vec<_>>();
     configured_models.sort_by(|(left, _), (right, _)| left.cmp(right));
     models.extend(
@@ -2691,8 +3285,53 @@ fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
             .into_iter()
             .map(|(model_id, capability)| chatgpt_model_info_from_capability(model_id, capability)),
     );
+}
 
-    models
+fn chatgpt_catalog_model_from_remote(
+    model: ChatGptRemoteModel,
+    config: &ChatGptProviderConfig,
+) -> ChatGptCatalogModel {
+    let capability = config.model_capabilities.get(&model.slug);
+    let context_window = capability
+        .and_then(|capability| capability.context_window)
+        .or_else(|| {
+            model
+                .context_window
+                .or(model.max_context_window)
+                .and_then(|window| u32::try_from(window).ok())
+        });
+    let image_input = capability
+        .and_then(|capability| capability.image_input)
+        .unwrap_or_else(|| {
+            model
+                .input_modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("image"))
+        });
+    let reasoning_efforts = configured_reasoning_effort_levels(capability).unwrap_or_else(|| {
+        model
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.trim())
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let responses_lite = capability
+        .and_then(|capability| capability.responses_lite)
+        .unwrap_or(model.use_responses_lite);
+
+    ChatGptCatalogModel {
+        info: chatgpt_model_info_from_parts(
+            &model.slug,
+            context_window,
+            image_input,
+            reasoning_efforts,
+        ),
+        responses_lite,
+        visibility: model.visibility,
+        priority: model.priority,
+    }
 }
 
 fn chatgpt_model_info(model_id: &str, config: &ChatGptProviderConfig) -> Option<ModelInfo> {
@@ -2713,8 +3352,140 @@ fn chatgpt_model_info(model_id: &str, config: &ChatGptProviderConfig) -> Option<
         })
 }
 
+pub fn configured_chatgpt_context_window(
+    settings: &Settings,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<u32> {
+    let provider = settings.providers.get(provider_id)?;
+    if provider.resolve_type(provider_id) != ProviderType::ChatGPT {
+        return None;
+    }
+    let config = provider.chatgpt.as_ref();
+    if let Some(context_window) = config
+        .and_then(|config| config.model_capabilities.get(model_id))
+        .and_then(|capability| capability.context_window)
+    {
+        return Some(context_window);
+    }
+    if let Some(account_hash) = capability_cache::current_account_hash()
+        && let Some(context_window) = capability_cache::cached_context_window(
+            provider_id,
+            &normalized_codex_base_url(&provider.base_url),
+            &account_hash,
+            model_id,
+        )
+    {
+        return Some(context_window);
+    }
+    chatgpt_model_info(model_id, &config.cloned().unwrap_or_default())
+        .and_then(|model| model.capabilities.limits.context_window)
+}
+
+pub fn claude_code_projected_model(settings: &Settings, model_ref: &str) -> String {
+    let model_ref = model_ref.trim();
+    let bare_model_ref = model_ref.trim_end_matches("[1m]");
+    let Some((provider_id, model_id)) = bare_model_ref.split_once('/') else {
+        return model_ref.to_string();
+    };
+    let Some(provider) = settings.providers.get(provider_id) else {
+        return model_ref.to_string();
+    };
+    if provider.resolve_type(provider_id) != ProviderType::ChatGPT {
+        return model_ref.to_string();
+    }
+    if provider
+        .chatgpt
+        .as_ref()
+        .is_some_and(|config| config.claude_code_context == ClaudeCodeContextMode::Standard)
+    {
+        return bare_model_ref.to_string();
+    }
+    if configured_chatgpt_context_window(settings, provider_id, model_id)
+        .is_some_and(|window| window > CLAUDE_CODE_DEFAULT_CONTEXT_WINDOW)
+    {
+        format!("{bare_model_ref}[1m]")
+    } else {
+        bare_model_ref.to_string()
+    }
+}
+
 fn normalize_chatgpt_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
+}
+
+fn normalize_chatgpt_56_reasoning(request: &mut MessagesRequest) -> bool {
+    if !normalize_chatgpt_model_id(&request.model).starts_with("gpt-5.6") {
+        return false;
+    }
+
+    let mut mapped = false;
+    if let Some(reasoning) = request
+        .extra
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        && let Some(effort) = reasoning.get("effort").and_then(Value::as_str)
+    {
+        match effort {
+            "none" | "minimal" => {
+                reasoning.insert("effort".to_string(), Value::String("low".to_string()));
+            }
+            "ultra" => {
+                reasoning.insert("effort".to_string(), Value::String("max".to_string()));
+                mapped = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(effort) = request
+        .extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+    {
+        match effort {
+            "none" | "minimal" => {
+                request.extra.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String("low".to_string()),
+                );
+            }
+            "ultra" => {
+                request.extra.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String("max".to_string()),
+                );
+                mapped = true;
+            }
+            _ => {}
+        }
+    }
+    if request
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.r#type.as_deref())
+        == Some("disabled")
+    {
+        request.thinking = None;
+        request.extra.insert(
+            "reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+    }
+    mapped
+}
+
+fn request_has_delegation_tool(request: &MessagesRequest) -> bool {
+    request.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            let name = tool.name.to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                "agent" | "delegate" | "spawn_agent" | "spawn_agents" | "subagent" | "task"
+            ) || name.contains("spawn_agent")
+                || name.contains("subagent")
+                || name.contains("delegate")
+        })
+    })
 }
 
 fn chatgpt_model_supports_responses_lite(model_id: &str) -> bool {
@@ -2733,8 +3504,12 @@ fn chatgpt_model_info_from_spec(
     let image_input = capability
         .and_then(|capability| capability.image_input)
         .unwrap_or(spec.image_input);
-    let reasoning_efforts =
-        configured_reasoning_effort_levels(capability).unwrap_or_else(default_reasoning_efforts);
+    let reasoning_efforts = configured_reasoning_effort_levels(capability).unwrap_or_else(|| {
+        spec.reasoning_efforts
+            .iter()
+            .map(|effort| (*effort).to_string())
+            .collect()
+    });
 
     chatgpt_model_info_from_parts(
         spec.model_id,
@@ -2845,6 +3620,8 @@ fn chatgpt_model_info_from_parts(
                 "thinking".to_string(),
                 "reasoning_effort".to_string(),
                 "prompt_cache_key".to_string(),
+                "prompt_cache_options".to_string(),
+                "safety_identifier".to_string(),
                 "parallel_tool_calls".to_string(),
                 "service_tier".to_string(),
                 "verbosity".to_string(),
@@ -3275,6 +4052,41 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn chatgpt_stream_context_overflow_notifies_request_observer() {
+        let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let observer_events = Arc::clone(&captured);
+        let observer: ProviderRequestObserver = Arc::new(move |event| {
+            observer_events.lock().unwrap().push(event);
+        });
+        let handler = provider.upstream_event_handler(ChatGptUpstreamEventContext {
+            request_id: 1,
+            compact_request: false,
+            transport: "sse",
+            first_upstream_event_seen: Arc::new(AtomicBool::new(false)),
+            thinking_diagnostics: Arc::new(ChatGptThinkingDiagnostics::default()),
+            stream_started_at: Instant::now(),
+            observer: Some(observer),
+            pending_context_usage: None,
+        });
+
+        handler(&json!({
+            "type": "error",
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "context limit"
+            }
+        }));
+
+        assert!(captured.lock().unwrap().iter().any(|event| {
+            event
+                .request_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.context_upstream_overflow == Some(true))
+        }));
+    }
+
     #[test]
     fn chatgpt_server_error_rotates_runtime_ids() {
         let runtime_ids = Arc::new(RwLock::new(ChatGptRuntimeIds {
@@ -3362,6 +4174,10 @@ mod tests {
         assert!(gpt54.is_enabled());
         assert_eq!(gpt54.source_str(), "model_capability");
 
+        let sol = provider.responses_lite_decision("chatgpt/gpt-5.6-sol");
+        assert!(sol.is_enabled());
+        assert_eq!(sol.source_str(), "model_capability");
+
         let spark = provider.responses_lite_decision("gpt-5.3-codex-spark");
         assert!(!spark.is_enabled());
         assert_eq!(spark.source_str(), "unknown_model");
@@ -3418,7 +4234,44 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",]
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+
+        let sol = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol model");
+        let terra = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-terra")
+            .expect("gpt-5.6-terra model");
+        let luna = models
+            .iter()
+            .find(|model| model.model_id == "gpt-5.6-luna")
+            .expect("gpt-5.6-luna model");
+        for model in [sol, terra, luna] {
+            assert_eq!(model.capabilities.limits.context_window, Some(372_000));
+            assert!(model.capabilities.modalities.input.image.is_supported());
+        }
+        assert_eq!(
+            sol.capabilities.limits.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            terra.capabilities.limits.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            luna.capabilities.limits.reasoning_effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
 
         let gpt55 = models
@@ -3476,7 +4329,7 @@ mod tests {
         );
         assert_eq!(
             gpt55.capabilities.limits.reasoning_effort_levels,
-            vec!["minimal", "low", "medium", "high", "xhigh", "max"]
+            vec!["low", "medium", "high", "xhigh"]
         );
 
         let spark = models
@@ -3545,13 +4398,171 @@ mod tests {
             new_model.capabilities.limits.reasoning_effort_levels,
             vec!["low".to_string(), "ultra".to_string()]
         );
+    }
 
-        let threshold = chatgpt_context_limit_preflight_threshold("chatgpt/gpt-5.6-codex", &config);
-        assert_eq!(
-            threshold.body_bytes,
-            512_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
+    #[test]
+    fn remote_chatgpt_catalog_uses_codex_metadata_and_config_overrides() {
+        let remote: ChatGptRemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.6-sol",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "ultra"}
+            ],
+            "context_window": 372000,
+            "max_context_window": 400000,
+            "input_modalities": ["text", "image"],
+            "use_responses_lite": true,
+            "visibility": "list",
+            "priority": 1
+        }))
+        .unwrap();
+        let mut config = ChatGptProviderConfig::default();
+        config.model_capabilities.insert(
+            "gpt-5.6-sol".to_string(),
+            ChatGptModelCapabilityOverride {
+                context_window: Some(500_000),
+                image_input: Some(false),
+                reasoning_effort_levels: Some(vec!["high".to_string(), "ultra".to_string()]),
+                responses_lite: Some(false),
+            },
         );
-        assert_eq!(threshold.context_window, Some(512_000));
+
+        let catalog = chatgpt_catalog_model_from_remote(remote, &config);
+
+        assert_eq!(catalog.info.model_id, "gpt-5.6-sol");
+        assert_eq!(
+            catalog.info.capabilities.limits.context_window,
+            Some(500_000)
+        );
+        assert_eq!(
+            catalog.info.capabilities.modalities.input.image,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            catalog.info.capabilities.limits.reasoning_effort_levels,
+            vec!["high", "ultra"]
+        );
+        assert!(!catalog.responses_lite);
+        assert_eq!(catalog.visibility.as_deref(), Some("list"));
+        assert_eq!(catalog.priority, 1);
+    }
+
+    #[test]
+    fn chatgpt_ultra_maps_to_max_and_enables_proactive_instructions_with_delegate_tool() {
+        let mut request = MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "spawn_agent".to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::from([("reasoning_effort".to_string(), json!("ultra"))]),
+        };
+
+        assert!(normalize_chatgpt_56_reasoning(&mut request));
+        assert!(request_has_delegation_tool(&request));
+        assert_eq!(request.extra["reasoning_effort"], "max");
+
+        let model = chatgpt_model_info("gpt-5.6-sol", &ChatGptProviderConfig::default()).unwrap();
+        let body = build_chatgpt_responses_body_with_codex_context(
+            &request,
+            responses::CodexRequestContext {
+                model: Some(&model),
+                additional_instructions: Some(PROACTIVE_MULTI_AGENT_INSTRUCTIONS),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert!(
+            body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("Proactive multi-agent delegation is active")
+        );
+    }
+
+    #[test]
+    fn chatgpt_ultra_without_delegate_or_model_support_stays_max_only() {
+        let mut request = MessagesRequest {
+            model: "gpt-5.6-luna".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::from([("reasoning".to_string(), json!({"effort": "ultra"}))]),
+        };
+
+        assert!(normalize_chatgpt_56_reasoning(&mut request));
+        assert!(!request_has_delegation_tool(&request));
+        assert_eq!(request.extra["reasoning"]["effort"], "max");
+        let luna = chatgpt_model_info("gpt-5.6-luna", &ChatGptProviderConfig::default()).unwrap();
+        assert!(
+            !luna
+                .capabilities
+                .limits
+                .reasoning_effort_levels
+                .contains(&"ultra".to_string())
+        );
+    }
+
+    #[test]
+    fn chatgpt_56_maps_unsupported_none_minimal_and_disabled_to_low() {
+        let mut request = MessagesRequest {
+            model: "gpt-5.6-terra".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("disabled".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::from([("reasoning".to_string(), json!({"effort": "minimal"}))]),
+        };
+
+        assert!(!normalize_chatgpt_56_reasoning(&mut request));
+        assert_eq!(request.extra["reasoning"]["effort"], "low");
+        assert_eq!(request.extra["reasoning_effort"], "low");
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn codex_models_endpoint_tracks_custom_codex_base() {
+        assert_eq!(
+            codex_models_endpoint("https://chatgpt.com/backend-api/codex/responses"),
+            "https://chatgpt.com/backend-api/codex/models"
+        );
+        assert_eq!(
+            codex_models_endpoint("http://127.0.0.1:8080/api/codex"),
+            "http://127.0.0.1:8080/api/codex/models"
+        );
     }
 
     #[test]
@@ -3841,6 +4852,8 @@ mod tests {
                 service_tier: Some("flex"),
                 standalone_tools: true,
                 responses_lite: true,
+                model: None,
+                additional_instructions: None,
             },
         );
 
@@ -4063,6 +5076,8 @@ mod tests {
                 service_tier: Some("priority"),
                 standalone_tools: true,
                 responses_lite: true,
+                model: None,
+                additional_instructions: None,
             },
         );
 
@@ -4228,6 +5243,8 @@ mod tests {
                 service_tier: None,
                 standalone_tools: true,
                 responses_lite: true,
+                model: None,
+                additional_instructions: None,
             },
         );
 
@@ -4554,37 +5571,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_limit_preflight_threshold_uses_model_capability_then_fallback() {
-        let config = ChatGptProviderConfig::default();
-        let gpt55 = chatgpt_context_limit_preflight_threshold("gpt-5.5", &config);
-        assert_eq!(
-            gpt55.body_bytes,
-            272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
-        );
-        assert_eq!(gpt55.source, "model_context_window");
-        assert_eq!(gpt55.context_window, Some(272_000));
-
-        let spark = chatgpt_context_limit_preflight_threshold("gpt-5.3-codex-spark", &config);
-        assert_eq!(
-            spark.body_bytes,
-            128_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN
-        );
-        assert_eq!(spark.source, "model_context_window");
-        assert_eq!(spark.context_window, Some(128_000));
-
-        let unknown = chatgpt_context_limit_preflight_threshold("unknown-model", &config);
-        assert_eq!(
-            unknown.body_bytes,
-            CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES
-        );
-        assert_eq!(unknown.source, "fallback_body_bytes");
-        assert_eq!(unknown.context_window, None);
-    }
-
     #[tokio::test]
-    async fn chatgpt_local_context_limit_preflight_returns_request_too_large_without_upstream_call()
-    {
+    async fn chatgpt_virtual_context_preflight_blocks_before_upstream_call() {
         let (endpoint, requests) = capture_once_server().await;
         let provider = test_chatgpt_provider(endpoint).await;
         let token = ChatGptToken {
@@ -4593,36 +5581,164 @@ mod tests {
             expires_at: i64::MAX,
             account_id: Some("account".to_string()),
         };
-        let mut body = json!({
-            "model": "gpt-5.3-codex-spark",
-            "input": [{"role": "user", "content": "x".repeat(CHATGPT_CONTEXT_LIMIT_FALLBACK_PREFLIGHT_BODY_BYTES)}],
+        let body = json!({
+            "model": "gpt-5.6-luna",
+            "input": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "prior"},
+                {"role": "user", "content": "x".repeat(1_400_000)}
+            ],
             "stream": true
         });
 
-        let error = provider
-            .send_responses_request_with_prompt_too_long_retry(
-                &mut body,
-                &token,
-                false,
-                1,
-                ChatGptOutputTokenBudget::default(),
-                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::UnknownModel),
-                None,
-            )
-            .await
-            .expect_err("oversized body should return a context-limit error");
+        let estimate = provider.virtual_context_estimate(
+            &body,
+            &token,
+            Some("session-context"),
+            372_000,
+            CompactRequestKind::None,
+        );
+        assert_eq!(estimate.safe_input_limit, 339_000);
+        assert!(estimate.compressible_history);
+        assert_eq!(estimate.estimator_source, ContextEstimatorSource::FullRough);
+        let error = virtual_context_limit_error(&estimate)
+            .expect("oversized virtual context should be blocked");
 
         match error.without_upstream_metadata() {
-            ProviderError::RequestTooLarge(message) => {
-                assert!(message.contains("exceeds the model context window"));
+            ProviderError::InvalidRequest(message) => {
+                assert!(message.starts_with("Prompt is too long:"));
+                assert!(message.contains("339000 maximum safe input"));
+                assert!(message.contains("model context window: 372000"));
             }
             other => panic!("unexpected error: {other}"),
         }
-        assert_eq!(
-            error.upstream_metadata().map(|metadata| metadata.status),
-            Some(400)
-        );
         assert!(requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chatgpt_virtual_context_thresholds_follow_compaction_state() {
+        let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
+        let token = chatgpt_test_token();
+        let history = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "follow-up"}
+            ]
+        });
+        let single_turn = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"role": "user", "content": "question"}]
+        });
+
+        let ordinary = provider.virtual_context_estimate(
+            &history,
+            &token,
+            Some("threshold-session"),
+            372_000,
+            CompactRequestKind::None,
+        );
+        let summary = provider.virtual_context_estimate(
+            &history,
+            &token,
+            Some("threshold-session"),
+            372_000,
+            CompactRequestKind::SummaryGeneration,
+        );
+        let continuation = provider.virtual_context_estimate(
+            &single_turn,
+            &token,
+            Some("threshold-session"),
+            372_000,
+            CompactRequestKind::CompactedContinuation,
+        );
+        let no_history = provider.virtual_context_estimate(
+            &single_turn,
+            &token,
+            Some("threshold-session"),
+            372_000,
+            CompactRequestKind::None,
+        );
+
+        assert_eq!(ordinary.safe_input_limit, 339_000);
+        assert_eq!(summary.safe_input_limit, 352_000);
+        assert_eq!(continuation.safe_input_limit, 339_000);
+        assert_eq!(no_history.safe_input_limit, 352_000);
+    }
+
+    #[test]
+    fn chatgpt_context_estimator_uses_fixed_media_cost() {
+        let small = json!({"type": "input_image", "image_url": "data:image/png;base64,a"});
+        let large = json!({
+            "type": "input_image",
+            "image_url": format!("data:image/png;base64,{}", "a".repeat(1_000_000))
+        });
+        assert_eq!(
+            estimate_context_value_tokens(&small),
+            CHATGPT_MEDIA_ESTIMATED_TOKENS
+        );
+        assert_eq!(
+            estimate_context_value_tokens(&large),
+            CHATGPT_MEDIA_ESTIMATED_TOKENS
+        );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_context_estimator_reuses_usage_only_for_matching_prefix() {
+        let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
+        let token = chatgpt_test_token();
+        let first = json!({
+            "model": "gpt-5.6-terra",
+            "input": [{"role": "user", "content": "first"}]
+        });
+        let second = json!({
+            "model": "gpt-5.6-terra",
+            "input": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        let key = ContextUsageKey {
+            provider_id: "chatgpt".to_string(),
+            account_hash: capability_cache::account_hash(token.account_id.as_deref()).unwrap(),
+            model: "gpt-5.6-terra".to_string(),
+            stable_client_conversation_id: "usage-session".to_string(),
+        };
+        provider.context_usage.lock().unwrap().insert(
+            key,
+            ContextUsageBaseline {
+                static_body: context_static_body(&first),
+                context_items: first["input"].as_array().unwrap().clone(),
+                total_tokens: 1_000,
+                updated_at: Instant::now(),
+            },
+        );
+
+        let matching = provider.virtual_context_estimate(
+            &second,
+            &token,
+            Some("usage-session"),
+            372_000,
+            CompactRequestKind::None,
+        );
+        assert_eq!(
+            matching.estimator_source,
+            ContextEstimatorSource::UsagePlusDelta
+        );
+        assert!(matching.estimated_tokens >= 1_000);
+
+        let different_session = provider.virtual_context_estimate(
+            &second,
+            &token,
+            Some("other-session"),
+            372_000,
+            CompactRequestKind::None,
+        );
+        assert_eq!(
+            different_session.estimator_source,
+            ContextEstimatorSource::FullRough
+        );
     }
 
     #[tokio::test]
@@ -4750,6 +5866,38 @@ mod tests {
             handshakes[0].header("authorization").as_deref(),
             Some("Bearer access")
         );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_completion_records_context_usage_baseline() {
+        let (endpoint, _, _) = websocket_events_server(vec![
+            websocket_response_created("resp-ws-context"),
+            websocket_response_completed("resp-ws-context"),
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+        let token = chatgpt_test_token();
+        let mut prepared = chatgpt_test_prepared_request(103);
+        let pending = test_pending_context_usage(&provider, &prepared, &token, "ws-context");
+        let key = pending.key.clone();
+        prepared.pending_context_usage = Some(pending);
+
+        let stream = provider
+            .chat_prepared_with_token(prepared, token)
+            .await
+            .expect("websocket stream should start");
+        assert!(
+            collect_stream_results(stream)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let cache = provider.context_usage.lock().unwrap();
+        let baseline = cache.get(&key).expect("usage baseline");
+        assert_eq!(baseline.total_tokens, 3);
+        assert_eq!(baseline.context_items.len(), 1);
     }
 
     #[tokio::test]
@@ -5626,6 +6774,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_sse_fallback_completion_records_context_usage_baseline() {
+        let (endpoint, _) = websocket_upgrade_required_then_sse_server().await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Auto;
+        let token = chatgpt_test_token();
+        let mut prepared = chatgpt_test_prepared_request(104);
+        let pending = test_pending_context_usage(&provider, &prepared, &token, "sse-context");
+        let key = pending.key.clone();
+        prepared.pending_context_usage = Some(pending);
+
+        let stream = provider
+            .chat_prepared_with_token(prepared, token)
+            .await
+            .expect("auto transport should fall back to SSE");
+        assert!(
+            collect_stream_results(stream)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let cache = provider.context_usage.lock().unwrap();
+        assert_eq!(
+            cache.get(&key).map(|baseline| baseline.total_tokens),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
     async fn chatgpt_auto_transport_retries_websocket_after_startup_cooldown_expires() {
         let (endpoint, requests) = websocket_fallback_cooldown_retry_server().await;
         let mut provider = test_chatgpt_provider(endpoint).await;
@@ -5837,7 +7014,9 @@ mod tests {
             .expect_err("upstream context-limit error should not be retried");
 
         match error.without_upstream_metadata() {
-            ProviderError::RequestTooLarge(message) => assert_eq!(message, "context limit"),
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "Prompt is too long: context limit")
+            }
             other => panic!("unexpected error: {other}"),
         }
         let requests = requests.lock().await;
@@ -5862,12 +7041,13 @@ mod tests {
     }
 
     #[test]
-    fn context_length_errors_map_to_request_too_large_even_with_http_200() {
+    fn context_length_errors_map_to_anthropic_invalid_request_even_with_http_200() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}"#;
         let error = map_chatgpt_error_status_body(StatusCode::OK, body.to_string());
 
         match error.without_upstream_metadata() {
-            ProviderError::RequestTooLarge(message) => {
+            ProviderError::InvalidRequest(message) => {
+                assert!(message.starts_with("Prompt is too long:"));
                 assert!(message.contains("exceeds the context window"));
             }
             other => panic!("unexpected error: {other}"),
@@ -5875,7 +7055,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_stream_context_length_error_maps_to_request_too_large() {
+    fn chatgpt_stream_context_length_error_maps_to_anthropic_invalid_request() {
         let body = r#"{"type":"error","error":{"code":"context_length_exceeded","message":"context limit"}}"#;
         let error = map_chatgpt_stream_error(ProviderError::UpstreamError {
             status: 200,
@@ -5883,7 +7063,9 @@ mod tests {
         });
 
         match error.without_upstream_metadata() {
-            ProviderError::RequestTooLarge(message) => assert_eq!(message, "context limit"),
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "Prompt is too long: context limit")
+            }
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -5901,6 +7083,22 @@ mod tests {
                     message,
                     "requested max_tokens exceeds the upstream model output limit; lower max_tokens or choose a model with a larger output budget"
                 );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn combined_input_and_max_tokens_overflow_is_not_normalized_as_prompt_too_long() {
+        let error = map_chatgpt_error_status_body(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"context_length_exceeded","message":"input length plus max_tokens exceeds the model context limit"}}"#.to_string(),
+        );
+
+        match error.without_upstream_metadata() {
+            ProviderError::InvalidRequest(message) => {
+                assert!(!message.starts_with("Prompt is too long:"));
+                assert!(message.contains("max_tokens exceeds"));
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -6081,6 +7279,27 @@ mod tests {
             stable_client_conversation_id: stable_client_conversation_id.map(ToOwned::to_owned),
             responses_lite: ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn),
             observer: None,
+            pending_context_usage: None,
+        }
+    }
+
+    fn test_pending_context_usage(
+        provider: &ChatGptProvider,
+        prepared: &ChatGptPreparedRequest,
+        token: &ChatGptToken,
+        session_id: &str,
+    ) -> PendingContextUsage {
+        let full_input = prepared.body["input"].as_array().unwrap().clone();
+        PendingContextUsage {
+            key: ContextUsageKey {
+                provider_id: provider.id.clone(),
+                account_hash: capability_cache::account_hash(token.account_id.as_deref()).unwrap(),
+                model: prepared.body["model"].as_str().unwrap().to_string(),
+                stable_client_conversation_id: session_id.to_string(),
+            },
+            static_body: context_static_body(&prepared.body),
+            full_input,
+            compact_kind: CompactRequestKind::None,
         }
     }
 
@@ -6932,8 +8151,10 @@ mod tests {
     async fn test_chatgpt_provider(endpoint: String) -> ChatGptProvider {
         ChatGptProvider {
             id: "chatgpt".to_string(),
+            base_url: endpoint.clone(),
             http_client: Client::new(),
             endpoint,
+            models_endpoint: "http://127.0.0.1/models".to_string(),
             usage_endpoint: "http://127.0.0.1/usage".to_string(),
             installation_id: "install-test".to_string(),
             runtime_ids: Arc::new(RwLock::new(ChatGptRuntimeIds {
@@ -6955,10 +8176,12 @@ mod tests {
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
             auth: ChatGptAuth::new(Client::new()).await.unwrap(),
+            remote_models: Arc::new(RwLock::new(HashMap::new())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
             })),
+            context_usage: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 

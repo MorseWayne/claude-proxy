@@ -82,7 +82,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     ),
                     ("Avg Latency", &avg_lat),
                     ("Observe", &observability),
-                    ("Resp Lite", &observability_details),
+                    ("Context", &observability_details),
                     ("Top Error", &errors),
                 ],
             );
@@ -95,7 +95,7 @@ pub fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     ("Errors", &format!("{}", metrics.errors_total)),
                     ("Avg Latency", &avg_lat),
                     ("Observe", &observability),
-                    ("Resp Lite", &observability_details),
+                    ("Context", &observability_details),
                     ("Top Error", &errors),
                 ],
             );
@@ -274,11 +274,11 @@ fn observability_details(summary: &ObservabilitySummary) -> String {
         return "no samples".to_string();
     }
     format!(
-        "{} · WS {} · Cont {} · Saved {}",
+        "{} · 1M {} · Block {} · Miss {}",
         format_number(summary.responses_lite_requests),
-        format_number(summary.websocket_requests),
-        format_number(summary.continuation_used_requests),
-        format_bytes(summary.continuation_saved_bytes)
+        format_number(summary.virtual_context_requests),
+        format_number(summary.context_local_blocks),
+        format_number(summary.context_upstream_overflows),
     )
 }
 
@@ -666,20 +666,6 @@ fn format_number(n: u64) -> String {
     }
 }
 
-/// Format byte count with binary units for observability savings.
-fn format_bytes(n: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-
-    if n < 1024 {
-        format!("{n} B")
-    } else if n < 1024 * 1024 {
-        format!("{:.1} KiB", n as f64 / KIB)
-    } else {
-        format!("{:.1} MiB", n as f64 / MIB)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,19 +716,19 @@ mod tests {
     }
 
     #[test]
-    fn observability_details_formats_responses_lite_and_saved_bytes() {
+    fn observability_details_formats_virtual_context_counters() {
         let summary = ObservabilitySummary {
             requests: 10,
             responses_lite_requests: 7,
-            websocket_requests: 6,
-            continuation_used_requests: 5,
-            continuation_saved_bytes: 1536,
+            virtual_context_requests: 6,
+            context_local_blocks: 5,
+            context_upstream_overflows: 2,
             ..Default::default()
         };
 
         assert_eq!(
             observability_details(&summary),
-            "7 · WS 6 · Cont 5 · Saved 1.5 KiB"
+            "7 · 1M 6 · Block 5 · Miss 2"
         );
     }
 

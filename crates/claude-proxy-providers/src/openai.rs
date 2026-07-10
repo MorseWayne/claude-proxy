@@ -75,6 +75,19 @@ fn apply_openai_responses_options(
                     .and_then(Value::as_str)
             }),
     );
+    insert_trimmed_string(
+        object,
+        "safety_identifier",
+        request
+            .extra
+            .get("safety_identifier")
+            .and_then(Value::as_str),
+    );
+    if let Some(value) = request.extra.get("prompt_cache_options")
+        && value.is_object()
+    {
+        object.insert("prompt_cache_options".to_string(), value.clone());
+    }
     if let Some(value) = request.extra.get("parallel_tool_calls")
         && value.is_boolean()
     {
@@ -110,6 +123,38 @@ fn insert_trimmed_string(object: &mut Map<String, Value>, key: &str, value: Opti
         object
             .entry(key.to_string())
             .or_insert_with(|| value.into());
+    }
+}
+
+fn normalize_openai_56_reasoning(request: &mut MessagesRequest) {
+    if !request.model.starts_with("gpt-5.6") {
+        return;
+    }
+    if request
+        .extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        == Some("minimal")
+    {
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("low"));
+    }
+    if let Some(reasoning) = request
+        .extra
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        && let Some(effort) = reasoning.get("effort").and_then(Value::as_str)
+    {
+        match effort {
+            "minimal" => {
+                reasoning.insert("effort".to_string(), json!("low"));
+            }
+            "ultra" => {
+                reasoning.insert("effort".to_string(), json!("max"));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -205,8 +250,18 @@ impl OpenAiProvider {
     }
 
     fn responses_request_body(&self, request: &MessagesRequest) -> Value {
-        let mut body = crate::responses::convert_to_responses(request);
-        apply_openai_responses_options(&mut body, request, &self.runtime);
+        let mut request = request.clone();
+        normalize_openai_56_reasoning(&mut request);
+        let model = openai_model_info(&request.model);
+        let mut body = crate::responses::convert_to_responses_with_context(
+            &request,
+            crate::responses::ConversionContext {
+                provider_id: Some("openai"),
+                model: Some(&model),
+                ..Default::default()
+            },
+        );
+        apply_openai_responses_options(&mut body, &request, &self.runtime);
         body
     }
 
@@ -295,19 +350,26 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&[])
             .iter()
             .filter_map(|m| {
-                m["id"].as_str().map(|id| {
-                    merge_model_info(ModelInfo {
-                        model_id: id.to_string(),
-                        vendor: Some("openai".to_string()),
-                        is_chat_default: None,
-                        capabilities: ModelCapabilities::default(),
+                m["id"]
+                    .as_str()
+                    .filter(|id| !is_hidden_openai_model_alias(id))
+                    .map(|id| {
+                        merge_model_info(ModelInfo {
+                            model_id: id.to_string(),
+                            vendor: Some("openai".to_string()),
+                            is_chat_default: None,
+                            capabilities: ModelCapabilities::default(),
+                        })
                     })
-                })
             })
             .collect();
 
         Ok(models)
     }
+}
+
+fn is_hidden_openai_model_alias(model_id: &str) -> bool {
+    model_id == "gpt-5.6"
 }
 
 #[cfg(test)]
@@ -331,12 +393,25 @@ mod tests {
     }
 
     #[test]
+    fn openai_picker_hides_unsuffixed_gpt_56_alias() {
+        assert!(is_hidden_openai_model_alias("gpt-5.6"));
+        assert!(!is_hidden_openai_model_alias("gpt-5.6-sol"));
+        assert!(!is_hidden_openai_model_alias("gpt-5.6-terra"));
+        assert!(!is_hidden_openai_model_alias("gpt-5.6-luna"));
+    }
+
+    #[test]
     fn openai_responses_body_applies_runtime_and_request_options() {
         let mut extra = std::collections::HashMap::new();
         extra.insert("parallel_tool_calls".to_string(), json!(false));
         extra.insert("verbosity".to_string(), json!("high"));
         extra.insert("service_tier".to_string(), json!("priority"));
         extra.insert("prompt_cache_key".to_string(), json!("request-thread"));
+        extra.insert("safety_identifier".to_string(), json!("tenant-42"));
+        extra.insert(
+            "prompt_cache_options".to_string(),
+            json!({"retention": "24h"}),
+        );
         let runtime = ProviderRuntimeConfig {
             openai: claude_proxy_config::settings::OpenAiRuntimeConfig {
                 service_tier: Some("flex".to_string()),
@@ -385,6 +460,46 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "request-thread");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["text"], json!({"verbosity": "high"}));
+        assert_eq!(body["safety_identifier"], "tenant-42");
+        assert_eq!(body["prompt_cache_options"], json!({"retention": "24h"}));
+    }
+
+    #[test]
+    fn openai_gpt_56_maps_legacy_minimal_effort_to_low() {
+        let provider = OpenAiProvider::new(
+            "openai",
+            "test-key",
+            "http://127.0.0.1:1",
+            "",
+            1,
+            1,
+            &[],
+            UpstreamRequestPolicy::default(),
+            ProviderRuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut req = MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            system: None,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: Default::default(),
+        };
+        req.extra
+            .insert("reasoning_effort".to_string(), json!("minimal"));
+
+        let body = provider.responses_request_body(&req);
+
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 
     #[test]
