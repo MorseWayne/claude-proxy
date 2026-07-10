@@ -1,8 +1,27 @@
 # claude-proxy
 
-A Claude-compatible proxy that routes requests to OpenAI, Anthropic, **GitHub Copilot**, **ChatGPT**, or any OpenAI-compatible upstream provider.
+**Use Claude Code with ChatGPT/Codex, OpenAI, GitHub Copilot, Gemini, OpenRouter, Anthropic, or your own models.**
 
-Single native binary, zero runtime dependencies.
+> Bring the model accounts you already have. Route them through one fast, observable gateway.
+
+[![CI](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/claude-proxy?display_name=tag)](https://github.com/MorseWayne/claude-proxy/releases/latest)
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+
+[中文](README.md) · [Install](#install) · [Quick Start](#quick-start) · [Configuration](#configuration)
+
+`claude-proxy` is a multi-model gateway for Claude Code and other Anthropic Messages API clients. It ships as a single native binary with zero runtime dependencies and provides one CLI/TUI for routing, authentication, and production observability.
+
+## Why claude-proxy
+
+- **Use existing accounts**: Sign in to ChatGPT and GitHub Copilot with OAuth instead of maintaining API keys.
+- **Route across providers**: Mix OpenAI, Anthropic, Copilot, ChatGPT, OpenRouter, Google, and private compatible services in one configuration.
+- **Extend Claude Code context**: Eligible ChatGPT models get virtual 1M projection, local context preflight, and automatic compaction signals.
+- **Respect model capabilities**: Model aliases and reasoning-effort choices follow real capability metadata instead of sending unsupported values.
+- **Operate with confidence**: Built-in TUI dashboard, persistent SQLite metrics, rate limits, concurrency controls, hot reload, daemon mode, and request deduplication.
+- **Deploy one file**: A native Rust binary for both local workstations and shared team gateways.
 
 ## Install
 
@@ -234,7 +253,7 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 
 ## Features
 
-- **Multi-Provider**: OpenAI, Anthropic, GitHub Copilot, and any OpenAI-compatible API
+- **Multi-Provider**: OpenAI, Anthropic, GitHub Copilot, ChatGPT, OpenRouter, Google, and custom compatible APIs
 - **Copilot Integration**: Full GitHub OAuth auth, VS Code impersonation, premium request optimization
 - **Auto Model Discovery**: Fetches available models when adding a provider, interactive default model selection
 - **TUI Config Interface**: Built-in terminal UI with keyboard navigation for config and provider management

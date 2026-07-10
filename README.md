@@ -1,76 +1,27 @@
 # claude-proxy
 
-Claude 兼容代理服务器：把 Claude Code、Claude SDK 或任何 Anthropic Messages API 客户端的请求，路由到 OpenAI、Anthropic、GitHub Copilot、ChatGPT、OpenRouter、Google 或自定义兼容端点。
+**让 Claude Code 自由使用 ChatGPT/Codex、OpenAI、GitHub Copilot、Gemini、OpenRouter、Anthropic 和自定义模型。**
 
-它是一个单个原生二进制文件，零运行时依赖，重点解决三件事：统一 Claude 入口、灵活切换上游模型、用 CLI/TUI 管理真实生产运行状态。
+> Use Claude Code with the models and accounts you already have — through one fast, observable gateway.
 
-[English](README_EN.md)
+[![CI](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml)
+[![Release](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/claude-proxy?display_name=tag)](https://github.com/MorseWayne/claude-proxy/releases/latest)
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#许可证)
+
+[English](README_EN.md) · [立即安装](#安装) · [快速开始](#快速开始) · [查看 Provider](#支持的-provider)
+
+`claude-proxy` 是面向 Claude Code 和 Anthropic Messages API 客户端的多模型网关。它以单个原生二进制运行，零运行时依赖，并通过 CLI/TUI 统一管理模型路由、账号认证和生产运行状态。
 
 ## 为什么选择 claude-proxy
 
-- **面向 Claude Code 的兼容层**：对外提供 Anthropic Messages API，对内适配多种上游服务，Claude Code 只需要配置一个 `ANTHROPIC_BASE_URL`。
-- **多 Provider 原生路由**：同一份配置里可混用 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和私有兼容服务。
-- **账号型 Provider 支持**：Copilot 和 ChatGPT 使用 OAuth 登录，不需要手动维护 API key。
-- **模型别名与快速切换**：通过 `provider_id/model` 精确路由，也可以用 `opus`、`sonnet`、`haiku`、`reasoning` 等别名映射 Claude 模型名。
-- **终端可观测性**：内置 TUI Dashboard、模型用量统计、延迟、错误数和 SQLite 历史累计数据。
-- **运行时控制完整**：支持限流、全局并发、单 Provider 并发、配置热重载、守护进程、模型缓存预热和重复请求去重。
-- **适合本地与团队网关**：原生二进制易部署，可接入代理、额外 CA 证书和自定义 OpenAI/Anthropic 兼容网关。
-
-## 截图预览
-
-### 1. 快速接入 Claude Code
-
-从添加 provider、启动服务到设置 `ANTHROPIC_BASE_URL`，核心路径只需要几条命令。
-
-![快速接入流程](images/quickstart-flow.svg)
-
-### 2. CLI 总览
-
-一个二进制覆盖 provider、配置、服务、补全和 TUI，不需要额外运行时或后台管理面板。
-
-![CLI 总览](images/cli-overview.svg)
-
-### 3. 多 Provider 管理
-
-TUI 可以集中查看 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和自定义 Provider，并快速切换默认模型。
-
-![多 Provider 管理](images/multi-providers.png)
-
-### 4. 模型路由配置
-
-Model 页面展示默认模型和 Claude alias 的路由关系，方便确认 `opus`、`sonnet`、`haiku` 等别名最终会落到哪个上游模型。
-
-![模型路由配置](images/model-route.png)
-
-### 5. 配置与服务控制
-
-配置查看会自动脱敏；服务侧支持前台运行、Unix daemon、SIGUSR1 reload 和状态查询。
-
-![配置与服务控制](images/config-server-commands.svg)
-
-### 6. TUI 模型选择
-
-TUI 提供键盘导航的模型选择、Provider 管理和配置入口，适合不想手写 TOML 的场景。
-
-![TUI 模型选择](images/tui-model-selection.png)
-
-### 7. TUI 指标仪表盘
-
-Dashboard 会展示请求数、错误数、延迟和按模型聚合的 token 用量，并合并 SQLite 历史累计数据。
-
-![TUI 仪表盘](images/metrics-dashboard.png)
-
-### 8. Metrics API
-
-管理接口可直接返回 JSON 指标，方便接入脚本、监控或自定义 dashboard。
-
-![Metrics API](images/metrics-api.svg)
-
-### 9. 在 Claude Code 中使用
-
-设置环境变量后，Claude Code 可以像访问 Anthropic API 一样访问本地代理。
-
-![Claude Code 集成](images/claude-code-usage.png)
+- **已有账号直接接入**：ChatGPT 和 GitHub Copilot 支持 OAuth，无需手动维护 API key。
+- **多 Provider 原生路由**：一份配置同时使用 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和私有兼容服务。
+- **Claude Code 上下文增强**：为符合条件的 ChatGPT 模型提供虚拟 1M 投影、本地上下文预检和自动压缩信号。
+- **按模型能力配置推理**：模型别名、推理强度和能力约束由真实模型元数据驱动，避免发送不支持的参数。
+- **可观察、可运营**：内置 TUI Dashboard、SQLite 历史指标、限流、并发控制、热重载、守护进程和请求去重。
+- **单文件部署**：原生 Rust 二进制，零运行时依赖，适合个人工作站和团队网关。
 
 ## 安装
 
@@ -109,6 +60,49 @@ export ANTHROPIC_API_KEY=freecc
 ```
 
 之后，Claude Code 发出的 Anthropic Messages API 请求会进入 `claude-proxy`，再按配置路由到对应上游模型。
+
+## 界面预览
+
+在一个 TUI 中管理 Provider、模型路由、OAuth 登录和运行指标：
+
+![多 Provider 管理](images/multi-providers.png)
+
+<details>
+<summary>查看更多 CLI、TUI 与 Claude Code 集成截图</summary>
+
+### 快速接入 Claude Code
+
+![快速接入流程](images/quickstart-flow.svg)
+
+### CLI 总览
+
+![CLI 总览](images/cli-overview.svg)
+
+### 模型路由配置
+
+![模型路由配置](images/model-route.png)
+
+### 配置与服务控制
+
+![配置与服务控制](images/config-server-commands.svg)
+
+### TUI 模型选择
+
+![TUI 模型选择](images/tui-model-selection.png)
+
+### TUI 指标仪表盘
+
+![TUI 仪表盘](images/metrics-dashboard.png)
+
+### Metrics API
+
+![Metrics API](images/metrics-api.svg)
+
+### 在 Claude Code 中使用
+
+![Claude Code 集成](images/claude-code-usage.png)
+
+</details>
 
 ## 支持的 Provider
 
