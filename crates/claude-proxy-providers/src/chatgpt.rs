@@ -150,6 +150,10 @@ struct ChatGptModelsPayload {
     models: Vec<ChatGptRemoteModel>,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatGptRemoteModel {
     slug: String,
@@ -163,6 +167,8 @@ struct ChatGptRemoteModel {
     input_modalities: Vec<String>,
     #[serde(default)]
     use_responses_lite: bool,
+    #[serde(default = "default_true")]
+    supports_reasoning_summary_parameter: bool,
     #[serde(default)]
     visibility: Option<String>,
     #[serde(default)]
@@ -185,6 +191,7 @@ struct ChatGptRemoteServiceTier {
 struct ChatGptCatalogModel {
     info: ModelInfo,
     responses_lite: bool,
+    supports_reasoning_summary_parameter: bool,
     visibility: Option<String>,
     priority: i32,
     service_tiers: Option<Vec<String>>,
@@ -768,6 +775,16 @@ impl ChatGptProvider {
             .get(model)
             .map(|model| model.info.clone())
             .or_else(|| chatgpt_model_info(model, &self.chatgpt_config))
+    }
+
+    fn supports_reasoning_summary_parameter(&self, model: &str) -> bool {
+        let model = normalize_chatgpt_model_id(model);
+        self.remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned")
+            .get(model)
+            .map(|model| model.supports_reasoning_summary_parameter)
+            .unwrap_or(true)
     }
 
     fn virtual_context_estimate(
@@ -1934,6 +1951,8 @@ impl Provider for ChatGptProvider {
         let stable_client_conversation_id =
             responses::stable_client_conversation_id_for_continuation(&request);
         let responses_lite = self.responses_lite_decision(&request.model);
+        let supports_reasoning_summary_parameter =
+            self.supports_reasoning_summary_parameter(&request.model);
         let body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
@@ -1944,6 +1963,7 @@ impl Provider for ChatGptProvider {
                 responses_lite: responses_lite.is_enabled(),
                 model: model_context,
                 additional_instructions: proactive_multi_agent,
+                supports_reasoning_summary_parameter,
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -3375,6 +3395,7 @@ fn chatgpt_catalog_model_from_remote(
     let responses_lite = capability
         .and_then(|capability| capability.responses_lite)
         .unwrap_or(model.use_responses_lite);
+    let supports_reasoning_summary_parameter = model.supports_reasoning_summary_parameter;
     let service_tiers = model.service_tiers.map(|tiers| {
         tiers
             .into_iter()
@@ -3391,6 +3412,7 @@ fn chatgpt_catalog_model_from_remote(
             reasoning_efforts,
         ),
         responses_lite,
+        supports_reasoning_summary_parameter,
         visibility: model.visibility,
         priority: model.priority,
         service_tiers,
@@ -4544,6 +4566,22 @@ mod tests {
     }
 
     #[test]
+    fn remote_chatgpt_catalog_preserves_reasoning_summary_capability() {
+        let catalog = |supports_reasoning_summary_parameter: Option<bool>| {
+            let mut value = json!({"slug": "gpt-test"});
+            if let Some(supported) = supports_reasoning_summary_parameter {
+                value["supports_reasoning_summary_parameter"] = json!(supported);
+            }
+            let remote: ChatGptRemoteModel = serde_json::from_value(value).unwrap();
+            chatgpt_catalog_model_from_remote(remote, &ChatGptProviderConfig::default())
+        };
+
+        assert!(catalog(None).supports_reasoning_summary_parameter);
+        assert!(catalog(Some(true)).supports_reasoning_summary_parameter);
+        assert!(!catalog(Some(false)).supports_reasoning_summary_parameter);
+    }
+
+    #[test]
     fn chatgpt_ultra_maps_to_max_and_enables_proactive_instructions_with_delegate_tool() {
         let mut request = MessagesRequest {
             model: "gpt-5.6-sol".to_string(),
@@ -4839,9 +4877,58 @@ mod tests {
             },
         );
 
-        assert_eq!(body["include"], json!([]));
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["parallel_tool_calls"], true);
-        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["reasoning"], json!({}));
+    }
+
+    #[test]
+    fn chatgpt_responses_body_honors_reasoning_summary_capability() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "reasoning".to_string(),
+            json!({"effort": "medium", "summary": "detailed"}),
+        );
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex-spark".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let supported = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                supports_reasoning_summary_parameter: true,
+                ..responses::CodexRequestContext::default()
+            },
+        );
+        let unsupported = build_chatgpt_responses_body_with_codex_context(
+            &req,
+            responses::CodexRequestContext {
+                supports_reasoning_summary_parameter: false,
+                ..responses::CodexRequestContext::default()
+            },
+        );
+
+        assert_eq!(
+            supported["reasoning"],
+            json!({"effort": "medium", "summary": "detailed"})
+        );
+        assert_eq!(unsupported["reasoning"], json!({"effort": "medium"}));
     }
 
     #[test]
@@ -4949,6 +5036,7 @@ mod tests {
                 responses_lite: true,
                 model: None,
                 additional_instructions: None,
+                supports_reasoning_summary_parameter: true,
             },
         );
 
@@ -5173,6 +5261,7 @@ mod tests {
                 responses_lite: true,
                 model: None,
                 additional_instructions: None,
+                supports_reasoning_summary_parameter: true,
             },
         );
 
@@ -5340,6 +5429,7 @@ mod tests {
                 responses_lite: true,
                 model: None,
                 additional_instructions: None,
+                supports_reasoning_summary_parameter: true,
             },
         );
 

@@ -71,6 +71,7 @@ pub struct ConversionContext<'a> {
     pub provider_id: Option<&'a str>,
     pub model: Option<&'a ModelInfo>,
     pub tool_conversion_mode: ToolConversionMode,
+    pub supports_reasoning_summary_parameter: Option<bool>,
 }
 
 pub fn convert_to_responses(req: &MessagesRequest) -> Value {
@@ -984,7 +985,7 @@ fn normalize_tool_schema(schema: &Value) -> Value {
 
 fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> Option<Value> {
     if let Some(reasoning) = req.extra.get("reasoning") {
-        return Some(reasoning_for_model(req, reasoning.clone()));
+        return Some(reasoning_for_model(req, context, reasoning.clone()));
     }
     if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
         return Some(reasoning_effort_for_context(req, context, effort));
@@ -1018,7 +1019,7 @@ fn reasoning_effort_for_context(
             clamp_reasoning_effort(effort, &model.capabilities.limits.reasoning_effort_levels)
         })
         .unwrap_or(effort);
-    reasoning_effort_for_model(req, effort)
+    reasoning_effort_for_model(req, context, effort)
 }
 
 fn clamp_reasoning_effort<'a>(effort: &'a str, supported: &'a [String]) -> Option<&'a str> {
@@ -1029,19 +1030,28 @@ fn clamp_reasoning_effort<'a>(effort: &'a str, supported: &'a [String]) -> Optio
     }
 }
 
-fn reasoning_effort_for_model(req: &MessagesRequest, effort: &str) -> Value {
+fn reasoning_effort_for_model(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    effort: &str,
+) -> Value {
     if effort == "none" {
         return json!({"effort": "none"});
     }
 
     let reasoning = json!({"effort": effort, "summary": "detailed"});
-    reasoning_for_model(req, reasoning)
+    reasoning_for_model(req, context, reasoning)
 }
 
-fn reasoning_for_model(req: &MessagesRequest, mut reasoning: Value) -> Value {
-    if !supports_reasoning_summary(&req.model)
-        && let Some(object) = reasoning.as_object_mut()
-    {
+fn reasoning_for_model(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    mut reasoning: Value,
+) -> Value {
+    let supports_reasoning_summary_parameter = context
+        .supports_reasoning_summary_parameter
+        .unwrap_or_else(|| supports_reasoning_summary(&req.model));
+    if !supports_reasoning_summary_parameter && let Some(object) = reasoning.as_object_mut() {
         object.remove("summary");
     }
     reasoning

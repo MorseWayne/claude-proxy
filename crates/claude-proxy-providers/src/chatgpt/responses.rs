@@ -12,6 +12,7 @@ pub(super) struct CodexRequestContext<'a> {
     pub responses_lite: bool,
     pub model: Option<&'a ModelInfo>,
     pub additional_instructions: Option<&'a str>,
+    pub supports_reasoning_summary_parameter: bool,
 }
 
 impl Default for CodexRequestContext<'_> {
@@ -23,6 +24,7 @@ impl Default for CodexRequestContext<'_> {
             responses_lite: false,
             model: None,
             additional_instructions: None,
+            supports_reasoning_summary_parameter: true,
         }
     }
 }
@@ -96,6 +98,9 @@ pub(super) fn build_body_with_context(
             } else {
                 crate::responses::ToolConversionMode::Function
             },
+            supports_reasoning_summary_parameter: Some(
+                context.supports_reasoning_summary_parameter,
+            ),
         },
     );
     if let Some(object) = body.as_object_mut() {
@@ -201,10 +206,8 @@ fn apply_codex_reasoning_defaults(
 ) {
     let has_explicit_reasoning = request.extra.contains_key("reasoning");
     let has_explicit_reasoning_effort = request.extra.contains_key("reasoning_effort");
-    if context.responses_lite {
-        body.entry("reasoning".to_string())
-            .or_insert_with(|| json!({}));
-    }
+    body.entry("reasoning".to_string())
+        .or_insert_with(|| json!({}));
     let Some(reasoning) = body.get_mut("reasoning") else {
         return;
     };
