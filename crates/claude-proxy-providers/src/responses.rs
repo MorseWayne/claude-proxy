@@ -508,6 +508,9 @@ fn should_truncate_tool_output(
         return false;
     }
     compression.tool_outputs_to_consider -= 1;
+    if tool_result_has_encrypted_content(content) {
+        return false;
+    }
     let original_bytes = raw_tool_result_text_len(content);
     if compression.excess_bytes == 0 || original_bytes <= MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
         return false;
@@ -835,9 +838,13 @@ fn tool_result_output(
     is_error: Option<bool>,
     truncate_if_large: bool,
 ) -> Value {
-    let should_truncate_current =
-        !truncate_if_large && raw_tool_result_text_len(content) > MAX_CURRENT_TOOL_OUTPUT_BYTES;
-    if is_error == Some(true) || truncate_if_large || should_truncate_current {
+    let has_encrypted_content = tool_result_has_encrypted_content(content);
+    let should_truncate_current = !has_encrypted_content
+        && !truncate_if_large
+        && raw_tool_result_text_len(content) > MAX_CURRENT_TOOL_OUTPUT_BYTES;
+    if !has_encrypted_content
+        && (is_error == Some(true) || truncate_if_large || should_truncate_current)
+    {
         return json!(tool_result_text(content, is_error, truncate_if_large));
     }
 
@@ -865,7 +872,35 @@ fn tool_result_output(
 }
 
 fn tool_result_content_part(value: &Value) -> ResponsesMessagePart {
+    if let Some(encrypted_content) = encrypted_tool_result_text(value) {
+        return ResponsesMessagePart::Input(json!({
+            "type": "encrypted_content",
+            "encrypted_content": encrypted_content,
+        }));
+    }
     content_part_from_value(value).unwrap_or_else(|| ResponsesMessagePart::Text(value.to_string()))
+}
+
+fn tool_result_has_encrypted_content(content: &Option<Value>) -> bool {
+    content
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| encrypted_tool_result_text(item).is_some())
+        })
+}
+
+fn encrypted_tool_result_text(value: &Value) -> Option<&str> {
+    (value.get("type").and_then(Value::as_str) == Some("text")
+        && value
+            .get("_meta")
+            .and_then(|meta| meta.get("codex/encryptedContent"))
+            .and_then(Value::as_bool)
+            == Some(true))
+    .then(|| value.get("text").and_then(Value::as_str))
+    .flatten()
 }
 
 fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> {
@@ -1385,12 +1420,18 @@ fn provider_usage_from_responses_response(response: &Value) -> Option<ProviderUs
 fn provider_usage_from_responses_usage(usage: &Value) -> ProviderUsageMetadata {
     let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
     let cached_input_tokens = responses_cached_input_tokens(usage).min(input_tokens);
+    let cache_write_input_tokens = responses_cache_write_input_tokens(usage)
+        .map(|tokens| tokens.min(input_tokens.saturating_sub(cached_input_tokens)));
+    let cache_creation_input_tokens = cache_write_input_tokens
+        .unwrap_or_else(|| usage["cache_creation_input_tokens"].as_u64().unwrap_or(0));
 
     ProviderUsageMetadata {
-        input_tokens: input_tokens.saturating_sub(cached_input_tokens),
+        input_tokens: input_tokens
+            .saturating_sub(cached_input_tokens)
+            .saturating_sub(cache_write_input_tokens.unwrap_or(0)),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         reasoning_output_tokens: responses_reasoning_output_tokens(usage),
-        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_creation_input_tokens,
         cache_read_input_tokens: cached_input_tokens,
     }
 }
@@ -1413,6 +1454,15 @@ fn responses_cached_input_tokens(usage: &Value) -> u64 {
         .or_else(|| usage.get("cache_read_input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+fn responses_cache_write_input_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.get("cache_write_input_tokens"))
+        .or_else(|| usage.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn u64_to_u32_saturating(value: u64) -> u32 {
@@ -3164,6 +3214,44 @@ mod tests {
     }
 
     #[test]
+    fn responses_usage_accounting_tracks_cache_write_tokens_as_input_subset() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+            "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 60
+            }
+        }));
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 60);
+        assert_eq!(usage.cache_read_input_tokens, 40);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(
+            usage.input_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.output_tokens,
+            110
+        );
+    }
+
+    #[test]
+    fn responses_usage_accounting_preserves_legacy_separate_cache_creation_tokens() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 70,
+            "output_tokens": 10,
+            "cache_creation_input_tokens": 30
+        }));
+
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
     fn responses_usage_accounting_defaults_missing_cached_details_to_zero() {
         let usage = provider_usage_from_responses_usage(&json!({
             "input_tokens": 11,
@@ -3189,7 +3277,10 @@ mod tests {
                 "usage": {
                     "input_tokens": 100,
                     "output_tokens": 20,
-                    "input_tokens_details": {"cached_tokens": 30}
+                    "input_tokens_details": {
+                        "cached_tokens": 30,
+                        "cache_write_tokens": 20
+                    }
                 }
             }
         }));
@@ -3198,7 +3289,8 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta");
 
-        assert_eq!(stop.data["usage"]["input_tokens"], 70);
+        assert_eq!(stop.data["usage"]["input_tokens"], 50);
+        assert_eq!(stop.data["usage"]["cache_creation_input_tokens"], 20);
         assert_eq!(stop.data["usage"]["cache_read_input_tokens"], 30);
         assert_eq!(stop.data["usage"]["output_tokens"], 20);
     }
@@ -3627,6 +3719,77 @@ mod tests {
         assert_eq!(
             body["input"][1]["output"][1]["image_url"],
             "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_encrypted_mcp_tool_content() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([
+                        {"type": "text", "text": "Lookup completed"},
+                        {
+                            "type": "text",
+                            "text": "gAAAA-test",
+                            "_meta": {"codex/encryptedContent": true}
+                        }
+                    ])),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "Lookup completed"},
+                {"type": "encrypted_content", "encrypted_content": "gAAAA-test"}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_encrypted_mcp_tool_content_bypasses_history_truncation() {
+        let encrypted = "e".repeat(MAX_CURRENT_TOOL_OUTPUT_BYTES + 1);
+        let content = Some(json!([{
+            "type": "text",
+            "text": encrypted,
+            "_meta": {"codex/encryptedContent": true}
+        }]));
+        let mut compression = HistoryCompressionState {
+            text_items_to_consider: 0,
+            tool_outputs_to_consider: 1,
+            excess_bytes: MAX_CURRENT_TOOL_OUTPUT_BYTES,
+        };
+
+        assert!(!should_truncate_tool_output(
+            &content,
+            false,
+            &mut compression
+        ));
+        assert_eq!(compression.excess_bytes, MAX_CURRENT_TOOL_OUTPUT_BYTES);
+        let output = tool_result_output(&content, None, true);
+        assert_eq!(
+            output[0]["encrypted_content"].as_str().map(str::len),
+            Some(MAX_CURRENT_TOOL_OUTPUT_BYTES + 1)
         );
     }
 

@@ -117,6 +117,8 @@ pub struct RateLimitSnapshot {
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<RateLimitCredits>,
+    #[serde(default)]
+    pub spend_control_reached: Option<bool>,
     pub plan_type: Option<String>,
     pub rate_limit_reached_type: Option<String>,
     pub source: RateLimitSource,

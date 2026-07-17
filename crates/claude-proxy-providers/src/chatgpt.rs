@@ -88,7 +88,17 @@ struct UsagePayload {
     #[serde(default)]
     credits: Option<CreditsPayload>,
     #[serde(default)]
+    spend_control: Option<SpendControlPayload>,
+    #[serde(default, alias = "spendControlReached")]
+    spend_control_reached: Option<bool>,
+    #[serde(default)]
     additional_rate_limits: Option<Vec<AdditionalRateLimitPayload>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpendControlPayload {
+    #[serde(default)]
+    reached: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +153,7 @@ struct CreditsPayload {
 struct CachedRateLimits {
     snapshots: Vec<RateLimitSnapshot>,
     fetched_at: Option<Instant>,
+    hard_stop_generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -668,6 +679,7 @@ impl ChatGptProvider {
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
+                hard_stop_generation: 0,
             })),
             context_usage: Arc::new(StdMutex::new(HashMap::new())),
         })
@@ -1599,6 +1611,23 @@ impl ChatGptProvider {
         cache_rate_limits_into(&self.cached_rate_limits, snapshots).await;
     }
 
+    async fn rate_limit_hard_stop_generation(&self) -> u64 {
+        self.cached_rate_limits.lock().await.hard_stop_generation
+    }
+
+    async fn cache_rate_limits_if_generation(
+        &self,
+        snapshots: Vec<RateLimitSnapshot>,
+        expected_generation: u64,
+    ) -> bool {
+        cache_rate_limits_if_generation_into(
+            &self.cached_rate_limits,
+            snapshots,
+            Some(expected_generation),
+        )
+        .await
+    }
+
     async fn cached_rate_limits(&self) -> Vec<RateLimitSnapshot> {
         self.cached_rate_limits.lock().await.snapshots.clone()
     }
@@ -1617,21 +1646,40 @@ async fn cache_rate_limits_into(
     cache: &Arc<Mutex<CachedRateLimits>>,
     snapshots: Vec<RateLimitSnapshot>,
 ) {
+    let _ = cache_rate_limits_if_generation_into(cache, snapshots, None).await;
+}
+
+async fn cache_rate_limits_if_generation_into(
+    cache: &Arc<Mutex<CachedRateLimits>>,
+    snapshots: Vec<RateLimitSnapshot>,
+    expected_generation: Option<u64>,
+) -> bool {
     if snapshots.is_empty() {
-        return;
+        return true;
     }
 
     let mut cached = cache.lock().await;
+    if expected_generation.is_some_and(|expected| expected != cached.hard_stop_generation) {
+        return false;
+    }
+    let mut observed_hard_stop = false;
     for snapshot in snapshots {
         if let Some(existing) = cached.snapshots.iter_mut().find(|existing| {
             rate_limit_snapshot_key(existing) == rate_limit_snapshot_key(&snapshot)
         }) {
-            *existing = merge_rate_limit_snapshot(existing.clone(), snapshot);
+            let merged = merge_rate_limit_snapshot(existing.clone(), snapshot);
+            observed_hard_stop |= rate_limit_snapshot_is_workspace_hard_stop(&merged);
+            *existing = merged;
         } else {
+            observed_hard_stop |= rate_limit_snapshot_is_workspace_hard_stop(&snapshot);
             cached.snapshots.push(snapshot);
         }
     }
+    if observed_hard_stop {
+        cached.hard_stop_generation = cached.hard_stop_generation.wrapping_add(1);
+    }
     cached.fetched_at = Some(Instant::now());
+    true
 }
 
 fn rate_limit_snapshot_key(snapshot: &RateLimitSnapshot) -> String {
@@ -1641,6 +1689,21 @@ fn rate_limit_snapshot_key(snapshot: &RateLimitSnapshot) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("codex")
         .to_string()
+}
+
+fn rate_limit_snapshot_is_workspace_hard_stop(snapshot: &RateLimitSnapshot) -> bool {
+    if snapshot.spend_control_reached == Some(true) {
+        return true;
+    }
+    matches!(
+        snapshot.rate_limit_reached_type.as_deref(),
+        Some(
+            "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached"
+        )
+    )
 }
 
 fn merge_rate_limit_snapshot(
@@ -1654,6 +1717,9 @@ fn merge_rate_limit_snapshot(
         primary: update.primary.or(previous.primary),
         secondary: update.secondary.or(previous.secondary),
         credits: update.credits.or(previous.credits),
+        spend_control_reached: update
+            .spend_control_reached
+            .or(previous.spend_control_reached),
         plan_type: update.plan_type.or(previous.plan_type),
         rate_limit_reached_type: update
             .rate_limit_reached_type
@@ -1760,6 +1826,9 @@ fn rate_limit_snapshot_summary(snapshot: &RateLimitSnapshot) -> String {
     }
     if let Some(kind) = snapshot.rate_limit_reached_type.as_deref() {
         parts.push(format!("reached={kind}"));
+    }
+    if let Some(reached) = snapshot.spend_control_reached {
+        parts.push(format!("spend_control_reached={reached}"));
     }
 
     if parts.is_empty() {
@@ -2109,10 +2178,13 @@ impl Provider for ChatGptProvider {
             return Ok(snapshots);
         }
 
+        let hard_stop_generation = self.rate_limit_hard_stop_generation().await;
         match self.fetch_usage_rate_limits().await {
             Ok(snapshots) => {
-                self.cache_rate_limits(snapshots.clone()).await;
-                Ok(snapshots)
+                let _ = self
+                    .cache_rate_limits_if_generation(snapshots, hard_stop_generation)
+                    .await;
+                Ok(self.cached_rate_limits().await)
             }
             Err(error) if error.is_authentication() => Ok(self.cached_rate_limits().await),
             Err(error) => {
@@ -2503,6 +2575,10 @@ fn rate_limit_snapshots_from_usage_payload(
 ) -> Vec<RateLimitSnapshot> {
     let plan_type = payload.plan_type;
     let reached_type = payload.rate_limit_reached_type.and_then(|value| value.kind);
+    let spend_control_reached = payload
+        .spend_control
+        .and_then(|spend_control| spend_control.reached)
+        .or(payload.spend_control_reached);
     let mut snapshots = vec![RateLimitSnapshot {
         provider_id: provider_id.to_string(),
         feature: Some("codex".to_string()),
@@ -2518,6 +2594,7 @@ fn rate_limit_snapshots_from_usage_payload(
             .and_then(|rate_limit| rate_limit.secondary.as_ref())
             .map(rate_limit_window_from_payload),
         credits: payload.credits.as_ref().map(credits_from_payload),
+        spend_control_reached,
         plan_type: plan_type.clone(),
         rate_limit_reached_type: reached_type,
         source: RateLimitSource::UsageEndpoint,
@@ -2544,6 +2621,7 @@ fn rate_limit_snapshots_from_usage_payload(
                     .and_then(|rate_limit| rate_limit.secondary.as_ref())
                     .map(rate_limit_window_from_payload),
                 credits: None,
+                spend_control_reached: None,
                 plan_type: plan_type.clone(),
                 rate_limit_reached_type: None,
                 source: RateLimitSource::UsageEndpoint,
@@ -2603,6 +2681,26 @@ fn rate_limit_snapshot_from_sse_event(
         .and_then(Value::as_str)
         .map(normalize_limit_id)
         .unwrap_or_else(|| "codex".to_string());
+    let spend_control_reached = event
+        .get("spend_control_reached")
+        .or_else(|| event.get("spendControlReached"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            event
+                .get("spend_control")
+                .or_else(|| event.get("spendControl"))
+                .and_then(|value| value.get("reached"))
+                .and_then(Value::as_bool)
+        });
+    let rate_limit_reached_type = event
+        .get("rate_limit_reached_type")
+        .or_else(|| event.get("rateLimitReachedType"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("type").and_then(Value::as_str))
+        })
+        .map(str::to_string);
 
     Some(RateLimitSnapshot {
         provider_id: provider_id.to_string(),
@@ -2620,11 +2718,12 @@ fn rate_limit_snapshot_from_sse_event(
             .and_then(|rate_limit| rate_limit.secondary.as_ref())
             .map(rate_limit_window_from_payload),
         credits: credits.as_ref().map(credits_from_payload),
+        spend_control_reached,
         plan_type: event
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_string),
-        rate_limit_reached_type: None,
+        rate_limit_reached_type,
         source: RateLimitSource::StreamEvent,
         updated_at_unix_secs,
     })
@@ -2654,6 +2753,7 @@ fn rate_limit_snapshots_from_headers(
                 primary: rate_limit_window_from_headers(headers, &prefix, "primary"),
                 secondary: rate_limit_window_from_headers(headers, &prefix, "secondary"),
                 credits: credits_from_headers(headers, &prefix),
+                spend_control_reached: None,
                 plan_type: None,
                 rate_limit_reached_type: None,
                 source: RateLimitSource::ResponseHeaders,
@@ -2705,6 +2805,7 @@ fn has_rate_limit_snapshot_data(snapshot: &RateLimitSnapshot) -> bool {
     snapshot.primary.is_some()
         || snapshot.secondary.is_some()
         || snapshot.credits.is_some()
+        || snapshot.spend_control_reached.is_some()
         || snapshot.plan_type.is_some()
         || snapshot.rate_limit_reached_type.is_some()
 }
@@ -3324,6 +3425,7 @@ fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
     let mut models = CHATGPT_MODEL_SPECS
         .iter()
         .copied()
+        .filter(|spec| !matches!(spec.model_id, "gpt-5.4" | "gpt-5.4-mini"))
         .map(|spec| {
             let capability = config.model_capabilities.get(spec.model_id);
             chatgpt_model_info_from_spec(spec, capability)
@@ -3913,6 +4015,9 @@ mod tests {
             "rate_limit_reached_type": {
                 "type": "workspace_member_usage_limit_reached"
             },
+            "spend_control": {
+                "reached": true
+            },
             "credits": {
                 "has_credits": true,
                 "unlimited": false,
@@ -3944,6 +4049,7 @@ mod tests {
             snapshots[0].rate_limit_reached_type.as_deref(),
             Some("workspace_member_usage_limit_reached")
         );
+        assert_eq!(snapshots[0].spend_control_reached, Some(true));
         assert_eq!(snapshots[0].primary.as_ref().unwrap().used_percent, 42.0);
         assert_eq!(
             snapshots[0].primary.as_ref().unwrap().window_minutes,
@@ -3959,6 +4065,7 @@ mod tests {
         );
         assert_eq!(snapshots[1].feature.as_deref(), Some("codex_other"));
         assert_eq!(snapshots[1].limit_name.as_deref(), Some("codex_other"));
+        assert_eq!(snapshots[1].spend_control_reached, None);
         assert_eq!(
             snapshots[1].primary.as_ref().unwrap().window_minutes,
             Some(30)
@@ -4048,6 +4155,10 @@ mod tests {
                     "unlimited": false,
                     "balance": "2.25"
                 },
+                "spendControlReached": true,
+                "rateLimitReachedType": {
+                    "type": "workspace_member_usage_limit_reached"
+                },
                 "metered_limit_name": "codex_other"
             }),
             999,
@@ -4062,7 +4173,89 @@ mod tests {
             snapshot.credits.as_ref().unwrap().balance.as_deref(),
             Some("2.25")
         );
+        assert_eq!(snapshot.spend_control_reached, Some(true));
+        assert_eq!(
+            snapshot.rate_limit_reached_type.as_deref(),
+            Some("workspace_member_usage_limit_reached")
+        );
         assert_eq!(snapshot.source, RateLimitSource::StreamEvent);
+    }
+
+    #[test]
+    fn sparse_rate_limit_merge_preserves_spend_control_state() {
+        let merged = merge_rate_limit_snapshot(
+            RateLimitSnapshot {
+                provider_id: "chatgpt".to_string(),
+                feature: Some("codex".to_string()),
+                spend_control_reached: Some(true),
+                source: RateLimitSource::StreamEvent,
+                updated_at_unix_secs: 1,
+                ..Default::default()
+            },
+            RateLimitSnapshot {
+                provider_id: "chatgpt".to_string(),
+                feature: Some("codex".to_string()),
+                source: RateLimitSource::ResponseHeaders,
+                updated_at_unix_secs: 2,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.spend_control_reached, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stale_usage_refresh_does_not_overwrite_newer_hard_stop() {
+        let cache = Arc::new(Mutex::new(CachedRateLimits {
+            snapshots: Vec::new(),
+            fetched_at: None,
+            hard_stop_generation: 0,
+        }));
+        let expected_generation = cache.lock().await.hard_stop_generation;
+
+        cache_rate_limits_into(
+            &cache,
+            vec![RateLimitSnapshot {
+                provider_id: "chatgpt".to_string(),
+                feature: Some("codex".to_string()),
+                spend_control_reached: Some(true),
+                source: RateLimitSource::StreamEvent,
+                updated_at_unix_secs: 2,
+                ..Default::default()
+            }],
+        )
+        .await;
+        cache_rate_limits_into(
+            &cache,
+            vec![RateLimitSnapshot {
+                provider_id: "chatgpt".to_string(),
+                feature: Some("codex".to_string()),
+                spend_control_reached: Some(true),
+                source: RateLimitSource::StreamEvent,
+                updated_at_unix_secs: 3,
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        let accepted = cache_rate_limits_if_generation_into(
+            &cache,
+            vec![RateLimitSnapshot {
+                provider_id: "chatgpt".to_string(),
+                feature: Some("codex".to_string()),
+                spend_control_reached: Some(false),
+                source: RateLimitSource::UsageEndpoint,
+                updated_at_unix_secs: 1,
+                ..Default::default()
+            }],
+            Some(expected_generation),
+        )
+        .await;
+
+        assert!(!accepted);
+        let cached = cache.lock().await;
+        assert_eq!(cached.hard_stop_generation, 2);
+        assert_eq!(cached.snapshots[0].spend_control_reached, Some(true));
     }
 
     #[test]
@@ -4337,11 +4530,11 @@ mod tests {
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
                 "gpt-5.3-codex-spark",
             ]
         );
+        assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_some());
+        assert!(chatgpt_model_info("gpt-5.4-mini", &ChatGptProviderConfig::default()).is_some());
 
         let sol = models
             .iter()
@@ -5108,6 +5301,41 @@ mod tests {
         assert_eq!(
             responses::prompt_cache_key_source(&req),
             responses::PromptCacheKeySource::StableClientConversation
+        );
+    }
+
+    #[test]
+    fn chatgpt_prompt_cache_prefers_session_without_changing_continuation_scope() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(json!({
+                "thread_id": "thread-123",
+                "session_id": "session-456"
+            })),
+            extra: Default::default(),
+        };
+
+        assert_eq!(
+            build_chatgpt_responses_body(&req)["prompt_cache_key"],
+            "session-456"
+        );
+        assert_eq!(
+            responses::stable_client_conversation_id_for_continuation(&req).as_deref(),
+            Some("thread-123")
         );
     }
 
@@ -8384,6 +8612,7 @@ mod tests {
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
+                hard_stop_generation: 0,
             })),
             context_usage: Arc::new(StdMutex::new(HashMap::new())),
         }

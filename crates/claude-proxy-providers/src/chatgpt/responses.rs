@@ -294,11 +294,29 @@ fn resolve_prompt_cache_key(request: &MessagesRequest) -> Option<PromptCacheKey>
             source: PromptCacheKeySource::Explicit,
         })
         .or_else(|| {
-            stable_client_conversation_id(request).map(|value| PromptCacheKey {
+            stable_prompt_cache_scope_id(request).map(|value| PromptCacheKey {
                 value: clamp_prompt_cache_key(value),
                 source: PromptCacheKeySource::StableClientConversation,
             })
         })
+}
+
+fn stable_prompt_cache_scope_id(request: &MessagesRequest) -> Option<&str> {
+    [
+        "session_id",
+        "client_session_id",
+        "x-client-session-id",
+        "conversation_id",
+        "client_conversation_id",
+        "x-client-conversation-id",
+        "thread_id",
+        "client_thread_id",
+        "x-client-thread-id",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        metadata_string(request, key).or_else(|| trimmed_string(request.extra.get(key)))
+    })
 }
 
 fn stable_client_conversation_id(request: &MessagesRequest) -> Option<&str> {

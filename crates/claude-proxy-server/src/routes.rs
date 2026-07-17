@@ -93,17 +93,7 @@ fn attach_virtual_context_metadata(
 }
 
 fn request_has_stable_client_session(request: &MessagesRequest) -> bool {
-    const KEYS: &[&str] = &[
-        "conversation_id",
-        "thread_id",
-        "session_id",
-        "client_conversation_id",
-        "client_thread_id",
-        "client_session_id",
-        "x-client-conversation-id",
-        "x-client-thread-id",
-        "x-client-session-id",
-    ];
+    const KEYS: &[&str] = &["session_id", "client_session_id", "x-client-session-id"];
     KEYS.iter().any(|key| {
         request.extra.get(*key).and_then(Value::as_str).is_some()
             || request
@@ -117,15 +107,15 @@ fn request_has_stable_client_session(request: &MessagesRequest) -> bool {
 
 fn client_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     const HEADER_NAMES: &[&str] = &[
-        "x-client-conversation-id",
         "x-client-session-id",
-        "x-client-thread-id",
-        "x-claude-conversation-id",
         "x-claude-session-id",
-        "x-claude-thread-id",
         "x-session-id",
         "session-id",
         "session_id",
+        "x-client-conversation-id",
+        "x-claude-conversation-id",
+        "x-client-thread-id",
+        "x-claude-thread-id",
     ];
     HEADER_NAMES.iter().find_map(|name| {
         headers
@@ -2694,6 +2684,37 @@ mod tests {
                 .get("client_session_id")
                 .and_then(Value::as_str),
             Some("explicit-session")
+        );
+    }
+
+    #[test]
+    fn client_session_metadata_attaches_session_alongside_thread_scope() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert("thread_id".to_string(), json!("thread-123"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-thread-id",
+            HeaderValue::from_static("header-thread"),
+        );
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("session-456"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("session-456")
+        );
+        assert_eq!(
+            request.extra.get("thread_id").and_then(Value::as_str),
+            Some("thread-123")
         );
     }
 

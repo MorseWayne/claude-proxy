@@ -429,9 +429,14 @@ fn format_rate_limit_extra(snapshot: &RateLimitSnapshot) -> String {
             parts.push("credits unlimited".to_string());
         } else if let Some(balance) = credits.balance.as_deref() {
             parts.push(format!("credits {balance}"));
+        } else if credits.has_credits == Some(true) {
+            parts.push("credits available".to_string());
         } else if credits.has_credits == Some(false) {
             parts.push("no credits".to_string());
         }
+    }
+    if snapshot.spend_control_reached == Some(true) {
+        parts.push("spend control reached".to_string());
     }
     if let Some(plan_type) = snapshot.plan_type.as_ref() {
         parts.push(plan_type.clone());
@@ -678,6 +683,24 @@ mod tests {
         };
 
         assert_eq!(format_rate_limit_extra(&snapshot), "stream");
+    }
+
+    #[test]
+    fn rate_limit_extra_labels_available_credits_and_spend_control() {
+        let snapshot = RateLimitSnapshot {
+            credits: Some(claude_proxy_providers::provider::RateLimitCredits {
+                has_credits: Some(true),
+                ..Default::default()
+            }),
+            spend_control_reached: Some(true),
+            source: RateLimitSource::UsageEndpoint,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            format_rate_limit_extra(&snapshot),
+            "credits available · spend control reached · usage"
+        );
     }
 
     #[test]
