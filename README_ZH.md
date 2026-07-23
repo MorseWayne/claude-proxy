@@ -484,7 +484,15 @@ raw_sse_events = false
 |------|------|------|
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/v1/messages` | Anthropic Messages API 代理 |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容代理 |
+| `POST` | `/v1/responses` | OpenAI Responses 兼容代理 |
 | `GET` | `/v1/models` | 获取可用模型列表 |
+
+两个 OpenAI 兼容接口均支持流式/非流式文本、reasoning、function tool、tool
+历史、usage 以及图片 URL/data URL 输入。Responses 接口按无状态模式工作：
+`store: true`、`background: true`、`previous_response_id`、`conversation` 和
+`item_reference` 等依赖服务端状态的字段会明确返回错误，不会静默忽略；暂不暴露
+Responses WebSocket 传输和 structured output 格式。
 
 ### 管理接口
 

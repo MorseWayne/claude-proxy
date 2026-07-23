@@ -366,3 +366,162 @@ async fn test_admin_config_with_auth() {
     let config_str = body["config"].as_str().unwrap();
     assert!(config_str.contains("***"));
 }
+
+#[tokio::test]
+async fn test_openai_chat_completions_non_streaming() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/chat/completions"))
+        .header("authorization", "Bearer test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "developer", "content": "Be concise"},
+                {"role": "user", "content": "Hi"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "gpt-4");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 4);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+}
+
+#[tokio::test]
+async fn test_openai_chat_completions_streaming() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/chat/completions"))
+        .header("authorization", "Bearer test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let body = response.text().await.unwrap();
+    assert!(body.contains("\"object\":\"chat.completion.chunk\""));
+    assert!(body.contains("\"content\":\"Hello\""));
+    assert!(body.contains("\"content\":\" world\""));
+    assert!(body.contains("\"choices\":[]"));
+    assert!(body.contains("\"usage\":{"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn test_openai_responses_non_streaming() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("x-api-key", "test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "instructions": "Be concise",
+            "input": "Hi"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["model"], "gpt-4");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["text"], "Hello world");
+    assert_eq!(body["usage"]["input_tokens"], 4);
+    assert_eq!(body["usage"]["output_tokens"], 2);
+}
+
+#[tokio::test]
+async fn test_openai_responses_streaming() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("x-api-key", "test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "Hi"}
+            ]}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.created"));
+    assert!(body.contains("event: response.output_text.delta"));
+    assert!(body.contains("\"delta\":\"Hello\""));
+    assert!(body.contains("event: response.output_item.done"));
+    assert!(body.contains("event: response.completed"));
+    assert!(!body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn test_openai_endpoint_errors_use_openai_shape() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+    let client = reqwest::Client::new();
+
+    let unauthorized = client
+        .post(format!("{proxy_url}/v1/chat/completions"))
+        .header("authorization", "Bearer wrong-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = unauthorized.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert!(body.get("type").is_none());
+
+    let stateful = client
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("authorization", "Bearer test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "input": "Hi",
+            "previous_response_id": "resp_previous"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stateful.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = stateful.json().await.unwrap();
+    assert_eq!(body["error"]["param"], "previous_response_id");
+}

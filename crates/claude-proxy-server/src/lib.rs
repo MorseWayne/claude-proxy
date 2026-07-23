@@ -1,8 +1,10 @@
 //! Axum HTTP server for claude-proxy.
 
 pub mod app;
+mod downstream;
 pub mod middleware;
 mod non_stream;
+mod openai;
 pub mod persistence;
 pub mod routes;
 
@@ -30,6 +32,8 @@ pub fn build_router(state: AppState, _settings: &Settings) -> Router {
     Router::new()
         .route("/health", get(routes::health))
         .route("/v1/messages", post(routes::messages))
+        .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/responses", post(openai::responses))
         .route("/v1/models", get(routes::list_models))
         .route("/admin/config", get(routes::admin_get_config))
         .route("/admin/config", put(routes::admin_update_config))

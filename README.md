@@ -208,7 +208,17 @@ Claude model names (e.g., `claude-opus-4-20250514`) are automatically resolved t
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/v1/messages` | Anthropic Messages API proxy |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions-compatible proxy |
+| `POST` | `/v1/responses` | OpenAI Responses-compatible proxy |
 | `GET` | `/v1/models` | List available models |
+
+Both OpenAI-compatible endpoints support streaming and non-streaming text,
+reasoning, function tools, tool history, usage, and image URL/data URL input.
+The Responses endpoint is stateless: server-side storage/continuation fields
+such as `store: true`, `background: true`, `previous_response_id`,
+`conversation`, and `item_reference` are rejected instead of being silently
+ignored. Responses WebSocket transport and structured output formats are not
+exposed.
 
 ### Admin Endpoints
 

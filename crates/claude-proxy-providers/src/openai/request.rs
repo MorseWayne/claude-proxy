@@ -77,7 +77,11 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
                                 "content": content_str
                             }));
                         }
-                        Content::Unknown(_) => {}
+                        Content::Unknown(value) => {
+                            if let Some(part) = chat_content_part_from_unknown(value) {
+                                parts.push(part);
+                            }
+                        }
                     }
                 }
 
@@ -154,6 +158,47 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
     body
 }
 
+fn chat_content_part_from_unknown(value: &Value) -> Option<Value> {
+    let image_url = match value.get("type").and_then(Value::as_str) {
+        Some("image") => image_source_url(value.get("source")?),
+        Some("input_image") | Some("image_url") => image_url_string(value.get("image_url")?),
+        _ => None,
+    }?;
+    Some(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": image_url,
+        }
+    }))
+}
+
+fn image_url_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(url) => Some(url.clone()),
+        Value::Object(image_url) => image_url
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn image_source_url(source: &Value) -> Option<String> {
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            (!media_type.is_empty() && !data.is_empty())
+                .then(|| format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +272,29 @@ mod tests {
         assert_eq!(
             body["tool_choice"],
             json!({"type": "function", "function": {"name": "WebSearch"}})
+        );
+    }
+
+    #[test]
+    fn convert_request_maps_image_blocks_to_chat_image_url_parts() {
+        let req = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![Content::Unknown(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "AAAA",
+                }
+            }))]),
+        }]);
+
+        let body = convert_request(&req);
+
+        assert_eq!(body["messages"][1]["content"][0]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
         );
     }
 

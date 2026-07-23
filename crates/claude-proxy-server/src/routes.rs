@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::app::{
     AppState, InflightEvent, RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
 };
+use crate::downstream::{DownstreamProtocol, protocol_error_response, provider_error_response};
 use crate::persistence::CompletedUsageRecord;
 
 const SSE_HEARTBEAT_FRAME: &[u8] = b": ping\n\n";
@@ -148,6 +149,15 @@ pub async fn messages(
     headers: HeaderMap,
     Json(request): Json<MessagesRequest>,
 ) -> Response {
+    execute_messages_request(state, headers, request, DownstreamProtocol::anthropic()).await
+}
+
+pub(crate) async fn execute_messages_request(
+    state: AppState,
+    headers: HeaderMap,
+    request: MessagesRequest,
+    protocol: DownstreamProtocol,
+) -> Response {
     let start = std::time::Instant::now();
     let (observability_enabled, observability_idle_gap_ms, stream_config) = {
         let settings = state.settings.read().await;
@@ -164,7 +174,8 @@ pub async fn messages(
         let settings = state.settings.read().await;
         if !check_auth(&headers, &settings.server.auth_token) {
             record_request_error(&state, start);
-            return error_response(
+            return protocol_error_response(
+                &protocol,
                 StatusCode::UNAUTHORIZED,
                 &ErrorResponse::authentication("invalid API key"),
             );
@@ -177,7 +188,7 @@ pub async fn messages(
     );
 
     // Concurrency limiting
-    let request_permit = match acquire_request_permit(&state, start).await {
+    let request_permit = match acquire_request_permit(&state, start, &protocol).await {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -201,9 +212,10 @@ pub async fn messages(
                         _provider: None,
                     },
                     stream_config,
+                    protocol.clone(),
                 )
             } else {
-                join_inflight_non_stream(receiver, request_permit).await
+                join_inflight_non_stream(receiver, request_permit, &protocol).await
             };
             state
                 .metrics
@@ -221,7 +233,8 @@ pub async fn messages(
             let _ = broadcast_tx.send(InflightEvent::Done);
             state.inflight.lock().await.remove(&request_hash);
             record_request_error(&state, start);
-            return error_response(
+            return protocol_error_response(
+                &protocol,
                 StatusCode::NOT_FOUND,
                 &ErrorResponse::not_found(&format!("provider not available: {e}")),
             );
@@ -234,20 +247,20 @@ pub async fn messages(
         let _ = broadcast_tx.send(InflightEvent::Done);
         state.inflight.lock().await.remove(&request_hash);
         record_request_error(&state, start);
-        return error_response(StatusCode::BAD_REQUEST, &error);
+        return protocol_error_response(&protocol, StatusCode::BAD_REQUEST, &error);
     }
 
-    let provider_permit = match acquire_provider_permit(&state, &resolved.provider_id, start).await
-    {
-        Ok(permit) => permit,
-        Err(response) => {
-            let msg = "provider concurrency limit reached";
-            let _ = broadcast_tx.send(InflightEvent::Error(msg.to_string()));
-            let _ = broadcast_tx.send(InflightEvent::Done);
-            state.inflight.lock().await.remove(&request_hash);
-            return response;
-        }
-    };
+    let provider_permit =
+        match acquire_provider_permit(&state, &resolved.provider_id, start, &protocol).await {
+            Ok(permit) => permit,
+            Err(response) => {
+                let msg = "provider concurrency limit reached";
+                let _ = broadcast_tx.send(InflightEvent::Error(msg.to_string()));
+                let _ = broadcast_tx.send(InflightEvent::Done);
+                state.inflight.lock().await.remove(&request_hash);
+                return response;
+            }
+        };
 
     let provider_setup_ms = start.elapsed().as_millis() as u64;
     let metrics_context = RequestMetricsContext {
@@ -296,6 +309,7 @@ pub async fn messages(
                         observer_state: observer_state.clone(),
                         observability,
                         stream_config,
+                        protocol: protocol.clone(),
                     },
                 )
                 .await
@@ -315,6 +329,7 @@ pub async fn messages(
                         observer_state: observer_state.clone(),
                         observability,
                         stream_config,
+                        protocol: protocol.clone(),
                     },
                 )
                 .await
@@ -338,11 +353,14 @@ pub async fn messages(
             handle_provider_error(
                 &state,
                 &metrics_context,
-                request_hash,
-                broadcast_tx,
                 e,
-                start,
-                observability,
+                ProviderErrorResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    start,
+                    observability,
+                    protocol,
+                },
             )
             .await
         }
@@ -1202,11 +1220,13 @@ struct LeaderResponseContext {
     observer_state: Arc<StdMutex<RequestObserverState>>,
     observability: Option<ObservabilityContext>,
     stream_config: StreamResponseConfig,
+    protocol: DownstreamProtocol,
 }
 
 async fn acquire_request_permit(
     state: &AppState,
     start: std::time::Instant,
+    protocol: &DownstreamProtocol,
 ) -> Result<OwnedSemaphorePermit, Response> {
     let semaphore = state.concurrency_semaphore.read().await.clone();
     match tokio::time::timeout(Duration::from_secs(10), semaphore.acquire_owned()).await {
@@ -1214,7 +1234,8 @@ async fn acquire_request_permit(
         Ok(Err(_)) => {
             error!("Semaphore closed unexpectedly");
             record_request_error(state, start);
-            Err(error_response(
+            Err(protocol_error_response(
+                protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("service unavailable"),
             ))
@@ -1222,7 +1243,8 @@ async fn acquire_request_permit(
         Err(_) => {
             warn!("Concurrency limit reached, request timed out");
             record_request_error(state, start);
-            Err(error_response(
+            Err(protocol_error_response(
+                protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("too many concurrent requests"),
             ))
@@ -1234,6 +1256,7 @@ async fn acquire_provider_permit(
     state: &AppState,
     provider_id: &str,
     start: std::time::Instant,
+    protocol: &DownstreamProtocol,
 ) -> Result<OwnedSemaphorePermit, Response> {
     let max_concurrency = state.settings.read().await.limits.provider_max_concurrency as usize;
     let semaphore = {
@@ -1249,7 +1272,8 @@ async fn acquire_provider_permit(
         Ok(Err(_)) => {
             error!("Provider semaphore closed unexpectedly");
             record_request_error(state, start);
-            Err(error_response(
+            Err(protocol_error_response(
+                protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("service unavailable"),
             ))
@@ -1257,7 +1281,8 @@ async fn acquire_provider_permit(
         Err(_) => {
             warn!("Provider concurrency limit reached for {provider_id}");
             record_request_error(state, start);
-            Err(error_response(
+            Err(protocol_error_response(
+                protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 &ErrorResponse::api_error("provider concurrency limit reached"),
             ))
@@ -1291,10 +1316,12 @@ fn join_inflight_stream(
     mut receiver: broadcast::Receiver<InflightEvent>,
     permits: StreamPermits,
     stream_config: StreamResponseConfig,
+    protocol: DownstreamProtocol,
 ) -> Response {
     let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
     tokio::spawn(async move {
         let _permits = permits;
+        let mut encoder = protocol.stream_encoder();
         let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.tick().await;
@@ -1303,26 +1330,24 @@ fn join_inflight_stream(
                 event = receiver.recv() => {
                     match event {
                         Ok(InflightEvent::Event(event)) => {
-                            let sse_text = format_sse_event(&event);
-                            if tx.send(Ok(sse_text.into_bytes())).await.is_err() {
+                            if send_stream_frames(&tx, encoder.encode_event(&event)).await.is_err() {
                                 break;
                             }
                         }
-                        Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
+                        Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => {
+                            let _ = send_stream_frames(&tx, encoder.finish()).await;
+                            break;
+                        }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            let error_event = stream_api_error_event(format!(
+                            let frames = encoder.encode_error(format!(
                                 "duplicate request stream fell behind and missed {skipped} event(s); please retry"
                             ));
-                            let _ = tx
-                                .send(Ok(format_sse_event(&error_event).into_bytes()))
-                                .await;
+                            let _ = send_stream_frames(&tx, frames).await;
                             break;
                         }
                         Ok(InflightEvent::Error(msg)) => {
-                            let error_event = stream_api_error_event(msg);
-                            let _ = tx
-                                .send(Ok(format_sse_event(&error_event).into_bytes()))
-                                .await;
+                            let frames = encoder.encode_error(msg);
+                            let _ = send_stream_frames(&tx, frames).await;
                             break;
                         }
                     }
@@ -1342,6 +1367,7 @@ fn join_inflight_stream(
 async fn join_inflight_non_stream(
     mut receiver: broadcast::Receiver<InflightEvent>,
     _request_permit: OwnedSemaphorePermit,
+    protocol: &DownstreamProtocol,
 ) -> Response {
     let mut events = Vec::new();
     loop {
@@ -1349,7 +1375,8 @@ async fn join_inflight_non_stream(
             Ok(InflightEvent::Event(event)) => events.push(event),
             Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                return error_response(
+                return protocol_error_response(
+                    protocol,
                     StatusCode::BAD_GATEWAY,
                     &ErrorResponse::api_error(&format!(
                         "duplicate request stream fell behind and missed {skipped} event(s); please retry"
@@ -1357,15 +1384,28 @@ async fn join_inflight_non_stream(
                 );
             }
             Ok(InflightEvent::Error(msg)) => {
-                return error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&msg));
+                return protocol_error_response(
+                    protocol,
+                    StatusCode::BAD_GATEWAY,
+                    &ErrorResponse::api_error(&msg),
+                );
             }
         }
     }
 
-    let response_data = crate::non_stream::response_from_events(&events)
-        .or_else(|| events.last().map(|e| e.data.clone()))
-        .unwrap_or(json!({"error": "no response from provider"}));
-    Json(response_data).into_response()
+    protocol.non_stream_response(&events)
+}
+
+async fn send_stream_frames(
+    sender: &tokio::sync::mpsc::Sender<Result<Vec<u8>, Infallible>>,
+    frames: Vec<Vec<u8>>,
+) -> Result<(), ()> {
+    for frame in frames {
+        if sender.send(Ok(frame)).await.is_err() {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 async fn stream_leader_response(
@@ -1382,6 +1422,7 @@ async fn stream_leader_response(
         observer_state,
         observability,
         stream_config,
+        protocol,
     } = context;
     let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
 
@@ -1402,6 +1443,7 @@ async fn stream_leader_response(
         .await;
     tokio::spawn(async move {
         let _permits = permits;
+        let mut encoder = protocol.stream_encoder();
         let task_start = std::time::Instant::now();
         let mut timing = ObservabilityTiming::default();
         let mut usage = TokenUsage::default();
@@ -1454,10 +1496,14 @@ async fn stream_leader_response(
                                     tool_use_pending,
                                 )
                                 .await;
-                            let sse_text = leader_tx_open.then(|| format_sse_event(&event));
+                            let frames = if leader_tx_open {
+                                encoder.encode_event(&event)
+                            } else {
+                                Vec::new()
+                            };
                             let _ = broadcast_tx.send(InflightEvent::Event(event));
-                            if let Some(sse_text) = sse_text
-                                && sender.send(Ok(sse_text.into_bytes())).await.is_err()
+                            if leader_tx_open
+                                && send_stream_frames(&sender, frames).await.is_err()
                             {
                                 leader_tx_open = false;
                             }
@@ -1479,10 +1525,9 @@ async fn stream_leader_response(
                             last_error = Some(error_message.clone());
                             last_error_metadata = e.upstream_metadata().cloned();
                             let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
-                            let error_event = stream_api_error_event(error_message);
                             if leader_tx_open {
-                                let sse_text = format_sse_event(&error_event);
-                                let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                                let frames = encoder.encode_error(error_message);
+                                let _ = send_stream_frames(&sender, frames).await;
                             }
                             break;
                         }
@@ -1514,9 +1559,8 @@ async fn stream_leader_response(
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     if leader_tx_open {
-                        let error_event = stream_api_error_event(error_message);
-                        let sse_text = format_sse_event(&error_event);
-                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                        let frames = encoder.encode_error(error_message);
+                        let _ = send_stream_frames(&sender, frames).await;
                     }
                     break;
                 }
@@ -1537,9 +1581,8 @@ async fn stream_leader_response(
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     if leader_tx_open {
-                        let error_event = stream_api_error_event(error_message);
-                        let sse_text = format_sse_event(&error_event);
-                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                        let frames = encoder.encode_error(error_message);
+                        let _ = send_stream_frames(&sender, frames).await;
                     }
                     break;
                 }
@@ -1560,13 +1603,16 @@ async fn stream_leader_response(
                     last_error = Some(error_message.clone());
                     let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                     if leader_tx_open {
-                        let error_event = stream_api_error_event(error_message);
-                        let sse_text = format_sse_event(&error_event);
-                        let _ = sender.send(Ok(sse_text.into_bytes())).await;
+                        let frames = encoder.encode_error(error_message);
+                        let _ = send_stream_frames(&sender, frames).await;
                     }
                     break;
                 }
             }
+        }
+        if !had_error && leader_tx_open {
+            let frames = encoder.finish();
+            let _ = send_stream_frames(&sender, frames).await;
         }
         let _ = broadcast_tx.send(InflightEvent::Done);
         inflight_map.lock().await.remove(&request_hash);
@@ -1627,6 +1673,7 @@ async fn collect_leader_response(
         observer_state,
         observability,
         stream_config: _,
+        protocol,
     } = context;
     let stream_start = std::time::Instant::now();
     let mut timing = ObservabilityTiming::default();
@@ -1650,7 +1697,7 @@ async fn collect_leader_response(
                 let terminal_reason = provider_stream_error_terminal_reason(&e);
                 let error_kind = provider_error_kind(&e);
                 let error_message = e.to_string();
-                let response = provider_error_to_response(&e);
+                let response = provider_error_for_protocol(&protocol, &e);
                 let _ = broadcast_tx.send(InflightEvent::Error(error_message.clone()));
                 let _ = broadcast_tx.send(InflightEvent::Done);
                 state.inflight.lock().await.remove(&request_hash);
@@ -1701,10 +1748,6 @@ async fn collect_leader_response(
     let _ = broadcast_tx.send(InflightEvent::Done);
     state.inflight.lock().await.remove(&request_hash);
 
-    let response_data = crate::non_stream::response_from_events(&events)
-        .or_else(|| events.last().map(|e| e.data.clone()))
-        .unwrap_or(json!({"error": "no response from provider"}));
-
     let latency_ms = start.elapsed().as_millis() as u64;
     merge_observer_usage(&observer_state, &mut usage);
     state
@@ -1733,18 +1776,30 @@ async fn collect_leader_response(
             )
             .await;
     }
-    Json(response_data).into_response()
+    protocol.non_stream_response(&events)
+}
+
+struct ProviderErrorResponseContext {
+    request_hash: u64,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
+    start: std::time::Instant,
+    observability: Option<ObservabilityContext>,
+    protocol: DownstreamProtocol,
 }
 
 async fn handle_provider_error(
     state: &AppState,
     request: &RequestMetricsContext,
-    request_hash: u64,
-    broadcast_tx: broadcast::Sender<InflightEvent>,
     error: ProviderError,
-    start: std::time::Instant,
-    observability: Option<ObservabilityContext>,
+    context: ProviderErrorResponseContext,
 ) -> Response {
+    let ProviderErrorResponseContext {
+        request_hash,
+        broadcast_tx,
+        start,
+        observability,
+        protocol,
+    } = context;
     let _ = broadcast_tx.send(InflightEvent::Error(error.to_string()));
     let _ = broadcast_tx.send(InflightEvent::Done);
     state.inflight.lock().await.remove(&request_hash);
@@ -1788,7 +1843,15 @@ async fn handle_provider_error(
             )
             .await;
     }
-    provider_error_to_response(&error)
+    provider_error_for_protocol(&protocol, &error)
+}
+
+fn provider_error_for_protocol(protocol: &DownstreamProtocol, error: &ProviderError) -> Response {
+    if matches!(protocol, DownstreamProtocol::Anthropic) {
+        provider_error_to_response(error)
+    } else {
+        provider_error_response(protocol, error)
+    }
 }
 
 fn sse_body_response(body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Infallible>>) -> Response {
@@ -2057,15 +2120,7 @@ async fn provider_rate_limit_snapshots(
     snapshots
 }
 
-fn format_sse_event(event: &SseEvent) -> String {
-    let data_str = serde_json::to_string(&event.data).unwrap_or_default();
-    if event.event.is_empty() {
-        format!("data: {data_str}\n\n")
-    } else {
-        format!("event: {}\ndata: {data_str}\n\n", event.event)
-    }
-}
-
+#[cfg(test)]
 fn stream_api_error_event(message: impl Into<String>) -> SseEvent {
     SseEvent {
         event: "error".to_string(),
@@ -2864,6 +2919,7 @@ mod tests {
                 observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
                 observability: None,
                 stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
             },
         )
         .await;
@@ -2931,6 +2987,7 @@ mod tests {
                 observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
                 observability: None,
                 stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
             },
         )
         .await;
@@ -2992,6 +3049,7 @@ mod tests {
                 _provider: None,
             },
             test_stream_config(),
+            DownstreamProtocol::anthropic(),
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = std::str::from_utf8(&body).unwrap();
@@ -3019,7 +3077,9 @@ mod tests {
                 .unwrap();
         }
 
-        let response = join_inflight_non_stream(receiver, request_permit).await;
+        let response =
+            join_inflight_non_stream(receiver, request_permit, &DownstreamProtocol::anthropic())
+                .await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
