@@ -1,6 +1,8 @@
 use claude_proxy_core::*;
 use serde_json::{Map, Value};
 
+use crate::tool_choice::normalize_for_anthropic_messages;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct SanitizeStats {
     pub empty_text_blocks: usize,
@@ -25,6 +27,7 @@ pub(super) fn prepare_messages_request(
     effort: Option<&str>,
 ) -> Result<(Value, SanitizeStats), serde_json::Error> {
     let stats = sanitize_messages(request);
+    normalize_for_anthropic_messages(request);
     request.extra.clear();
 
     let mut body = serde_json::to_value(request)?;
@@ -251,6 +254,31 @@ mod tests {
             }
             MessageContent::Text(_) => panic!("expected content blocks"),
         }
+    }
+
+    #[test]
+    fn maps_parallel_tool_calls_false_before_clearing_extra_fields() {
+        let mut request = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("Use one tool".to_string()),
+        }]);
+        request.tools = Some(vec![Tool {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }]);
+        request
+            .extra
+            .insert("parallel_tool_calls".to_string(), Value::Bool(false));
+
+        let (body, _) = prepare_messages_request(&mut request, None).unwrap();
+
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(
+            body["tool_choice"]["disable_parallel_tool_use"],
+            Value::Bool(true)
+        );
     }
 
     #[test]

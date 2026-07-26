@@ -129,8 +129,14 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
         "store": false,
     });
 
-    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-        body["parallel_tool_calls"] = json!(true);
+    let requested_parallel_tool_calls = req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool);
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        || requested_parallel_tool_calls.is_some()
+    {
+        body["parallel_tool_calls"] = json!(requested_parallel_tool_calls.unwrap_or(true));
     }
 
     if should_include_encrypted_reasoning(req) {
@@ -3983,6 +3989,39 @@ mod tests {
         assert!(body.get("include").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_parallel_tool_calls_false() {
+        let mut extra = HashMap::new();
+        extra.insert("parallel_tool_calls".to_string(), json!(false));
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Use one tool".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "lookup".to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = convert_to_responses(&req);
+
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]

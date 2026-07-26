@@ -123,6 +123,13 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
     if let Some(tc) = &req.tool_choice {
         body["tool_choice"] = normalize_for_chat_completions(tc);
     }
+    if let Some(parallel_tool_calls) = req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+    {
+        body["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
+    }
     if let Some(thinking) = &req.thinking {
         let mut tv = serde_json::Map::new();
         if let Some(ref t) = thinking.r#type {
@@ -171,6 +178,35 @@ mod tests {
             body["tool_choice"],
             json!({"type": "function", "function": {"name": "WebSearch"}})
         );
+    }
+
+    #[test]
+    fn convert_to_openai_chat_preserves_parallel_tool_calls() {
+        let mut req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Use one tool".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+        req.extra
+            .insert("parallel_tool_calls".to_string(), json!(false));
+
+        let body = convert_to_openai_chat(&req);
+
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]

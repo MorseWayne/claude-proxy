@@ -18,6 +18,7 @@ use crate::http::{
 };
 use crate::provider::{Provider, ProviderError};
 use crate::sse::{SseDecoder, parse_sse_frame};
+use crate::tool_choice::normalize_for_anthropic_messages;
 
 pub struct AnthropicProvider {
     id: String,
@@ -90,6 +91,7 @@ impl Provider for AnthropicProvider {
         // Serialize request and inject cache_control for prompt caching
         let mut request = request;
         sanitize_anthropic_history(&mut request);
+        normalize_for_anthropic_messages(&mut request);
         let mut body = serde_json::to_value(&request)
             .map_err(|e| ProviderError::Network(format!("failed to serialize request: {e}")))?;
         inject_cache_control(&mut body);

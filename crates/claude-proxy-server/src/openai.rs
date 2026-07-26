@@ -423,12 +423,7 @@ fn reject_responses_semantic_gaps(object: &Map<String, Value>) -> Result<(), Req
 }
 
 fn validate_parallel_tool_calls(object: &Map<String, Value>) -> Result<(), RequestError> {
-    if object.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
-        return Err(RequestError::invalid(
-            "parallel_tool_calls",
-            "parallel_tool_calls=false cannot be guaranteed across providers",
-        ));
-    }
+    optional_bool(object, "parallel_tool_calls")?;
     Ok(())
 }
 
@@ -1347,6 +1342,44 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.param.as_deref(), Some("previous_response_id"));
+    }
+
+    #[test]
+    fn accepts_parallel_tool_calls_false_for_openai_compatibility_requests() {
+        let (chat_request, _) = convert_chat_request(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "parallel_tool_calls": false
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_request.extra.get("parallel_tool_calls"),
+            Some(&json!(false))
+        );
+
+        let (responses_request, _) = convert_responses_request(json!({
+            "model": "gpt-test",
+            "input": "hello",
+            "parallel_tool_calls": false
+        }))
+        .unwrap();
+        assert_eq!(
+            responses_request.extra.get("parallel_tool_calls"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_parallel_tool_calls() {
+        let error = convert_chat_request(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "parallel_tool_calls": "false"
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.param.as_deref(), Some("parallel_tool_calls"));
+        assert_eq!(error.message, "parallel_tool_calls must be a boolean");
     }
 
     #[test]

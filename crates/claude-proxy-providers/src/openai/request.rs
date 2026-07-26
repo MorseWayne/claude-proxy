@@ -143,6 +143,13 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
     if let Some(tc) = &req.tool_choice {
         body["tool_choice"] = normalize_for_chat_completions(tc);
     }
+    if let Some(parallel_tool_calls) = req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+    {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
+    }
 
     if let Some(thinking) = &req.thinking {
         let mut thinking_value = serde_json::Map::new();
@@ -273,6 +280,20 @@ mod tests {
             body["tool_choice"],
             json!({"type": "function", "function": {"name": "WebSearch"}})
         );
+    }
+
+    #[test]
+    fn convert_request_preserves_parallel_tool_calls() {
+        let mut req = base_request(vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("Use one tool".to_string()),
+        }]);
+        req.extra
+            .insert("parallel_tool_calls".to_string(), json!(false));
+
+        let body = convert_request(&req);
+
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
