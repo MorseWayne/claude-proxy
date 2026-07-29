@@ -1336,37 +1336,54 @@ impl ChatGptProvider {
     async fn chat_via_websocket_with_auth_retry(
         &self,
         prepared: ChatGptPreparedRequest,
-        token: ChatGptToken,
+        mut token: ChatGptToken,
     ) -> Result<
         BoxStream<'static, Result<SseEvent, ProviderError>>,
         transport::ChatGptWebSocketStartError,
     > {
-        let first = self.start_websocket_stream(prepared.clone(), &token).await;
-        match first {
-            Ok(stream) => Ok(stream),
-            Err(error) if error.error.is_authentication() => {
-                let refreshed = match self.auth.force_refresh_token().await {
-                    Ok(token) => token,
-                    Err(error) => {
-                        if error.is_authentication() {
-                            self.auth.clear_token().await;
-                        }
-                        return Err(transport::ChatGptWebSocketStartError {
-                            error,
-                            fallback_allowed: false,
-                            phase: transport::ChatGptWebSocketPhase::Protocol,
-                        });
-                    }
-                };
-                let retried = self.start_websocket_stream(prepared, &refreshed).await;
-                if let Err(error) = &retried
-                    && error.error.is_authentication()
+        let mut authentication_retried = false;
+        let mut stale_continuation_retried = false;
+
+        loop {
+            match self.start_websocket_stream(prepared.clone(), &token).await {
+                Ok(stream) => return Ok(stream),
+                Err(error)
+                    if !stale_continuation_retried
+                        && error.fallback_allowed
+                        && transport::provider_error_is_previous_response_not_found(
+                            &error.error,
+                        ) =>
                 {
-                    self.auth.clear_token().await;
+                    stale_continuation_retried = true;
                 }
-                retried
+                Err(error) if !authentication_retried && error.error.is_authentication() => {
+                    authentication_retried = true;
+                    token = match self.auth.force_refresh_token().await {
+                        Ok(token) => token,
+                        Err(error) => {
+                            if error.is_authentication() {
+                                self.auth.clear_token().await;
+                            }
+                            return Err(transport::ChatGptWebSocketStartError {
+                                error,
+                                fallback_allowed: false,
+                                phase: transport::ChatGptWebSocketPhase::Protocol,
+                            });
+                        }
+                    };
+                }
+                Err(mut error) => {
+                    if error.error.is_authentication() {
+                        self.auth.clear_token().await;
+                    }
+                    if stale_continuation_retried
+                        && transport::provider_error_is_previous_response_not_found(&error.error)
+                    {
+                        error.fallback_allowed = true;
+                    }
+                    return Err(error);
+                }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -3365,7 +3382,7 @@ struct ChatGptModelSpec {
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     ChatGptModelSpec {
         model_id: "gpt-5.6-sol",
-        context_window: 372_000,
+        context_window: 272_000,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3373,7 +3390,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-terra",
-        context_window: 372_000,
+        context_window: 272_000,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3381,43 +3398,11 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-luna",
-        context_window: 372_000,
+        context_window: 272_000,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
         service_tiers: &["priority"],
-    },
-    ChatGptModelSpec {
-        model_id: "gpt-5.5",
-        context_window: 272_000,
-        image_input: true,
-        responses_lite: false,
-        reasoning_efforts: &["low", "medium", "high", "xhigh"],
-        service_tiers: &["priority"],
-    },
-    ChatGptModelSpec {
-        model_id: "gpt-5.4",
-        context_window: 272_000,
-        image_input: true,
-        responses_lite: true,
-        reasoning_efforts: &["low", "medium", "high", "xhigh"],
-        service_tiers: &["priority"],
-    },
-    ChatGptModelSpec {
-        model_id: "gpt-5.4-mini",
-        context_window: 272_000,
-        image_input: true,
-        responses_lite: true,
-        reasoning_efforts: &["low", "medium", "high", "xhigh"],
-        service_tiers: &[],
-    },
-    ChatGptModelSpec {
-        model_id: "gpt-5.3-codex-spark",
-        context_window: 128_000,
-        image_input: false,
-        responses_lite: false,
-        reasoning_efforts: &["low", "medium", "high", "xhigh"],
-        service_tiers: &[],
     },
 ];
 
@@ -3425,7 +3410,6 @@ fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
     let mut models = CHATGPT_MODEL_SPECS
         .iter()
         .copied()
-        .filter(|spec| !matches!(spec.model_id, "gpt-5.4" | "gpt-5.4-mini"))
         .map(|spec| {
             let capability = config.model_capabilities.get(spec.model_id);
             chatgpt_model_info_from_spec(spec, capability)
@@ -3818,6 +3802,10 @@ fn chatgpt_model_info_from_parts(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite's handshake callback fixes the large HTTP response as its error type"
+)]
 mod tests {
     use super::*;
     use futures::SinkExt;
@@ -3889,9 +3877,29 @@ mod tests {
     async fn codex_service_tier_filters_known_unsupported_models() {
         let mut provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
         provider.chatgpt_config.fast_mode = true;
+        provider
+            .remote_models
+            .write()
+            .expect("ChatGPT remote models lock poisoned")
+            .insert(
+                "remote-no-priority".to_string(),
+                ChatGptCatalogModel {
+                    info: chatgpt_model_info_from_parts(
+                        "remote-no-priority",
+                        Some(272_000),
+                        true,
+                        Vec::new(),
+                    ),
+                    responses_lite: true,
+                    supports_reasoning_summary_parameter: true,
+                    visibility: None,
+                    priority: 0,
+                    service_tiers: Some(Vec::new()),
+                },
+            );
 
         assert_eq!(provider.codex_service_tier("gpt-5.6-sol"), Some("priority"));
-        assert_eq!(provider.codex_service_tier("gpt-5.4-mini"), None);
+        assert_eq!(provider.codex_service_tier("remote-no-priority"), None);
         assert_eq!(
             provider.codex_service_tier("custom-model"),
             Some("priority")
@@ -4435,15 +4443,15 @@ mod tests {
     #[test]
     fn chatgpt_request_size_warning_uses_model_context_metadata() {
         let config = ChatGptProviderConfig::default();
-        let threshold = chatgpt_request_warning_threshold("gpt-5.5", &config).unwrap();
+        let threshold = chatgpt_request_warning_threshold("gpt-5.6-sol", &config).unwrap();
 
         assert_eq!(
             threshold,
             272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
         );
-        assert!(request_size_warning("gpt-5.5", &config, threshold - 1).is_none());
+        assert!(request_size_warning("gpt-5.6-sol", &config, threshold - 1).is_none());
         assert_eq!(
-            request_size_warning("gpt-5.5", &config, threshold),
+            request_size_warning("gpt-5.6-sol", &config, threshold),
             Some((threshold, threshold / CHATGPT_BYTES_PER_ESTIMATED_TOKEN))
         );
         assert!(request_size_warning("unknown-model", &config, threshold).is_none());
@@ -4462,8 +4470,8 @@ mod tests {
         assert_eq!(routed_gpt55.source_str(), "unknown_model");
 
         let gpt54 = provider.responses_lite_decision("gpt-5.4");
-        assert!(gpt54.is_enabled());
-        assert_eq!(gpt54.source_str(), "model_capability");
+        assert!(!gpt54.is_enabled());
+        assert_eq!(gpt54.source_str(), "unknown_model");
 
         let sol = provider.responses_lite_decision("chatgpt/gpt-5.6-sol");
         assert!(sol.is_enabled());
@@ -4523,18 +4531,9 @@ mod tests {
             .iter()
             .map(|model| model.model_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            vec![
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.3-codex-spark",
-            ]
-        );
-        assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_some());
-        assert!(chatgpt_model_info("gpt-5.4-mini", &ChatGptProviderConfig::default()).is_some());
+        assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+        assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_none());
+        assert!(chatgpt_model_info("gpt-5.4-mini", &ChatGptProviderConfig::default()).is_none());
 
         let sol = models
             .iter()
@@ -4549,7 +4548,7 @@ mod tests {
             .find(|model| model.model_id == "gpt-5.6-luna")
             .expect("gpt-5.6-luna model");
         for model in [sol, terra, luna] {
-            assert_eq!(model.capabilities.limits.context_window, Some(372_000));
+            assert_eq!(model.capabilities.limits.context_window, Some(272_000));
             assert!(model.capabilities.modalities.input.image.is_supported());
         }
         assert_eq!(
@@ -4564,74 +4563,6 @@ mod tests {
             luna.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh", "max"]
         );
-
-        let gpt55 = models
-            .iter()
-            .find(|model| model.model_id == "gpt-5.5")
-            .expect("gpt-5.5 model");
-
-        assert_eq!(gpt55.capabilities.limits.max_output_tokens, None);
-        assert_eq!(gpt55.capabilities.limits.context_window, Some(272_000));
-        assert!(gpt55.capabilities.endpoints.openai_responses.is_supported());
-        assert_eq!(
-            gpt55.capabilities.endpoints.openai_chat_completions,
-            CapabilityState::Unsupported
-        );
-        assert!(gpt55.capabilities.modalities.input.image.is_supported());
-        assert_eq!(
-            gpt55.capabilities.features.stop_sequences,
-            CapabilityState::Unknown
-        );
-        assert_eq!(
-            gpt55.capabilities.features.sampling,
-            CapabilityState::Unknown
-        );
-        assert!(
-            !gpt55
-                .capabilities
-                .supported_parameters
-                .contains(&"max_tokens".to_string())
-        );
-        assert!(
-            !gpt55
-                .capabilities
-                .supported_parameters
-                .contains(&"stop_sequences".to_string())
-        );
-        assert!(
-            gpt55
-                .capabilities
-                .supported_parameters
-                .contains(&"service_tier".to_string())
-        );
-        assert_eq!(
-            gpt55.capabilities.quality.tool_search.state,
-            CapabilityState::Unsupported
-        );
-        assert_eq!(
-            gpt55.capabilities.quality.prompt_cache.scope,
-            PromptCacheScope::Basic
-        );
-        assert!(gpt55.capabilities.quality.structured_outputs.is_supported());
-        assert!(gpt55.capabilities.quality.fast_mode.is_supported());
-        assert_eq!(
-            gpt55.capabilities.quality.token_counting.mode,
-            TokenCountingMode::Rough
-        );
-        assert_eq!(
-            gpt55.capabilities.limits.reasoning_effort_levels,
-            vec!["low", "medium", "high", "xhigh"]
-        );
-
-        let spark = models
-            .iter()
-            .find(|model| model.model_id == "gpt-5.3-codex-spark")
-            .expect("codex spark model");
-        assert_eq!(
-            spark.capabilities.modalities.input.image,
-            CapabilityState::Unsupported
-        );
-        assert_eq!(spark.capabilities.limits.context_window, Some(128_000));
     }
 
     #[test]
@@ -5029,7 +4960,14 @@ mod tests {
 
         let body = build_chatgpt_responses_lite_body(&req);
 
-        assert_eq!(body["tools"], json!([]));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"], json!([]));
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            DEFAULT_CHATGPT_INSTRUCTIONS
+        );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
@@ -5196,6 +5134,17 @@ mod tests {
         extra.insert("parallel_tool_calls".to_string(), json!(false));
         extra.insert("verbosity".to_string(), json!("high"));
         extra.insert("service_tier".to_string(), json!("priority"));
+        extra.insert(
+            "stream_options".to_string(),
+            json!({"reasoning_summary_delivery": "sequential_cutoff"}),
+        );
+        extra.insert(
+            "client_metadata".to_string(),
+            json!({
+                "x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}",
+                "x-codex-installation-id": "client-value"
+            }),
+        );
         let req = MessagesRequest {
             model: "gpt-5.5".to_string(),
             system: None,
@@ -5223,7 +5172,7 @@ mod tests {
         let body = build_chatgpt_responses_body_with_codex_context(
             &req,
             responses::CodexRequestContext {
-                installation_id: None,
+                installation_id: Some("proxy-installation"),
                 service_tier: Some("flex"),
                 standalone_tools: true,
                 responses_lite: true,
@@ -5236,6 +5185,18 @@ mod tests {
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["text"], json!({"verbosity": "high"}));
+        assert_eq!(
+            body["stream_options"],
+            json!({"reasoning_summary_delivery": "sequential_cutoff"})
+        );
+        assert_eq!(
+            body["client_metadata"]["x-codex-turn-metadata"],
+            "{\"turn_id\":\"turn-1\"}"
+        );
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "proxy-installation"
+        );
     }
 
     #[test]
@@ -5723,11 +5684,11 @@ mod tests {
 
         let body = build_chatgpt_responses_lite_body(&req);
 
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "Read");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "Read");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(
-            body["tools"][0]["parameters"],
+            body["input"][0]["tools"][0]["parameters"],
             json!({
                 "type": "object",
                 "properties": {"file_path": {"type": "string"}}
@@ -5943,7 +5904,10 @@ mod tests {
         let body = build_chatgpt_responses_lite_body(&req);
 
         assert_eq!(body["model"], "gpt-5.4-mini");
-        assert_eq!(body["instructions"], DEFAULT_CHATGPT_INSTRUCTIONS);
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            DEFAULT_CHATGPT_INSTRUCTIONS
+        );
         assert_eq!(body["reasoning"]["effort"], "none");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert!(body["reasoning"].get("summary").is_none());
@@ -6427,9 +6391,11 @@ mod tests {
         assert!(events.iter().all(Result::is_ok));
         assert_eq!(provider.effective_transport(), ChatGptTransport::Sse);
 
-        let websocket_requests = websocket_requests.lock().unwrap();
-        assert_eq!(websocket_requests.len(), 1);
-        assert_eq!(websocket_requests[0]["generate"], false);
+        {
+            let websocket_requests = websocket_requests.lock().unwrap();
+            assert_eq!(websocket_requests.len(), 1);
+            assert_eq!(websocket_requests[0]["generate"], false);
+        }
         let sse_requests = sse_requests.lock().await;
         assert_eq!(sse_requests.len(), 1);
         let sse_body = request_body_json(&sse_requests[0]);
@@ -6509,16 +6475,23 @@ mod tests {
                 .all(Result::is_ok)
         );
 
-        let websocket_requests = websocket_requests.lock().unwrap();
-        assert_eq!(websocket_requests.len(), 3);
-        assert!(websocket_requests[0].get("previous_response_id").is_none());
-        assert_eq!(websocket_requests[1]["previous_response_id"], "resp-ws-1");
-        assert_eq!(websocket_requests[1]["input"], json!([second_delta]));
-        assert!(websocket_requests[2].get("previous_response_id").is_none());
-        assert_eq!(
-            websocket_requests[2]["input"].as_array().map(Vec::len),
-            Some(3)
-        );
+        {
+            let websocket_requests = websocket_requests.lock().unwrap();
+            assert_eq!(websocket_requests.len(), 4);
+            assert!(websocket_requests[0].get("previous_response_id").is_none());
+            assert_eq!(websocket_requests[1]["previous_response_id"], "resp-ws-1");
+            assert_eq!(websocket_requests[1]["input"], json!([second_delta]));
+            assert!(websocket_requests[2].get("previous_response_id").is_none());
+            assert_eq!(
+                websocket_requests[2]["input"].as_array().map(Vec::len),
+                Some(3)
+            );
+            assert!(websocket_requests[3].get("previous_response_id").is_none());
+            assert_eq!(
+                websocket_requests[3]["input"].as_array().map(Vec::len),
+                Some(3)
+            );
+        }
 
         let sse_requests = sse_requests.lock().await;
         assert_eq!(sse_requests.len(), 1);
@@ -8069,6 +8042,25 @@ mod tests {
                     "message": "Previous response with id 'resp-ws-1' not found."
                 }
             });
+            websocket
+                .send(WsMessage::Text(stale_error.to_string().into()))
+                .await
+                .unwrap();
+            let _ = websocket.close(None).await;
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+            if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                captured_websocket_requests
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
             websocket
                 .send(WsMessage::Text(stale_error.to_string().into()))
                 .await

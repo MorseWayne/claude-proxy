@@ -93,6 +93,13 @@ fn apply_openai_responses_options(
     {
         object.insert("parallel_tool_calls".to_string(), value.clone());
     }
+    for key in ["stream_options", "client_metadata"] {
+        if let Some(value) = request.extra.get(key)
+            && value.is_object()
+        {
+            object.insert(key.to_string(), value.clone());
+        }
+    }
     if let Some(verbosity) = openai_responses_verbosity(request) {
         object.insert("text".to_string(), json!({ "verbosity": verbosity }));
     }
@@ -350,26 +357,19 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&[])
             .iter()
             .filter_map(|m| {
-                m["id"]
-                    .as_str()
-                    .filter(|id| !is_hidden_openai_model_alias(id))
-                    .map(|id| {
-                        merge_model_info(ModelInfo {
-                            model_id: id.to_string(),
-                            vendor: Some("openai".to_string()),
-                            is_chat_default: None,
-                            capabilities: ModelCapabilities::default(),
-                        })
+                m["id"].as_str().map(|id| {
+                    merge_model_info(ModelInfo {
+                        model_id: id.to_string(),
+                        vendor: Some("openai".to_string()),
+                        is_chat_default: None,
+                        capabilities: ModelCapabilities::default(),
                     })
+                })
             })
             .collect();
 
         Ok(models)
     }
-}
-
-fn is_hidden_openai_model_alias(model_id: &str) -> bool {
-    model_id == "gpt-5.6"
 }
 
 #[cfg(test)]
@@ -393,14 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_picker_hides_unsuffixed_gpt_56_alias() {
-        assert!(is_hidden_openai_model_alias("gpt-5.6"));
-        assert!(!is_hidden_openai_model_alias("gpt-5.6-sol"));
-        assert!(!is_hidden_openai_model_alias("gpt-5.6-terra"));
-        assert!(!is_hidden_openai_model_alias("gpt-5.6-luna"));
-    }
-
-    #[test]
     fn openai_responses_body_applies_runtime_and_request_options() {
         let mut extra = std::collections::HashMap::new();
         extra.insert("parallel_tool_calls".to_string(), json!(false));
@@ -408,9 +400,14 @@ mod tests {
         extra.insert("service_tier".to_string(), json!("priority"));
         extra.insert("prompt_cache_key".to_string(), json!("request-thread"));
         extra.insert("safety_identifier".to_string(), json!("tenant-42"));
+        extra.insert("prompt_cache_options".to_string(), json!({"ttl": "24h"}));
         extra.insert(
-            "prompt_cache_options".to_string(),
-            json!({"retention": "24h"}),
+            "stream_options".to_string(),
+            json!({"reasoning_summary_delivery": "sequential_cutoff"}),
+        );
+        extra.insert(
+            "client_metadata".to_string(),
+            json!({"x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"}),
         );
         let runtime = ProviderRuntimeConfig {
             openai: claude_proxy_config::settings::OpenAiRuntimeConfig {
@@ -461,7 +458,15 @@ mod tests {
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["text"], json!({"verbosity": "high"}));
         assert_eq!(body["safety_identifier"], "tenant-42");
-        assert_eq!(body["prompt_cache_options"], json!({"retention": "24h"}));
+        assert_eq!(body["prompt_cache_options"], json!({"ttl": "24h"}));
+        assert_eq!(
+            body["stream_options"],
+            json!({"reasoning_summary_delivery": "sequential_cutoff"})
+        );
+        assert_eq!(
+            body["client_metadata"],
+            json!({"x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"})
+        );
     }
 
     #[test]

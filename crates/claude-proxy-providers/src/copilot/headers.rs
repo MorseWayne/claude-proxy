@@ -50,15 +50,6 @@ impl HeaderBuilder {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn refresh_session_id(&mut self) {
-        self.session_id = format!(
-            "{}{:x}",
-            Uuid::new_v4().to_string().replace('-', ""),
-            chrono::Utc::now().timestamp_millis()
-        );
-    }
-
     pub fn build_headers(
         &self,
         token: &str,

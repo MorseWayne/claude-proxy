@@ -42,6 +42,7 @@ const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChatGptWebSocketPhase {
@@ -811,6 +812,8 @@ fn canonical_request_body(body: &Value) -> Value {
         object.remove("previous_response_id");
         object.remove("type");
         object.remove("generate");
+        object.remove("client_metadata");
+        object.remove("stream_options");
     }
     canonical_json_value(body)
 }
@@ -2293,7 +2296,19 @@ fn continuation_error_allows_sse_fallback(
     continuation.used && provider_error_is_previous_response_not_found(error)
 }
 
-fn provider_error_is_previous_response_not_found(error: &ProviderError) -> bool {
+pub(super) fn provider_error_is_previous_response_not_found(error: &ProviderError) -> bool {
+    if error
+        .upstream_metadata()
+        .and_then(|metadata| metadata.body_preview.as_deref())
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .is_some_and(|value| {
+            value.pointer("/error/code").and_then(Value::as_str)
+                == Some(PREVIOUS_RESPONSE_NOT_FOUND_CODE)
+        })
+    {
+        return true;
+    }
+
     let message = error
         .upstream_metadata()
         .and_then(|metadata| metadata.message.as_deref())
@@ -2536,12 +2551,15 @@ mod tests {
             "input": [{"role": "user", "content": "hi"}],
             "model": "gpt-5.3-codex",
             "text": {"verbosity": "high"},
-            "tools": [{"name": "Read", "type": "function"}]
+            "tools": [{"name": "Read", "type": "function"}],
+            "client_metadata": {"x-codex-turn-metadata": "turn-1"},
+            "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"}
         }));
         let second = canonical_request_body(&json!({
             "tools": [{"type": "function", "name": "Read"}],
             "text": {"verbosity": "high"},
             "model": "gpt-5.3-codex",
+            "client_metadata": {"x-codex-turn-metadata": "turn-2"},
             "input": [{"role": "user", "content": "different"}]
         }));
         let changed = canonical_request_body(&json!({
@@ -3068,6 +3086,22 @@ mod tests {
         let error = map_wrapped_websocket_error_event(&error_event, &error_event.to_string());
 
         assert!(!provider_error_is_previous_response_not_found(&error));
+    }
+
+    #[test]
+    fn continuation_error_detection_uses_stable_error_code() {
+        let error_event = json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": "The continuation cursor is stale."
+            }
+        });
+        let error = map_wrapped_websocket_error_event(&error_event, &error_event.to_string());
+
+        assert!(provider_error_is_previous_response_not_found(&error));
     }
 
     #[test]

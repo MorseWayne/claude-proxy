@@ -7,11 +7,36 @@
   ],
   "input": [
     {
+      "role": "developer",
+      "tools": [
+        {
+          "description": "Run a shell command",
+          "format": {
+            "definition": "start: command\ncommand: /[\\s\\S]+/",
+            "syntax": "lark",
+            "type": "grammar"
+          },
+          "name": "Bash",
+          "type": "custom"
+        }
+      ],
+      "type": "additional_tools"
+    },
+    {
+      "content": [
+        {
+          "text": "Follow the user's instructions.",
+          "type": "input_text"
+        }
+      ],
+      "role": "developer",
+      "type": "message"
+    },
+    {
       "content": "List changed files.",
       "role": "user"
     }
   ],
-  "instructions": "Follow the user's instructions.",
   "model": "gpt-5.3-codex",
   "parallel_tool_calls": false,
   "prompt_cache_key": "thread-fixture",
@@ -20,17 +45,5 @@
   },
   "store": false,
   "stream": true,
-  "tool_choice": "auto",
-  "tools": [
-    {
-      "description": "Run a shell command",
-      "format": {
-        "definition": "start: command\ncommand: /[\\s\\S]+/",
-        "syntax": "lark",
-        "type": "grammar"
-      },
-      "name": "Bash",
-      "type": "custom"
-    }
-  ]
+  "tool_choice": "auto"
 }

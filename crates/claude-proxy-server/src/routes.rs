@@ -36,6 +36,7 @@ use crate::downstream::{DownstreamProtocol, protocol_error_response, provider_er
 use crate::persistence::CompletedUsageRecord;
 
 const SSE_HEARTBEAT_FRAME: &[u8] = b": ping\n\n";
+const CONCURRENCY_RETRY_AFTER: &str = "1";
 
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
@@ -1223,6 +1224,22 @@ struct LeaderResponseContext {
     protocol: DownstreamProtocol,
 }
 
+fn concurrency_limit_response(protocol: &DownstreamProtocol, message: &str) -> Response {
+    let mut response = protocol_error_response(
+        protocol,
+        StatusCode::TOO_MANY_REQUESTS,
+        &ErrorResponse::rate_limit(message),
+    );
+    response.headers_mut().insert(
+        "retry-after",
+        HeaderValue::from_static(CONCURRENCY_RETRY_AFTER),
+    );
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("true"));
+    response
+}
+
 async fn acquire_request_permit(
     state: &AppState,
     start: std::time::Instant,
@@ -1243,10 +1260,9 @@ async fn acquire_request_permit(
         Err(_) => {
             warn!("Concurrency limit reached, request timed out");
             record_request_error(state, start);
-            Err(protocol_error_response(
+            Err(concurrency_limit_response(
                 protocol,
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("too many concurrent requests"),
+                "too many concurrent requests",
             ))
         }
     }
@@ -1281,10 +1297,9 @@ async fn acquire_provider_permit(
         Err(_) => {
             warn!("Provider concurrency limit reached for {provider_id}");
             record_request_error(state, start);
-            Err(protocol_error_response(
+            Err(concurrency_limit_response(
                 protocol,
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("provider concurrency limit reached"),
+                "provider concurrency limit reached",
             ))
         }
     }
@@ -2514,6 +2529,34 @@ mod tests {
             idle_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(600),
             tool_use_terminal_timeout: Duration::from_millis(50),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_response_is_retryable_rate_limit_for_all_protocols() {
+        let protocols = [
+            DownstreamProtocol::anthropic(),
+            DownstreamProtocol::chat_completions("model", false),
+            DownstreamProtocol::responses("model", serde_json::Map::new()),
+        ];
+
+        for protocol in protocols {
+            let response = concurrency_limit_response(&protocol, "too many concurrent requests");
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers().get("retry-after").unwrap(),
+                HeaderValue::from_static(CONCURRENCY_RETRY_AFTER)
+            );
+            assert_eq!(
+                response.headers().get("x-should-retry").unwrap(),
+                HeaderValue::from_static("true")
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "rate_limit_error");
+            assert_eq!(body["error"]["message"], "too many concurrent requests");
         }
     }
 

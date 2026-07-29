@@ -56,6 +56,7 @@ const RESPONSES_FIELDS: &[&str] = &[
     "temperature",
     "top_p",
     "stream",
+    "stream_options",
     "tools",
     "tool_choice",
     "parallel_tool_calls",
@@ -63,7 +64,7 @@ const RESPONSES_FIELDS: &[&str] = &[
     "metadata",
     "service_tier",
     "prompt_cache_key",
-    "prompt_cache_retention",
+    "prompt_cache_options",
     "safety_identifier",
     "text",
     "store",
@@ -76,6 +77,7 @@ const RESPONSES_FIELDS: &[&str] = &[
     "top_logprobs",
     "truncation",
     "user",
+    "client_metadata",
 ];
 
 #[derive(Debug)]
@@ -229,6 +231,7 @@ fn convert_responses_request(
     let object = request_object(value)?;
     reject_unknown_fields(&object, RESPONSES_FIELDS)?;
     reject_responses_semantic_gaps(&object)?;
+    validate_responses_passthrough_fields(&object)?;
 
     let model = required_string(&object, "model")?;
     let input = object
@@ -255,9 +258,11 @@ fn convert_responses_request(
             "reasoning",
             "service_tier",
             "prompt_cache_key",
-            "prompt_cache_retention",
+            "prompt_cache_options",
             "safety_identifier",
             "parallel_tool_calls",
+            "stream_options",
+            "client_metadata",
         ],
     );
     if let Some(effort) = object
@@ -317,6 +322,46 @@ fn convert_responses_request(
         request,
         DownstreamProtocol::responses(model, response_fields),
     ))
+}
+
+fn validate_responses_passthrough_fields(object: &Map<String, Value>) -> Result<(), RequestError> {
+    if let Some(stream_options) = object
+        .get("stream_options")
+        .filter(|value| !value.is_null())
+    {
+        stream_options.as_object().ok_or_else(|| {
+            RequestError::invalid("stream_options", "stream_options must be an object")
+        })?;
+    }
+
+    if let Some(prompt_cache_options) = object
+        .get("prompt_cache_options")
+        .filter(|value| !value.is_null())
+    {
+        prompt_cache_options.as_object().ok_or_else(|| {
+            RequestError::invalid(
+                "prompt_cache_options",
+                "prompt_cache_options must be an object",
+            )
+        })?;
+    }
+
+    if let Some(client_metadata) = object
+        .get("client_metadata")
+        .filter(|value| !value.is_null())
+    {
+        let client_metadata = client_metadata.as_object().ok_or_else(|| {
+            RequestError::invalid("client_metadata", "client_metadata must be an object")
+        })?;
+        if client_metadata.values().any(|value| !value.is_string()) {
+            return Err(RequestError::invalid(
+                "client_metadata",
+                "client_metadata values must be strings",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn request_object(value: Value) -> Result<Map<String, Value>, RequestError> {
@@ -1269,6 +1314,46 @@ fn convert_tool_choice(
 mod tests {
     use super::*;
 
+    fn chat_request_with_token_limits(
+        max_tokens: Option<u32>,
+        max_completion_tokens: Option<u32>,
+    ) -> Value {
+        let mut request = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let object = request.as_object_mut().unwrap();
+        if let Some(value) = max_tokens {
+            object.insert("max_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = max_completion_tokens {
+            object.insert("max_completion_tokens".to_string(), json!(value));
+        }
+        request
+    }
+
+    #[test]
+    fn reconciles_chat_completion_token_limit_aliases() {
+        for (legacy, current, expected) in [
+            (Some(4096), None, 4096),
+            (None, Some(1200), 1200),
+            (Some(16384), Some(16384), 16384),
+        ] {
+            let (request, _) =
+                convert_chat_request(chat_request_with_token_limits(legacy, current)).unwrap();
+            assert_eq!(request.max_tokens, Some(expected));
+        }
+
+        let error = convert_chat_request(chat_request_with_token_limits(Some(4096), Some(1200)))
+            .unwrap_err();
+        assert_eq!(error.param.as_deref(), Some("max_completion_tokens"));
+        assert_eq!(
+            error.message,
+            "max_tokens and max_completion_tokens must match when both are supplied"
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn converts_chat_messages_tools_and_usage_option() {
         let (request, protocol) = convert_chat_request(json!({
@@ -1313,6 +1398,17 @@ mod tests {
         let (request, protocol) = convert_responses_request(json!({
             "model": "gpt-test",
             "instructions": "Use tools",
+            "stream": true,
+            "stream_options": {
+                "reasoning_summary_delivery": "sequential_cutoff"
+            },
+            "prompt_cache_options": {
+                "mode": "explicit",
+                "ttl": "24h"
+            },
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"
+            },
             "input": [
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_text", "text": "weather?"}
@@ -1330,7 +1426,52 @@ mod tests {
 
         assert_eq!(request.messages.len(), 3);
         assert!(matches!(request.system, Some(SystemPrompt::Text(_))));
+        assert_eq!(
+            request.extra["stream_options"],
+            json!({"reasoning_summary_delivery": "sequential_cutoff"})
+        );
+        assert_eq!(
+            request.extra["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "24h"})
+        );
+        assert_eq!(
+            request.extra["client_metadata"],
+            json!({"x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"})
+        );
         assert!(matches!(protocol, DownstreamProtocol::Responses(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_codex_responses_transport_options() {
+        for (request, expected_param) in [
+            (
+                json!({
+                    "model": "gpt-test",
+                    "input": "hello",
+                    "stream_options": []
+                }),
+                "stream_options",
+            ),
+            (
+                json!({
+                    "model": "gpt-test",
+                    "input": "hello",
+                    "prompt_cache_options": "24h"
+                }),
+                "prompt_cache_options",
+            ),
+            (
+                json!({
+                    "model": "gpt-test",
+                    "input": "hello",
+                    "client_metadata": {"attempt": 1}
+                }),
+                "client_metadata",
+            ),
+        ] {
+            let error = convert_responses_request(request).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(expected_param));
+        }
     }
 
     #[test]

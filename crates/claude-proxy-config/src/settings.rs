@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
-use tempfile::NamedTempFile;
 
 use crate::error::ConfigError;
 
@@ -914,11 +912,7 @@ impl Settings {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let mut settings = Self::from_toml(&content, path)?;
-        if settings.migrate_chatgpt_55_aliases() {
-            persist_migrated_settings(path, &settings)?;
-        }
-        Ok(settings)
+        Self::from_toml(&content, path)
     }
 
     /// Parse settings from a TOML string.
@@ -938,28 +932,6 @@ impl Settings {
                 config.provider_type = Some(ProviderType::parse(id));
             }
         }
-    }
-
-    /// Upgrade exact ChatGPT GPT-5.5 aliases to the GPT-5.6 capability tiers.
-    /// Other providers and custom model references are intentionally untouched.
-    pub fn migrate_chatgpt_55_aliases(&mut self) -> bool {
-        let mut changed =
-            migrate_chatgpt_55_alias(&mut self.model.default, "chatgpt/gpt-5.6-sol", true);
-        changed |= migrate_optional_chatgpt_55_alias(
-            &mut self.model.reasoning,
-            "chatgpt/gpt-5.6-sol",
-            true,
-        );
-        changed |=
-            migrate_optional_chatgpt_55_alias(&mut self.model.opus, "chatgpt/gpt-5.6-sol", true);
-        changed |= migrate_optional_chatgpt_55_alias(
-            &mut self.model.sonnet,
-            "chatgpt/gpt-5.6-terra",
-            true,
-        );
-        changed |=
-            migrate_optional_chatgpt_55_alias(&mut self.model.haiku, "chatgpt/gpt-5.6-luna", false);
-        changed
     }
 
     /// Serialize settings to a TOML string.
@@ -1159,77 +1131,6 @@ fn chatgpt_56_alias(provider_id: &str, model_id: &str) -> ModelAliasConfig {
     let mut alias = ModelAliasConfig::new(format!("{provider_id}/{model_id}"));
     alias.reasoning_effort = Some(ModelReasoningEffort::High);
     alias
-}
-
-fn migrate_optional_chatgpt_55_alias(
-    alias: &mut Option<ModelAliasConfig>,
-    target: &str,
-    supports_ultra: bool,
-) -> bool {
-    alias
-        .as_mut()
-        .is_some_and(|alias| migrate_chatgpt_55_alias(alias, target, supports_ultra))
-}
-
-fn migrate_chatgpt_55_alias(
-    alias: &mut ModelAliasConfig,
-    target: &str,
-    supports_ultra: bool,
-) -> bool {
-    if alias.name != "chatgpt/gpt-5.5" {
-        return false;
-    }
-
-    alias.name = target.to_string();
-    alias.reasoning_effort = Some(match alias.reasoning_effort {
-        None | Some(ModelReasoningEffort::Auto) => ModelReasoningEffort::High,
-        Some(ModelReasoningEffort::Disabled | ModelReasoningEffort::Minimal) => {
-            ModelReasoningEffort::Low
-        }
-        Some(ModelReasoningEffort::Ultra) if !supports_ultra => ModelReasoningEffort::Max,
-        Some(effort) => effort,
-    });
-    true
-}
-
-fn persist_migrated_settings(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = NamedTempFile::new_in(parent).map_err(|error| {
-        ConfigError::Migration(format!(
-            "failed to create temporary config beside {}: {error}",
-            path.display()
-        ))
-    })?;
-    temp.write_all(settings.to_toml().as_bytes())
-        .and_then(|_| temp.as_file().sync_all())
-        .map_err(|error| {
-            ConfigError::Migration(format!(
-                "failed to write migrated config beside {}: {error}",
-                path.display()
-            ))
-        })?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let backup = path.with_file_name(format!("{file_name}.bak"));
-    std::fs::copy(path, &backup).map_err(|error| {
-        ConfigError::Migration(format!(
-            "failed to back up {} to {}: {error}",
-            path.display(),
-            backup.display()
-        ))
-    })?;
-
-    temp.persist(path).map_err(|error| {
-        ConfigError::Migration(format!(
-            "failed to atomically replace {}: {}",
-            path.display(),
-            error.error
-        ))
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1511,112 +1412,6 @@ reasoning_effort = "extreme"
                 .and_then(|alias| alias.reasoning_effort),
             Some(ModelReasoningEffort::High)
         );
-    }
-
-    #[test]
-    fn load_migrates_exact_chatgpt_55_aliases_with_backup_and_effort_mapping() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let original = r#"
-[model.default]
-name = "chatgpt/gpt-5.5"
-reasoning_effort = "none"
-reasoning_markers = "sanitize_only"
-
-[model.reasoning]
-name = "chatgpt/gpt-5.5"
-
-[model.opus]
-name = "chatgpt/gpt-5.5"
-reasoning_effort = "minimal"
-
-[model.sonnet]
-name = "chatgpt/gpt-5.5"
-reasoning_effort = "ultra"
-
-[model.haiku]
-name = "chatgpt/gpt-5.5"
-reasoning_effort = "ultra"
-"#;
-        std::fs::write(&path, original).unwrap();
-
-        let settings = Settings::load(&path).unwrap();
-
-        assert_eq!(settings.model.default.name, "chatgpt/gpt-5.6-sol");
-        assert_eq!(
-            settings.model.default.reasoning_effort,
-            Some(ModelReasoningEffort::Low)
-        );
-        assert_eq!(
-            settings.model.default.reasoning_markers,
-            Some(ReasoningMarkerMode::SanitizeOnly)
-        );
-        assert_eq!(settings.model.reasoning_name(), Some("chatgpt/gpt-5.6-sol"));
-        assert_eq!(
-            settings
-                .model
-                .reasoning
-                .as_ref()
-                .and_then(|alias| alias.reasoning_effort),
-            Some(ModelReasoningEffort::High)
-        );
-        assert_eq!(settings.model.opus_name(), Some("chatgpt/gpt-5.6-sol"));
-        assert_eq!(
-            settings
-                .model
-                .opus
-                .as_ref()
-                .and_then(|alias| alias.reasoning_effort),
-            Some(ModelReasoningEffort::Low)
-        );
-        assert_eq!(settings.model.sonnet_name(), Some("chatgpt/gpt-5.6-terra"));
-        assert_eq!(
-            settings
-                .model
-                .sonnet
-                .as_ref()
-                .and_then(|alias| alias.reasoning_effort),
-            Some(ModelReasoningEffort::Ultra)
-        );
-        assert_eq!(settings.model.haiku_name(), Some("chatgpt/gpt-5.6-luna"));
-        assert_eq!(
-            settings
-                .model
-                .haiku
-                .as_ref()
-                .and_then(|alias| alias.reasoning_effort),
-            Some(ModelReasoningEffort::Max)
-        );
-        assert_eq!(
-            std::fs::read_to_string(path.with_file_name("config.toml.bak")).unwrap(),
-            original
-        );
-        let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(persisted.contains("gpt-5.6-sol"));
-        assert!(persisted.contains("gpt-5.6-terra"));
-        assert!(persisted.contains("gpt-5.6-luna"));
-    }
-
-    #[test]
-    fn migration_leaves_openai_and_non_exact_chatgpt_aliases_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let original = r#"
-[model]
-default = "openai/gpt-5.5"
-reasoning = "chatgpt/gpt-5.5-preview"
-"#;
-        std::fs::write(&path, original).unwrap();
-
-        let settings = Settings::load(&path).unwrap();
-
-        assert_eq!(settings.model.default.name, "openai/gpt-5.5");
-        assert_eq!(
-            settings.model.reasoning_name(),
-            Some("chatgpt/gpt-5.5-preview")
-        );
-        assert!(!path.with_file_name("config.toml.bak").exists());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]

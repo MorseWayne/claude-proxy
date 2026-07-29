@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::http::{fmt_reqwest_err, read_upstream_response_json, read_upstream_response_text};
@@ -461,28 +461,6 @@ impl CopilotAuth {
             .as_ref()
             .map(|t| t.token.clone())
             .ok_or_else(|| ProviderError::Authentication("no copilot token".to_string()))
-    }
-
-    /// Start a background token refresh loop.
-    #[allow(dead_code)]
-    pub fn start_refresh_loop(self: &Arc<Self>) {
-        let auth = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                let needs_refresh = {
-                    let ct = auth.copilot_token.read().await;
-                    ct.as_ref().is_none_or(|t| {
-                        let now = chrono::Utc::now().timestamp();
-                        now + t.refresh_in - 60 >= t.expires_at
-                    })
-                };
-                if needs_refresh && let Err(e) = auth.refresh_copilot_token().await {
-                    warn!("Background Copilot token refresh failed: {e}");
-                }
-            }
-        });
     }
 }
 

@@ -133,9 +133,44 @@ pub(super) fn build_body_with_context(
             };
             object.insert("instructions".to_string(), json!(instructions));
         }
+        if context.responses_lite {
+            apply_responses_lite_layout(object);
+        }
         apply_codex_metadata(object, request, context);
     }
     body
+}
+
+fn apply_responses_lite_layout(body: &mut Map<String, Value>) {
+    let tools = match body.remove("tools") {
+        Some(Value::Array(tools)) => tools,
+        _ => Vec::new(),
+    };
+    let instructions = body
+        .remove("instructions")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty());
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut prefix = vec![json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": tools,
+    })];
+    if let Some(instructions) = instructions {
+        prefix.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": instructions,
+            }],
+        }));
+    }
+    prefix.append(input);
+    *input = prefix;
 }
 
 fn apply_codex_defaults(body: &mut Map<String, Value>, context: CodexRequestContext<'_>) {
@@ -192,6 +227,12 @@ fn apply_codex_request_options(
         && (!context.responses_lite || value.as_bool() == Some(false))
     {
         body.insert("parallel_tool_calls".to_string(), value.clone());
+    }
+
+    if let Some(value) = request.extra.get("stream_options")
+        && value.is_object()
+    {
+        body.insert("stream_options".to_string(), value.clone());
     }
 
     if let Some(verbosity) = codex_responses_verbosity(request) {
@@ -253,7 +294,12 @@ fn apply_codex_metadata(
         );
     }
 
-    let mut client_metadata = Map::new();
+    let mut client_metadata: Map<String, Value> = request
+        .extra
+        .get("client_metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
 
     if let Some(installation_id) = context
         .installation_id

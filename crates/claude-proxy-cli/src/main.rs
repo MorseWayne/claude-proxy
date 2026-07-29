@@ -1179,18 +1179,6 @@ fn build_oauth_http_client(
 }
 
 fn load_settings_or_exit() -> claude_proxy_config::Settings {
-    // Try auto-migration first
-    match claude_proxy_config::migrate::auto_migrate() {
-        Ok(Some(settings)) => {
-            eprintln!("{} Migrated .env to config.toml", "✓".green());
-            return settings;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("{} Migration error: {e}", "Warning:".yellow());
-        }
-    }
-
     match claude_proxy_config::Settings::config_file_path() {
         Some(path) if path.exists() => {
             claude_proxy_config::Settings::load(&path).unwrap_or_else(|e| {

@@ -14,7 +14,4 @@ pub enum ConfigError {
 
     #[error("invalid configuration: {0}")]
     Validation(String),
-
-    #[error("migration failed: {0}")]
-    Migration(String),
 }

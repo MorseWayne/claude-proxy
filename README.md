@@ -148,10 +148,10 @@ base_url = "https://chatgpt.com/backend-api/codex"
 # user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
 
 # Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
-[providers.chatgpt.chatgpt.model_capabilities."gpt-5.5"]
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
 context_window = 272000
 image_input = true
-reasoning_effort_levels = ["minimal", "low", "medium", "high", "xhigh", "max"]
+reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
 responses_lite = true
 
 [model]
@@ -166,9 +166,9 @@ host = "127.0.0.1"
 port = 8082
 auth_token = "freecc"                   # API key required from clients
 sse_heartbeat_interval_seconds = 15     # Downstream SSE keepalive interval
-stream_idle_timeout_seconds = 120       # Upstream stream idle timeout
+stream_idle_timeout_seconds = 300       # Upstream stream idle timeout
 stream_overall_timeout_seconds = 600    # Per streaming request overall timeout
-tool_use_terminal_timeout_seconds = 30  # Timeout waiting for message_stop after tool_use starts
+tool_use_terminal_timeout_seconds = 120 # Timeout waiting for message_stop after tool_use starts
 
 [admin]
 auth_token = ""                         # Admin API token (empty = fallback to server.auth_token)

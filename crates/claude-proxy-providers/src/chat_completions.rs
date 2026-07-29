@@ -1121,7 +1121,7 @@ mod tests {
             .iter()
             .filter_map(|event| event.stream_metadata.as_ref())
             .filter_map(|metadata| metadata.usage.as_ref())
-            .last()
+            .next_back()
             .expect("late usage metadata should be observed");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
