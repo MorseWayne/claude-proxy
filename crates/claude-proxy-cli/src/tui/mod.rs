@@ -2984,7 +2984,9 @@ fn poll_metrics(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claude_proxy_config::settings::{ModelAliasConfig, ModelConfig, ServerConfig};
+    use claude_proxy_config::settings::{
+        ChatGptModelCapabilityOverride, ModelAliasConfig, ModelConfig, ServerConfig,
+    };
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3090,8 +3092,8 @@ mod tests {
                 default: ModelAliasConfig::new("chatgpt/gpt-5.6-sol"),
                 reasoning: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-terra")),
                 opus: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-luna")),
-                sonnet: Some(ModelAliasConfig::new("chatgpt/gpt-5.5")),
-                haiku: Some(ModelAliasConfig::new("chatgpt/gpt-5.3-codex-spark")),
+                sonnet: Some(ModelAliasConfig::new("chatgpt/custom-large")),
+                haiku: Some(ModelAliasConfig::new("chatgpt/custom-standard")),
             },
             ..Settings::default()
         };
@@ -3103,7 +3105,26 @@ mod tests {
                 proxy: String::new(),
                 provider_type: Some(ProviderType::ChatGPT),
                 copilot: None,
-                chatgpt: Some(ChatGptProviderConfig::default()),
+                chatgpt: Some(ChatGptProviderConfig {
+                    model_capabilities: [
+                        (
+                            "custom-large".to_string(),
+                            ChatGptModelCapabilityOverride {
+                                context_window: Some(272_000),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "custom-standard".to_string(),
+                            ChatGptModelCapabilityOverride {
+                                context_window: Some(200_000),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                    .into(),
+                    ..Default::default()
+                }),
                 runtime: Default::default(),
                 reasoning_markers: Default::default(),
             },
@@ -3122,10 +3143,13 @@ mod tests {
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
             "chatgpt/gpt-5.6-luna[1m]"
         );
-        assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "chatgpt/gpt-5.5[1m]");
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "chatgpt/custom-large[1m]"
+        );
         assert_eq!(
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
-            "chatgpt/gpt-5.3-codex-spark"
+            "chatgpt/custom-standard"
         );
 
         settings.providers.get_mut("chatgpt").unwrap().chatgpt = Some(ChatGptProviderConfig {
