@@ -492,6 +492,77 @@ raw_sse_events = false
 `item_reference` 等依赖服务端状态的字段会明确返回错误，不会静默忽略；暂不暴露
 Responses WebSocket 传输和 structured output 格式。
 
+### OpenAI 客户端接入
+
+将代理的 `/v1` 地址设置为 OpenAI Base URL，并使用 `server.auth_token` 作为
+API Key。模型名可以使用下面的 `provider_id/model_name` 完整形式，也可以使用
+`[model]` 中配置的别名。
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8082/v1
+export OPENAI_API_KEY=your-server-auth-token
+```
+
+Chat Completions：
+
+```bash
+curl "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4.1",
+    "messages": [{"role": "user", "content": "你好"}],
+    "stream": false
+  }'
+```
+
+Responses：
+
+```bash
+curl "$OPENAI_BASE_URL/responses" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4.1",
+    "input": "你好",
+    "stream": false
+  }'
+```
+
+Python SDK：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8082/v1",
+    api_key="your-server-auth-token",
+)
+
+response = client.chat.completions.create(
+    model="openai/gpt-4.1",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)
+```
+
+JavaScript SDK：
+
+```javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:8082/v1",
+  apiKey: "your-server-auth-token",
+});
+
+const response = await client.responses.create({
+  model: "openai/gpt-4.1",
+  input: "你好",
+});
+console.log(response.output_text);
+```
+
 ### 管理接口
 
 管理接口需要 `Authorization: Bearer <admin_token>`。如果未设置 `admin.auth_token`，会使用 `server.auth_token` 作为 fallback。

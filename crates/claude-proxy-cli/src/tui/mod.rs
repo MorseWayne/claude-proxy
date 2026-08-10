@@ -2496,6 +2496,10 @@ fn claude_code_base_url(settings: &Settings) -> String {
     format!("http://{}:{}", host, settings.server.port)
 }
 
+fn openai_base_url(settings: &Settings) -> String {
+    format!("{}/v1", claude_code_base_url(settings))
+}
+
 fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => {
@@ -3083,6 +3087,29 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
         assert_eq!(value["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn openai_base_url_is_client_ready_for_wildcard_and_ipv6_hosts() {
+        let wildcard = Settings {
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8082,
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(openai_base_url(&wildcard), "http://127.0.0.1:8082/v1");
+
+        let ipv6 = Settings {
+            server: ServerConfig {
+                host: "::1".to_string(),
+                port: 8082,
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(openai_base_url(&ipv6), "http://[::1]:8082/v1");
     }
 
     #[test]

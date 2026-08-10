@@ -220,6 +220,77 @@ such as `store: true`, `background: true`, `previous_response_id`,
 ignored. Responses WebSocket transport and structured output formats are not
 exposed.
 
+### OpenAI Client Setup
+
+Use the proxy's `/v1` URL as the OpenAI base URL and `server.auth_token` as the
+API key. Model names may use the explicit `provider_id/model_name` form shown
+below, or one of the aliases configured in `[model]`.
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8082/v1
+export OPENAI_API_KEY=your-server-auth-token
+```
+
+Chat Completions:
+
+```bash
+curl "$OPENAI_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4.1",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": false
+  }'
+```
+
+Responses:
+
+```bash
+curl "$OPENAI_BASE_URL/responses" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4.1",
+    "input": "Hello",
+    "stream": false
+  }'
+```
+
+Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8082/v1",
+    api_key="your-server-auth-token",
+)
+
+response = client.chat.completions.create(
+    model="openai/gpt-4.1",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(response.choices[0].message.content)
+```
+
+JavaScript SDK:
+
+```javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:8082/v1",
+  apiKey: "your-server-auth-token",
+});
+
+const response = await client.responses.create({
+  model: "openai/gpt-4.1",
+  input: "Hello",
+});
+console.log(response.output_text);
+```
+
 ### Admin Endpoints
 
 All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to `server.auth_token` if admin_token is not set.

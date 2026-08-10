@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::super::app::{App, Focus, NavItem};
-use super::super::{theme, widgets};
+use super::super::{openai_base_url, theme, widgets};
 
 pub fn render_settings_page(f: &mut Frame, app: &App, area: Rect) {
     match app.nav {
@@ -31,7 +31,7 @@ fn render_hint(f: &mut Frame, area: Rect, text: &str) {
 fn render_server_page(f: &mut Frame, app: &App, area: Rect) {
     let inner = widgets::render_content_frame(f, area, app, "Server");
     let is_focused = matches!(app.focus, Focus::Content);
-    let rows = widgets::field_rows(inner, 5);
+    let rows = widgets::field_rows(inner, 8);
 
     widgets::render_field(
         f,
@@ -66,9 +66,17 @@ fn render_server_page(f: &mut Frame, app: &App, area: Rect) {
         true,
     );
 
+    let openai_url = openai_base_url(&app.settings);
+    widgets::render_field(f, rows[4], "OpenAI Base URL", &openai_url, false, false);
+    render_hint(f, rows[5], "Chat Completions: POST /v1/chat/completions");
     render_hint(
         f,
-        rows[4],
+        rows[6],
+        "Responses: POST /v1/responses · Models: GET /v1/models",
+    );
+    render_hint(
+        f,
+        rows[7],
         "Admin token: empty = reuse server auth token for admin API",
     );
 }
