@@ -58,6 +58,9 @@ use tracing::{info, warn};
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "Follow the user's instructions.";
 const CHATGPT_SEND_MAX_ATTEMPTS: usize = 2;
+const CHATGPT_CONNECTION_MAX_ATTEMPTS: usize = 4;
+const CHATGPT_CONNECTION_BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const CHATGPT_CONNECTION_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
 const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
 const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
@@ -180,6 +183,24 @@ struct ChatGptRemoteModel {
     use_responses_lite: bool,
     #[serde(default = "default_true")]
     supports_reasoning_summary_parameter: bool,
+    #[serde(default = "default_true")]
+    supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    auto_compact_token_limit: Option<i64>,
+    #[serde(default)]
+    effective_context_window_percent: Option<i64>,
+    #[serde(default)]
+    #[serde(rename = "default_reasoning_level")]
+    _default_reasoning_level: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "default_reasoning_summary")]
+    _default_reasoning_summary: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "support_verbosity")]
+    _support_verbosity: Option<bool>,
+    #[serde(default)]
+    #[serde(rename = "default_verbosity")]
+    _default_verbosity: Option<String>,
     #[serde(default)]
     visibility: Option<String>,
     #[serde(default)]
@@ -203,6 +224,9 @@ struct ChatGptCatalogModel {
     info: ModelInfo,
     responses_lite: bool,
     supports_reasoning_summary_parameter: bool,
+    supports_parallel_tool_calls: bool,
+    auto_compact_token_limit: Option<u32>,
+    effective_context_window_percent: Option<u32>,
     visibility: Option<String>,
     priority: i32,
     service_tiers: Option<Vec<String>>,
@@ -799,6 +823,40 @@ impl ChatGptProvider {
             .unwrap_or(true)
     }
 
+    fn supports_parallel_tool_calls(&self, model: &str) -> bool {
+        let model = normalize_chatgpt_model_id(model);
+        self.remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned")
+            .get(model)
+            .map(|model| model.supports_parallel_tool_calls)
+            .unwrap_or(true)
+    }
+
+    fn model_catalog_safe_input_limit(
+        &self,
+        model: &str,
+        model_context_window: u32,
+    ) -> Option<u32> {
+        let model = normalize_chatgpt_model_id(model);
+        let models = self
+            .remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned");
+        let model = models.get(model)?;
+        let ninety_percent = model_context_window.saturating_mul(9) / 10;
+        let auto_compact = model
+            .auto_compact_token_limit
+            .map(|limit| limit.min(ninety_percent));
+        let effective = model.effective_context_window_percent.map(|percent| {
+            model_context_window
+                .saturating_mul(percent)
+                .checked_div(100)
+                .unwrap_or_default()
+        });
+        auto_compact.into_iter().chain(effective).min()
+    }
+
     fn virtual_context_estimate(
         &self,
         body: &Value,
@@ -864,7 +922,15 @@ impl ChatGptProvider {
             }
             CompactRequestKind::None => CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE,
         };
-        let safe_input_limit = model_context_window.saturating_sub(reserve);
+        let safe_input_limit = model_context_window.saturating_sub(reserve).min(
+            self.model_catalog_safe_input_limit(
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                model_context_window,
+            )
+            .unwrap_or(u32::MAX),
+        );
         let pending_usage = key.map(|key| PendingContextUsage {
             key,
             static_body,
@@ -1031,6 +1097,12 @@ impl ChatGptProvider {
         );
         let started_at = Instant::now();
         let runtime_ids = self.runtime_ids_snapshot();
+        let session_id = responses::codex_client_metadata_value(body, "session_id")
+            .unwrap_or(&runtime_ids.session_id);
+        let thread_id = responses::codex_client_metadata_value(body, "thread_id")
+            .unwrap_or(&runtime_ids.thread_id);
+        let window_id = responses::codex_client_metadata_value(body, "x-codex-window-id")
+            .unwrap_or(&runtime_ids.window_id);
         let client_request_id = chatgpt_runtime_id();
         info!(
             request_id,
@@ -1041,9 +1113,9 @@ impl ChatGptProvider {
             body_wire_bytes,
             body_content_encoding,
             upstream_request_id = %client_request_id,
-            session_id = %runtime_ids.session_id,
-            thread_id = %runtime_ids.thread_id,
-            window_id = %runtime_ids.window_id,
+            session_id,
+            thread_id,
+            window_id,
             requested_output_tokens = budget.requested.unwrap_or(0),
             requested_output_tokens_present = budget.requested.is_some(),
             effective_output_tokens = budget.effective.unwrap_or(0),
@@ -1064,9 +1136,26 @@ impl ChatGptProvider {
             .header("originator", self.request_headers.originator.clone())
             .header("User-Agent", self.request_headers.user_agent.clone())
             .header("x-client-request-id", client_request_id)
-            .header("session-id", runtime_ids.session_id)
-            .header("thread-id", runtime_ids.thread_id)
-            .header("x-codex-window-id", runtime_ids.window_id);
+            .header("session-id", session_id)
+            .header("thread-id", thread_id)
+            .header("x-codex-window-id", window_id);
+
+        if let Some(routing_hint) = responses::codex_routing_hint(body) {
+            let routing_hint = HeaderValue::from_str(&routing_hint).map_err(|error| {
+                ProviderError::InvalidRequest(format!(
+                    "invalid ChatGPT x-codex-routing-hint header value: {error}"
+                ))
+            })?;
+            request_builder = request_builder.header("x-codex-routing-hint", routing_hint);
+        }
+        if let Some(turn_metadata) = responses::codex_turn_metadata(body) {
+            let turn_metadata = HeaderValue::from_str(turn_metadata).map_err(|error| {
+                ProviderError::InvalidRequest(format!(
+                    "invalid ChatGPT x-codex-turn-metadata header value: {error}"
+                ))
+            })?;
+            request_builder = request_builder.header("x-codex-turn-metadata", turn_metadata);
+        }
 
         if responses_lite.is_enabled() {
             request_builder =
@@ -2039,17 +2128,25 @@ impl Provider for ChatGptProvider {
         let responses_lite = self.responses_lite_decision(&request.model);
         let supports_reasoning_summary_parameter =
             self.supports_reasoning_summary_parameter(&request.model);
+        let supports_parallel_tool_calls = self.supports_parallel_tool_calls(&request.model);
+        let runtime_ids = self.runtime_ids_snapshot();
+        let turn_id = chatgpt_runtime_id();
         let body = responses::build_body_with_context(
             &request,
             DEFAULT_CHATGPT_INSTRUCTIONS,
             responses::CodexRequestContext {
                 installation_id: Some(&self.installation_id),
+                session_id: Some(&runtime_ids.session_id),
+                thread_id: Some(&runtime_ids.thread_id),
+                turn_id: Some(&turn_id),
+                window_id: Some(&runtime_ids.window_id),
                 service_tier: self.codex_service_tier(&request.model),
                 standalone_tools: self.chatgpt_config.standalone_tools,
                 responses_lite: responses_lite.is_enabled(),
                 model: model_context,
                 additional_instructions: proactive_multi_agent,
                 supports_reasoning_summary_parameter,
+                supports_parallel_tool_calls,
             },
         );
         let request_id = next_chatgpt_request_id();
@@ -2504,6 +2601,9 @@ fn chatgpt_upstream_request_policy(runtime: &ProviderRuntimeConfig) -> UpstreamR
     UpstreamRequestPolicy {
         max_attempts: CHATGPT_SEND_MAX_ATTEMPTS,
         attempt_timeout: None,
+        connection_max_attempts: CHATGPT_CONNECTION_MAX_ATTEMPTS,
+        connection_base_retry_delay: CHATGPT_CONNECTION_BASE_RETRY_DELAY,
+        connection_max_retry_delay: CHATGPT_CONNECTION_MAX_RETRY_DELAY,
         retry_rate_limits: false,
         ..UpstreamRequestPolicy::default()
     }
@@ -3482,6 +3582,15 @@ fn chatgpt_catalog_model_from_remote(
         .and_then(|capability| capability.responses_lite)
         .unwrap_or(model.use_responses_lite);
     let supports_reasoning_summary_parameter = model.supports_reasoning_summary_parameter;
+    let supports_parallel_tool_calls = model.supports_parallel_tool_calls;
+    let auto_compact_token_limit = model
+        .auto_compact_token_limit
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let effective_context_window_percent = model
+        .effective_context_window_percent
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value));
     let service_tiers = model.service_tiers.map(|tiers| {
         tiers
             .into_iter()
@@ -3499,6 +3608,9 @@ fn chatgpt_catalog_model_from_remote(
         ),
         responses_lite,
         supports_reasoning_summary_parameter,
+        supports_parallel_tool_calls,
+        auto_compact_token_limit,
+        effective_context_window_percent,
         visibility: model.visibility,
         priority: model.priority,
         service_tiers,
@@ -3892,6 +4004,9 @@ mod tests {
                     ),
                     responses_lite: true,
                     supports_reasoning_summary_parameter: true,
+                    supports_parallel_tool_calls: true,
+                    auto_compact_token_limit: None,
+                    effective_context_window_percent: None,
                     visibility: None,
                     priority: 0,
                     service_tiers: Some(Vec::new()),
@@ -4635,6 +4750,13 @@ mod tests {
             "max_context_window": 400000,
             "input_modalities": ["text", "image"],
             "use_responses_lite": true,
+            "supports_parallel_tool_calls": false,
+            "auto_compact_token_limit": 320000,
+            "effective_context_window_percent": 85,
+            "default_reasoning_level": "medium",
+            "default_reasoning_summary": "auto",
+            "support_verbosity": true,
+            "default_verbosity": "medium",
             "visibility": "list",
             "priority": 1
         }))
@@ -4666,6 +4788,9 @@ mod tests {
             vec!["high", "ultra"]
         );
         assert!(!catalog.responses_lite);
+        assert!(!catalog.supports_parallel_tool_calls);
+        assert_eq!(catalog.auto_compact_token_limit, Some(320_000));
+        assert_eq!(catalog.effective_context_window_percent, Some(85));
         assert_eq!(catalog.visibility.as_deref(), Some("list"));
         assert_eq!(catalog.priority, 1);
     }
@@ -4847,6 +4972,7 @@ mod tests {
         let policy = chatgpt_upstream_request_policy(&runtime);
 
         assert_eq!(policy.max_attempts, 4);
+        assert_eq!(policy.connection_max_attempts, 4);
         assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(20)));
         assert!(!policy.retry_rate_limits);
     }
@@ -4968,6 +5094,7 @@ mod tests {
             body["input"][1]["content"][0]["text"],
             DEFAULT_CHATGPT_INSTRUCTIONS
         );
+        assert_eq!(body["input"][1]["role"], "developer");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
@@ -5125,7 +5252,11 @@ mod tests {
             client_metadata.get("x-codex-installation-id"),
             Some(&json!("install-123"))
         );
-        assert_eq!(client_metadata.len(), 1);
+        assert_eq!(client_metadata.len(), 2);
+        let turn_metadata: Value =
+            serde_json::from_str(client_metadata["x-codex-turn-metadata"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(turn_metadata["request_kind"], "turn");
     }
 
     #[test]
@@ -5179,6 +5310,7 @@ mod tests {
                 model: None,
                 additional_instructions: None,
                 supports_reasoning_summary_parameter: true,
+                ..responses::CodexRequestContext::default()
             },
         );
 
@@ -5189,10 +5321,15 @@ mod tests {
             body["stream_options"],
             json!({"reasoning_summary_delivery": "sequential_cutoff"})
         );
-        assert_eq!(
-            body["client_metadata"]["x-codex-turn-metadata"],
-            "{\"turn_id\":\"turn-1\"}"
-        );
+        let turn_metadata: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(turn_metadata["installation_id"], "proxy-installation");
+        assert_eq!(turn_metadata["turn_id"], "turn-1");
+        assert_eq!(turn_metadata["request_kind"], "turn");
         assert_eq!(
             body["client_metadata"]["x-codex-installation-id"],
             "proxy-installation"
@@ -5451,6 +5588,7 @@ mod tests {
                 model: None,
                 additional_instructions: None,
                 supports_reasoning_summary_parameter: true,
+                ..responses::CodexRequestContext::default()
             },
         );
 
@@ -5461,7 +5599,7 @@ mod tests {
             client_metadata.get("x-codex-installation-id"),
             Some(&json!("install-123"))
         );
-        assert_eq!(client_metadata.len(), 1);
+        assert_eq!(client_metadata.len(), 2);
     }
 
     #[test]
@@ -5619,6 +5757,7 @@ mod tests {
                 model: None,
                 additional_instructions: None,
                 supports_reasoning_summary_parameter: true,
+                ..responses::CodexRequestContext::default()
             },
         );
 
@@ -5684,11 +5823,14 @@ mod tests {
 
         let body = build_chatgpt_responses_lite_body(&req);
 
-        assert_eq!(body["input"][0]["tools"][0]["type"], "function");
-        assert_eq!(body["input"][0]["tools"][0]["name"], "Read");
+        let tool = &body["input"][0]["tools"][0]["tools"][0];
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "Read");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(
-            body["input"][0]["tools"][0]["parameters"],
+            tool["parameters"],
             json!({
                 "type": "object",
                 "properties": {"file_path": {"type": "string"}}
@@ -6131,7 +6273,11 @@ mod tests {
         let body = json!({
             "model": "gpt-5.3-codex",
             "input": [{"role": "user", "content": "hi"}],
-            "stream": true
+            "stream": true,
+            "service_tier": "priority",
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"turn\",\"turn_id\":\"turn-test\"}"
+            }
         });
 
         let response = provider
@@ -6166,6 +6312,10 @@ mod tests {
         assert!(headers.contains("session-id: session-test"));
         assert!(headers.contains("thread-id: thread-test"));
         assert!(headers.contains("x-codex-window-id: window-test"));
+        assert!(headers.contains("x-codex-routing-hint: model=gpt-5.3-codex;tier=priority"));
+        assert!(headers.contains(
+            "x-codex-turn-metadata: {\"request_kind\":\"turn\",\"turn_id\":\"turn-test\"}"
+        ));
         assert!(headers.contains("x-openai-internal-codex-responses-lite: true"));
         let request_body = request_body_json(&requests[0]);
         assert_eq!(request_body["model"], "gpt-5.3-codex");
@@ -6251,6 +6401,11 @@ mod tests {
             handshakes[0].header("authorization").as_deref(),
             Some("Bearer access")
         );
+        assert_eq!(
+            handshakes[0].header("x-codex-routing-hint").as_deref(),
+            Some("model=gpt-5.3-codex")
+        );
+        assert!(handshakes[0].header("x-codex-turn-metadata").is_some());
     }
 
     #[tokio::test]
@@ -7658,7 +7813,10 @@ mod tests {
             "parallel_tool_calls": false,
             "store": false,
             "stream": true,
-            "include": []
+            "include": [],
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"turn\",\"turn_id\":\"turn-test\"}"
+            }
         })
     }
 

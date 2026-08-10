@@ -76,6 +76,15 @@ pub struct ProviderRetryConfig {
     pub max_attempts: Option<usize>,
     #[serde(default)]
     pub base_delay_ms: Option<u64>,
+    /// Retry budget used only for connection-establishment failures.
+    #[serde(default)]
+    pub connection_max_attempts: Option<usize>,
+    /// Initial exponential backoff for connection-establishment failures.
+    #[serde(default)]
+    pub connection_base_delay_ms: Option<u64>,
+    /// Maximum exponential backoff for connection-establishment failures.
+    #[serde(default)]
+    pub connection_max_delay_ms: Option<u64>,
     #[serde(default)]
     pub network_errors: Option<bool>,
     #[serde(default)]
@@ -1485,6 +1494,7 @@ api_key = "sk-test"
         .unwrap();
         let default_runtime = &default_settings.providers["openai"].runtime;
         assert_eq!(default_runtime.retry.max_attempts, None);
+        assert_eq!(default_runtime.retry.connection_max_attempts, None);
         assert_eq!(default_runtime.request.attempt_timeout_seconds, None);
         assert!(default_runtime.request.extra_headers.is_empty());
         assert!(default_runtime.request.query_params.is_empty());
@@ -1497,6 +1507,9 @@ api_key = "sk-test"
 [providers.openai.runtime.retry]
 max_attempts = 5
 base_delay_ms = 150
+connection_max_attempts = 6
+connection_base_delay_ms = 5000
+connection_max_delay_ms = 60000
 network_errors = false
 timeout_errors = true
 rate_limits = false
@@ -1516,6 +1529,9 @@ service_tier = "flex"
 
         assert_eq!(runtime.retry.max_attempts, Some(5));
         assert_eq!(runtime.retry.base_delay_ms, Some(150));
+        assert_eq!(runtime.retry.connection_max_attempts, Some(6));
+        assert_eq!(runtime.retry.connection_base_delay_ms, Some(5_000));
+        assert_eq!(runtime.retry.connection_max_delay_ms, Some(60_000));
         assert_eq!(runtime.retry.network_errors, Some(false));
         assert_eq!(runtime.retry.timeout_errors, Some(true));
         assert_eq!(runtime.retry.rate_limits, Some(false));

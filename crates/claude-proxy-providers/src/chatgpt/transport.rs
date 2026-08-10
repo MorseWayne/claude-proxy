@@ -979,7 +979,7 @@ pub(super) async fn prewarm_websocket(
     let idle_timeout = websocket_idle_timeout(provider);
     let connection_key = websocket_connection_key(provider, token, body);
     let (mut stream, reused, checked_out_connection_id) =
-        match checkout_connection(provider, token, &connection_key).await {
+        match checkout_connection(provider, token, &connection_key, body).await {
             Ok((stream, reused, connection_id)) => (stream, reused, connection_id),
             Err(error) => {
                 provider
@@ -1144,7 +1144,7 @@ where
     let idle_timeout = websocket_idle_timeout(provider);
     let connection_key = websocket_connection_key(provider, token, &body);
     let (mut stream, reused, checked_out_connection_id) =
-        match checkout_connection(provider, token, &connection_key).await {
+        match checkout_connection(provider, token, &connection_key, &body).await {
             Ok((stream, reused, connection_id)) => (stream, reused, connection_id),
             Err(error) => {
                 return Err(error);
@@ -1435,13 +1435,14 @@ async fn checkout_connection(
     provider: &ChatGptProvider,
     token: &ChatGptToken,
     key: &WebSocketConnectionKey,
+    body: &Value,
 ) -> Result<(ChatGptWsStream, bool, Option<u64>), ChatGptWebSocketStartError> {
     if let Some((stream, connection_id)) = provider.websocket_session.lock().await.take_fresh(key) {
         return Ok((stream, true, Some(connection_id)));
     }
 
     let url = websocket_url(provider)?;
-    let headers = websocket_headers(provider, token)?;
+    let headers = websocket_headers(provider, token, body)?;
     let stream = connect_websocket(provider, url, headers).await?;
     Ok((stream, false, None))
 }
@@ -1564,10 +1565,17 @@ fn websocket_url(provider: &ChatGptProvider) -> Result<Url, ChatGptWebSocketStar
 fn websocket_headers(
     provider: &ChatGptProvider,
     token: &ChatGptToken,
+    body: &Value,
 ) -> Result<HeaderMap, ChatGptWebSocketStartError> {
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", token.access_token);
     let runtime_ids = provider.runtime_ids_snapshot();
+    let session_id = super::responses::codex_client_metadata_value(body, "session_id")
+        .unwrap_or(&runtime_ids.session_id);
+    let thread_id = super::responses::codex_client_metadata_value(body, "thread_id")
+        .unwrap_or(&runtime_ids.thread_id);
+    let window_id = super::responses::codex_client_metadata_value(body, "x-codex-window-id")
+        .unwrap_or(&runtime_ids.window_id);
     let client_request_id = super::chatgpt_runtime_id();
     headers.insert(
         AUTHORIZATION,
@@ -1586,22 +1594,34 @@ fn websocket_headers(
     );
     headers.insert(
         HeaderName::from_static("session-id"),
-        HeaderValue::from_str(&runtime_ids.session_id)
-            .map_err(invalid_header_error("session-id"))?,
+        HeaderValue::from_str(session_id).map_err(invalid_header_error("session-id"))?,
     );
     headers.insert(
         HeaderName::from_static("thread-id"),
-        HeaderValue::from_str(&runtime_ids.thread_id).map_err(invalid_header_error("thread-id"))?,
+        HeaderValue::from_str(thread_id).map_err(invalid_header_error("thread-id"))?,
     );
     headers.insert(
         HeaderName::from_static("x-codex-window-id"),
-        HeaderValue::from_str(&runtime_ids.window_id)
-            .map_err(invalid_header_error("x-codex-window-id"))?,
+        HeaderValue::from_str(window_id).map_err(invalid_header_error("x-codex-window-id"))?,
     );
     headers.insert(
         HeaderName::from_static(OPENAI_BETA_HEADER),
         HeaderValue::from_static(RESPONSES_WEBSOCKETS_BETA),
     );
+    if let Some(routing_hint) = super::responses::codex_routing_hint(body) {
+        headers.insert(
+            HeaderName::from_static("x-codex-routing-hint"),
+            HeaderValue::from_str(&routing_hint)
+                .map_err(invalid_header_error("x-codex-routing-hint"))?,
+        );
+    }
+    if let Some(turn_metadata) = super::responses::codex_turn_metadata(body) {
+        headers.insert(
+            HeaderName::from_static("x-codex-turn-metadata"),
+            HeaderValue::from_str(turn_metadata)
+                .map_err(invalid_header_error("x-codex-turn-metadata"))?,
+        );
+    }
 
     if let Some(account_id) = token.account_id.as_deref() {
         headers.insert(
@@ -2129,6 +2149,7 @@ fn response_create_prewarm_request_text(
     mut body: Value,
     use_responses_lite: bool,
 ) -> Result<String, ChatGptWebSocketStartError> {
+    super::responses::set_codex_request_kind(&mut body, "prewarm");
     let object = body.as_object_mut().ok_or_else(|| {
         ChatGptWebSocketStartError::new(
             ProviderError::InvalidRequest(

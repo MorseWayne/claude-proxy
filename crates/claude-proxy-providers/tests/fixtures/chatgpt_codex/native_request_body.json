@@ -1,6 +1,7 @@
 {
   "client_metadata": {
-    "x-codex-installation-id": "install-fixture"
+    "x-codex-installation-id": "install-fixture",
+    "x-codex-turn-metadata": "{\"installation_id\":\"install-fixture\",\"request_kind\":\"turn\"}"
   },
   "include": [
     "reasoning.encrypted_content"
@@ -10,14 +11,21 @@
       "role": "developer",
       "tools": [
         {
-          "description": "Run a shell command",
-          "format": {
-            "definition": "start: command\ncommand: /[\\s\\S]+/",
-            "syntax": "lark",
-            "type": "grammar"
-          },
-          "name": "Bash",
-          "type": "custom"
+          "description": "",
+          "name": "functions",
+          "tools": [
+            {
+              "description": "Run a shell command",
+              "format": {
+                "definition": "start: command\ncommand: /[\\s\\S]+/",
+                "syntax": "lark",
+                "type": "grammar"
+              },
+              "name": "Bash",
+              "type": "custom"
+            }
+          ],
+          "type": "namespace"
         }
       ],
       "type": "additional_tools"

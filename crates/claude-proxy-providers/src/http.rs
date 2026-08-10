@@ -62,6 +62,9 @@ pub struct UpstreamRequestPolicy {
     pub max_attempts: usize,
     pub attempt_timeout: Option<Duration>,
     pub base_retry_delay: Duration,
+    pub connection_max_attempts: usize,
+    pub connection_base_retry_delay: Duration,
+    pub connection_max_retry_delay: Duration,
     pub retry_network_errors: bool,
     pub retry_timeout_errors: bool,
     pub retry_rate_limits: bool,
@@ -74,6 +77,9 @@ impl Default for UpstreamRequestPolicy {
             max_attempts: MAX_SEND_ATTEMPTS,
             attempt_timeout: None,
             base_retry_delay: BASE_RETRY_DELAY,
+            connection_max_attempts: MAX_SEND_ATTEMPTS,
+            connection_base_retry_delay: BASE_RETRY_DELAY,
+            connection_max_retry_delay: MAX_RETRY_AFTER_DELAY,
             retry_network_errors: true,
             retry_timeout_errors: true,
             retry_rate_limits: true,
@@ -96,9 +102,24 @@ impl UpstreamRequestPolicy {
     fn apply_retry_config(&mut self, retry: &ProviderRetryConfig) {
         if let Some(max_attempts) = retry.max_attempts {
             self.max_attempts = max_attempts;
+            if retry.connection_max_attempts.is_none() {
+                self.connection_max_attempts = max_attempts;
+            }
         }
         if let Some(base_delay_ms) = retry.base_delay_ms {
             self.base_retry_delay = Duration::from_millis(base_delay_ms);
+            if retry.connection_base_delay_ms.is_none() {
+                self.connection_base_retry_delay = Duration::from_millis(base_delay_ms);
+            }
+        }
+        if let Some(max_attempts) = retry.connection_max_attempts {
+            self.connection_max_attempts = max_attempts;
+        }
+        if let Some(base_delay_ms) = retry.connection_base_delay_ms {
+            self.connection_base_retry_delay = Duration::from_millis(base_delay_ms);
+        }
+        if let Some(max_delay_ms) = retry.connection_max_delay_ms {
+            self.connection_max_retry_delay = Duration::from_millis(max_delay_ms);
         }
         if let Some(retry_network_errors) = retry.network_errors {
             self.retry_network_errors = retry_network_errors;
@@ -123,6 +144,16 @@ impl UpstreamRequestPolicy {
     fn max_attempts(self) -> usize {
         self.max_attempts.max(1)
     }
+
+    fn connection_max_attempts(self) -> usize {
+        self.connection_max_attempts.max(1)
+    }
+}
+
+#[derive(Debug)]
+struct SendAttemptError {
+    error: ProviderError,
+    connection_failed: bool,
 }
 
 pub fn apply_runtime_request_config(
@@ -204,14 +235,31 @@ pub async fn send_upstream_request_with_policy(
     policy: UpstreamRequestPolicy,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 0;
+    let mut connection_attempt = 0;
     let max_attempts = policy.max_attempts();
+    let connection_max_attempts = policy.connection_max_attempts();
     loop {
-        attempt += 1;
         let Some(next_request) = request.try_clone() else {
             return send_once(request, policy.attempt_timeout).await;
         };
 
-        let response = send_once(next_request, policy.attempt_timeout).await;
+        let detailed = send_once_detailed(next_request, policy.attempt_timeout).await;
+        if detailed
+            .as_ref()
+            .is_err_and(|error| error.connection_failed)
+        {
+            connection_attempt += 1;
+            let response = detailed.map_err(|error| error.error);
+            if connection_attempt >= connection_max_attempts || !policy.retry_network_errors {
+                return response;
+            }
+            warn_retrying_upstream_request(connection_attempt, connection_max_attempts, &response);
+            sleep(connection_retry_delay(connection_attempt, policy)).await;
+            continue;
+        }
+
+        attempt += 1;
+        let response = detailed.map_err(|error| error.error);
         if attempt >= max_attempts || !should_retry_result(&response, policy) {
             return response;
         }
@@ -225,21 +273,44 @@ async fn send_once(
     request: reqwest::RequestBuilder,
     attempt_timeout: Option<Duration>,
 ) -> Result<reqwest::Response, ProviderError> {
-    with_request_timeout(
-        async {
-            request.send().await.map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Network(fmt_reqwest_err(&e))
-                }
-            })
-        },
-        attempt_timeout,
-    )
-    .await
+    send_once_detailed(request, attempt_timeout)
+        .await
+        .map_err(|error| error.error)
 }
 
+async fn send_once_detailed(
+    request: reqwest::RequestBuilder,
+    attempt_timeout: Option<Duration>,
+) -> Result<reqwest::Response, SendAttemptError> {
+    let send = async {
+        request.send().await.map_err(|e| {
+            let connection_failed = e.is_connect();
+            if e.is_timeout() {
+                SendAttemptError {
+                    error: ProviderError::Timeout,
+                    connection_failed: false,
+                }
+            } else {
+                SendAttemptError {
+                    error: ProviderError::Network(fmt_reqwest_err(&e)),
+                    connection_failed,
+                }
+            }
+        })
+    };
+    if let Some(attempt_timeout) = attempt_timeout {
+        timeout(attempt_timeout, send)
+            .await
+            .map_err(|_| SendAttemptError {
+                error: ProviderError::Timeout,
+                connection_failed: false,
+            })?
+    } else {
+        send.await
+    }
+}
+
+#[cfg(test)]
 async fn with_request_timeout<F, T>(
     request: F,
     attempt_timeout: Option<Duration>,
@@ -392,6 +463,15 @@ fn retry_delay(
     response
         .and_then(retry_after_delay)
         .unwrap_or_else(|| policy.base_retry_delay * attempt as u32)
+}
+
+fn connection_retry_delay(attempt: usize, policy: UpstreamRequestPolicy) -> Duration {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 2_u32.checked_pow(exponent).unwrap_or(u32::MAX);
+    policy
+        .connection_base_retry_delay
+        .saturating_mul(multiplier)
+        .min(policy.connection_max_retry_delay)
 }
 
 fn retry_after_delay_secs(value: &str) -> Option<Duration> {
@@ -1052,6 +1132,9 @@ mod tests {
             retry: ProviderRetryConfig {
                 max_attempts: Some(4),
                 base_delay_ms: Some(50),
+                connection_max_attempts: Some(6),
+                connection_base_delay_ms: Some(500),
+                connection_max_delay_ms: Some(8_000),
                 network_errors: Some(false),
                 timeout_errors: Some(false),
                 rate_limits: Some(false),
@@ -1068,11 +1151,54 @@ mod tests {
 
         assert_eq!(policy.max_attempts, 4);
         assert_eq!(policy.base_retry_delay, Duration::from_millis(50));
+        assert_eq!(policy.connection_max_attempts, 6);
+        assert_eq!(
+            policy.connection_base_retry_delay,
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            policy.connection_max_retry_delay,
+            Duration::from_millis(8_000)
+        );
         assert_eq!(policy.attempt_timeout, Some(Duration::from_secs(30)));
         assert!(!policy.retry_network_errors);
         assert!(!policy.retry_timeout_errors);
         assert!(!policy.retry_rate_limits);
         assert!(!policy.retry_transient_statuses);
+    }
+
+    #[test]
+    fn connection_retry_delay_is_exponential_and_capped() {
+        let policy = UpstreamRequestPolicy {
+            connection_base_retry_delay: Duration::from_secs(5),
+            connection_max_retry_delay: Duration::from_secs(12),
+            ..UpstreamRequestPolicy::default()
+        };
+
+        assert_eq!(connection_retry_delay(1, policy), Duration::from_secs(5));
+        assert_eq!(connection_retry_delay(2, policy), Duration::from_secs(10));
+        assert_eq!(connection_retry_delay(3, policy), Duration::from_secs(12));
+    }
+
+    #[tokio::test]
+    async fn send_attempt_distinguishes_connection_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = send_once_detailed(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}/")),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.connection_failed);
+        assert!(matches!(error.error, ProviderError::Network(_)));
     }
 
     #[test]

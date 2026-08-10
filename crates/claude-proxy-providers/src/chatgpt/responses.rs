@@ -1,3 +1,4 @@
+use crate::openai_compat::{CompactRequestKind, classify_compact_request_body};
 use crate::provider::ProviderError;
 use claude_proxy_config::settings::ReasoningMarkerMode;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
@@ -7,24 +8,34 @@ use serde_json::{Map, Value, json};
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CodexRequestContext<'a> {
     pub installation_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+    pub window_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub standalone_tools: bool,
     pub responses_lite: bool,
     pub model: Option<&'a ModelInfo>,
     pub additional_instructions: Option<&'a str>,
     pub supports_reasoning_summary_parameter: bool,
+    pub supports_parallel_tool_calls: bool,
 }
 
 impl Default for CodexRequestContext<'_> {
     fn default() -> Self {
         Self {
             installation_id: None,
+            session_id: None,
+            thread_id: None,
+            turn_id: None,
+            window_id: None,
             service_tier: None,
             standalone_tools: true,
             responses_lite: false,
             model: None,
             additional_instructions: None,
             supports_reasoning_summary_parameter: true,
+            supports_parallel_tool_calls: true,
         }
     }
 }
@@ -133,44 +144,10 @@ pub(super) fn build_body_with_context(
             };
             object.insert("instructions".to_string(), json!(instructions));
         }
-        if context.responses_lite {
-            apply_responses_lite_layout(object);
-        }
+        apply_responses_lite_shape(object, context.responses_lite);
         apply_codex_metadata(object, request, context);
     }
     body
-}
-
-fn apply_responses_lite_layout(body: &mut Map<String, Value>) {
-    let tools = match body.remove("tools") {
-        Some(Value::Array(tools)) => tools,
-        _ => Vec::new(),
-    };
-    let instructions = body
-        .remove("instructions")
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .filter(|value| !value.is_empty());
-    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
-    };
-
-    let mut prefix = vec![json!({
-        "type": "additional_tools",
-        "role": "developer",
-        "tools": tools,
-    })];
-    if let Some(instructions) = instructions {
-        prefix.push(json!({
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": instructions,
-            }],
-        }));
-    }
-    prefix.append(input);
-    *input = prefix;
 }
 
 fn apply_codex_defaults(body: &mut Map<String, Value>, context: CodexRequestContext<'_>) {
@@ -180,7 +157,7 @@ fn apply_codex_defaults(body: &mut Map<String, Value>, context: CodexRequestCont
     body.entry("tool_choice".to_string())
         .or_insert_with(|| json!("auto"));
 
-    if context.responses_lite {
+    if context.responses_lite || !context.supports_parallel_tool_calls {
         body.insert("parallel_tool_calls".to_string(), json!(false));
     } else {
         let has_tools = body
@@ -224,7 +201,8 @@ fn apply_codex_request_options(
 
     if let Some(value) = request.extra.get("parallel_tool_calls")
         && value.is_boolean()
-        && (!context.responses_lite || value.as_bool() == Some(false))
+        && ((!context.responses_lite && context.supports_parallel_tool_calls)
+            || value.as_bool() == Some(false))
     {
         body.insert("parallel_tool_calls".to_string(), value.clone());
     }
@@ -300,6 +278,12 @@ fn apply_codex_metadata(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let mut turn_metadata = client_metadata
+        .get("x-codex-turn-metadata")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
 
     if let Some(installation_id) = context
         .installation_id
@@ -310,6 +294,32 @@ fn apply_codex_metadata(
             "x-codex-installation-id".to_string(),
             json!(installation_id),
         );
+        turn_metadata.insert("installation_id".to_string(), json!(installation_id));
+    }
+
+    for (flat_key, canonical_key, value) in [
+        ("session_id", "session_id", context.session_id),
+        ("thread_id", "thread_id", context.thread_id),
+        ("turn_id", "turn_id", context.turn_id),
+        ("x-codex-window-id", "window_id", context.window_id),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            client_metadata.insert(flat_key.to_string(), json!(value));
+            turn_metadata.insert(canonical_key.to_string(), json!(value));
+        }
+    }
+
+    if !client_metadata.is_empty() {
+        turn_metadata.insert(
+            "request_kind".to_string(),
+            json!(codex_request_kind(classify_compact_request_body(
+                &Value::Object(body.clone(),)
+            ))),
+        );
+        client_metadata.insert(
+            "x-codex-turn-metadata".to_string(),
+            Value::String(Value::Object(turn_metadata).to_string()),
+        );
     }
 
     if !client_metadata.is_empty() {
@@ -317,6 +327,104 @@ fn apply_codex_metadata(
             "client_metadata".to_string(),
             Value::Object(client_metadata),
         );
+    }
+}
+
+fn codex_request_kind(kind: CompactRequestKind) -> &'static str {
+    match kind {
+        CompactRequestKind::None => "turn",
+        _ => "compaction",
+    }
+}
+
+fn apply_responses_lite_shape(body: &mut Map<String, Value>, responses_lite: bool) {
+    if !responses_lite {
+        return;
+    }
+
+    let tools = body
+        .remove("tools")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let (direct_tools, mut hosted_tools): (Vec<_>, Vec<_>) = tools.into_iter().partition(|tool| {
+        matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("function" | "custom")
+        )
+    });
+    if !direct_tools.is_empty() {
+        hosted_tools.push(json!({
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": direct_tools,
+        }));
+    }
+
+    let mut prefix = vec![json!({
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": hosted_tools,
+    })];
+    if let Some(instructions) = body
+        .remove("instructions")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+    {
+        prefix.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+        }));
+    }
+    let input = body
+        .entry("input".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(items) = input.as_array_mut() {
+        prefix.append(items);
+        *items = prefix;
+    }
+}
+
+pub(super) fn codex_turn_metadata(body: &Value) -> Option<&str> {
+    body.pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)
+}
+
+pub(super) fn codex_client_metadata_value<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get("client_metadata")?.get(key)?.as_str()
+}
+
+pub(super) fn codex_routing_hint(body: &Value) -> Option<String> {
+    let model = body.get("model")?.as_str()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let tier = body
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    Some(match tier {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    })
+}
+
+pub(super) fn set_codex_request_kind(body: &mut Value, request_kind: &str) {
+    let Some(metadata) = body
+        .pointer_mut("/client_metadata/x-codex-turn-metadata")
+        .and_then(|value| value.as_str())
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+    else {
+        return;
+    };
+    let mut metadata = metadata;
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("request_kind".to_string(), json!(request_kind));
+    }
+    if let Some(slot) = body.pointer_mut("/client_metadata/x-codex-turn-metadata") {
+        *slot = Value::String(metadata.to_string());
     }
 }
 
