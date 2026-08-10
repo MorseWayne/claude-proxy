@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.0.3 - 2026-08-10
+
+### Added in v3.0.3
+
+- Added OpenAI client setup examples and exposed the client-ready OpenAI Base URL plus compatible endpoints in the TUI server settings page.
+- Added canonical Codex turn metadata and routing hints to ChatGPT HTTP and WebSocket requests, including distinct prewarm and compaction request kinds.
+- Added configurable connection-specific retry limits and exponential backoff (`connection_max_attempts`, `connection_base_delay_ms`, and `connection_max_delay_ms`).
+
+### Changed in v3.0.3
+
+- Aligned Responses Lite requests with the latest Codex wire format by moving instructions and direct tools into `input`, using `additional_tools`, and grouping function/custom tools under the `functions` namespace.
+- Extended the ChatGPT model catalog contract with parallel-tool, auto-compaction, and effective-context-window capabilities, and now uses those limits for request shaping and virtual-context preflight.
+- Separated connection-establishment retries from ordinary request retries so transient connect failures no longer consume the normal retry budget.
+
 ## v2.0.10 - 2026-06-26
 
 ### Fixed in v2.0.10
