@@ -82,19 +82,22 @@ pub struct ConversionContext<'a> {
     pub supports_reasoning_summary_parameter: Option<bool>,
 }
 
-pub fn convert_to_responses(req: &MessagesRequest) -> Value {
+pub fn convert_to_responses(req: &MessagesRequest) -> Result<Value, ProviderError> {
     convert_to_responses_with_context(req, ConversionContext::default())
 }
 
 pub fn convert_to_responses_with_context(
     req: &MessagesRequest,
     context: ConversionContext<'_>,
-) -> Value {
+) -> Result<Value, ProviderError> {
     let _ = context.provider_id;
     convert_to_responses_inner(req, context)
 }
 
-fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<'_>) -> Value {
+fn convert_to_responses_inner(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+) -> Result<Value, ProviderError> {
     let correlation = ResponsesCorrelation::from_request(req);
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
@@ -183,18 +186,23 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
     if let Some(tools) = &req.tools {
         let converted_tools = tools
             .iter()
-            .map(|tool| {
-                let converted =
-                    convert_tool_with_mode(tool, context.tool_conversion_mode, &correlation);
+            .enumerate()
+            .map(|(index, tool)| {
+                let converted = convert_tool_with_mode(
+                    tool,
+                    index,
+                    context.tool_conversion_mode,
+                    &correlation,
+                )?;
                 if converted.standalone {
                     standalone_tool_names.insert(tool.name.clone());
                 }
                 if converted.value["type"].as_str() == Some("web_search") {
                     native_tool_choices.insert(tool.name.clone(), "web_search");
                 }
-                converted.value
+                Ok(converted.value)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ProviderError>>()?;
         body["tools"] = json!(converted_tools);
     }
     if let Some(tool_choice) = &req.tool_choice {
@@ -215,7 +223,7 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
     if let Some(reasoning) = convert_reasoning(req, context) {
         body["reasoning"] = reasoning;
     }
-    body
+    Ok(body)
 }
 
 fn system_to_text(system: &Option<SystemPrompt>) -> Option<String> {
@@ -1041,35 +1049,36 @@ fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> 
 
 fn convert_tool_with_mode(
     tool: &Tool,
+    tool_index: usize,
     mode: ToolConversionMode,
     correlation: &ResponsesCorrelation,
-) -> ToolConversionResult {
+) -> Result<ToolConversionResult, ProviderError> {
     if tool
         .extra
         .get("type")
         .and_then(Value::as_str)
         .is_some_and(|tool_type| tool_type.starts_with("web_search"))
     {
-        return ToolConversionResult {
-            value: convert_web_search_tool(tool),
+        return Ok(ToolConversionResult {
+            value: convert_web_search_tool(tool, tool_index)?,
             standalone: false,
-        };
+        });
     }
 
     if mode == ToolConversionMode::CodexStandalone
         && tool.name == "Bash"
         && tool_schema_has_string_property(&tool.input_schema, "command")
     {
-        return ToolConversionResult {
+        return Ok(ToolConversionResult {
             value: convert_bash_freeform_tool(tool, correlation),
             standalone: true,
-        };
+        });
     }
 
-    ToolConversionResult {
+    Ok(ToolConversionResult {
         value: convert_function_tool(tool, correlation),
         standalone: false,
-    }
+    })
 }
 
 fn convert_function_tool(tool: &Tool, correlation: &ResponsesCorrelation) -> Value {
@@ -1101,24 +1110,62 @@ fn convert_bash_freeform_tool(tool: &Tool, correlation: &ResponsesCorrelation) -
     })
 }
 
-fn convert_web_search_tool(tool: &Tool) -> Value {
+fn convert_web_search_tool(tool: &Tool, tool_index: usize) -> Result<Value, ProviderError> {
     let mut value = json!({"type": "web_search"});
-    let allowed_domains = tool.extra.get("allowed_domains").cloned();
-    let blocked_domains = tool.extra.get("blocked_domains").cloned();
+    let allowed_domains = normalize_web_search_domains(tool, tool_index, "allowed_domains")?;
+    let blocked_domains = normalize_web_search_domains(tool, tool_index, "blocked_domains")?;
+
+    if allowed_domains.is_some() && blocked_domains.is_some() {
+        return Err(ProviderError::InvalidRequest(format!(
+            "tools[{tool_index}] cannot specify both allowed_domains and blocked_domains"
+        )));
+    }
+
     if allowed_domains.is_some() || blocked_domains.is_some() {
         let mut filters = serde_json::Map::new();
         if let Some(domains) = allowed_domains {
-            filters.insert("allowed_domains".to_string(), domains);
+            filters.insert("allowed_domains".to_string(), json!(domains));
         }
         if let Some(domains) = blocked_domains {
-            filters.insert("blocked_domains".to_string(), domains);
+            filters.insert("blocked_domains".to_string(), json!(domains));
         }
         value["filters"] = Value::Object(filters);
     }
     if let Some(location) = tool.extra.get("user_location") {
         value["user_location"] = location.clone();
     }
-    value
+    Ok(value)
+}
+
+fn normalize_web_search_domains(
+    tool: &Tool,
+    tool_index: usize,
+    field: &str,
+) -> Result<Option<Vec<String>>, ProviderError> {
+    let Some(value) = tool.extra.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let domains = value.as_array().ok_or_else(|| {
+        ProviderError::InvalidRequest(format!("tools[{tool_index}].{field} must be an array"))
+    })?;
+    let mut normalized = Vec::with_capacity(domains.len());
+    let mut seen = HashSet::with_capacity(domains.len());
+    for (domain_index, domain) in domains.iter().enumerate() {
+        let domain = domain.as_str().ok_or_else(|| {
+            ProviderError::InvalidRequest(format!(
+                "tools[{tool_index}].{field}[{domain_index}] must be a string"
+            ))
+        })?;
+        let domain = domain.trim();
+        if domain.is_empty() {
+            continue;
+        }
+        let domain = domain.to_ascii_lowercase();
+        if seen.insert(domain.clone()) {
+            normalized.push(domain);
+        }
+    }
+    Ok((!normalized.is_empty()).then_some(normalized))
 }
 
 fn tool_schema_has_string_property(schema: &Value, property: &str) -> bool {
@@ -4225,7 +4272,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["instructions"], "Be useful.");
         assert_eq!(body["max_output_tokens"], 1024);
@@ -4262,7 +4309,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
@@ -4290,7 +4337,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
         assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
@@ -4330,7 +4377,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
@@ -4374,7 +4421,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
         assert_eq!(
@@ -4418,7 +4465,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
@@ -4472,7 +4519,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["input"][1]["output"][0]["type"], "input_text");
@@ -4520,7 +4567,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(
             body["input"][0]["output"],
@@ -4584,7 +4631,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["input"][0]["output"], r#"[{"path":"README.md"}]"#);
     }
@@ -4625,7 +4672,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(
             body["input"][0]["output"],
@@ -4678,7 +4725,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(
             body["tools"][0]["parameters"],
@@ -4716,7 +4763,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(
             body["tool_choice"],
@@ -4746,7 +4793,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert!(body.get("include").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
@@ -4782,7 +4829,7 @@ mod tests {
             extra,
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["parallel_tool_calls"], false);
     }
@@ -4811,7 +4858,7 @@ mod tests {
             extra,
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert!(body.get("include").is_none());
         assert_eq!(body["reasoning"], json!({"effort": "none"}));
@@ -4842,7 +4889,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     }
@@ -4878,7 +4925,7 @@ mod tests {
                 extra: HashMap::new(),
             };
 
-            let body = convert_to_responses(&req);
+            let body = convert_to_responses(&req).unwrap();
 
             assert_eq!(body["reasoning"]["effort"], expected_effort);
             assert_eq!(body["reasoning"]["summary"], "detailed");
@@ -4928,7 +4975,8 @@ mod tests {
                 model: Some(&model),
                 ..ConversionContext::default()
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(body["reasoning"]["effort"], "medium");
     }
@@ -4958,7 +5006,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "detailed");
@@ -4989,7 +5037,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "detailed");
@@ -5020,7 +5068,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
 
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
     }
@@ -5064,7 +5112,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
         let input = body["input"].as_array().expect("input items");
 
         assert!(
@@ -5113,7 +5161,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
         let output = body["input"][0]["output"]
             .as_str()
             .expect("tool output string");
@@ -5156,7 +5204,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
         let input = body["input"].as_array().expect("input items");
 
         assert!(
@@ -5206,7 +5254,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
         let input = body["input"].as_array().expect("input items");
 
         assert_eq!(input[0]["content"], large_text);
@@ -5247,7 +5295,7 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let body = convert_to_responses(&req);
+        let body = convert_to_responses(&req).unwrap();
         let input = body["input"].as_array().expect("input items");
         let serialized = serde_json::to_string(input).expect("input json");
 
@@ -6564,7 +6612,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let body = convert_to_responses(&request);
+        let body = convert_to_responses(&request).unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(body["input"][0]["encrypted_content"], signature);
 
@@ -6705,8 +6753,8 @@ mod tests {
                 {
                     "type":"web_search_20250305",
                     "name":"web_search",
-                    "allowed_domains":["example.com"],
-                    "blocked_domains":["bad.example"],
+                    "allowed_domains":[" Example.COM ", "", "example.com"],
+                    "blocked_domains":[],
                     "user_location":{"type":"approximate","country":"CN"}
                 },
                 {
@@ -6716,7 +6764,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let body = convert_to_responses(&request);
+        let body = convert_to_responses(&request).unwrap();
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["tools"][0]["type"], "web_search");
@@ -6725,9 +6773,13 @@ mod tests {
             "example.com"
         );
         assert_eq!(
-            body["tools"][0]["filters"]["blocked_domains"][0],
-            "bad.example"
+            body["tools"][0]["filters"]["allowed_domains"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
+        assert!(body["tools"][0]["filters"].get("blocked_domains").is_none());
         assert_eq!(body["tools"][0]["user_location"]["country"], "CN");
         let mapped_name = body["tools"][1]["name"].as_str().unwrap();
         assert!(mapped_name.len() <= RESPONSES_IDENTIFIER_MAX_BYTES);
@@ -6737,6 +6789,105 @@ mod tests {
                 .unwrap()
                 .contains_key("$schema")
         );
+    }
+
+    #[test]
+    fn request_omits_empty_native_web_search_filters() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":[],
+                "blocked_domains":["", "   "]
+            }]
+        }))
+        .unwrap();
+
+        let body = convert_to_responses(&request).unwrap();
+
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert!(body["tools"][0].get("filters").is_none());
+    }
+
+    #[test]
+    fn request_preserves_normalized_native_web_search_blocklist() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "blocked_domains":[" Bad.Example ", "bad.example"]
+            }]
+        }))
+        .unwrap();
+
+        let body = convert_to_responses(&request).unwrap();
+
+        assert_eq!(
+            body["tools"][0]["filters"]["blocked_domains"],
+            json!(["bad.example"])
+        );
+        assert!(body["tools"][0]["filters"].get("allowed_domains").is_none());
+    }
+
+    #[test]
+    fn request_rejects_conflicting_native_web_search_filters() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com"],
+                "blocked_domains":["bad.example"]
+            }]
+        }))
+        .unwrap();
+
+        let error = convert_to_responses(&request).unwrap_err();
+
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid request: tools[0] cannot specify both allowed_domains and blocked_domains"
+        );
+    }
+
+    #[test]
+    fn request_rejects_malformed_native_web_search_filters() {
+        let cases = [
+            (
+                json!({"allowed_domains":"example.com"}),
+                "invalid request: tools[0].allowed_domains must be an array",
+            ),
+            (
+                json!({"allowed_domains":["example.com", 42]}),
+                "invalid request: tools[0].allowed_domains[1] must be a string",
+            ),
+        ];
+
+        for (fields, expected) in cases {
+            let mut tool = json!({
+                "type":"web_search_20250305",
+                "name":"web_search"
+            });
+            tool.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5",
+                "messages":[{"role":"user","content":"search"}],
+                "tools":[tool]
+            }))
+            .unwrap();
+
+            let error = convert_to_responses(&request).unwrap_err();
+
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
@@ -6764,7 +6915,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let body = convert_to_responses(&request);
+        let body = convert_to_responses(&request).unwrap();
         assert_eq!(body["input"][0]["type"], "web_search_call");
         assert_eq!(body["input"][0]["id"], "ws_1");
         assert_eq!(body["input"][0]["action"]["query"], "rust");

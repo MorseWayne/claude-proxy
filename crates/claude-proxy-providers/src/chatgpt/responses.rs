@@ -94,13 +94,14 @@ pub(super) fn build_body(
             ..CodexRequestContext::default()
         },
     )
+    .expect("test request should convert to a valid Responses body")
 }
 
 pub(super) fn build_body_with_context(
     request: &MessagesRequest,
     default_instructions: &str,
     context: CodexRequestContext<'_>,
-) -> Value {
+) -> Result<Value, crate::provider::ProviderError> {
     let mut body = crate::responses::convert_to_responses_with_context(
         request,
         crate::responses::ConversionContext {
@@ -115,7 +116,7 @@ pub(super) fn build_body_with_context(
                 context.supports_reasoning_summary_parameter,
             ),
         },
-    );
+    )?;
     if let Some(object) = body.as_object_mut() {
         object.remove("stop");
         object.remove("max_output_tokens");
@@ -149,7 +150,7 @@ pub(super) fn build_body_with_context(
         apply_responses_lite_shape(object, context.responses_lite);
         apply_codex_metadata(object, request, context);
     }
-    body
+    Ok(body)
 }
 
 fn apply_codex_defaults(body: &mut Map<String, Value>, context: CodexRequestContext<'_>) {

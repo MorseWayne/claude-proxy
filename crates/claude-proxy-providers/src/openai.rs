@@ -256,7 +256,7 @@ impl OpenAiProvider {
         }
     }
 
-    fn responses_request_body(&self, request: &MessagesRequest) -> Value {
+    fn responses_request_body(&self, request: &MessagesRequest) -> Result<Value, ProviderError> {
         let mut request = request.clone();
         normalize_openai_56_reasoning(&mut request);
         let model = openai_model_info(&request.model);
@@ -267,9 +267,9 @@ impl OpenAiProvider {
                 model: Some(&model),
                 ..Default::default()
             },
-        );
+        )?;
         apply_openai_responses_options(&mut body, &request, &self.runtime);
-        body
+        Ok(body)
     }
 
     async fn chat_via_responses(
@@ -278,7 +278,7 @@ impl OpenAiProvider {
         observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let correlation = crate::responses::ResponsesCorrelation::from_request(&request);
-        let body = self.responses_request_body(&request);
+        let body = self.responses_request_body(&request)?;
         let url = format!("{}/responses", self.base_url);
 
         log_request_observability("openai", "/responses", &body, None);
@@ -456,7 +456,7 @@ mod tests {
             extra,
         };
 
-        let body = provider.responses_request_body(&req);
+        let body = provider.responses_request_body(&req).unwrap();
 
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["prompt_cache_key"], "request-thread");
@@ -507,7 +507,7 @@ mod tests {
         req.extra
             .insert("reasoning_effort".to_string(), json!("minimal"));
 
-        let body = provider.responses_request_body(&req);
+        let body = provider.responses_request_body(&req).unwrap();
 
         assert_eq!(body["reasoning"]["effort"], "low");
     }
@@ -549,7 +549,7 @@ mod tests {
             extra,
         };
 
-        let body = provider.responses_request_body(&req);
+        let body = provider.responses_request_body(&req).unwrap();
 
         assert!(body.get("parallel_tool_calls").is_none());
         assert!(body.get("prompt_cache_key").is_none());

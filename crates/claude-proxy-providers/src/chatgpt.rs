@@ -2173,7 +2173,7 @@ impl Provider for ChatGptProvider {
                 supports_reasoning_summary_parameter,
                 supports_parallel_tool_calls,
             },
-        );
+        )?;
         let request_id = next_chatgpt_request_id();
         validate_chatgpt_tool_schema_budget(&body)?;
         let output_token_budget = chatgpt_output_token_budget(&request, &body);
@@ -3086,6 +3086,7 @@ fn build_chatgpt_responses_body_with_codex_context(
     context: responses::CodexRequestContext<'_>,
 ) -> Value {
     responses::build_body_with_context(request, DEFAULT_CHATGPT_INSTRUCTIONS, context)
+        .expect("test request should convert to a valid ChatGPT Responses body")
 }
 
 fn ensure_chatgpt_stable_client_conversation_id(
