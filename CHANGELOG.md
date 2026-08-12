@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.0.4 - 2026-08-12
+
+### Added in v3.0.4
+
+- Added a source-preserving provider event envelope so upstream Responses events can retain their native protocol semantics alongside the normalized Anthropic view.
+- Added native Codex Responses encoders for OpenAI Responses and Chat Completions, including parallel tool calls, delayed tool metadata recovery, reasoning content, web search, and exact usage details.
+
+### Changed in v3.0.4
+
+- Removed the lossy Codex Responses to Anthropic to OpenAI conversion path for OpenAI-compatible downstream endpoints.
+- Preserved native Responses output items, identifiers, statuses, sequence numbers, encrypted reasoning, custom tools, and web-search sources for both streaming and non-streaming clients.
+- Restored request-side tool names and call identifiers recursively in native upstream response events.
+
 ## v3.0.3 - 2026-08-10
 
 ### Added in v3.0.3
