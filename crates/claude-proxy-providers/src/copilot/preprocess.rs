@@ -242,6 +242,7 @@ mod tests {
                 name: "test_tool".to_string(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,

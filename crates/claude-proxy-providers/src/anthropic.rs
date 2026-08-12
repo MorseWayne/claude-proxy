@@ -266,6 +266,7 @@ fn keep_content_block(block: &mut Content) -> bool {
         Content::ToolUse { .. }
         | Content::ToolResult { .. }
         | Content::ServerToolUse { .. }
+        | Content::WebSearchToolResult { .. }
         | Content::Unknown(_) => true,
     }
 }

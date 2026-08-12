@@ -1130,6 +1130,7 @@ pub(super) async fn open_websocket_stream<F>(
     token: &ChatGptToken,
     context: ChatGptWebSocketRequestContext<'_>,
     on_event: F,
+    responses_correlation: crate::responses::ResponsesCorrelation,
 ) -> Result<ChatGptWebSocketStreamStart, ChatGptWebSocketStartError>
 where
     F: Fn(&Value) + Send + Sync + 'static,
@@ -1416,9 +1417,10 @@ where
         }
     });
 
-    let stream = crate::responses::stream_responses_json_events_with_marker_mode_and_observer(
+    let stream = crate::responses::stream_responses_json_events_with_context_and_observer(
         rx_event,
         marker_mode,
+        responses_correlation,
         on_event,
     );
     Ok(ChatGptWebSocketStreamStart {

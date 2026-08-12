@@ -63,17 +63,19 @@ struct PromptCacheKey {
     source: PromptCacheKeySource,
 }
 
-pub(super) fn stream_response_with_marker_mode<F>(
+pub(super) fn stream_response_with_marker_mode_and_context<F>(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
+    correlation: crate::responses::ResponsesCorrelation,
     on_event: F,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
-    crate::responses::stream_responses_response_with_marker_mode_and_observer(
+    crate::responses::stream_responses_response_with_context_and_observer(
         response,
         marker_mode,
+        correlation,
         on_event,
     )
 }

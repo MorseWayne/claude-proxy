@@ -277,6 +277,7 @@ impl OpenAiProvider {
         request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let correlation = crate::responses::ResponsesCorrelation::from_request(&request);
         let body = self.responses_request_body(&request);
         let url = format!("{}/responses", self.base_url);
 
@@ -293,18 +294,20 @@ impl OpenAiProvider {
 
         if request.stream {
             Ok(
-                crate::responses::stream_responses_response_with_marker_mode_and_provider_observer(
+                crate::responses::stream_responses_response_with_context_and_provider_observer(
                     response,
                     marker_mode_from_request(&request),
+                    correlation,
                     observer,
                 ),
             )
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::responses::convert_non_streaming_response_with_marker_mode(
+            let events = crate::responses::convert_non_streaming_response_with_context(
                 &data,
                 marker_mode_from_request(&request),
+                correlation,
             );
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))
@@ -444,6 +447,7 @@ mod tests {
                 name: "search".to_string(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,

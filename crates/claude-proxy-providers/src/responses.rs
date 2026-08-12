@@ -4,7 +4,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -21,6 +21,14 @@ use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
 use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
 use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
+
+mod correlation;
+mod signature;
+
+#[cfg(test)]
+use correlation::IDENTIFIER_MAX_BYTES as RESPONSES_IDENTIFIER_MAX_BYTES;
+pub use correlation::ResponsesCorrelation;
+use signature::is_gpt_signature;
 
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
@@ -87,6 +95,7 @@ pub fn convert_to_responses_with_context(
 }
 
 fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<'_>) -> Value {
+    let correlation = ResponsesCorrelation::from_request(req);
     let mut input = Vec::new();
     let current_message_index = req.messages.len().saturating_sub(1);
     let historical_stats = req
@@ -119,6 +128,7 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
             msg,
             index == current_message_index,
             &mut compression,
+            &correlation,
         );
     }
 
@@ -132,15 +142,23 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
     let requested_parallel_tool_calls = req
         .extra
         .get("parallel_tool_calls")
-        .and_then(Value::as_bool);
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            req.tool_choice
+                .as_ref()
+                .and_then(|choice| choice.get("disable_parallel_tool_use"))
+                .and_then(Value::as_bool)
+                .map(|disabled| !disabled)
+        });
     if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
         || requested_parallel_tool_calls.is_some()
     {
         body["parallel_tool_calls"] = json!(requested_parallel_tool_calls.unwrap_or(true));
     }
 
+    let mut include = Vec::new();
     if should_include_encrypted_reasoning(req) {
-        body["include"] = json!(["reasoning.encrypted_content"]);
+        include.push("reasoning.encrypted_content");
     }
 
     if let Some(instructions) = system_to_text(&req.system) {
@@ -161,13 +179,18 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
         body["stop"] = json!(stop);
     }
     let mut standalone_tool_names = HashSet::new();
+    let mut native_tool_choices = HashMap::new();
     if let Some(tools) = &req.tools {
         let converted_tools = tools
             .iter()
             .map(|tool| {
-                let converted = convert_tool_with_mode(tool, context.tool_conversion_mode);
+                let converted =
+                    convert_tool_with_mode(tool, context.tool_conversion_mode, &correlation);
                 if converted.standalone {
                     standalone_tool_names.insert(tool.name.clone());
+                }
+                if converted.value["type"].as_str() == Some("web_search") {
+                    native_tool_choices.insert(tool.name.clone(), "web_search");
                 }
                 converted.value
             })
@@ -175,7 +198,19 @@ fn convert_to_responses_inner(req: &MessagesRequest, context: ConversionContext<
         body["tools"] = json!(converted_tools);
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body["tool_choice"] = normalize_responses_tool_choice(tool_choice, &standalone_tool_names);
+        body["tool_choice"] = normalize_responses_tool_choice(
+            tool_choice,
+            &standalone_tool_names,
+            &native_tool_choices,
+            &correlation,
+        );
+    }
+    if !native_tool_choices.is_empty() {
+        include.push("web_search_call.action.sources");
+        include.push("web_search_call.results");
+    }
+    if !include.is_empty() {
+        body["include"] = json!(include);
     }
     if let Some(reasoning) = convert_reasoning(req, context) {
         body["reasoning"] = reasoning;
@@ -284,6 +319,14 @@ fn block_compression_stats(blocks: &[Content]) -> HistoryCompressionStats {
                 stats.tool_outputs += 1;
                 stats.tool_output_bytes += raw_tool_result_text_len(content);
             }
+            Content::WebSearchToolResult { .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+            }
             Content::Unknown(_) => {}
         }
     }
@@ -325,13 +368,21 @@ fn append_message_items(
     msg: &Message,
     is_current_message: bool,
     compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
 ) {
     match &msg.content {
         MessageContent::Text(text) => {
             append_text_message_item(input, &msg.role, text, is_current_message, compression);
         }
         MessageContent::Blocks(blocks) => {
-            append_block_message_items(input, &msg.role, blocks, is_current_message, compression);
+            append_block_message_items(
+                input,
+                &msg.role,
+                blocks,
+                is_current_message,
+                compression,
+                correlation,
+            );
         }
     }
 }
@@ -355,9 +406,31 @@ fn append_block_message_items(
     blocks: &[Content],
     is_current_message: bool,
     compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
 ) {
     let mut parts = Vec::new();
-    for block in blocks {
+    let mut index = 0;
+    while index < blocks.len() {
+        if let Content::ServerToolUse {
+            id,
+            name,
+            input: args,
+        } = &blocks[index]
+            && name == "web_search"
+        {
+            flush_message_parts(input, role, &mut parts, is_current_message, compression);
+            let results = blocks.get(index + 1).and_then(|next| match next {
+                Content::WebSearchToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == id => Some(content),
+                _ => None,
+            });
+            append_web_search_call(input, id, args, results);
+            index += 1 + usize::from(results.is_some());
+            continue;
+        }
+        let block = &blocks[index];
         append_block_item(
             input,
             role,
@@ -365,7 +438,9 @@ fn append_block_message_items(
             block,
             is_current_message,
             compression,
+            correlation,
         );
+        index += 1;
     }
     flush_message_parts(input, role, &mut parts, is_current_message, compression);
 }
@@ -377,10 +452,24 @@ fn append_block_item(
     block: &Content,
     is_current_message: bool,
     compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
 ) {
     match block {
         Content::Text { text } => parts.push(ResponsesMessagePart::Text(text.clone())),
-        Content::Thinking { .. } => {}
+        Content::Thinking { signature, .. } => {
+            if *role == Role::Assistant
+                && let Some(signature) =
+                    signature.as_deref().filter(|value| is_gpt_signature(value))
+            {
+                flush_message_parts(input, role, parts, is_current_message, compression);
+                input.push(json!({
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": null,
+                    "encrypted_content": signature,
+                }));
+            }
+        }
         Content::ToolUse {
             id,
             name,
@@ -392,7 +481,7 @@ fn append_block_item(
             input: args,
         } => {
             flush_message_parts(input, role, parts, is_current_message, compression);
-            append_function_call(input, id, name, args);
+            append_function_call(input, id, name, args, correlation);
         }
         Content::ToolResult {
             tool_use_id,
@@ -407,19 +496,48 @@ fn append_block_item(
                 *is_error,
                 is_current_message,
                 compression,
+                correlation,
             );
         }
+        Content::WebSearchToolResult { .. } => {}
         Content::Unknown(value) => {
             parts.push(content_part_from_unknown(value));
         }
     }
 }
 
-fn append_function_call(input: &mut Vec<Value>, id: &str, name: &str, args: &Value) {
+fn append_web_search_call(
+    input: &mut Vec<Value>,
+    id: &str,
+    arguments: &Value,
+    results: Option<&Value>,
+) {
+    let mut item = json!({
+        "type": "web_search_call",
+        "id": id,
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": arguments.get("query").and_then(Value::as_str).unwrap_or_default(),
+        }
+    });
+    if let Some(results) = results {
+        item["results"] = results.clone();
+    }
+    input.push(item);
+}
+
+fn append_function_call(
+    input: &mut Vec<Value>,
+    id: &str,
+    name: &str,
+    args: &Value,
+    correlation: &ResponsesCorrelation,
+) {
     input.push(json!({
         "type": "function_call",
-        "call_id": id,
-        "name": name,
+        "call_id": correlation.upstream_call_id(id),
+        "name": correlation.upstream_tool_name(name),
         "arguments": serde_json::to_string(args).unwrap_or_default(),
     }));
 }
@@ -431,6 +549,7 @@ fn append_function_call_output(
     is_error: Option<bool>,
     is_current_message: bool,
     compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
 ) {
     let output = tool_result_output(
         content,
@@ -439,7 +558,7 @@ fn append_function_call_output(
     );
     input.push(json!({
         "type": "function_call_output",
-        "call_id": tool_use_id,
+        "call_id": correlation.upstream_call_id(tool_use_id),
         "output": output,
     }));
 }
@@ -920,27 +1039,43 @@ fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> 
     }
 }
 
-fn convert_tool_with_mode(tool: &Tool, mode: ToolConversionMode) -> ToolConversionResult {
+fn convert_tool_with_mode(
+    tool: &Tool,
+    mode: ToolConversionMode,
+    correlation: &ResponsesCorrelation,
+) -> ToolConversionResult {
+    if tool
+        .extra
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| tool_type.starts_with("web_search"))
+    {
+        return ToolConversionResult {
+            value: convert_web_search_tool(tool),
+            standalone: false,
+        };
+    }
+
     if mode == ToolConversionMode::CodexStandalone
         && tool.name == "Bash"
         && tool_schema_has_string_property(&tool.input_schema, "command")
     {
         return ToolConversionResult {
-            value: convert_bash_freeform_tool(tool),
+            value: convert_bash_freeform_tool(tool, correlation),
             standalone: true,
         };
     }
 
     ToolConversionResult {
-        value: convert_function_tool(tool),
+        value: convert_function_tool(tool, correlation),
         standalone: false,
     }
 }
 
-fn convert_function_tool(tool: &Tool) -> Value {
+fn convert_function_tool(tool: &Tool, correlation: &ResponsesCorrelation) -> Value {
     let mut value = json!({
         "type": "function",
-        "name": tool.name,
+        "name": correlation.upstream_tool_name(&tool.name),
         "parameters": normalize_tool_schema(&tool.input_schema),
     });
 
@@ -951,10 +1086,10 @@ fn convert_function_tool(tool: &Tool) -> Value {
     value
 }
 
-fn convert_bash_freeform_tool(tool: &Tool) -> Value {
+fn convert_bash_freeform_tool(tool: &Tool, correlation: &ResponsesCorrelation) -> Value {
     json!({
         "type": "custom",
-        "name": tool.name,
+        "name": correlation.upstream_tool_name(&tool.name),
         "description": tool.description.as_deref().unwrap_or(
             "Run a shell command. This is a FREEFORM tool, so provide the shell command text directly; do not wrap it in JSON."
         ),
@@ -964,6 +1099,26 @@ fn convert_bash_freeform_tool(tool: &Tool) -> Value {
             "definition": "start: command\ncommand: /[\\s\\S]+/"
         }
     })
+}
+
+fn convert_web_search_tool(tool: &Tool) -> Value {
+    let mut value = json!({"type": "web_search"});
+    let allowed_domains = tool.extra.get("allowed_domains").cloned();
+    let blocked_domains = tool.extra.get("blocked_domains").cloned();
+    if allowed_domains.is_some() || blocked_domains.is_some() {
+        let mut filters = serde_json::Map::new();
+        if let Some(domains) = allowed_domains {
+            filters.insert("allowed_domains".to_string(), domains);
+        }
+        if let Some(domains) = blocked_domains {
+            filters.insert("blocked_domains".to_string(), domains);
+        }
+        value["filters"] = Value::Object(filters);
+    }
+    if let Some(location) = tool.extra.get("user_location") {
+        value["user_location"] = location.clone();
+    }
+    value
 }
 
 fn tool_schema_has_string_property(schema: &Value, property: &str) -> bool {
@@ -978,7 +1133,15 @@ fn tool_schema_has_string_property(schema: &Value, property: &str) -> bool {
 fn normalize_responses_tool_choice(
     tool_choice: &Value,
     standalone_tool_names: &HashSet<String>,
+    native_tool_choices: &HashMap<String, &str>,
+    correlation: &ResponsesCorrelation,
 ) -> Value {
+    if tool_choice.get("type").and_then(Value::as_str) == Some("tool")
+        && let Some(name) = tool_choice.get("name").and_then(Value::as_str)
+        && let Some(native_type) = native_tool_choices.get(name)
+    {
+        return json!({"type": native_type});
+    }
     if tool_choice.get("type").and_then(Value::as_str) == Some("tool")
         && tool_choice
             .get("name")
@@ -988,7 +1151,11 @@ fn normalize_responses_tool_choice(
         return json!("auto");
     }
 
-    normalize_for_responses(tool_choice)
+    let mut normalized = normalize_for_responses(tool_choice);
+    if let Some(name) = normalized.get("name").and_then(Value::as_str) {
+        normalized["name"] = json!(correlation.upstream_tool_name(name));
+    }
+    normalized
 }
 
 fn normalize_tool_schema(schema: &Value) -> Value {
@@ -1005,6 +1172,7 @@ fn normalize_tool_schema(schema: &Value) -> Value {
     }
 
     let mut normalized = object.clone();
+    remove_json_schema_keywords(&mut normalized);
     normalized.insert("type".to_string(), json!("object"));
     if !normalized
         .get("properties")
@@ -1024,6 +1192,25 @@ fn normalize_tool_schema(schema: &Value) -> Value {
     Value::Object(normalized)
 }
 
+fn remove_json_schema_keywords(object: &mut serde_json::Map<String, Value>) {
+    object.remove("$schema");
+    for value in object.values_mut() {
+        remove_json_schema_keywords_from_value(value);
+    }
+}
+
+fn remove_json_schema_keywords_from_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => remove_json_schema_keywords(object),
+        Value::Array(items) => {
+            for item in items {
+                remove_json_schema_keywords_from_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> Option<Value> {
     if let Some(reasoning) = req.extra.get("reasoning") {
         return Some(reasoning_for_model(req, context, reasoning.clone()));
@@ -1040,7 +1227,12 @@ fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> O
         return Some(reasoning_effort_for_context(req, context, effort));
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
-        let effort = default_adaptive_reasoning_effort(&req.model);
+        let effort = req
+            .extra
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| default_adaptive_reasoning_effort(&req.model));
         return Some(reasoning_effort_for_context(req, context, effort));
     }
     if thinking.r#type.as_deref() == Some("enabled") {
@@ -1105,21 +1297,26 @@ pub fn stream_responses_response(
     stream_responses_response_with_observer(response, |_| {})
 }
 
-pub fn stream_responses_response_with_marker_mode(
+pub fn stream_responses_response_with_context(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    stream_responses_response_with_marker_mode_and_observer(response, marker_mode, |_| {})
+    stream_responses_response_with_context_and_observer(response, marker_mode, correlation, |_| {})
 }
 
-pub fn stream_responses_response_with_marker_mode_and_provider_observer(
+pub fn stream_responses_response_with_context_and_provider_observer(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
     observer: Option<ProviderRequestObserver>,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    stream_responses_response_with_marker_mode_and_observer(response, marker_mode, move |event| {
-        notify_stream_metadata(observer.as_ref(), event);
-    })
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        correlation,
+        move |event| notify_stream_metadata(observer.as_ref(), event),
+    )
 }
 
 #[cfg(test)]
@@ -1137,9 +1334,27 @@ where
     )
 }
 
+#[cfg(test)]
 pub fn stream_responses_response_with_marker_mode_and_observer<F>(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
+    on_event: F,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        ResponsesCorrelation::default(),
+        on_event,
+    )
+}
+
+pub fn stream_responses_response_with_context_and_observer<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
     on_event: F,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>>
 where
@@ -1156,7 +1371,7 @@ where
     let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
-        let mut converter = ResponsesStreamConverter::with_marker_mode(marker_mode);
+        let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
         let mut preview = Vec::new();
@@ -1273,9 +1488,10 @@ where
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-pub(crate) fn stream_responses_json_events_with_marker_mode_and_observer<F>(
+pub(crate) fn stream_responses_json_events_with_context_and_observer<F>(
     mut events: mpsc::Receiver<Result<Value, ProviderError>>,
     marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
     on_event: F,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>>
 where
@@ -1285,7 +1501,7 @@ where
     let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
-        let mut converter = ResponsesStreamConverter::with_marker_mode(marker_mode);
+        let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
 
         while let Some(event) = events.recv().await {
             let value = match event {
@@ -1678,9 +1894,24 @@ struct ResponsesStreamConverter {
     function_call_ids: HashMap<u64, String>,
     function_argument_buffers: HashMap<u64, String>,
     function_argument_emitted: HashMap<u64, String>,
+    function_queue: VecDeque<u64>,
+    function_done: HashSet<u64>,
+    function_completed: HashSet<u64>,
+    function_custom: HashSet<u64>,
+    custom_tool_input_buffers: HashMap<u64, String>,
+    custom_tool_input_raw_emitted: HashMap<u64, usize>,
+    active_function: Option<u64>,
+    tool_aliases: HashMap<String, u64>,
+    deferred_events: Vec<Value>,
+    allow_incomplete_tool_metadata: bool,
     custom_tool_input_open: HashSet<u64>,
     custom_tool_input_emitted: HashSet<u64>,
     saw_function_call: bool,
+    reasoning_signatures: HashMap<u64, String>,
+    reasoning_completed: HashSet<u64>,
+    current_reasoning_output: Option<u64>,
+    web_search_completed: HashSet<String>,
+    correlation: ResponsesCorrelation,
     input_tokens: u32,
     output_tokens: u32,
     cache_creation_input_tokens: u32,
@@ -1694,10 +1925,16 @@ impl ResponsesStreamConverter {
         Self::with_marker_mode(ReasoningMarkerMode::Strict)
     }
 
+    #[cfg(test)]
     fn with_marker_mode(marker_mode: ReasoningMarkerMode) -> Self {
+        Self::with_context(marker_mode, ResponsesCorrelation::default())
+    }
+
+    fn with_context(marker_mode: ReasoningMarkerMode, correlation: ResponsesCorrelation) -> Self {
         Self {
             message_id: format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
             reasoning_text: ReasoningTextSplitter::new(marker_mode),
+            correlation,
             ..Default::default()
         }
     }
@@ -1705,6 +1942,11 @@ impl ResponsesStreamConverter {
     fn process_event(&mut self, event: &Value) -> Vec<SseEvent> {
         let mut events = Vec::new();
         let event_type = event["type"].as_str().unwrap_or_default();
+
+        if !self.function_queue.is_empty() && !is_tool_protocol_event(event_type, event) {
+            self.deferred_events.push(event.clone());
+            return events;
+        }
 
         match event_type {
             "response.created" | "response.in_progress" => {
@@ -1771,15 +2013,16 @@ impl ResponsesStreamConverter {
             "response.function_call_arguments.delta" => {
                 self.ensure_started(event.get("response").unwrap_or(event), &mut events);
                 self.flush_reasoning_text(&mut events);
-                let output_index = event["output_index"].as_u64().unwrap_or(0);
+                let output_index = self.tool_output_index(event);
                 let delta = event["delta"].as_str().unwrap_or_default();
                 if !delta.is_empty() {
-                    self.ensure_function_block(output_index, event, &mut events);
+                    self.remember_tool_call_metadata(output_index, event);
+                    self.enqueue_function(output_index, false);
                     self.function_argument_buffers
                         .entry(output_index)
                         .or_default()
                         .push_str(delta);
-                    self.emit_parseable_function_arguments(output_index, event, &mut events);
+                    self.drain_function_queue(&mut events);
                 }
             }
             "response.function_call_arguments.done" => {
@@ -1805,11 +2048,22 @@ impl ResponsesStreamConverter {
                 if let Some(response) = event.get("response") {
                     self.ensure_started(response, &mut events);
                     self.set_usage(response);
+                    self.recover_terminal_tool_calls(response);
+                    self.allow_incomplete_tool_metadata = true;
+                    self.function_done
+                        .extend(self.function_queue.iter().copied());
+                    self.drain_function_queue(&mut events);
+                    self.replay_deferred_events(&mut events);
+                    self.recover_terminal_native_items(response, &mut events);
                     self.flush_reasoning_text(&mut events);
                     self.stop_response(response, &mut events);
                 }
             }
             _ => {}
+        }
+
+        if self.function_queue.is_empty() && !self.deferred_events.is_empty() && !self.stopped {
+            self.replay_deferred_events(&mut events);
         }
 
         events
@@ -1818,6 +2072,11 @@ impl ResponsesStreamConverter {
     fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if self.started && !self.stopped {
+            self.allow_incomplete_tool_metadata = true;
+            self.function_done
+                .extend(self.function_queue.iter().copied());
+            self.drain_function_queue(&mut events);
+            self.replay_deferred_events(&mut events);
             self.flush_reasoning_text(&mut events);
             self.close_open_block(&mut events);
             self.stop_with_reason("end_turn", &mut events);
@@ -1867,7 +2126,13 @@ impl ResponsesStreamConverter {
             self.flush_reasoning_text(events);
             self.saw_function_call = true;
             self.remember_tool_call_metadata(output_index, event);
-            self.ensure_function_block(output_index, event, events);
+            self.enqueue_function(
+                output_index,
+                item["type"].as_str() == Some("custom_tool_call"),
+            );
+            self.drain_function_queue(events);
+        } else if item["type"].as_str() == Some("reasoning") {
+            self.begin_reasoning_item(output_index, item, events);
         }
     }
 
@@ -1908,6 +2173,7 @@ impl ResponsesStreamConverter {
 
         self.flush_reasoning_text(events);
         let key = reasoning_stream_key(event_type, event);
+        self.prepare_reasoning_output(key.1, events);
         let previous = self
             .reasoning_delta_buffers
             .get(&key)
@@ -1959,6 +2225,7 @@ impl ResponsesStreamConverter {
 
         self.flush_reasoning_text(events);
         let key = reasoning_stream_key("response.reasoning_summary_text.delta", event);
+        self.prepare_reasoning_output(key.1, events);
         let previous = self
             .reasoning_delta_buffers
             .get(&key)
@@ -2032,45 +2299,52 @@ impl ResponsesStreamConverter {
     }
 
     fn handle_output_item_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
-        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let output_index = self.tool_output_index(event);
         let item = &event["item"];
         match item["type"].as_str() {
             Some("function_call") => {
                 self.saw_function_call = true;
                 self.remember_tool_call_metadata(output_index, event);
-                let idx = self.ensure_function_block(output_index, event, events);
-                let arguments = item["arguments"].as_str();
-                self.emit_function_arguments(output_index, idx, arguments, false, events);
-                self.close_function_block(output_index, idx, events);
+                self.enqueue_function(output_index, false);
+                if let Some(arguments) = item["arguments"].as_str() {
+                    self.function_argument_buffers
+                        .insert(output_index, arguments.to_string());
+                }
+                self.function_done.insert(output_index);
+                self.drain_function_queue(events);
             }
             Some("custom_tool_call") => {
                 self.saw_function_call = true;
                 self.remember_tool_call_metadata(output_index, event);
-                let idx = self.ensure_function_block(output_index, event, events);
-                self.emit_custom_tool_input_done(output_index, idx, item["input"].as_str(), events);
-                self.close_function_block(output_index, idx, events);
+                self.enqueue_function(output_index, true);
+                if let Some(input) = item["input"].as_str() {
+                    self.custom_tool_input_buffers
+                        .insert(output_index, input.to_string());
+                }
+                self.function_done.insert(output_index);
+                self.drain_function_queue(events);
             }
+            Some("reasoning") => self.finish_reasoning_item(output_index, item, events),
+            Some("web_search_call") => self.emit_web_search_blocks(item, events),
             _ => {}
         }
     }
 
     fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
-        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let output_index = self.tool_output_index(event);
         self.saw_function_call = true;
         self.remember_tool_call_metadata(output_index, event);
-
-        let idx = self.ensure_function_block(output_index, event, events);
-        self.emit_function_arguments(
-            output_index,
-            idx,
-            event["arguments"].as_str(),
-            false,
-            events,
-        );
+        self.enqueue_function(output_index, false);
+        if let Some(arguments) = event["arguments"].as_str() {
+            self.function_argument_buffers
+                .insert(output_index, arguments.to_string());
+        }
+        self.function_done.insert(output_index);
+        self.drain_function_queue(events);
     }
 
     fn handle_custom_tool_call_input_delta(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
-        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let output_index = self.tool_output_index(event);
         let delta = event["delta"].as_str().unwrap_or_default();
         if delta.is_empty() {
             return;
@@ -2078,16 +2352,25 @@ impl ResponsesStreamConverter {
 
         self.saw_function_call = true;
         self.remember_tool_call_metadata(output_index, event);
-        let idx = self.ensure_function_block(output_index, event, events);
-        self.emit_custom_tool_input_delta(output_index, idx, delta, events);
+        self.enqueue_function(output_index, true);
+        self.custom_tool_input_buffers
+            .entry(output_index)
+            .or_default()
+            .push_str(delta);
+        self.drain_function_queue(events);
     }
 
     fn handle_custom_tool_call_input_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
-        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let output_index = self.tool_output_index(event);
         self.saw_function_call = true;
         self.remember_tool_call_metadata(output_index, event);
-        let idx = self.ensure_function_block(output_index, event, events);
-        self.emit_custom_tool_input_done(output_index, idx, event["input"].as_str(), events);
+        self.enqueue_function(output_index, true);
+        if let Some(input) = event["input"].as_str() {
+            self.custom_tool_input_buffers
+                .insert(output_index, input.to_string());
+        }
+        self.function_done.insert(output_index);
+        self.drain_function_queue(events);
     }
 
     fn remember_tool_call_metadata(&mut self, output_index: u64, event: &Value) {
@@ -2103,6 +2386,166 @@ impl ResponsesStreamConverter {
         {
             self.function_call_ids
                 .insert(output_index, call_id.to_string());
+        }
+        for alias in [
+            item["id"].as_str(),
+            item["call_id"].as_str(),
+            event["item_id"].as_str(),
+            event["call_id"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.tool_aliases.insert(alias.to_string(), output_index);
+        }
+    }
+
+    fn tool_output_index(&self, event: &Value) -> u64 {
+        event["output_index"].as_u64().unwrap_or_else(|| {
+            [
+                event["item_id"].as_str(),
+                event["call_id"].as_str(),
+                event["item"]["id"].as_str(),
+                event["item"]["call_id"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|alias| self.tool_aliases.get(alias).copied())
+            .unwrap_or(0)
+        })
+    }
+
+    fn enqueue_function(&mut self, output_index: u64, custom: bool) {
+        if self.function_completed.contains(&output_index)
+            || self.function_queue.contains(&output_index)
+        {
+            return;
+        }
+        self.function_queue.push_back(output_index);
+        if custom {
+            self.function_custom.insert(output_index);
+        }
+    }
+
+    fn drain_function_queue(&mut self, events: &mut Vec<SseEvent>) {
+        loop {
+            let Some(&output_index) = self.function_queue.front() else {
+                self.active_function = None;
+                return;
+            };
+            let done = self.function_done.contains(&output_index);
+            let metadata_ready = self
+                .function_names
+                .get(&output_index)
+                .is_some_and(|name| !name.is_empty());
+            if !(metadata_ready || done && self.allow_incomplete_tool_metadata) {
+                return;
+            }
+
+            if self.active_function != Some(output_index) {
+                self.active_function = Some(output_index);
+                let synthetic = json!({});
+                self.ensure_function_block(output_index, &synthetic, events);
+            }
+            let Some(&idx) = self.function_blocks.get(&output_index) else {
+                return;
+            };
+
+            if self.function_custom.contains(&output_index) {
+                let input = self
+                    .custom_tool_input_buffers
+                    .get(&output_index)
+                    .cloned()
+                    .unwrap_or_default();
+                let emitted = self
+                    .custom_tool_input_raw_emitted
+                    .get(&output_index)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(input.len());
+                if let Some(delta) = input.get(emitted..).filter(|delta| !delta.is_empty()) {
+                    self.emit_custom_tool_input_delta(output_index, idx, delta, events);
+                    self.custom_tool_input_raw_emitted
+                        .insert(output_index, input.len());
+                }
+                if done {
+                    self.emit_custom_tool_input_done(output_index, idx, Some(&input), events);
+                }
+            } else if done {
+                self.emit_function_arguments(output_index, idx, None, false, events);
+            } else {
+                let synthetic = json!({});
+                self.emit_parseable_function_arguments(output_index, &synthetic, events);
+            }
+
+            if !done {
+                return;
+            }
+            self.close_function_block(output_index, idx, events);
+            self.function_queue.pop_front();
+            self.function_done.remove(&output_index);
+            self.function_custom.remove(&output_index);
+            self.custom_tool_input_buffers.remove(&output_index);
+            self.custom_tool_input_raw_emitted.remove(&output_index);
+            self.function_completed.insert(output_index);
+            self.active_function = None;
+        }
+    }
+
+    fn recover_terminal_tool_calls(&mut self, response: &Value) {
+        let Some(output) = response["output"].as_array() else {
+            return;
+        };
+        for (position, item) in output.iter().enumerate() {
+            let Some(item_type) = item["type"].as_str() else {
+                continue;
+            };
+            if !is_responses_tool_call_type(Some(item_type)) {
+                continue;
+            }
+            let output_index = item["output_index"].as_u64().unwrap_or(position as u64);
+            if self.function_completed.contains(&output_index) {
+                continue;
+            }
+            let event = json!({"output_index": output_index, "item": item});
+            self.remember_tool_call_metadata(output_index, &event);
+            self.enqueue_function(output_index, item_type == "custom_tool_call");
+            if item_type == "custom_tool_call" {
+                if let Some(input) = item["input"].as_str() {
+                    self.custom_tool_input_buffers
+                        .insert(output_index, input.to_string());
+                }
+            } else if let Some(arguments) = item["arguments"].as_str() {
+                self.function_argument_buffers
+                    .insert(output_index, arguments.to_string());
+            }
+            self.function_done.insert(output_index);
+        }
+    }
+
+    fn recover_terminal_native_items(&mut self, response: &Value, events: &mut Vec<SseEvent>) {
+        let Some(output) = response["output"].as_array() else {
+            return;
+        };
+        for (position, item) in output.iter().enumerate() {
+            let output_index = item["output_index"].as_u64().unwrap_or(position as u64);
+            match item["type"].as_str() {
+                Some("reasoning") if !self.reasoning_completed.contains(&output_index) => {
+                    self.finish_reasoning_item(output_index, item, events);
+                }
+                Some("web_search_call") => self.emit_web_search_blocks(item, events),
+                _ => {}
+            }
+        }
+    }
+
+    fn replay_deferred_events(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.function_queue.is_empty() || self.deferred_events.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred_events);
+        for event in deferred {
+            events.extend(self.process_event(&event));
         }
     }
 
@@ -2298,6 +2741,134 @@ impl ResponsesStreamConverter {
         events.push(content_delta(idx, "thinking_delta", "thinking", thinking));
     }
 
+    fn begin_reasoning_item(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        self.prepare_reasoning_output(output_index, events);
+        if let Some(signature) = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature))
+        {
+            self.reasoning_signatures
+                .insert(output_index, signature.to_string());
+        }
+    }
+
+    fn prepare_reasoning_output(&mut self, output_index: u64, events: &mut Vec<SseEvent>) {
+        if self.current_reasoning_output == Some(output_index) {
+            return;
+        }
+        if matches!(self.open_block, Some(OpenBlock::Thinking(_))) {
+            self.close_open_block(events);
+        }
+        self.current_reasoning_output = Some(output_index);
+    }
+
+    fn finish_reasoning_item(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        self.prepare_reasoning_output(output_index, events);
+        if let Some(signature) = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature))
+        {
+            self.reasoning_signatures
+                .insert(output_index, signature.to_string());
+        }
+
+        let has_summary = self
+            .reasoning_summary_emitted
+            .iter()
+            .any(|(index, _)| *index == output_index);
+        if !has_summary && let Some(summary) = item["summary"].as_array() {
+            for part in summary {
+                if let Some(text) = part["text"].as_str() {
+                    let text = strip_blank_reasoning_summary_comment_lines(text);
+                    if !text.is_empty() {
+                        self.emit_thinking_content(&text, events);
+                    }
+                }
+            }
+        }
+
+        if let Some(signature) = self.reasoning_signatures.remove(&output_index) {
+            let idx = self.ensure_thinking_block(events);
+            events.push(content_delta(
+                idx,
+                "signature_delta",
+                "signature",
+                &signature,
+            ));
+        }
+        if matches!(self.open_block, Some(OpenBlock::Thinking(_))) {
+            self.close_open_block(events);
+        }
+        self.reasoning_completed.insert(output_index);
+        self.current_reasoning_output = None;
+    }
+
+    fn emit_web_search_blocks(&mut self, item: &Value, events: &mut Vec<SseEvent>) {
+        self.close_open_block(events);
+        let id = item["id"]
+            .as_str()
+            .or_else(|| item["call_id"].as_str())
+            .unwrap_or("web_search_unknown");
+        if !self.web_search_completed.insert(id.to_string()) {
+            return;
+        }
+        let query = item["action"]["query"]
+            .as_str()
+            .or_else(|| item["query"].as_str())
+            .unwrap_or_default();
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        });
+        if !query.is_empty() {
+            events.push(content_delta(
+                idx,
+                "input_json_delta",
+                "partial_json",
+                &json!({"query": query}).to_string(),
+            ));
+        }
+        events.push(block_stop(idx));
+
+        let content = web_search_result_content(item);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                }
+            }),
+        });
+        events.push(block_stop(idx));
+    }
+
     fn ensure_text_block(
         &mut self,
         output_index: u64,
@@ -2379,6 +2950,8 @@ impl ResponsesStreamConverter {
             .map(str::to_string)
             .or_else(|| self.function_names.get(&output_index).cloned())
             .unwrap_or_default();
+        let call_id = self.correlation.anthropic_call_id(&call_id).to_string();
+        let name = self.correlation.anthropic_tool_name(&name).to_string();
         events.push(SseEvent {
             event: "content_block_start".to_string(),
             data: json!({
@@ -2479,6 +3052,16 @@ impl ResponsesStreamConverter {
 }
 
 fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static str {
+    if let Some(reason) = response["stop_reason"].as_str() {
+        return match reason {
+            "max_output_tokens" | "max_tokens" | "length" => "max_tokens",
+            "tool_use" | "tool_calls" => "tool_use",
+            "stop_sequence" => "stop_sequence",
+            "content_filter" | "content_policy_violation" | "refusal" => "refusal",
+            "error" => "error",
+            _ => "end_turn",
+        };
+    }
     if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
         return match reason {
             "max_output_tokens" | "max_tokens" => "max_tokens",
@@ -2506,6 +3089,22 @@ fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static s
 
 fn is_responses_tool_call_type(item_type: Option<&str>) -> bool {
     matches!(item_type, Some("function_call") | Some("custom_tool_call"))
+}
+
+fn is_tool_protocol_event(event_type: &str, event: &Value) -> bool {
+    match event_type {
+        "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done"
+        | "response.custom_tool_call_input.delta"
+        | "response.custom_tool_call_input.done"
+        | "response.completed"
+        | "response.incomplete"
+        | "response.failed" => true,
+        "response.output_item.added" | "response.output_item.done" => {
+            is_responses_tool_call_type(event["item"]["type"].as_str())
+        }
+        _ => false,
+    }
 }
 
 fn custom_tool_input_arguments(tool_name: &str, input: &str) -> String {
@@ -2557,16 +3156,43 @@ fn block_stop(index: u32) -> SseEvent {
     }
 }
 
+fn web_search_result_content(item: &Value) -> Vec<Value> {
+    item["results"]
+        .as_array()
+        .or_else(|| item["action"]["sources"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let url = result["url"].as_str()?;
+            Some(json!({
+                "type": "web_search_result",
+                "title": result["title"].as_str().unwrap_or(url),
+                "url": url,
+                "page_age": result.get("page_age").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
     convert_non_streaming_response_with_marker_mode(data, ReasoningMarkerMode::Strict)
 }
 
+#[cfg(test)]
 pub fn convert_non_streaming_response_with_marker_mode(
     data: &Value,
     marker_mode: ReasoningMarkerMode,
 ) -> Vec<SseEvent> {
-    let mut converter = NonStreamingResponsesConverter::new(data, marker_mode);
+    convert_non_streaming_response_with_context(data, marker_mode, ResponsesCorrelation::default())
+}
+
+pub fn convert_non_streaming_response_with_context(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+) -> Vec<SseEvent> {
+    let mut converter = NonStreamingResponsesConverter::new(data, marker_mode, correlation);
     converter.convert()
 }
 
@@ -2579,10 +3205,15 @@ struct NonStreamingResponsesConverter<'a> {
     cache_creation_input_tokens: u32,
     cache_read_input_tokens: u32,
     marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
 }
 
 impl<'a> NonStreamingResponsesConverter<'a> {
-    fn new(data: &'a Value, marker_mode: ReasoningMarkerMode) -> Self {
+    fn new(
+        data: &'a Value,
+        marker_mode: ReasoningMarkerMode,
+        correlation: ResponsesCorrelation,
+    ) -> Self {
         let usage = provider_usage_from_responses_usage(&data["usage"]);
         Self {
             data,
@@ -2593,6 +3224,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             cache_creation_input_tokens: u64_to_u32_saturating(usage.cache_creation_input_tokens),
             cache_read_input_tokens: u64_to_u32_saturating(usage.cache_read_input_tokens),
             marker_mode,
+            correlation,
         }
     }
 
@@ -2626,6 +3258,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                     Some("function_call") => self.convert_function_call(item),
                     Some("custom_tool_call") => self.convert_custom_tool_call(item),
                     Some("reasoning") => self.convert_reasoning_item(item),
+                    Some("web_search_call") => self.convert_web_search_call(item),
                     _ => {}
                 }
             }
@@ -2696,8 +3329,8 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                 "index": idx,
                 "content_block": {
                     "type": "tool_use",
-                    "id": item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown"),
-                    "name": item["name"].as_str().unwrap_or(""),
+                    "id": self.correlation.anthropic_call_id(item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown")),
+                    "name": self.correlation.anthropic_tool_name(item["name"].as_str().unwrap_or("")),
                     "input": input
                 }
             }),
@@ -2723,8 +3356,8 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                 "index": idx,
                 "content_block": {
                     "type": "tool_use",
-                    "id": item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown"),
-                    "name": item["name"].as_str().unwrap_or(""),
+                    "id": self.correlation.anthropic_call_id(item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown")),
+                    "name": self.correlation.anthropic_tool_name(item["name"].as_str().unwrap_or("")),
                     "input": input
                 }
             }),
@@ -2733,10 +3366,13 @@ impl<'a> NonStreamingResponsesConverter<'a> {
     }
 
     fn convert_reasoning_item(&mut self, item: &Value) {
+        let signature = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature));
         if let Some(text) = item["text"].as_str()
             && !text.is_empty()
         {
-            self.add_thinking_block(text);
+            self.add_thinking_block(text, signature);
             return;
         }
 
@@ -2752,15 +3388,58 @@ impl<'a> NonStreamingResponsesConverter<'a> {
             }
         }
         if !summaries.is_empty() {
-            self.add_thinking_block(&summaries.join("\n"));
+            self.add_thinking_block(&summaries.join("\n"), signature);
+        } else if signature.is_some() {
+            self.add_thinking_block("", signature);
         }
+    }
+
+    fn convert_web_search_call(&mut self, item: &Value) {
+        let id = item["id"].as_str().unwrap_or("web_search_unknown");
+        let query = item["action"]["query"]
+            .as_str()
+            .or_else(|| item["query"].as_str())
+            .unwrap_or_default();
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": {"query": query}
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+
+        let content = web_search_result_content(item);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
     }
 
     fn add_text_block(&mut self, text: &str) {
         for segment in split_text(text, self.marker_mode) {
             match segment {
                 TextSegment::Text(text) => self.add_plain_text_block(&text),
-                TextSegment::Reasoning(thinking) => self.add_thinking_block(&thinking),
+                TextSegment::Reasoning(thinking) => self.add_thinking_block(&thinking, None),
             }
         }
     }
@@ -2785,7 +3464,7 @@ impl<'a> NonStreamingResponsesConverter<'a> {
         self.events.push(block_stop(idx));
     }
 
-    fn add_thinking_block(&mut self, text: &str) {
+    fn add_thinking_block(&mut self, text: &str, signature: Option<&str>) {
         let idx = self.next_block_index;
         self.next_block_index += 1;
         self.events.push(SseEvent {
@@ -2796,8 +3475,18 @@ impl<'a> NonStreamingResponsesConverter<'a> {
                 "content_block": {"type": "thinking", "thinking": ""}
             }),
         });
-        self.events
-            .push(content_delta(idx, "thinking_delta", "thinking", text));
+        if !text.is_empty() {
+            self.events
+                .push(content_delta(idx, "thinking_delta", "thinking", text));
+        }
+        if let Some(signature) = signature {
+            self.events.push(content_delta(
+                idx,
+                "signature_delta",
+                "signature",
+                signature,
+            ));
+        }
         self.events.push(block_stop(idx));
     }
 }
@@ -2807,6 +3496,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -3456,6 +4146,7 @@ mod tests {
                 name: "weather".to_string(),
                 description: Some("Get weather".to_string()),
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: Some(ThinkingConfig {
@@ -3894,6 +4585,7 @@ mod tests {
                     name: "empty".to_string(),
                     description: None,
                     input_schema: json!({}),
+                    extra: Default::default(),
                 },
                 Tool {
                     name: "bad_required".to_string(),
@@ -3903,11 +4595,13 @@ mod tests {
                         "properties": {"path": {"type": "string"}},
                         "required": "path"
                     }),
+                    extra: Default::default(),
                 },
                 Tool {
                     name: "non_object".to_string(),
                     description: None,
                     input_schema: json!({"type": "string"}),
+                    extra: Default::default(),
                 },
             ]),
             tool_choice: None,
@@ -4012,6 +4706,7 @@ mod tests {
                 name: "lookup".to_string(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -5743,6 +6438,300 @@ mod tests {
             sanitize_tool_arguments("Other", "{\"pages\":\"\",\"value\":\"\"}"),
             None
         );
+    }
+
+    fn valid_gpt_signature(seed: u8) -> String {
+        let mut payload = vec![0_u8; 73];
+        payload[0] = 0x80;
+        payload[16] = seed;
+        base64::engine::general_purpose::URL_SAFE.encode(payload)
+    }
+
+    fn assert_anthropic_block_lifecycle(events: &[SseEvent]) {
+        let mut open = None;
+        let mut stopped = false;
+        let mut seen_indices = HashSet::new();
+        for event in events {
+            assert!(!stopped, "event emitted after message_stop: {event:?}");
+            match event.event.as_str() {
+                "content_block_start" => {
+                    assert!(open.is_none(), "content blocks overlap");
+                    let index = event.data["index"].as_u64().expect("block index");
+                    assert!(seen_indices.insert(index), "block index reused");
+                    open = Some(index);
+                }
+                "content_block_delta" => {
+                    assert_eq!(
+                        open,
+                        event.data["index"].as_u64(),
+                        "delta targets a block that is not open"
+                    );
+                }
+                "content_block_stop" => {
+                    assert_eq!(open, event.data["index"].as_u64());
+                    open = None;
+                }
+                "message_delta" => assert!(open.is_none()),
+                "message_stop" => {
+                    assert!(open.is_none());
+                    stopped = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn signed_reasoning_round_trips_through_request_stream_and_non_stream() {
+        let signature = valid_gpt_signature(7);
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "summary",
+                    "signature": signature
+                }]
+            }]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request);
+        assert_eq!(body["input"][0]["type"], "reasoning");
+        assert_eq!(body["input"][0]["encrypted_content"], signature);
+
+        let early_signature = valid_gpt_signature(8);
+        let final_signature = valid_gpt_signature(9);
+        let mut converter = ResponsesStreamConverter::new();
+        let upstream = [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"reasoning","encrypted_content":early_signature}
+            }),
+            json!({
+                "type":"response.reasoning_summary_text.delta",
+                "output_index":0,
+                "summary_index":0,
+                "delta":"summary"
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "summary":[{"type":"summary_text","text":"summary"}],
+                    "encrypted_content":final_signature
+                }
+            }),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ];
+        let events = upstream
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        assert_anthropic_block_lifecycle(&events);
+        let signatures = events
+            .iter()
+            .filter_map(|event| event.data["delta"]["signature"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(signatures, vec![final_signature.as_str()]);
+
+        let data = json!({
+            "id":"resp_1",
+            "model":"gpt-5",
+            "status":"completed",
+            "output":[{"type":"reasoning","summary":[],"encrypted_content":final_signature}],
+            "usage":{}
+        });
+        let events = convert_non_streaming_response(&data);
+        assert_anthropic_block_lifecycle(&events);
+        assert!(events.iter().any(|event| {
+            event.data["delta"]["type"] == "signature_delta"
+                && event.data["delta"]["signature"] == final_signature
+        }));
+    }
+
+    #[test]
+    fn parallel_function_calls_are_serialized_and_deferred_text_is_replayed() {
+        let mut converter = ResponsesStreamConverter::new();
+        let upstream = [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"item_a","call_id":"call_a","name":"first"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item_b","call_id":"call_b","name":"second"}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item_b","delta":"{\"b\":2}"}),
+            json!({"type":"response.output_text.delta","output_index":2,"content_index":0,"delta":"after tools"}),
+            json!({"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"b\":2}"}),
+            json!({"type":"response.function_call_arguments.done","call_id":"call_a","arguments":"{\"a\":1}"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ];
+        let events = upstream
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        assert_anthropic_block_lifecycle(&events);
+        let block_types = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_start")
+                    .then(|| event.data["content_block"]["type"].as_str())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(block_types, vec!["tool_use", "tool_use", "text"]);
+    }
+
+    #[test]
+    fn function_block_waits_for_name_from_output_item_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = converter.process_event(&json!({
+            "type":"response.created",
+            "response":{"id":"resp_1","model":"gpt-5"}
+        }));
+        events.extend(converter.process_event(&json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","id":"item_1","call_id":"call_1"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type":"response.function_call_arguments.done",
+            "item_id":"item_1",
+            "arguments":"{\"path\":\"a\"}"
+        })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| { event.data["content_block"]["type"] == "tool_use" })
+        );
+
+        events.extend(converter.process_event(&json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":{
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"Read",
+                "arguments":"{\"path\":\"a\"}"
+            }
+        })));
+        assert_anthropic_block_lifecycle(&events);
+        let start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(start.data["content_block"]["name"], "Read");
+    }
+
+    #[test]
+    fn request_maps_native_web_search_parallel_choice_effort_and_identifiers() {
+        let long_name = "tool/".repeat(20);
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "thinking":{"type":"adaptive"},
+            "output_config":{"effort":"low"},
+            "tool_choice":{"type":"auto","disable_parallel_tool_use":true},
+            "tools":[
+                {
+                    "type":"web_search_20250305",
+                    "name":"web_search",
+                    "allowed_domains":["example.com"],
+                    "blocked_domains":["bad.example"],
+                    "user_location":{"type":"approximate","country":"CN"}
+                },
+                {
+                    "name":long_name,
+                    "input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}
+                }
+            ]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(
+            body["tools"][0]["filters"]["allowed_domains"][0],
+            "example.com"
+        );
+        assert_eq!(
+            body["tools"][0]["filters"]["blocked_domains"][0],
+            "bad.example"
+        );
+        assert_eq!(body["tools"][0]["user_location"]["country"], "CN");
+        let mapped_name = body["tools"][1]["name"].as_str().unwrap();
+        assert!(mapped_name.len() <= RESPONSES_IDENTIFIER_MAX_BYTES);
+        assert!(
+            !body["tools"][1]["parameters"]
+                .as_object()
+                .unwrap()
+                .contains_key("$schema")
+        );
+    }
+
+    #[test]
+    fn request_replays_native_web_search_history_as_a_responses_output_item() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":[
+                        {
+                            "type":"server_tool_use",
+                            "id":"ws_1",
+                            "name":"web_search",
+                            "input":{"query":"rust"}
+                        },
+                        {
+                            "type":"web_search_tool_result",
+                            "tool_use_id":"ws_1",
+                            "content":[{"type":"web_search_result","title":"Rust","url":"https://www.rust-lang.org/"}]
+                        }
+                    ]
+                },
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request);
+        assert_eq!(body["input"][0]["type"], "web_search_call");
+        assert_eq!(body["input"][0]["id"], "ws_1");
+        assert_eq!(body["input"][0]["action"]["query"], "rust");
+        assert_eq!(
+            body["input"][0]["results"][0]["url"],
+            "https://www.rust-lang.org/"
+        );
+    }
+
+    #[test]
+    fn non_streaming_web_search_maps_to_anthropic_server_blocks() {
+        let data = json!({
+            "id":"resp_1",
+            "model":"gpt-5",
+            "status":"completed",
+            "output":[{
+                "type":"web_search_call",
+                "id":"ws_1",
+                "action":{
+                    "query":"rust",
+                    "sources":[{"title":"Rust","url":"https://www.rust-lang.org/"}]
+                }
+            }],
+            "usage":{}
+        });
+        let events = convert_non_streaming_response(&data);
+        assert_anthropic_block_lifecycle(&events);
+        let types = events
+            .iter()
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(types, vec!["server_tool_use", "web_search_tool_result"]);
+        assert!(events.iter().any(|event| {
+            event.data["content_block"]["content"][0]["url"] == "https://www.rust-lang.org/"
+        }));
     }
 
     fn text_and_thinking_deltas(events: &[SseEvent]) -> Vec<(String, String)> {

@@ -82,6 +82,7 @@ pub(super) fn convert_request(req: &MessagesRequest) -> Value {
                                 parts.push(part);
                             }
                         }
+                        Content::WebSearchToolResult { .. } => {}
                     }
                 }
 

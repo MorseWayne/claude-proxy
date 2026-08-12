@@ -97,6 +97,7 @@ fn keep_content_block(block: &mut Content, stats: &mut SanitizeStats) -> bool {
         Content::ToolUse { .. }
         | Content::ToolResult { .. }
         | Content::ServerToolUse { .. }
+        | Content::WebSearchToolResult { .. }
         | Content::Unknown(_) => true,
     }
 }
@@ -266,6 +267,7 @@ mod tests {
             name: "lookup".to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            extra: Default::default(),
         }]);
         request
             .extra
@@ -344,6 +346,7 @@ mod tests {
             name: "example".to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            extra: Default::default(),
         }]);
         request.thinking = Some(ThinkingConfig {
             r#type: Some("enabled".to_string()),

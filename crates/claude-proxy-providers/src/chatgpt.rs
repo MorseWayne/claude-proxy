@@ -359,6 +359,7 @@ impl ResponsesLiteDecision {
 #[derive(Clone)]
 struct ChatGptPreparedRequest {
     body: Value,
+    responses_correlation: crate::responses::ResponsesCorrelation,
     marker_mode: ReasoningMarkerMode,
     compact_request: bool,
     request_id: u64,
@@ -367,6 +368,15 @@ struct ChatGptPreparedRequest {
     responses_lite: ResponsesLiteDecision,
     observer: Option<ProviderRequestObserver>,
     pending_context_usage: Option<PendingContextUsage>,
+}
+
+struct ChatGptSseStreamContext {
+    marker_mode: ReasoningMarkerMode,
+    request_id: u64,
+    compact_request: bool,
+    observer: Option<ProviderRequestObserver>,
+    pending_context_usage: Option<PendingContextUsage>,
+    responses_correlation: crate::responses::ResponsesCorrelation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1356,6 +1366,7 @@ impl ChatGptProvider {
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
         let ChatGptPreparedRequest {
             mut body,
+            responses_correlation,
             marker_mode,
             compact_request,
             request_id,
@@ -1413,11 +1424,14 @@ impl ChatGptProvider {
         Ok(self
             .stream_sse_response(
                 response,
-                marker_mode,
-                request_id,
-                compact_request,
-                observer,
-                pending_context_usage,
+                ChatGptSseStreamContext {
+                    marker_mode,
+                    request_id,
+                    compact_request,
+                    observer,
+                    pending_context_usage,
+                    responses_correlation,
+                },
             )
             .await)
     }
@@ -1486,6 +1500,7 @@ impl ChatGptProvider {
     > {
         let ChatGptPreparedRequest {
             body,
+            responses_correlation,
             marker_mode,
             compact_request,
             request_id,
@@ -1542,6 +1557,7 @@ impl ChatGptProvider {
                 responses_lite,
             },
             on_event,
+            responses_correlation,
         )
         .await
         .inspect_err(|_| {
@@ -1608,12 +1624,16 @@ impl ChatGptProvider {
     async fn stream_sse_response(
         &self,
         response: Response,
-        marker_mode: claude_proxy_config::settings::ReasoningMarkerMode,
-        request_id: u64,
-        compact_request: bool,
-        observer: Option<ProviderRequestObserver>,
-        pending_context_usage: Option<PendingContextUsage>,
+        context: ChatGptSseStreamContext,
     ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+        let ChatGptSseStreamContext {
+            marker_mode,
+            request_id,
+            compact_request,
+            observer,
+            pending_context_usage,
+            responses_correlation,
+        } = context;
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
         log_rate_limit_summary(
@@ -1637,7 +1657,12 @@ impl ChatGptProvider {
             observer,
             pending_context_usage,
         });
-        let stream = responses::stream_response_with_marker_mode(response, marker_mode, on_event);
+        let stream = responses::stream_response_with_marker_mode_and_context(
+            response,
+            marker_mode,
+            responses_correlation,
+            on_event,
+        );
         wrap_chatgpt_stream_logging(
             stream,
             request_id,
@@ -2258,6 +2283,9 @@ impl Provider for ChatGptProvider {
         self.chat_prepared_with_token(
             ChatGptPreparedRequest {
                 body,
+                responses_correlation: crate::responses::ResponsesCorrelation::from_request(
+                    &request,
+                ),
                 marker_mode,
                 compact_request,
                 request_id,
@@ -4846,6 +4874,7 @@ mod tests {
                 name: "spawn_agent".to_string(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -5120,6 +5149,7 @@ mod tests {
                 name: "Read".to_string(),
                 description: None,
                 input_schema: json!({"type": "object", "properties": {}}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -5293,6 +5323,7 @@ mod tests {
                 name: "Read".to_string(),
                 description: None,
                 input_schema: json!({"type": "object", "properties": {}}),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -5629,6 +5660,7 @@ mod tests {
                         },
                         "required": ["command"]
                     }),
+                    extra: Default::default(),
                 },
                 Tool {
                     name: "Read".to_string(),
@@ -5638,6 +5670,7 @@ mod tests {
                         "properties": {"file_path": {"type": "string"}},
                         "required": ["file_path"]
                     }),
+                    extra: Default::default(),
                 },
             ]),
             tool_choice: Some(json!({"type": "tool", "name": "Bash"})),
@@ -5682,6 +5715,7 @@ mod tests {
                     },
                     "required": ["command"]
                 }),
+                extra: Default::default(),
             }]),
             tool_choice: Some(json!({"type": "tool", "name": "Bash"})),
             thinking: None,
@@ -5735,6 +5769,7 @@ mod tests {
                     },
                     "required": ["command"]
                 }),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -5814,6 +5849,7 @@ mod tests {
                     "properties": {"file_path": {"type": "string"}},
                     "required": "file_path"
                 }),
+                extra: Default::default(),
             }]),
             tool_choice: None,
             thinking: None,
@@ -7835,6 +7871,7 @@ mod tests {
     ) -> ChatGptPreparedRequest {
         ChatGptPreparedRequest {
             body,
+            responses_correlation: crate::responses::ResponsesCorrelation::default(),
             marker_mode: ReasoningMarkerMode::Strict,
             compact_request: false,
             request_id,

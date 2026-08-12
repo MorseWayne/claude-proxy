@@ -984,6 +984,9 @@ fn add_content_stats(content: &Content, stats: &mut RequestPayloadStats) {
         Content::Unknown(value) => {
             stats.text_bytes += json_text_bytes(value);
         }
+        Content::WebSearchToolResult { content, .. } => {
+            stats.text_bytes += json_text_bytes(content);
+        }
         Content::ToolUse { .. } | Content::ServerToolUse { .. } => {}
     }
 }
@@ -3519,6 +3522,7 @@ mod tests {
             name: "read".to_string(),
             description: None,
             input_schema: json!({"type": "object"}),
+            extra: Default::default(),
         }]);
         request.tool_choice = Some(json!({"type": "auto"}));
         request

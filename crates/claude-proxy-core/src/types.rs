@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// Anthropic Messages API request.
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +215,10 @@ pub enum Content {
         name: String,
         input: Value,
     },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
     Unknown(Value),
 }
 
@@ -273,6 +277,15 @@ impl Serialize for Content {
                 "input": input,
             })
             .serialize(serializer),
+            Content::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => json!({
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+            })
+            .serialize(serializer),
             Content::Unknown(value) => value.serialize(serializer),
         }
     }
@@ -313,6 +326,13 @@ struct ToolResultContent {
     is_error: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct WebSearchToolResultContent {
+    tool_use_id: String,
+    #[serde(default)]
+    content: Value,
+}
+
 fn deserialize_content(value: Value) -> Result<Content, String> {
     let Some(content_type) = value.get("type").and_then(Value::as_str) else {
         return Ok(Content::Unknown(value));
@@ -349,16 +369,48 @@ fn deserialize_content(value: Value) -> Result<Content, String> {
                 input: content.input,
             })
             .map_err(|err| format!("invalid server_tool_use content block: {err}")),
+        "web_search_tool_result" => serde_json::from_value::<WebSearchToolResultContent>(value)
+            .map(|content| Content::WebSearchToolResult {
+                tool_use_id: content.tool_use_id,
+                content: content.content,
+            })
+            .map_err(|err| format!("invalid web_search_tool_result content block: {err}")),
         _ => Ok(Content::Unknown(value)),
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Tool {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Provider-native tool attributes that are not part of a function tool.
+    ///
+    /// Anthropic server tools (for example `web_search_20250305`) carry their
+    /// configuration next to `name`. Keeping those fields losslessly is
+    /// required for translating them to another provider's native tool shape.
+    pub extra: Map<String, Value>,
+}
+
+impl Serialize for Tool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut object = self.extra.clone();
+        object.insert("name".to_string(), json!(self.name));
+        if let Some(description) = &self.description {
+            object.insert("description".to_string(), json!(description));
+        }
+        let native_tool = object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|tool_type| tool_type != "function");
+        if !native_tool {
+            object.insert("input_schema".to_string(), self.input_schema.clone());
+        }
+        Value::Object(object).serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for Tool {
@@ -395,10 +447,20 @@ fn deserialize_tool(value: Value) -> Result<Tool, String> {
         .or_else(|| object.remove("parameters"))
         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
 
+    // The OpenAI `{type:function,function:{...}}` wrapper is normalized into
+    // the common fields above. Preserve every other provider-native field.
+    if object.get("type").and_then(Value::as_str) == Some("function") {
+        object.remove("type");
+    }
+    for (key, value) in function {
+        object.entry(key).or_insert(value);
+    }
+
     Ok(Tool {
         name,
         description,
         input_schema,
+        extra: object,
     })
 }
 
@@ -1125,5 +1187,22 @@ mod tests {
             tool.input_schema,
             json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test]
+    fn native_web_search_tool_round_trips_without_function_schema() {
+        let input = json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+            "allowed_domains": ["example.com"],
+            "blocked_domains": ["bad.example"],
+            "user_location": {"type": "approximate", "country": "CN"}
+        });
+        let tool: Tool = serde_json::from_value(input.clone()).unwrap();
+        let output = serde_json::to_value(tool).unwrap();
+
+        assert_eq!(output, input);
+        assert!(output.get("input_schema").is_none());
     }
 }

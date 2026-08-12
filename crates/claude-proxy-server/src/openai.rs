@@ -1258,6 +1258,7 @@ fn convert_tools(
                     .or_else(|| function.get("input_schema"))
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                extra: Map::new(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

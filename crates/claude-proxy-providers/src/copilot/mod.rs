@@ -277,6 +277,7 @@ impl CopilotProvider {
         token: &str,
         initiator: &str,
     ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+        let correlation = crate::responses::ResponsesCorrelation::from_request(&request);
         let url = format!("{}/responses", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
         let headers = self.build_headers(token, vision, initiator);
@@ -295,18 +296,18 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(
-                crate::responses::stream_responses_response_with_marker_mode(
-                    response,
-                    marker_mode_from_request(&request),
-                ),
-            )
+            Ok(crate::responses::stream_responses_response_with_context(
+                response,
+                marker_mode_from_request(&request),
+                correlation,
+            ))
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::responses::convert_non_streaming_response_with_marker_mode(
+            let events = crate::responses::convert_non_streaming_response_with_context(
                 &data,
                 marker_mode_from_request(&request),
+                correlation,
             );
             let stream = futures::stream::iter(events.into_iter().map(Ok));
             Ok(Box::pin(stream))

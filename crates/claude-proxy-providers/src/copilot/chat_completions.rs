@@ -77,6 +77,7 @@ pub(super) fn convert_to_openai_chat(req: &MessagesRequest) -> Value {
                             continue;
                         }
                         Content::Unknown(_) => {}
+                        Content::WebSearchToolResult { .. } => {}
                     }
                 }
                 if !parts.is_empty() {
