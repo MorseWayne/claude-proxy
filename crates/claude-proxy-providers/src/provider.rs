@@ -5,6 +5,58 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// A provider response event with a protocol-neutral normalized view and an
+/// optional lossless source-protocol view.
+///
+/// Normalized events are Anthropic Messages events today because they are the
+/// common denominator consumed by all existing downstream adapters. Native
+/// events preserve richer upstream semantics so a matching downstream can
+/// encode them without a lossy round trip through that common denominator.
+#[derive(Debug, Clone)]
+pub struct ProviderEvent {
+    normalized: Vec<SseEvent>,
+    native: Option<NativeProviderEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NativeProviderEvent {
+    OpenAiResponses(SseEvent),
+}
+
+impl ProviderEvent {
+    pub fn normalized(events: Vec<SseEvent>) -> Self {
+        Self {
+            normalized: events,
+            native: None,
+        }
+    }
+
+    pub fn openai_responses(native: SseEvent, normalized: Vec<SseEvent>) -> Self {
+        Self {
+            normalized,
+            native: Some(NativeProviderEvent::OpenAiResponses(native)),
+        }
+    }
+
+    pub fn normalized_events(&self) -> &[SseEvent] {
+        &self.normalized
+    }
+
+    pub fn into_normalized_events(self) -> Vec<SseEvent> {
+        self.normalized
+    }
+
+    pub fn native_event(&self) -> Option<&NativeProviderEvent> {
+        self.native.as_ref()
+    }
+}
+
+impl From<SseEvent> for ProviderEvent {
+    fn from(event: SseEvent) -> Self {
+        Self::normalized(vec![event])
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("authentication failed: {0}")]
@@ -270,17 +322,17 @@ pub trait Provider: Send + Sync {
     /// Provider identifier (e.g., "openai", "anthropic").
     fn id(&self) -> &str;
 
-    /// Send a chat request and return a stream of SSE events.
+    /// Send a chat request and return a stream of normalized provider events.
     async fn chat(
         &self,
         request: MessagesRequest,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError>;
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>;
 
     async fn chat_with_observer(
         &self,
         request: MessagesRequest,
         _observer: Option<ProviderRequestObserver>,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         self.chat(request).await
     }
 

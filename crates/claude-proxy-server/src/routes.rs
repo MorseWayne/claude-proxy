@@ -15,7 +15,7 @@ use claude_proxy_core::*;
 use claude_proxy_providers::chatgpt::{CLAUDE_CODE_CONTEXT_1M_BETA, VIRTUAL_CONTEXT_1M_EXTRA_KEY};
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
-    Provider, ProviderError, ProviderRequestMetadata, ProviderRequestObserver,
+    Provider, ProviderError, ProviderEvent, ProviderRequestMetadata, ProviderRequestObserver,
     ProviderRequestObserverEvent, ProviderRequestObserverEventKind, ProviderUsageMetadata,
     UpstreamErrorMetadata,
 };
@@ -1429,7 +1429,7 @@ async fn send_stream_frames(
 async fn stream_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
-    mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    mut stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     context: LeaderResponseContext,
 ) -> Response {
     let LeaderResponseContext {
@@ -1494,13 +1494,15 @@ async fn stream_leader_response(
                             if let Some(context) = &observability {
                                 timing.record_event(context.start, now, context.idle_gap_ms);
                             }
-                            extract_usage_from_event(&event.data, &mut usage);
-                            if sse_event_starts_tool_use(&event) {
+                            for normalized in event.normalized_events() {
+                                extract_usage_from_event(&normalized.data, &mut usage);
+                            }
+                            if provider_event_starts_tool_use(&event) {
                                 tool_use_pending = true;
                                 tool_use_deadline.as_mut().reset(
                                     TokioInstant::now() + stream_config.tool_use_terminal_timeout,
                                 );
-                            } else if sse_event_finishes_message(&event) {
+                            } else if provider_event_finishes_message(&event) {
                                 tool_use_pending = false;
                             } else if tool_use_pending {
                                 tool_use_deadline.as_mut().reset(
@@ -1510,7 +1512,7 @@ async fn stream_leader_response(
                             metrics
                                 .update_active_stream(
                                     &request_id,
-                                    sse_event_type(&event),
+                                    provider_event_type(&event),
                                     tool_use_pending,
                                 )
                                 .await;
@@ -1680,7 +1682,7 @@ async fn stream_leader_response(
 async fn collect_leader_response(
     state: &AppState,
     request: &RequestMetricsContext,
-    mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    mut stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     context: LeaderResponseContext,
 ) -> Response {
     let LeaderResponseContext {
@@ -1707,7 +1709,9 @@ async fn collect_leader_response(
                         context.idle_gap_ms,
                     );
                 }
-                extract_usage_from_event(&event.data, &mut usage);
+                for normalized in event.normalized_events() {
+                    extract_usage_from_event(&normalized.data, &mut usage);
+                }
                 let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
                 events.push(event);
             }
@@ -2157,8 +2161,22 @@ fn sse_event_starts_tool_use(event: &SseEvent) -> bool {
         && event.data["content_block"]["type"].as_str() == Some("tool_use")
 }
 
+fn provider_event_starts_tool_use(event: &ProviderEvent) -> bool {
+    event
+        .normalized_events()
+        .iter()
+        .any(sse_event_starts_tool_use)
+}
+
 fn sse_event_finishes_message(event: &SseEvent) -> bool {
     event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
+}
+
+fn provider_event_finishes_message(event: &ProviderEvent) -> bool {
+    event
+        .normalized_events()
+        .iter()
+        .any(sse_event_finishes_message)
 }
 
 fn sse_event_type(event: &SseEvent) -> String {
@@ -2169,6 +2187,19 @@ fn sse_event_type(event: &SseEvent) -> String {
         .or_else(|| (!event.event.is_empty()).then_some(event.event.as_str()))
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn provider_event_type(event: &ProviderEvent) -> String {
+    match event.native_event() {
+        Some(claude_proxy_providers::NativeProviderEvent::OpenAiResponses(event)) => {
+            sse_event_type(event)
+        }
+        None => event
+            .normalized_events()
+            .last()
+            .map(sse_event_type)
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
 }
 
 fn format_timeout_duration(duration: Duration) -> String {
@@ -2944,7 +2975,8 @@ mod tests {
             initiator: "user",
         };
         let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(2);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(2);
         let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
             .acquire_owned()
             .await
@@ -2979,7 +3011,8 @@ mod tests {
                         "type": "content_block_delta",
                         "delta": {"text": text}
                     }),
-                }))
+                }
+                .into()))
                 .await
                 .unwrap();
         }
@@ -2993,7 +3026,12 @@ mod tests {
                 .unwrap();
             match event {
                 InflightEvent::Event(event) => {
-                    received.push(event.data["delta"]["text"].as_str().unwrap().to_string());
+                    received.push(
+                        event.normalized_events()[0].data["delta"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
                 }
                 InflightEvent::Done => break,
                 InflightEvent::Error(message) => panic!("unexpected error event: {message}"),
@@ -3012,7 +3050,8 @@ mod tests {
             initiator: "user",
         };
         let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(16);
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(2);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(2);
         let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
             .acquire_owned()
             .await
@@ -3051,7 +3090,8 @@ mod tests {
                         "input": {}
                     }
                 }),
-            }))
+            }
+            .into()))
             .await
             .unwrap();
 
@@ -3078,13 +3118,16 @@ mod tests {
             .unwrap();
         for text in ["first", "second"] {
             broadcast_tx
-                .send(InflightEvent::Event(SseEvent {
-                    event: String::new(),
-                    data: json!({
-                        "type": "content_block_delta",
-                        "delta": {"text": text}
-                    }),
-                }))
+                .send(InflightEvent::Event(
+                    SseEvent {
+                        event: String::new(),
+                        data: json!({
+                            "type": "content_block_delta",
+                            "delta": {"text": text}
+                        }),
+                    }
+                    .into(),
+                ))
                 .unwrap();
         }
 
@@ -3113,13 +3156,16 @@ mod tests {
             .unwrap();
         for text in ["first", "second"] {
             broadcast_tx
-                .send(InflightEvent::Event(SseEvent {
-                    event: String::new(),
-                    data: json!({
-                        "type": "content_block_delta",
-                        "delta": {"text": text}
-                    }),
-                }))
+                .send(InflightEvent::Event(
+                    SseEvent {
+                        event: String::new(),
+                        data: json!({
+                            "type": "content_block_delta",
+                            "delta": {"text": text}
+                        }),
+                    }
+                    .into(),
+                ))
                 .unwrap();
         }
 

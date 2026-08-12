@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
 use claude_proxy_core::ModelInfo;
-use claude_proxy_providers::provider::{Provider, UpstreamErrorMetadata};
+use claude_proxy_providers::provider::{Provider, ProviderEvent, UpstreamErrorMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -1352,7 +1352,7 @@ pub struct AppState {
 #[derive(Debug, Clone)]
 pub enum InflightEvent {
     /// A successful SSE event from the provider stream.
-    Event(claude_proxy_core::SseEvent),
+    Event(ProviderEvent),
     /// The stream completed (no more events).
     Done,
     /// An error occurred during streaming.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use claude_proxy_core::{Content, MessageContent, MessagesRequest};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub(super) const IDENTIFIER_MAX_BYTES: usize = 64;
@@ -95,6 +96,46 @@ impl ResponsesCorrelation {
     pub(super) fn anthropic_call_id<'a>(&'a self, id: &'a str) -> &'a str {
         self.tool_call_ids.restore_original(id)
     }
+
+    pub(super) fn restore_response_event(&self, value: &Value) -> Value {
+        let mut value = value.clone();
+        self.restore_response_value(&mut value);
+        value
+    }
+
+    fn restore_response_value(&self, value: &mut Value) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    self.restore_response_value(value);
+                }
+            }
+            Value::Object(object) => {
+                let item_type = object.get("type").and_then(Value::as_str);
+                if matches!(
+                    item_type,
+                    Some(
+                        "function_call"
+                            | "custom_tool_call"
+                            | "response.function_call_arguments.done"
+                    )
+                ) && let Some(name) = object.get_mut("name")
+                    && let Some(value) = name.as_str()
+                {
+                    *name = Value::String(self.anthropic_tool_name(value).to_string());
+                }
+                if let Some(call_id) = object.get_mut("call_id")
+                    && let Some(value) = call_id.as_str()
+                {
+                    *call_id = Value::String(self.anthropic_call_id(value).to_string());
+                }
+                for value in object.values_mut() {
+                    self.restore_response_value(value);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn bounded_identifier(value: &str, namespace: &str) -> String {
@@ -132,4 +173,40 @@ fn hashed_identifier(value: &str, namespace: &str) -> String {
     let prefix_budget = IDENTIFIER_MAX_BYTES - suffix.len() - 2;
     readable.truncate(readable.floor_char_boundary(prefix_budget));
     format!("{readable}__{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn native_response_restores_tool_names_and_call_ids_recursively() {
+        let original_name = "tool with a deliberately invalid and very long identifier that exceeds sixty four bytes";
+        let original_call_id =
+            "call id with spaces and a deliberately oversized identifier that must be correlated";
+        let mut correlation = ResponsesCorrelation::default();
+        correlation.tool_names.insert(original_name, "tool");
+        correlation.tool_call_ids.insert(original_call_id, "call");
+        let upstream_name = correlation.upstream_tool_name(original_name).to_string();
+        let upstream_call_id = correlation.upstream_call_id(original_call_id).to_string();
+
+        let restored = correlation.restore_response_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "type": "function_call",
+                    "name": upstream_name,
+                    "call_id": upstream_call_id
+                }]
+            }
+        }));
+
+        assert_eq!(restored["response"]["output"][0]["name"], original_name);
+        assert_eq!(
+            restored["response"]["output"][0]["call_id"],
+            original_call_id
+        );
+    }
 }

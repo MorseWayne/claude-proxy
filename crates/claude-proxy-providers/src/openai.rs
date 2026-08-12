@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use claude_proxy_config::settings::ProviderRuntimeConfig;
 use claude_proxy_core::*;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use reqwest::Client;
 use serde_json::{Map, Value, json};
 
@@ -22,7 +22,7 @@ use crate::http::{
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
 };
-use crate::provider::{Provider, ProviderError, ProviderRequestObserver};
+use crate::provider::{Provider, ProviderError, ProviderEvent, ProviderRequestObserver};
 use crate::reasoning_markers::marker_mode_from_request;
 
 pub struct OpenAiProvider {
@@ -276,7 +276,7 @@ impl OpenAiProvider {
         &self,
         request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let correlation = crate::responses::ResponsesCorrelation::from_request(&request);
         let body = self.responses_request_body(&request);
         let url = format!("{}/responses", self.base_url);
@@ -304,12 +304,12 @@ impl OpenAiProvider {
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::responses::convert_non_streaming_response_with_context(
+            let event = crate::responses::convert_non_streaming_provider_response_with_context(
                 &data,
                 marker_mode_from_request(&request),
                 correlation,
             );
-            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            let stream = futures::stream::iter([Ok(event)]);
             Ok(Box::pin(stream))
         }
     }
@@ -324,7 +324,7 @@ impl Provider for OpenAiProvider {
     async fn chat(
         &self,
         request: MessagesRequest,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         self.chat_with_observer(request, None).await
     }
 
@@ -332,12 +332,13 @@ impl Provider for OpenAiProvider {
         &self,
         request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let request = apply_openai_intent(request);
         if prefers_responses(&request.model) {
             self.chat_via_responses(request, observer).await
         } else {
-            self.chat_via_completions(request, observer).await
+            let stream = self.chat_via_completions(request, observer).await?;
+            Ok(Box::pin(stream.map(|event| event.map(ProviderEvent::from))))
         }
     }
 

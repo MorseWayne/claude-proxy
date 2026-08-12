@@ -1,7 +1,7 @@
 use crate::openai_compat::{CompactRequestKind, classify_compact_request_body};
-use crate::provider::ProviderError;
+use crate::provider::{ProviderError, ProviderEvent};
 use claude_proxy_config::settings::ReasoningMarkerMode;
-use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
+use claude_proxy_core::{MessagesRequest, ModelInfo};
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
@@ -68,7 +68,7 @@ pub(super) fn stream_response_with_marker_mode_and_context<F>(
     marker_mode: ReasoningMarkerMode,
     correlation: crate::responses::ResponsesCorrelation,
     on_event: F,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {

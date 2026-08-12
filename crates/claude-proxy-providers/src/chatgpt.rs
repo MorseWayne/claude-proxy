@@ -48,7 +48,7 @@ use crate::openai_compat::{
     log_compact_request_observability, log_request_observability,
 };
 use crate::provider::{
-    Provider, ProviderError, ProviderRequestMetadata, ProviderRequestObserver,
+    Provider, ProviderError, ProviderEvent, ProviderRequestMetadata, ProviderRequestObserver,
     ProviderRequestObserverEvent, ProviderRequestObserverEventKind, RateLimitCredits,
     RateLimitSnapshot, RateLimitSource, RateLimitWindow,
 };
@@ -1288,7 +1288,7 @@ impl ChatGptProvider {
         &self,
         prepared: ChatGptPreparedRequest,
         token: ChatGptToken,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         match self.effective_transport() {
             ChatGptTransport::Sse => self.chat_via_sse_with_auth_retry(prepared, token).await,
             ChatGptTransport::Websocket => self
@@ -1363,7 +1363,7 @@ impl ChatGptProvider {
         &self,
         prepared: ChatGptPreparedRequest,
         token: ChatGptToken,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let ChatGptPreparedRequest {
             mut body,
             responses_correlation,
@@ -1441,7 +1441,7 @@ impl ChatGptProvider {
         prepared: ChatGptPreparedRequest,
         mut token: ChatGptToken,
     ) -> Result<
-        BoxStream<'static, Result<SseEvent, ProviderError>>,
+        BoxStream<'static, Result<ProviderEvent, ProviderError>>,
         transport::ChatGptWebSocketStartError,
     > {
         let mut authentication_retried = false;
@@ -1495,7 +1495,7 @@ impl ChatGptProvider {
         prepared: ChatGptPreparedRequest,
         token: &ChatGptToken,
     ) -> Result<
-        BoxStream<'static, Result<SseEvent, ProviderError>>,
+        BoxStream<'static, Result<ProviderEvent, ProviderError>>,
         transport::ChatGptWebSocketStartError,
     > {
         let ChatGptPreparedRequest {
@@ -1625,7 +1625,7 @@ impl ChatGptProvider {
         &self,
         response: Response,
         context: ChatGptSseStreamContext,
-    ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
         let ChatGptSseStreamContext {
             marker_mode,
             request_id,
@@ -2096,7 +2096,7 @@ impl Provider for ChatGptProvider {
     async fn chat(
         &self,
         request: MessagesRequest,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         self.chat_with_observer(request, None).await
     }
 
@@ -2104,7 +2104,7 @@ impl Provider for ChatGptProvider {
         &self,
         mut request: MessagesRequest,
         observer: Option<ProviderRequestObserver>,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let token = self.auth.get_existing_token().await?;
         let virtual_context_requested = request
             .extra
@@ -2280,24 +2280,27 @@ impl Provider for ChatGptProvider {
             }
         }
 
-        self.chat_prepared_with_token(
-            ChatGptPreparedRequest {
-                body,
-                responses_correlation: crate::responses::ResponsesCorrelation::from_request(
-                    &request,
-                ),
-                marker_mode,
-                compact_request,
-                request_id,
-                output_token_budget,
-                stable_client_conversation_id,
-                responses_lite,
-                observer,
-                pending_context_usage: context_estimate.and_then(|estimate| estimate.pending_usage),
-            },
-            token,
-        )
-        .await
+        let stream = self
+            .chat_prepared_with_token(
+                ChatGptPreparedRequest {
+                    body,
+                    responses_correlation: crate::responses::ResponsesCorrelation::from_request(
+                        &request,
+                    ),
+                    marker_mode,
+                    compact_request,
+                    request_id,
+                    output_token_budget,
+                    stable_client_conversation_id,
+                    responses_lite,
+                    observer,
+                    pending_context_usage: context_estimate
+                        .and_then(|estimate| estimate.pending_usage),
+                },
+                token,
+            )
+            .await?;
+        Ok(stream)
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -2353,14 +2356,14 @@ struct ChatGptThinkingDiagnostics {
 }
 
 fn wrap_chatgpt_stream_logging(
-    stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     request_id: u64,
     compact_request: bool,
     transport: &'static str,
     stream_started_at: Instant,
     first_upstream_event_seen: Arc<AtomicBool>,
     thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
     let first_stream_item_seen = Arc::new(AtomicBool::new(false));
     let first_stream_item_seen_for_map = Arc::clone(&first_stream_item_seen);
     Box::pin(stream.map(move |result| {
@@ -2414,7 +2417,7 @@ fn wrap_chatgpt_stream_logging(
                         compact_request,
                         transport,
                         elapsed_ms = elapsed_millis(stream_started_at),
-                        event = %event.event,
+                        event = %provider_event_type(event),
                         "ChatGPT first downstream stream item emitted"
                     );
                 }
@@ -2511,14 +2514,34 @@ fn chatgpt_sse_delta_len(event: &Value) -> usize {
         .map_or(0, str::len)
 }
 
-fn downstream_thinking_delta_len(event: &SseEvent) -> Option<usize> {
-    (event.event == "content_block_delta"
-        && event.data["delta"]["type"].as_str() == Some("thinking_delta"))
-    .then(|| event.data["delta"]["thinking"].as_str().map_or(0, str::len))
+fn downstream_thinking_delta_len(event: &ProviderEvent) -> Option<usize> {
+    event.normalized_events().iter().find_map(|event| {
+        (event.event == "content_block_delta"
+            && event.data["delta"]["type"].as_str() == Some("thinking_delta"))
+        .then(|| event.data["delta"]["thinking"].as_str().map_or(0, str::len))
+    })
 }
 
-fn sse_event_finishes_message(event: &SseEvent) -> bool {
-    event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
+fn sse_event_finishes_message(event: &ProviderEvent) -> bool {
+    event.normalized_events().iter().any(|event| {
+        event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
+    })
+}
+
+fn provider_event_type(event: &ProviderEvent) -> &str {
+    if let Some(crate::provider::NativeProviderEvent::OpenAiResponses(event)) = event.native_event()
+    {
+        return event
+            .data
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+    }
+    event
+        .normalized_events()
+        .last()
+        .map(|event| event.event.as_str())
+        .unwrap_or("unknown")
 }
 
 fn chatgpt_request_headers(
@@ -7079,7 +7102,7 @@ mod tests {
             .await
             .expect("first downstream event")
             .expect("message_start should be ok");
-        assert_eq!(first_event.event, "message_start");
+        assert_eq!(first_event.normalized_events()[0].event, "message_start");
         drop(second);
         tokio::time::timeout(Duration::from_secs(2), close_rx)
             .await
@@ -7167,7 +7190,7 @@ mod tests {
             .await
             .expect("first downstream event")
             .expect("message_start should be ok");
-        assert_eq!(first_event.event, "message_start");
+        assert_eq!(first_event.normalized_events()[0].event, "message_start");
 
         let third = provider
             .chat_prepared_with_token(
@@ -7485,7 +7508,7 @@ mod tests {
             .await
             .expect("first downstream event")
             .expect("message_start should be ok");
-        assert_eq!(first.event, "message_start");
+        assert_eq!(first.normalized_events()[0].event, "message_start");
         drop(stream);
 
         tokio::time::timeout(Duration::from_secs(2), close_rx)
@@ -7955,11 +7978,14 @@ mod tests {
     }
 
     async fn collect_stream_results(
-        mut stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+        mut stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     ) -> Vec<Result<SseEvent, ProviderError>> {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
-            events.push(event);
+            match event {
+                Ok(event) => events.extend(event.into_normalized_events().into_iter().map(Ok)),
+                Err(error) => events.push(Err(error)),
+            }
         }
         events
     }

@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::provider::ProviderEvent;
 use base64::Engine;
 use claude_proxy_config::settings::ReasoningMarkerMode;
-use claude_proxy_core::SseEvent;
 use futures::{SinkExt, Stream, StreamExt, stream::BoxStream};
 use reqwest::{
     StatusCode, Url,
@@ -118,13 +118,13 @@ struct ResolvedChatGptWebSocketProxy {
 type ChatGptWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct AbortOnDropStream {
-    inner: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    inner: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     abort_tx: Option<watch::Sender<bool>>,
 }
 
 impl AbortOnDropStream {
     fn new(
-        inner: BoxStream<'static, Result<SseEvent, ProviderError>>,
+        inner: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
         abort_tx: watch::Sender<bool>,
     ) -> Self {
         Self {
@@ -135,7 +135,7 @@ impl AbortOnDropStream {
 }
 
 impl Stream for AbortOnDropStream {
-    type Item = Result<SseEvent, ProviderError>;
+    type Item = Result<ProviderEvent, ProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
@@ -1109,7 +1109,7 @@ pub(super) async fn prewarm_websocket(
 }
 
 pub(super) struct ChatGptWebSocketStreamStart {
-    pub(super) stream: BoxStream<'static, Result<SseEvent, ProviderError>>,
+    pub(super) stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     pub(super) websocket_reused: bool,
     pub(super) continuation_used: bool,
     pub(super) continuation_disabled_reason: &'static str,

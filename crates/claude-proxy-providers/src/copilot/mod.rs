@@ -16,7 +16,7 @@ use claude_proxy_config::settings::{
     CopilotProviderConfig, ProviderConfig as ConfigProviderConfig, Settings,
 };
 use claude_proxy_core::*;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -26,7 +26,7 @@ use crate::http::{
     apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, read_upstream_response_json,
     read_upstream_response_text, send_upstream_request,
 };
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, ProviderEvent};
 use crate::reasoning_markers::marker_mode_from_request;
 
 use self::auth::CopilotAuth;
@@ -276,7 +276,7 @@ impl CopilotProvider {
         request: MessagesRequest,
         token: &str,
         initiator: &str,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let correlation = crate::responses::ResponsesCorrelation::from_request(&request);
         let url = format!("{}/responses", self.base_url);
         let vision = Self::has_vision_content(&request.messages);
@@ -304,12 +304,12 @@ impl CopilotProvider {
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let events = crate::responses::convert_non_streaming_response_with_context(
+            let event = crate::responses::convert_non_streaming_provider_response_with_context(
                 &data,
                 marker_mode_from_request(&request),
                 correlation,
             );
-            let stream = futures::stream::iter(events.into_iter().map(Ok));
+            let stream = futures::stream::iter([Ok(event)]);
             Ok(Box::pin(stream))
         }
     }
@@ -328,7 +328,7 @@ impl Provider for CopilotProvider {
     async fn chat(
         &self,
         request: MessagesRequest,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let mut request = request;
 
         // Step 1: Premium optimization preprocessing
@@ -367,7 +367,8 @@ impl Provider for CopilotProvider {
 
         if endpoints.iter().any(|e| e == "/v1/messages") {
             debug!("Using native /v1/messages path for model {}", request.model);
-            self.chat_via_messages(request, &token, initiator).await
+            let stream = self.chat_via_messages(request, &token, initiator).await?;
+            Ok(Box::pin(stream.map(|event| event.map(ProviderEvent::from))))
         } else if self.config.enable_responses_api && supports_responses_only(&endpoints) {
             debug!("Using /responses path for model {}", request.model);
             self.chat_via_responses(request, &token, initiator).await
@@ -376,7 +377,10 @@ impl Provider for CopilotProvider {
                 "Falling back to /chat/completions for model {}",
                 request.model
             );
-            self.chat_via_completions(request, &token, initiator).await
+            let stream = self
+                .chat_via_completions(request, &token, initiator)
+                .await?;
+            Ok(Box::pin(stream.map(|event| event.map(ProviderEvent::from))))
         }
     }
 

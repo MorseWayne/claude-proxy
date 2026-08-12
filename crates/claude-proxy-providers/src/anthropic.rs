@@ -16,7 +16,7 @@ use crate::http::{
     apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, next_upstream_stream_item,
     read_upstream_response_text, send_upstream_request,
 };
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, ProviderEvent};
 use crate::sse::{SseDecoder, parse_sse_frame};
 use crate::tool_choice::normalize_for_anthropic_messages;
 
@@ -85,7 +85,7 @@ impl Provider for AnthropicProvider {
     async fn chat(
         &self,
         request: MessagesRequest,
-    ) -> Result<BoxStream<'static, Result<SseEvent, ProviderError>>, ProviderError> {
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
 
         // Serialize request and inject cache_control for prompt caching
@@ -146,7 +146,10 @@ impl Provider for AnthropicProvider {
                     let _ = tx.send(Ok(event)).await;
                 }
             });
-            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            Ok(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(rx)
+                    .map(|event| event.map(ProviderEvent::from)),
+            ))
         } else {
             let body = read_upstream_response_text(response).await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -155,7 +158,7 @@ impl Provider for AnthropicProvider {
                 data,
             };
             let stream = futures::stream::iter(vec![Ok(event)]);
-            Ok(Box::pin(stream))
+            Ok(Box::pin(stream.map(|event| event.map(ProviderEvent::from))))
         }
     }
 
@@ -586,6 +589,7 @@ mod tests {
 
         let mut stream = provider.chat(request).await.unwrap();
         let event = stream.next().await.unwrap().unwrap();
+        let event = &event.normalized_events()[0];
 
         assert_eq!(event.event, "message");
         assert_eq!(event.data["id"], "msg_test");

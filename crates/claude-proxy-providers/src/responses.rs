@@ -14,7 +14,7 @@ use crate::openai_compat::{
     thinking_budget_to_reasoning_effort,
 };
 use crate::provider::{
-    ProviderError, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderError, ProviderEvent, ProviderRequestObserver, ProviderRequestObserverEvent,
     ProviderRequestObserverEventKind, ProviderStreamMetadata, ProviderUsageMetadata,
 };
 use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
@@ -1294,14 +1294,22 @@ fn reasoning_for_model(
 pub fn stream_responses_response(
     response: reqwest::Response,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    stream_responses_response_with_observer(response, |_| {})
+    Box::pin(
+        stream_responses_response_with_observer(response, |_| {}).flat_map(|result| {
+            let events = match result {
+                Ok(event) => event.into_normalized_events().into_iter().map(Ok).collect(),
+                Err(error) => vec![Err(error)],
+            };
+            futures::stream::iter(events)
+        }),
+    )
 }
 
 pub fn stream_responses_response_with_context(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
     stream_responses_response_with_context_and_observer(response, marker_mode, correlation, |_| {})
 }
 
@@ -1310,7 +1318,7 @@ pub fn stream_responses_response_with_context_and_provider_observer(
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
     observer: Option<ProviderRequestObserver>,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
     stream_responses_response_with_context_and_observer(
         response,
         marker_mode,
@@ -1323,7 +1331,7 @@ pub fn stream_responses_response_with_context_and_provider_observer(
 pub fn stream_responses_response_with_observer<F>(
     response: reqwest::Response,
     on_event: F,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
@@ -1339,7 +1347,7 @@ pub fn stream_responses_response_with_marker_mode_and_observer<F>(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     on_event: F,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
@@ -1356,11 +1364,11 @@ pub fn stream_responses_response_with_context_and_observer<F>(
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
     on_event: F,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+    let (tx, rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -1371,6 +1379,7 @@ where
     let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
+        let native_correlation = correlation.clone();
         let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
         let mut decoder = SseDecoder::new();
         let mut byte_stream = response.bytes_stream();
@@ -1402,10 +1411,17 @@ where
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
-                            for event in converter.process_event(&value) {
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
+                            let normalized = converter.process_event(&value);
+                            let native = native_correlation.restore_response_event(&value);
+                            if tx
+                                .send(Ok(ProviderEvent::openai_responses(
+                                    response_sse_event(native),
+                                    normalized,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
                         }
                     }
@@ -1423,10 +1439,17 @@ where
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
-                            for event in converter.process_event(&value) {
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
+                            let normalized = converter.process_event(&value);
+                            let native = native_correlation.restore_response_event(&value);
+                            if tx
+                                .send(Ok(ProviderEvent::openai_responses(
+                                    response_sse_event(native),
+                                    normalized,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
                         }
                     }
@@ -1450,10 +1473,17 @@ where
                 let _ = tx.send(Err(error)).await;
                 return;
             }
-            for event in converter.process_event(&value) {
-                if tx.send(Ok(event)).await.is_err() {
-                    return;
-                }
+            let normalized = converter.process_event(&value);
+            let native = native_correlation.restore_response_event(&value);
+            if tx
+                .send(Ok(ProviderEvent::openai_responses(
+                    response_sse_event(native),
+                    normalized,
+                )))
+                .await
+                .is_err()
+            {
+                return;
             }
         }
 
@@ -1479,7 +1509,7 @@ where
         }
 
         for event in converter.finish() {
-            if tx.send(Ok(event)).await.is_err() {
+            if tx.send(Ok(ProviderEvent::from(event))).await.is_err() {
                 break;
             }
         }
@@ -1493,14 +1523,15 @@ pub(crate) fn stream_responses_json_events_with_context_and_observer<F>(
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
     on_event: F,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>>
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
+    let (tx, rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     let on_event = Arc::new(on_event);
 
     tokio::spawn(async move {
+        let native_correlation = correlation.clone();
         let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
 
         while let Some(event) = events.recv().await {
@@ -1517,10 +1548,17 @@ where
                 let _ = tx.send(Err(error)).await;
                 return;
             }
-            for event in converter.process_event(&value) {
-                if tx.send(Ok(event)).await.is_err() {
-                    return;
-                }
+            let normalized = converter.process_event(&value);
+            let native = native_correlation.restore_response_event(&value);
+            if tx
+                .send(Ok(ProviderEvent::openai_responses(
+                    response_sse_event(native),
+                    normalized,
+                )))
+                .await
+                .is_err()
+            {
+                return;
             }
         }
 
@@ -1532,7 +1570,7 @@ where
         }
 
         for event in converter.finish() {
-            if tx.send(Ok(event)).await.is_err() {
+            if tx.send(Ok(ProviderEvent::from(event))).await.is_err() {
                 break;
             }
         }
@@ -1543,6 +1581,11 @@ where
 
 fn parse_sse_json(text: &str) -> Option<Value> {
     parse_sse_json_value(text)
+}
+
+fn response_sse_event(data: Value) -> SseEvent {
+    let event = data["type"].as_str().unwrap_or_default().to_string();
+    SseEvent { event, data }
 }
 
 fn responses_error_event(value: &Value) -> Option<ProviderError> {
@@ -3194,6 +3237,31 @@ pub fn convert_non_streaming_response_with_context(
 ) -> Vec<SseEvent> {
     let mut converter = NonStreamingResponsesConverter::new(data, marker_mode, correlation);
     converter.convert()
+}
+
+pub fn convert_non_streaming_provider_response_with_context(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+) -> ProviderEvent {
+    let normalized =
+        convert_non_streaming_response_with_context(data, marker_mode, correlation.clone());
+    let response = correlation.restore_response_event(data);
+    ProviderEvent::openai_responses(
+        response_sse_event(json!({
+            "type": terminal_response_event_type(&response),
+            "response": response,
+        })),
+        normalized,
+    )
+}
+
+fn terminal_response_event_type(response: &Value) -> &'static str {
+    match response["status"].as_str() {
+        Some("incomplete") => "response.incomplete",
+        Some("failed") | Some("cancelled") => "response.failed",
+        _ => "response.completed",
+    }
 }
 
 struct NonStreamingResponsesConverter<'a> {
