@@ -9,7 +9,7 @@ use claude_proxy_core::ModelInfo;
 use claude_proxy_providers::provider::{Provider, ProviderEvent, UpstreamErrorMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
 
 use crate::middleware::{RateLimitConfig, RateLimitRuntime};
 use crate::persistence::{CompletedUsageRecord, MetricsStore, StoredTotals};
@@ -720,7 +720,9 @@ mod tests {
                 rate_limit,
                 rate_window,
                 max_concurrency,
+                max_concurrency_queue: 32,
                 provider_max_concurrency,
+                provider_max_concurrency_queue: 16,
                 model_cache_ttl_seconds: DEFAULT_MODEL_CACHE_TTL.as_secs(),
             },
             http: HttpConfig::default(),
@@ -1226,18 +1228,17 @@ mod tests {
     #[tokio::test]
     async fn apply_settings_refreshes_runtime_limits() {
         let state = AppState::new(settings_with_limits(1, 1, 1, 60), None);
-        let original_semaphore = state.concurrency_semaphore.read().await.clone();
-        let _permit = original_semaphore.clone().try_acquire_owned().unwrap();
+        let original_limiter = state.concurrency_limiter.read().await.clone();
+        let _permit = original_limiter.acquire().await.unwrap();
         assert_eq!(
-            state.concurrency_semaphore.read().await.available_permits(),
+            state.concurrency_limiter.read().await.available_permits(),
             0
         );
 
-        state
-            .provider_concurrency_semaphores
-            .lock()
-            .await
-            .insert("openai".to_string(), Arc::new(Semaphore::new(1)));
+        state.provider_concurrency_limiters.lock().await.insert(
+            "openai".to_string(),
+            Arc::new(ConcurrencyLimiter::new(1, 1)),
+        );
         state
             .model_refresh_locks
             .lock()
@@ -1249,16 +1250,18 @@ mod tests {
             .await;
 
         assert_eq!(
-            state.concurrency_semaphore.read().await.available_permits(),
+            state.concurrency_limiter.read().await.available_permits(),
             3
         );
-        assert!(
+        assert_eq!(
             state
-                .provider_concurrency_semaphores
-                .lock()
+                .concurrency_limiter
+                .read()
                 .await
-                .is_empty()
+                .available_queue_slots(),
+            32
         );
+        assert!(state.provider_concurrency_limiters.lock().await.is_empty());
         assert!(state.provider_creation_locks.lock().await.is_empty());
         assert!(state.model_refresh_locks.lock().await.is_empty());
     }
@@ -1338,14 +1341,73 @@ pub struct AppState {
     pub provider_registry: Arc<RwLock<ProviderRegistry>>,
     provider_creation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     model_refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    pub concurrency_semaphore: Arc<RwLock<Arc<Semaphore>>>,
-    pub provider_concurrency_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    pub concurrency_limiter: Arc<RwLock<Arc<ConcurrencyLimiter>>>,
+    pub provider_concurrency_limiters: Arc<Mutex<HashMap<String, Arc<ConcurrencyLimiter>>>>,
     pub rate_limit_runtime: Arc<RateLimitRuntime>,
     pub metrics: Arc<Metrics>,
     pub provider_health: Arc<Mutex<HashMap<String, ProviderHealth>>>,
     /// Inflight request deduplication: maps request hash → broadcast sender.
     /// Multiple identical concurrent requests share one upstream call.
     pub inflight: Arc<Mutex<HashMap<u64, tokio::sync::broadcast::Sender<InflightEvent>>>>,
+}
+
+/// A concurrency gate with a bounded waiter queue.
+///
+/// The execution semaphore limits active work. When it is full, callers must first
+/// reserve a queue slot before awaiting an execution permit. Dropping the acquire
+/// future (for example after downstream cancellation) releases the queue slot.
+#[derive(Debug)]
+pub struct ConcurrencyLimiter {
+    execution: Arc<Semaphore>,
+    queue: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyAcquireError {
+    QueueFull,
+    Closed,
+}
+
+impl ConcurrencyLimiter {
+    pub fn new(max_concurrency: usize, max_queue: usize) -> Self {
+        Self {
+            execution: Arc::new(Semaphore::new(max_concurrency)),
+            queue: Arc::new(Semaphore::new(max_queue)),
+        }
+    }
+
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, ConcurrencyAcquireError> {
+        match self.execution.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => return Err(ConcurrencyAcquireError::Closed),
+            Err(TryAcquireError::NoPermits) => {}
+        }
+
+        let queue_permit = self
+            .queue
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                TryAcquireError::NoPermits => ConcurrencyAcquireError::QueueFull,
+                TryAcquireError::Closed => ConcurrencyAcquireError::Closed,
+            })?;
+        let execution_permit = self
+            .execution
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ConcurrencyAcquireError::Closed)?;
+        drop(queue_permit);
+        Ok(execution_permit)
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.execution.available_permits()
+    }
+
+    pub fn available_queue_slots(&self) -> usize {
+        self.queue.available_permits()
+    }
 }
 
 /// An event in the inflight broadcast channel.
@@ -1568,10 +1630,11 @@ impl AppState {
             ))),
             provider_creation_locks: Arc::new(Mutex::new(HashMap::new())),
             model_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
-            concurrency_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
+            concurrency_limiter: Arc::new(RwLock::new(Arc::new(ConcurrencyLimiter::new(
                 limits.max_concurrency as usize,
+                limits.max_concurrency_queue as usize,
             )))),
-            provider_concurrency_semaphores: Arc::new(Mutex::new(HashMap::new())),
+            provider_concurrency_limiters: Arc::new(Mutex::new(HashMap::new())),
             rate_limit_runtime: Arc::new(RateLimitRuntime::new(RateLimitConfig {
                 max_requests: limits.rate_limit,
                 per_seconds: limits.rate_window,
@@ -1601,9 +1664,11 @@ impl AppState {
             .write()
             .await
             .set_model_cache_ttl(model_cache_ttl_from_limits(limits));
-        *self.concurrency_semaphore.write().await =
-            Arc::new(Semaphore::new(limits.max_concurrency as usize));
-        self.provider_concurrency_semaphores.lock().await.clear();
+        *self.concurrency_limiter.write().await = Arc::new(ConcurrencyLimiter::new(
+            limits.max_concurrency as usize,
+            limits.max_concurrency_queue as usize,
+        ));
+        self.provider_concurrency_limiters.lock().await.clear();
     }
 
     pub async fn get_or_create_provider(

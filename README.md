@@ -174,10 +174,12 @@ tool_use_terminal_timeout_seconds = 120 # Timeout waiting for message_stop after
 auth_token = ""                         # Admin API token (empty = fallback to server.auth_token)
 
 [limits]
-rate_limit = 40                         # Max requests per window
+rate_limit = 240                        # Max requests per window
 rate_window = 60                        # Window in seconds
 max_concurrency = 5                     # Max concurrent requests
+max_concurrency_queue = 32              # Requests allowed to wait for global concurrency
 provider_max_concurrency = 4            # Max concurrent upstream requests per provider
+provider_max_concurrency_queue = 16     # Requests allowed to wait per provider
 
 [http]
 read_timeout = 300                      # Upstream read timeout (seconds)

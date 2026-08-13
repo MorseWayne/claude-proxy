@@ -158,6 +158,31 @@ mod tests {
         assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
         assert_eq!(retry_after_seconds(Duration::from_millis(1_001)), 2);
     }
+
+    #[tokio::test]
+    async fn local_rate_limit_response_disables_automatic_retry() {
+        use tower::Service;
+
+        let runtime = Arc::new(RateLimitRuntime::new(RateLimitConfig {
+            max_requests: 1,
+            per_seconds: 60,
+        }));
+        let mut service =
+            RateLimitLayer::new(runtime).layer(tower::service_fn(|_request: Request<()>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            }));
+
+        let first = service.call(Request::new(())).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let limited = service.call(Request::new(())).await.unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            limited.headers().get("x-should-retry"),
+            Some(&HeaderValue::from_static("false"))
+        );
+        assert!(limited.headers().get("retry-after").is_some());
+    }
 }
 
 /// A Tower layer that enforces rate limits.
@@ -224,6 +249,9 @@ where
                 let response = Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .header("content-type", "application/json")
+                    // This is a local admission limit. Automatic client retries would
+                    // consume the same limiter again and can create a feedback loop.
+                    .header("x-should-retry", "false")
                     .header(
                         "retry-after",
                         HeaderValue::from_str(&retry_after)

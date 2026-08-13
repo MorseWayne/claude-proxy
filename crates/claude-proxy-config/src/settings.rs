@@ -711,8 +711,16 @@ pub struct LimitsConfig {
     pub rate_window: u32,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
+    /// Maximum number of requests allowed to wait for a global concurrency permit.
+    /// A value of zero disables waiting and preserves fail-fast admission.
+    #[serde(default = "default_max_concurrency_queue")]
+    pub max_concurrency_queue: u32,
     #[serde(default = "default_provider_max_concurrency")]
     pub provider_max_concurrency: u32,
+    /// Maximum number of requests allowed to wait for one provider's concurrency permit.
+    /// A value of zero disables waiting and preserves fail-fast admission.
+    #[serde(default = "default_provider_max_concurrency_queue")]
+    pub provider_max_concurrency_queue: u32,
     #[serde(default = "default_model_cache_ttl_seconds")]
     pub model_cache_ttl_seconds: u64,
 }
@@ -796,7 +804,7 @@ fn default_tool_use_terminal_timeout_seconds() -> u64 {
     120
 }
 fn default_rate_limit() -> u32 {
-    40
+    240
 }
 fn default_rate_window() -> u32 {
     60
@@ -804,8 +812,14 @@ fn default_rate_window() -> u32 {
 fn default_max_concurrency() -> u32 {
     5
 }
+fn default_max_concurrency_queue() -> u32 {
+    32
+}
 fn default_provider_max_concurrency() -> u32 {
     4
+}
+fn default_provider_max_concurrency_queue() -> u32 {
+    16
 }
 fn default_model_cache_ttl_seconds() -> u64 {
     60 * 60
@@ -858,7 +872,9 @@ impl Default for LimitsConfig {
             rate_limit: default_rate_limit(),
             rate_window: default_rate_window(),
             max_concurrency: default_max_concurrency(),
+            max_concurrency_queue: default_max_concurrency_queue(),
             provider_max_concurrency: default_provider_max_concurrency(),
+            provider_max_concurrency_queue: default_provider_max_concurrency_queue(),
             model_cache_ttl_seconds: default_model_cache_ttl_seconds(),
         }
     }
@@ -1437,6 +1453,24 @@ auth_token = "test-token"
         let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
         assert_eq!(settings.server.port, 9090);
         assert_eq!(settings.server.auth_token, "test-token");
+        assert_eq!(settings.limits.rate_limit, 240);
+        assert_eq!(settings.limits.max_concurrency_queue, 32);
+        assert_eq!(settings.limits.provider_max_concurrency_queue, 16);
+    }
+
+    #[test]
+    fn concurrency_queue_limits_parse_overrides_and_allow_fail_fast() {
+        let toml = r#"
+[limits]
+max_concurrency_queue = 7
+provider_max_concurrency_queue = 0
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.limits.max_concurrency_queue, 7);
+        assert_eq!(settings.limits.provider_max_concurrency_queue, 0);
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

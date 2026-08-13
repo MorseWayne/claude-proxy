@@ -454,10 +454,12 @@ tool_use_terminal_timeout_seconds = 30  # tool_use 开始后等待 message_stop 
 auth_token = ""                         # 留空时使用 server.auth_token
 
 [limits]
-rate_limit = 40                         # 时间窗口内最大请求数
+rate_limit = 240                        # 时间窗口内最大请求数
 rate_window = 60                        # 时间窗口（秒）
 max_concurrency = 5                     # 全局最大并发请求数
+max_concurrency_queue = 32              # 全局并发等待队列长度
 provider_max_concurrency = 4            # 单个上游 provider 最大并发请求数
+provider_max_concurrency_queue = 16     # 单个 provider 并发等待队列长度
 model_cache_ttl_seconds = 3600          # 上游模型列表缓存时长（秒）
 
 [http]

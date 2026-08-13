@@ -30,14 +30,13 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::app::{
-    AppState, InflightEvent, RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
+    AppState, ConcurrencyAcquireError, ConcurrencyLimiter, InflightEvent,
+    RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
 };
 use crate::downstream::{DownstreamProtocol, protocol_error_response, provider_error_response};
 use crate::persistence::CompletedUsageRecord;
 
 const SSE_HEARTBEAT_FRAME: &[u8] = b": ping\n\n";
-const CONCURRENCY_RETRY_AFTER: &str = "1";
-
 fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
     if auth_token.is_empty() {
         return true;
@@ -1227,19 +1226,27 @@ struct LeaderResponseContext {
     protocol: DownstreamProtocol,
 }
 
-fn concurrency_limit_response(protocol: &DownstreamProtocol, message: &str) -> Response {
+fn concurrency_queue_full_response(protocol: &DownstreamProtocol, message: &str) -> Response {
     let mut response = protocol_error_response(
         protocol,
         StatusCode::TOO_MANY_REQUESTS,
         &ErrorResponse::rate_limit(message),
     );
-    response.headers_mut().insert(
-        "retry-after",
-        HeaderValue::from_static(CONCURRENCY_RETRY_AFTER),
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("false"));
+    response
+}
+
+fn concurrency_closed_response(protocol: &DownstreamProtocol) -> Response {
+    let mut response = protocol_error_response(
+        protocol,
+        StatusCode::SERVICE_UNAVAILABLE,
+        &ErrorResponse::api_error("concurrency controller unavailable"),
     );
     response
         .headers_mut()
-        .insert("x-should-retry", HeaderValue::from_static("true"));
+        .insert("x-should-retry", HeaderValue::from_static("false"));
     response
 }
 
@@ -1248,24 +1255,20 @@ async fn acquire_request_permit(
     start: std::time::Instant,
     protocol: &DownstreamProtocol,
 ) -> Result<OwnedSemaphorePermit, Response> {
-    let semaphore = state.concurrency_semaphore.read().await.clone();
-    match tokio::time::timeout(Duration::from_secs(10), semaphore.acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => {
+    let limiter = state.concurrency_limiter.read().await.clone();
+    match limiter.acquire().await {
+        Ok(permit) => Ok(permit),
+        Err(ConcurrencyAcquireError::Closed) => {
             error!("Semaphore closed unexpectedly");
             record_request_error(state, start);
-            Err(protocol_error_response(
-                protocol,
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("service unavailable"),
-            ))
+            Err(concurrency_closed_response(protocol))
         }
-        Err(_) => {
-            warn!("Concurrency limit reached, request timed out");
+        Err(ConcurrencyAcquireError::QueueFull) => {
+            warn!("Global concurrency queue is full");
             record_request_error(state, start);
-            Err(concurrency_limit_response(
+            Err(concurrency_queue_full_response(
                 protocol,
-                "too many concurrent requests",
+                "too many requests waiting for local concurrency",
             ))
         }
     }
@@ -1277,32 +1280,34 @@ async fn acquire_provider_permit(
     start: std::time::Instant,
     protocol: &DownstreamProtocol,
 ) -> Result<OwnedSemaphorePermit, Response> {
-    let max_concurrency = state.settings.read().await.limits.provider_max_concurrency as usize;
-    let semaphore = {
-        let mut semaphores = state.provider_concurrency_semaphores.lock().await;
-        semaphores
+    let (max_concurrency, max_queue) = {
+        let settings = state.settings.read().await;
+        (
+            settings.limits.provider_max_concurrency as usize,
+            settings.limits.provider_max_concurrency_queue as usize,
+        )
+    };
+    let limiter = {
+        let mut limiters = state.provider_concurrency_limiters.lock().await;
+        limiters
             .entry(provider_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max_concurrency)))
+            .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max_concurrency, max_queue)))
             .clone()
     };
 
-    match tokio::time::timeout(Duration::from_secs(10), semaphore.acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => {
+    match limiter.acquire().await {
+        Ok(permit) => Ok(permit),
+        Err(ConcurrencyAcquireError::Closed) => {
             error!("Provider semaphore closed unexpectedly");
             record_request_error(state, start);
-            Err(protocol_error_response(
-                protocol,
-                StatusCode::SERVICE_UNAVAILABLE,
-                &ErrorResponse::api_error("service unavailable"),
-            ))
+            Err(concurrency_closed_response(protocol))
         }
-        Err(_) => {
-            warn!("Provider concurrency limit reached for {provider_id}");
+        Err(ConcurrencyAcquireError::QueueFull) => {
+            warn!("Provider concurrency queue is full for {provider_id}");
             record_request_error(state, start);
-            Err(concurrency_limit_response(
+            Err(concurrency_queue_full_response(
                 protocol,
-                "provider concurrency limit reached",
+                "too many requests waiting for provider concurrency",
             ))
         }
     }
@@ -2567,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrency_limit_response_is_retryable_rate_limit_for_all_protocols() {
+    async fn concurrency_queue_full_response_is_not_retryable_for_all_protocols() {
         let protocols = [
             DownstreamProtocol::anthropic(),
             DownstreamProtocol::chat_completions("model", false),
@@ -2575,23 +2580,71 @@ mod tests {
         ];
 
         for protocol in protocols {
-            let response = concurrency_limit_response(&protocol, "too many concurrent requests");
+            let response = concurrency_queue_full_response(
+                &protocol,
+                "too many requests waiting for local concurrency",
+            );
 
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-            assert_eq!(
-                response.headers().get("retry-after").unwrap(),
-                HeaderValue::from_static(CONCURRENCY_RETRY_AFTER)
-            );
+            assert!(response.headers().get("retry-after").is_none());
             assert_eq!(
                 response.headers().get("x-should-retry").unwrap(),
-                HeaderValue::from_static("true")
+                HeaderValue::from_static("false")
             );
 
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["type"], "rate_limit_error");
-            assert_eq!(body["error"]["message"], "too many concurrent requests");
+            assert_eq!(
+                body["error"]["message"],
+                "too many requests waiting for local concurrency"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limiter_queues_until_capacity_is_available() {
+        let limiter = ConcurrencyLimiter::new(1, 1);
+        let active = limiter.acquire().await.unwrap();
+        let waiting = limiter.acquire();
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(limiter.available_queue_slots(), 0);
+        assert_eq!(
+            limiter.acquire().await.unwrap_err(),
+            ConcurrencyAcquireError::QueueFull
+        );
+
+        drop(active);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("queued request should be admitted")
+            .unwrap();
+        assert_eq!(limiter.available_queue_slots(), 1);
+        drop(admitted);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_queued_acquire_releases_queue_slot() {
+        let limiter = ConcurrencyLimiter::new(1, 1);
+        let active = limiter.acquire().await.unwrap();
+        let mut waiting = Box::pin(limiter.acquire());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(limiter.available_queue_slots(), 0);
+        drop(waiting);
+        assert_eq!(limiter.available_queue_slots(), 1);
+        drop(active);
     }
 
     #[test]
