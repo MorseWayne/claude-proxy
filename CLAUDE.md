@@ -59,68 +59,15 @@ Rust workspace (edition 2024) — 5 crates:
 
 ## Project Workflow
 
-- **MUST provide a structured summary after code changes.** After completing user-requested code modifications, summarize changed files, validation performed, commit hash, and any follow-up notes.
-- **MUST commit completed code changes.** After completing user-requested code modifications and verification, create a git commit for the change unless the user explicitly says not to commit.
+- Classify work by the global Level 0–3 risk model.
+- Level 2 work uses a short session todo; Level 3 work plans first and includes a focused review. Do not use or maintain Workflow Ledger or `.claude/WORKFLOW.md`.
+- After code changes, provide a structured summary covering changed files, validation performed, known gaps, and commit status.
+- Do not create a Git commit until the user has reviewed the completed and validated changes and explicitly confirms the commit.
+- Preserve unrelated user changes in the working tree and keep validation proportional to the touched behavior.
 
-## Workflow Ledger
+## Code Intelligence
 
-Use `workflow-ledger` for recoverable development work.
-
-- Classify tasks before executing: Level 0 Q&A, Level 1 lightweight edit, Level 2 standard code work, Level 3 complex work.
-- Maintain `.claude/WORKFLOW.md` for Level 2/3 tasks and for any task the user wants tracked across sessions.
-- Organize tracked work by phases and subtasks, not a flat checklist.
-- Before marking a phase Done, record `Acceptance / Review` with `Review`, `Validation`, `Tests`, and `Gaps`; failed validation means the phase stays In Progress or Blocked.
-- Record dependencies and discovered future tasks; complete prerequisites before blocked work, and defer non-blocking discoveries to Backlog/Future.
-- Use TodoWrite for current-session execution; use `.claude/WORKFLOW.md` for milestone history and resume points.
-- Do not create attachments or extra spec files unless Level 3 work genuinely needs them or the user asks.
-
-Do not rationalize skipping the ledger:
-
-- “This is small” still requires Level classification; Level 2/3 work is tracked.
-- “I will update it later” is unsafe; update at phase completion, blockers, key decisions, and handoff points.
-- TodoWrite is session-local; `.claude/WORKFLOW.md` is the durable recovery state.
-- Keep core fields stable so `.claude/bin/workflow-ledger doctor` can check the ledger.
-
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **claude-proxy** (4024 symbols, 10336 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/claude-proxy/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/claude-proxy/clusters` | All functional areas |
-| `gitnexus://repo/claude-proxy/processes` | All execution flows |
-| `gitnexus://repo/claude-proxy/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+- Use CodeGraph when it materially improves understanding of unfamiliar code, execution flows, dependencies, or change impact.
+- CodeGraph is optional rather than a pre-edit or pre-commit gate. If it is unavailable, stale, or unhelpful, continue with LSP, direct file reads, and targeted source search.
+- Before changing central or high-risk behavior, inspect relevant callers, callees, tests, and request flows using the most effective available tools, then report material risk to the user.
+- Use symbol-aware tooling for non-trivial renames; avoid blind repository-wide replacement.
