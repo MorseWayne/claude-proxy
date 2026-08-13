@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.0.5 - 2026-08-13
+
+### Fixed in v3.0.5
+
+- Reconstructed non-streaming OpenAI Chat Completions and Responses output from accumulated deltas when an upstream terminal Responses event omits its `output`, while preserving native response metadata.
+- Normalized Responses web-search domain filters across compatible request shapes.
+- Queued local concurrency without retry storms when all provider capacity is busy.
+- Bounded proxy stream frames and non-streaming response memory, with explicit idle, overall, and unfinished-tool safeguards.
+
 ## v3.0.4 - 2026-08-12
 
 ### Added in v3.0.4
