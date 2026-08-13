@@ -1107,14 +1107,22 @@ async fn login_oauth_provider(
         .map_err(claude_proxy_providers::ProviderError::Network)?;
     match provider_type {
         ProviderType::Copilot => {
-            let auth =
-                claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode").await?;
+            let auth = claude_proxy_providers::copilot::auth::CopilotAuth::new(
+                client,
+                "vscode",
+                settings.http.max_response_body_bytes,
+            )
+            .await?;
             auth.run_device_flow().await?;
             let _ = auth.refresh_copilot_token().await;
             Ok(())
         }
         ProviderType::ChatGPT => {
-            let auth = claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await?;
+            let auth = claude_proxy_providers::chatgpt::ChatGptAuth::new(
+                client,
+                settings.http.max_response_body_bytes,
+            )
+            .await?;
             auth.run_device_flow().await.map(|_| ())
         }
         _ => Ok(()),

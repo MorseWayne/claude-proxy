@@ -1891,8 +1891,12 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
 
             match provider_type {
                 ProviderType::Copilot => {
-                    match claude_proxy_providers::copilot::auth::CopilotAuth::new(client, "vscode")
-                        .await
+                    match claude_proxy_providers::copilot::auth::CopilotAuth::new(
+                        client,
+                        "vscode",
+                        settings.http.max_response_body_bytes,
+                    )
+                    .await
                     {
                         Ok(auth) => match auth.start_device_code().await {
                             Ok(info) => {
@@ -1922,7 +1926,12 @@ fn start_oauth_flow(app: &mut App, provider_id: &str) {
                     }
                 }
                 ProviderType::ChatGPT => {
-                    match claude_proxy_providers::chatgpt::ChatGptAuth::new(client).await {
+                    match claude_proxy_providers::chatgpt::ChatGptAuth::new(
+                        client,
+                        settings.http.max_response_body_bytes,
+                    )
+                    .await
+                    {
                         Ok(auth) => match auth.start_device_code().await {
                             Ok(info) => {
                                 let _ = tx.send(OAuthResult::CodeInfo {

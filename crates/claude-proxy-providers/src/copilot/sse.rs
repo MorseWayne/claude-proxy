@@ -10,11 +10,12 @@ use crate::sse::{SseDecoder, parse_sse_frame};
 
 pub(super) fn stream_anthropic_sse_response(
     response: reqwest::Response,
+    max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
 
     tokio::spawn(async move {
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
         let mut byte_stream = response.bytes_stream();
 
         loop {
@@ -29,7 +30,15 @@ pub(super) fn stream_anthropic_sse_response(
 
             match chunk_result {
                 Ok(chunk) => {
-                    decoder.push(&chunk);
+                    if let Err(error) = decoder.push(&chunk) {
+                        let _ = tx
+                            .send(Err(ProviderError::ResponseTooLarge(format!(
+                                "SSE frame exceeds configured limit of {} bytes",
+                                error.limit
+                            ))))
+                            .await;
+                        return;
+                    }
                     while let Some(event_text) = decoder.next_frame() {
                         if let Some(event) = parse_anthropic_sse_text(&event_text)
                             && tx.send(Ok(event)).await.is_err()
@@ -47,10 +56,21 @@ pub(super) fn stream_anthropic_sse_response(
             }
         }
 
-        if let Some(event_text) = decoder.finish()
-            && let Some(event) = parse_anthropic_sse_text(&event_text)
-        {
-            let _ = tx.send(Ok(event)).await;
+        match decoder.finish() {
+            Ok(Some(event_text)) => {
+                if let Some(event) = parse_anthropic_sse_text(&event_text) {
+                    let _ = tx.send(Ok(event)).await;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
+            }
         }
     });
 

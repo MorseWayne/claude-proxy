@@ -76,27 +76,34 @@ struct OpenAiFunction {
 pub(crate) fn stream_openai_response(
     response: reqwest::Response,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    stream_openai_response_with_marker_mode(response, ReasoningMarkerMode::Strict)
+    stream_openai_response_with_marker_mode(response, ReasoningMarkerMode::Strict, 1024 * 1024)
 }
 
 pub(crate) fn stream_openai_response_with_marker_mode(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
+    max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    stream_openai_response_with_marker_mode_and_observer(response, marker_mode, None)
+    stream_openai_response_with_marker_mode_and_observer(
+        response,
+        marker_mode,
+        None,
+        max_sse_frame_bytes,
+    )
 }
 
 pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     observer: Option<ProviderRequestObserver>,
+    max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
     let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
 
     tokio::spawn(async move {
         let mut converter = StreamConverter::with_marker_mode(marker_mode);
         let observer = observer.as_ref();
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
         let mut byte_stream = response.bytes_stream();
         let mut saw_done = false;
 
@@ -112,7 +119,15 @@ pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
 
             match chunk_result {
                 Ok(chunk) => {
-                    decoder.push(&chunk);
+                    if let Err(error) = decoder.push(&chunk) {
+                        let _ = tx
+                            .send(Err(ProviderError::ResponseTooLarge(format!(
+                                "SSE frame exceeds configured limit of {} bytes",
+                                error.limit
+                            ))))
+                            .await;
+                        return;
+                    }
                     while let Some(event_str) = decoder.next_frame() {
                         if is_sse_done(&event_str) {
                             saw_done = true;
@@ -133,17 +148,29 @@ pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
                     if converter.stopped || saw_done {
                         break;
                     }
-                    if let Some(event_str) = decoder.finish() {
-                        if is_sse_done(&event_str) {
-                            saw_done = true;
-                        } else if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
-                            let events = converter.process_chunk(&openai_chunk);
-                            notify_stream_metadata(observer, &openai_chunk);
-                            for event in events {
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
+                    match decoder.finish() {
+                        Ok(Some(event_str)) => {
+                            if is_sse_done(&event_str) {
+                                saw_done = true;
+                            } else if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
+                                let events = converter.process_chunk(&openai_chunk);
+                                notify_stream_metadata(observer, &openai_chunk);
+                                for event in events {
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = tx
+                                .send(Err(ProviderError::ResponseTooLarge(format!(
+                                    "SSE frame exceeds configured limit of {} bytes",
+                                    error.limit
+                                ))))
+                                .await;
+                            return;
                         }
                     }
                     if converter.stopped || saw_done {
@@ -157,15 +184,26 @@ pub(crate) fn stream_openai_response_with_marker_mode_and_observer(
             }
         }
 
-        if let Some(event_str) = decoder.finish()
-            && !is_sse_done(&event_str)
-            && let Some(openai_chunk) = parse_openai_chunk(&event_str)
-        {
-            notify_stream_metadata(observer, &openai_chunk);
-            for event in converter.process_chunk(&openai_chunk) {
-                if tx.send(Ok(event)).await.is_err() {
-                    return;
+        match decoder.finish() {
+            Ok(Some(event_str)) if !is_sse_done(&event_str) => {
+                if let Some(openai_chunk) = parse_openai_chunk(&event_str) {
+                    notify_stream_metadata(observer, &openai_chunk);
+                    for event in converter.process_chunk(&openai_chunk) {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
                 }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
+                return;
             }
         }
 
@@ -1108,6 +1146,7 @@ mod tests {
             response,
             ReasoningMarkerMode::Strict,
             Some(observer),
+            1024 * 1024,
         );
         let mut events = Vec::new();
 

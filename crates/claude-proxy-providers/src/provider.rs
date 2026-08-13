@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::io::{self, Write};
+use std::mem::size_of;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -49,6 +51,51 @@ impl ProviderEvent {
     pub fn native_event(&self) -> Option<&NativeProviderEvent> {
         self.native.as_ref()
     }
+
+    pub fn into_parts(self) -> (Vec<SseEvent>, Option<NativeProviderEvent>) {
+        (self.normalized, self.native)
+    }
+
+    /// Estimate the logical bytes retained by this owned event without
+    /// allocating a second serialized payload.
+    pub fn retained_size_bytes(&self) -> Option<u64> {
+        let mut size = u64::try_from(size_of::<Self>()).ok()?;
+        for event in &self.normalized {
+            size = size.checked_add(sse_event_retained_size(event)?)?;
+        }
+        if let Some(NativeProviderEvent::OpenAiResponses(event)) = &self.native {
+            size = size.checked_add(sse_event_retained_size(event)?)?;
+        }
+        Some(size)
+    }
+}
+
+fn sse_event_retained_size(event: &SseEvent) -> Option<u64> {
+    let fixed = u64::try_from(size_of::<SseEvent>()).ok()?;
+    let event_name = u64::try_from(event.event.len()).ok()?;
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, &event.data).ok()?;
+    fixed.checked_add(event_name)?.checked_add(writer.bytes)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(buffer.len()).map_err(|_| io::Error::other("size overflow"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("size overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl From<SseEvent> for ProviderEvent {
@@ -57,7 +104,35 @@ impl From<SseEvent> for ProviderEvent {
     }
 }
 
-#[derive(Debug, Error)]
+#[cfg(test)]
+mod provider_event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn retained_size_counts_normalized_and_native_payloads() {
+        let normalized = SseEvent {
+            event: "message_delta".to_string(),
+            data: json!({"delta": {"text": "hello"}}),
+        };
+        let normalized_only = ProviderEvent::normalized(vec![normalized.clone()]);
+        let with_native = ProviderEvent::openai_responses(
+            SseEvent {
+                event: "response.output_text.delta".to_string(),
+                data: json!({"delta": "hello"}),
+            },
+            vec![normalized],
+        );
+
+        assert!(normalized_only.retained_size_bytes().unwrap() > 0);
+        assert!(
+            with_native.retained_size_bytes().unwrap()
+                > normalized_only.retained_size_bytes().unwrap()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     #[error("authentication failed: {0}")]
     Authentication(String),
@@ -76,6 +151,9 @@ pub enum ProviderError {
 
     #[error("request too large: {0}")]
     RequestTooLarge(String),
+
+    #[error("upstream response too large: {0}")]
+    ResponseTooLarge(String),
 
     #[error("upstream overloaded: {message}")]
     Overloaded {

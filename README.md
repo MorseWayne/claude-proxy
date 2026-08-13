@@ -180,11 +180,14 @@ max_concurrency = 5                     # Max concurrent requests
 max_concurrency_queue = 32              # Requests allowed to wait for global concurrency
 provider_max_concurrency = 4            # Max concurrent upstream requests per provider
 provider_max_concurrency_queue = 16     # Requests allowed to wait per provider
+max_non_stream_response_bytes = 33554432 # Logical ProviderEvent bytes retained for stream=false (32 MiB)
 
 [http]
 read_timeout = 300                      # Upstream read timeout (seconds)
 write_timeout = 60                      # Upstream write timeout (seconds)
 connect_timeout = 60                    # Upstream connect timeout (seconds)
+max_response_body_bytes = 16777216      # Max successful non-SSE upstream body (16 MiB)
+max_sse_frame_bytes = 1048576           # Max incomplete upstream SSE frame (1 MiB)
 
 [log]
 level = "info"                          # Log level (trace/debug/info/warn/error)
@@ -193,6 +196,12 @@ with_stdout = true                      # Also emit to stderr (foreground server
 raw_api_payloads = false                # Log raw request payloads
 raw_sse_events = false                  # Log raw SSE events
 ```
+
+Response limits are enabled by default and measured in bytes. Oversized non-streaming
+responses fail before downstream headers are committed with an upstream `502` error;
+oversized streaming SSE frames terminate the already-started stream with an in-band
+protocol error. The non-stream budget counts the logical retained normalized and native
+event payloads, rather than exact allocator usage.
 
 `xhigh` remains supported for older configs; when newer Codex/ChatGPT upstreams advertise native `max`, you can use `max` in model capabilities or alias `reasoning_effort`.
 
@@ -360,6 +369,26 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 ![Claude Code Integration](images/claude-code-usage.png)
 
 ## Build from Source
+
+Build an optimized binary and install it locally in one command:
+
+```bash
+cargo install-local
+```
+
+Cargo installs `claude-proxy` to `$CARGO_HOME/bin` (usually `~/.cargo/bin`). To
+use another installation root, for example `~/.local/bin`, run:
+
+```bash
+CARGO_INSTALL_ROOT="$HOME/.local" cargo install-local
+```
+
+The shortcut is equivalent to
+`cargo install --path crates/claude-proxy-cli --locked --force`; Cargo's
+install command builds the release profile by default, while the committed
+lockfile keeps local installs reproducible.
+
+To build without installing:
 
 ```bash
 cargo build --release

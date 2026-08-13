@@ -47,6 +47,7 @@ pub struct CopilotProvider {
     config: CopilotProviderConfig,
     model_cache: RwLock<Vec<ModelInfo>>,
     model_endpoints: RwLock<HashMap<String, Vec<String>>>,
+    payload_limits: crate::http::ResponsePayloadLimits,
 }
 
 impl CopilotProvider {
@@ -65,7 +66,12 @@ impl CopilotProvider {
         };
 
         let http_client = Self::build_http_client(&config.proxy, settings)?;
-        let auth = CopilotAuth::new(http_client.clone(), &copilot_config.oauth_app).await?;
+        let auth = CopilotAuth::new(
+            http_client.clone(),
+            &copilot_config.oauth_app,
+            settings.http.max_response_body_bytes,
+        )
+        .await?;
 
         Ok(Self {
             id: id.to_string(),
@@ -76,6 +82,7 @@ impl CopilotProvider {
             config: copilot_config,
             model_cache: RwLock::new(Vec::new()),
             model_endpoints: RwLock::new(HashMap::new()),
+            payload_limits: crate::http::ResponsePayloadLimits::from_settings(settings),
         })
     }
 
@@ -219,9 +226,14 @@ impl CopilotProvider {
         }
 
         if request.stream {
-            Ok(sse::stream_anthropic_sse_response(response))
+            Ok(sse::stream_anthropic_sse_response(
+                response,
+                self.payload_limits.max_sse_frame_bytes,
+            ))
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = SseEvent {
                 event: "message".to_string(),
@@ -257,10 +269,13 @@ impl CopilotProvider {
                 crate::chat_completions::stream_openai_response_with_marker_mode(
                     response,
                     marker_mode_from_request(&request),
+                    self.payload_limits.max_sse_frame_bytes,
                 ),
             )
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let events = crate::chat_completions::convert_non_streaming_response_with_marker_mode(
                 &data,
@@ -300,9 +315,12 @@ impl CopilotProvider {
                 response,
                 marker_mode_from_request(&request),
                 correlation,
+                self.payload_limits.max_sse_frame_bytes,
             ))
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = crate::responses::convert_non_streaming_provider_response_with_context(
                 &data,
@@ -406,8 +424,12 @@ impl Provider for CopilotProvider {
             return Err(self.map_upstream_error(response).await);
         }
 
-        let data: Value =
-            read_upstream_response_json(response, "failed to parse models response").await?;
+        let data: Value = read_upstream_response_json(
+            response,
+            self.payload_limits.max_response_body_bytes,
+            "failed to parse models response",
+        )
+        .await?;
 
         let models: Vec<ModelInfo> = data["data"]
             .as_array()

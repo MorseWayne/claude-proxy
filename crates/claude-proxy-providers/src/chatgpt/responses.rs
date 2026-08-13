@@ -67,6 +67,7 @@ pub(super) fn stream_response_with_marker_mode_and_context<F>(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     correlation: crate::responses::ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
     on_event: F,
 ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
@@ -76,6 +77,7 @@ where
         response,
         marker_mode,
         correlation,
+        max_sse_frame_bytes,
         on_event,
     )
 }

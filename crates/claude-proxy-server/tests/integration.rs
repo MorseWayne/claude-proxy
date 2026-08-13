@@ -58,6 +58,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
             provider_max_concurrency: 10,
             provider_max_concurrency_queue: 16,
             model_cache_ttl_seconds: 3600,
+            max_non_stream_response_bytes: 32 * 1024 * 1024,
         },
         http: HttpConfig::default(),
         log: LogConfig::default(),

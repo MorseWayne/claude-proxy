@@ -723,6 +723,9 @@ pub struct LimitsConfig {
     pub provider_max_concurrency_queue: u32,
     #[serde(default = "default_model_cache_ttl_seconds")]
     pub model_cache_ttl_seconds: u64,
+    /// Maximum logical payload bytes retained while assembling one non-stream response.
+    #[serde(default = "default_max_non_stream_response_bytes")]
+    pub max_non_stream_response_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -733,6 +736,12 @@ pub struct HttpConfig {
     pub write_timeout: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
+    /// Maximum bytes read from one successful non-stream upstream response.
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: u64,
+    /// Maximum bytes buffered for one incomplete upstream SSE frame.
+    #[serde(default = "default_max_sse_frame_bytes")]
+    pub max_sse_frame_bytes: u64,
     /// Extra CA certificate files (PEM, single cert or bundle) to trust in
     /// addition to the built-in webpki Mozilla roots. Required for corporate
     /// networks that perform TLS MITM (Fortinet, Zscaler, Bluecoat, ...) —
@@ -824,6 +833,9 @@ fn default_provider_max_concurrency_queue() -> u32 {
 fn default_model_cache_ttl_seconds() -> u64 {
     60 * 60
 }
+fn default_max_non_stream_response_bytes() -> u64 {
+    32 * 1024 * 1024
+}
 fn default_read_timeout() -> u64 {
     300
 }
@@ -832,6 +844,12 @@ fn default_write_timeout() -> u64 {
 }
 fn default_connect_timeout() -> u64 {
     60
+}
+fn default_max_response_body_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_max_sse_frame_bytes() -> u64 {
+    1024 * 1024
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -876,6 +894,7 @@ impl Default for LimitsConfig {
             provider_max_concurrency: default_provider_max_concurrency(),
             provider_max_concurrency_queue: default_provider_max_concurrency_queue(),
             model_cache_ttl_seconds: default_model_cache_ttl_seconds(),
+            max_non_stream_response_bytes: default_max_non_stream_response_bytes(),
         }
     }
 }
@@ -886,6 +905,8 @@ impl Default for HttpConfig {
             read_timeout: default_read_timeout(),
             write_timeout: default_write_timeout(),
             connect_timeout: default_connect_timeout(),
+            max_response_body_bytes: default_max_response_body_bytes(),
+            max_sse_frame_bytes: default_max_sse_frame_bytes(),
             extra_ca_certs: Vec::new(),
         }
     }
@@ -1128,6 +1149,21 @@ impl Settings {
         if self.limits.model_cache_ttl_seconds == 0 {
             return Err(ConfigError::Validation(
                 "limits.model_cache_ttl_seconds must be > 0".to_string(),
+            ));
+        }
+        if self.limits.max_non_stream_response_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "limits.max_non_stream_response_bytes must be > 0".to_string(),
+            ));
+        }
+        if self.http.max_response_body_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "http.max_response_body_bytes must be > 0".to_string(),
+            ));
+        }
+        if self.http.max_sse_frame_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "http.max_sse_frame_bytes must be > 0".to_string(),
             ));
         }
         // Validate model format: must contain provider_id/model_name
@@ -1456,6 +1492,46 @@ auth_token = "test-token"
         assert_eq!(settings.limits.rate_limit, 240);
         assert_eq!(settings.limits.max_concurrency_queue, 32);
         assert_eq!(settings.limits.provider_max_concurrency_queue, 16);
+        assert_eq!(
+            settings.limits.max_non_stream_response_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(settings.http.max_response_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(settings.http.max_sse_frame_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn response_payload_limits_parse_overrides() {
+        let toml = r#"
+[limits]
+max_non_stream_response_bytes = 4096
+
+[http]
+max_response_body_bytes = 2048
+max_sse_frame_bytes = 1024
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.limits.max_non_stream_response_bytes, 4096);
+        assert_eq!(settings.http.max_response_body_bytes, 2048);
+        assert_eq!(settings.http.max_sse_frame_bytes, 1024);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_response_payload_limits_are_rejected() {
+        for toml in [
+            "[limits]\nmax_non_stream_response_bytes = 0\n",
+            "[http]\nmax_response_body_bytes = 0\n",
+            "[http]\nmax_sse_frame_bytes = 0\n",
+        ] {
+            let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+            assert!(
+                settings.validate().is_err(),
+                "TOML should be rejected: {toml}"
+            );
+        }
     }
 
     #[test]

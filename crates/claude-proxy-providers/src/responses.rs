@@ -1356,8 +1356,15 @@ pub fn stream_responses_response_with_context(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
-    stream_responses_response_with_context_and_observer(response, marker_mode, correlation, |_| {})
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        correlation,
+        max_sse_frame_bytes,
+        |_| {},
+    )
 }
 
 pub fn stream_responses_response_with_context_and_provider_observer(
@@ -1365,11 +1372,13 @@ pub fn stream_responses_response_with_context_and_provider_observer(
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
     observer: Option<ProviderRequestObserver>,
+    max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
     stream_responses_response_with_context_and_observer(
         response,
         marker_mode,
         correlation,
+        max_sse_frame_bytes,
         move |event| notify_stream_metadata(observer.as_ref(), event),
     )
 }
@@ -1402,6 +1411,7 @@ where
         response,
         marker_mode,
         ResponsesCorrelation::default(),
+        1024 * 1024,
         on_event,
     )
 }
@@ -1410,6 +1420,7 @@ pub fn stream_responses_response_with_context_and_observer<F>(
     response: reqwest::Response,
     marker_mode: ReasoningMarkerMode,
     correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
     on_event: F,
 ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
 where
@@ -1428,7 +1439,7 @@ where
     tokio::spawn(async move {
         let native_correlation = correlation.clone();
         let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
         let mut byte_stream = response.bytes_stream();
         let mut preview = Vec::new();
         let mut saw_done = false;
@@ -1446,7 +1457,15 @@ where
             match chunk_result {
                 Ok(chunk) => {
                     append_stream_preview(&mut preview, &chunk);
-                    decoder.push(&chunk);
+                    if let Err(error) = decoder.push(&chunk) {
+                        let _ = tx
+                            .send(Err(ProviderError::ResponseTooLarge(format!(
+                                "SSE frame exceeds configured limit of {} bytes",
+                                error.limit
+                            ))))
+                            .await;
+                        return;
+                    }
                     while let Some(event) = decoder.next_frame() {
                         if is_sse_done(&event) {
                             saw_done = true;
@@ -1477,27 +1496,39 @@ where
                     if converter.stopped || saw_done {
                         break;
                     }
-                    if let Some(event) = decoder.finish() {
-                        if is_sse_done(&event) {
-                            saw_done = true;
-                        } else if let Some(value) = parse_sse_json(&event) {
-                            on_event(&value);
-                            if let Some(error) = responses_error_event(&value) {
-                                let _ = tx.send(Err(error)).await;
-                                return;
+                    match decoder.finish() {
+                        Ok(Some(event)) => {
+                            if is_sse_done(&event) {
+                                saw_done = true;
+                            } else if let Some(value) = parse_sse_json(&event) {
+                                on_event(&value);
+                                if let Some(error) = responses_error_event(&value) {
+                                    let _ = tx.send(Err(error)).await;
+                                    return;
+                                }
+                                let normalized = converter.process_event(&value);
+                                let native = native_correlation.restore_response_event(&value);
+                                if tx
+                                    .send(Ok(ProviderEvent::openai_responses(
+                                        response_sse_event(native),
+                                        normalized,
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
-                            let normalized = converter.process_event(&value);
-                            let native = native_correlation.restore_response_event(&value);
-                            if tx
-                                .send(Ok(ProviderEvent::openai_responses(
-                                    response_sse_event(native),
-                                    normalized,
-                                )))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = tx
+                                .send(Err(ProviderError::ResponseTooLarge(format!(
+                                    "SSE frame exceeds configured limit of {} bytes",
+                                    error.limit
+                                ))))
+                                .await;
+                            return;
                         }
                     }
                     if converter.stopped || saw_done {
@@ -1511,25 +1542,36 @@ where
             }
         }
 
-        if let Some(event) = decoder.finish()
-            && !is_sse_done(&event)
-            && let Some(value) = parse_sse_json(&event)
-        {
-            on_event(&value);
-            if let Some(error) = responses_error_event(&value) {
-                let _ = tx.send(Err(error)).await;
-                return;
+        match decoder.finish() {
+            Ok(Some(event)) if !is_sse_done(&event) => {
+                if let Some(value) = parse_sse_json(&event) {
+                    on_event(&value);
+                    if let Some(error) = responses_error_event(&value) {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                    let normalized = converter.process_event(&value);
+                    let native = native_correlation.restore_response_event(&value);
+                    if tx
+                        .send(Ok(ProviderEvent::openai_responses(
+                            response_sse_event(native),
+                            normalized,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
-            let normalized = converter.process_event(&value);
-            let native = native_correlation.restore_response_event(&value);
-            if tx
-                .send(Ok(ProviderEvent::openai_responses(
-                    response_sse_event(native),
-                    normalized,
-                )))
-                .await
-                .is_err()
-            {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
                 return;
             }
         }

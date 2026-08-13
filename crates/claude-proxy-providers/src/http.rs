@@ -58,6 +58,21 @@ const NON_RETRYABLE_RATE_LIMIT_BODY_POINTERS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy)]
+pub struct ResponsePayloadLimits {
+    pub max_response_body_bytes: u64,
+    pub max_sse_frame_bytes: u64,
+}
+
+impl ResponsePayloadLimits {
+    pub fn from_settings(settings: &claude_proxy_config::Settings) -> Self {
+        Self {
+            max_response_body_bytes: settings.http.max_response_body_bytes,
+            max_sse_frame_bytes: settings.http.max_sse_frame_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct UpstreamRequestPolicy {
     pub max_attempts: usize,
     pub attempt_timeout: Option<Duration>,
@@ -329,34 +344,74 @@ where
 
 pub async fn read_upstream_response_text(
     response: reqwest::Response,
+    max_response_body_bytes: u64,
 ) -> Result<String, ProviderError> {
-    read_upstream_response_text_with_timeout(response, UPSTREAM_SUCCESS_BODY_TIMEOUT).await
+    read_upstream_response_text_with_timeout(
+        response,
+        max_response_body_bytes,
+        UPSTREAM_SUCCESS_BODY_TIMEOUT,
+    )
+    .await
 }
 
 async fn read_upstream_response_text_with_timeout(
     response: reqwest::Response,
+    max_response_body_bytes: u64,
     read_timeout: Duration,
 ) -> Result<String, ProviderError> {
-    timeout(read_timeout, response.text())
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_body_bytes)
+    {
+        return Err(response_too_large_error(max_response_body_bytes));
+    }
+
+    let read = async move {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                if error.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Network(fmt_reqwest_err(&error))
+                }
+            })?;
+            let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            if body_len
+                .checked_add(chunk_len)
+                .is_none_or(|length| length > max_response_body_bytes)
+            {
+                return Err(response_too_large_error(max_response_body_bytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).map_err(|error| {
+            ProviderError::Network(format!("upstream response is not UTF-8: {error}"))
+        })
+    };
+
+    timeout(read_timeout, read)
         .await
         .map_err(|_| ProviderError::Timeout)?
-        .map_err(|e| {
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(fmt_reqwest_err(&e))
-            }
-        })
+}
+
+fn response_too_large_error(limit: u64) -> ProviderError {
+    ProviderError::ResponseTooLarge(format!(
+        "response body exceeds configured limit of {limit} bytes"
+    ))
 }
 
 pub async fn read_upstream_response_json<T>(
     response: reqwest::Response,
+    max_response_body_bytes: u64,
     parse_error_context: &str,
 ) -> Result<T, ProviderError>
 where
     T: DeserializeOwned,
 {
-    let body = read_upstream_response_text(response).await?;
+    let body = read_upstream_response_text(response, max_response_body_bytes).await?;
     serde_json::from_str(&body)
         .map_err(|e| ProviderError::Network(format!("{parse_error_context}: {e}")))
 }
@@ -842,6 +897,42 @@ mod tests {
             .unwrap()
     }
 
+    async fn response_with_chunked_body(chunks: &[&str]) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunks = chunks
+            .iter()
+            .map(|chunk| chunk.to_string())
+            .collect::<Vec<_>>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn retryable_statuses_include_transient_failures() {
         assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
@@ -1096,11 +1187,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_success_body_rejects_content_length_over_limit() {
+        let response = response_with_status_headers_and_body("200 OK", &[], "12345").await;
+
+        let result = read_upstream_response_text(response, 4).await;
+
+        assert!(matches!(result, Err(ProviderError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn upstream_success_body_rejects_chunked_body_over_limit() {
+        let response = response_with_chunked_body(&["12", "345"]).await;
+
+        let result = read_upstream_response_text(response, 4).await;
+
+        assert!(matches!(result, Err(ProviderError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn upstream_success_body_accepts_exact_limit() {
+        let response = response_with_chunked_body(&["12", "34"]).await;
+
+        let result = read_upstream_response_text(response, 4).await.unwrap();
+
+        assert_eq!(result, "1234");
+    }
+
+    #[tokio::test]
+    async fn upstream_json_body_rejects_oversize_before_parsing() {
+        let response = response_with_chunked_body(&[r#"{"ok":true}"#]).await;
+
+        let result = read_upstream_response_json::<Value>(response, 4, "invalid test JSON").await;
+
+        assert!(matches!(result, Err(ProviderError::ResponseTooLarge(_))));
+    }
+
+    #[tokio::test]
     async fn upstream_success_body_read_times_out_when_idle() {
         let response = response_with_stalled_body("partial upstream success").await;
 
-        let result =
-            read_upstream_response_text_with_timeout(response, Duration::from_millis(20)).await;
+        let result = read_upstream_response_text_with_timeout(
+            response,
+            1024 * 1024,
+            Duration::from_millis(20),
+        )
+        .await;
 
         assert!(matches!(result, Err(ProviderError::Timeout)));
     }

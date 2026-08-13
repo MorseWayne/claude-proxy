@@ -675,6 +675,7 @@ pub struct ChatGptProvider {
     remote_models: Arc<RwLock<HashMap<String, ChatGptCatalogModel>>>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
     context_usage: Arc<StdMutex<HashMap<ContextUsageKey, ContextUsageBaseline>>>,
+    payload_limits: crate::http::ResponsePayloadLimits,
 }
 
 impl ChatGptProvider {
@@ -684,7 +685,8 @@ impl ChatGptProvider {
         settings: &Settings,
     ) -> Result<Self, ProviderError> {
         let http_client = build_http_client(&config.proxy, settings)?;
-        let auth = ChatGptAuth::new(http_client.clone()).await?;
+        let auth =
+            ChatGptAuth::new(http_client.clone(), settings.http.max_response_body_bytes).await?;
         let chatgpt_config = config.chatgpt.clone().unwrap_or_default();
         let transport = chatgpt_config.transport;
         let base_url = normalized_codex_base_url(&config.base_url);
@@ -716,6 +718,7 @@ impl ChatGptProvider {
                 hard_stop_generation: 0,
             })),
             context_usage: Arc::new(StdMutex::new(HashMap::new())),
+            payload_limits: crate::http::ResponsePayloadLimits::from_settings(settings),
         })
     }
 
@@ -980,8 +983,12 @@ impl ChatGptProvider {
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);
         }
-        let payload: ChatGptModelsPayload =
-            read_upstream_response_json(response, "invalid ChatGPT models response").await?;
+        let payload: ChatGptModelsPayload = read_upstream_response_json(
+            response,
+            self.payload_limits.max_response_body_bytes,
+            "invalid ChatGPT models response",
+        )
+        .await?;
         if payload.models.is_empty() {
             return Err(ProviderError::UpstreamError {
                 status: 502,
@@ -1269,7 +1276,9 @@ impl ChatGptProvider {
         }
 
         let headers = response.headers().clone();
-        let error_body = read_upstream_response_text(response).await?;
+        let error_body =
+            read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                .await?;
         if is_prompt_too_long_error(status, &error_body) {
             notify_request_metadata_observer(
                 observer,
@@ -1661,6 +1670,7 @@ impl ChatGptProvider {
             response,
             marker_mode,
             responses_correlation,
+            self.payload_limits.max_sse_frame_bytes,
             on_event,
         );
         wrap_chatgpt_stream_logging(
@@ -8821,7 +8831,11 @@ mod tests {
             websocket_sse_cooldown_until_secs: Arc::new(AtomicU64::new(0)),
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
-            auth: ChatGptAuth::new(Client::new()).await.unwrap(),
+            auth: ChatGptAuth::new(Client::new(), 1024 * 1024).await.unwrap(),
+            payload_limits: crate::http::ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
             remote_models: Arc::new(RwLock::new(HashMap::new())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),

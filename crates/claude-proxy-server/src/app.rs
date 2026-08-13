@@ -6,7 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::LimitsConfig;
 use claude_proxy_core::ModelInfo;
-use claude_proxy_providers::provider::{Provider, ProviderEvent, UpstreamErrorMetadata};
+use claude_proxy_providers::provider::{
+    Provider, ProviderError, ProviderEvent, UpstreamErrorMetadata,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
@@ -724,6 +726,7 @@ mod tests {
                 provider_max_concurrency,
                 provider_max_concurrency_queue: 16,
                 model_cache_ttl_seconds: DEFAULT_MODEL_CACHE_TTL.as_secs(),
+                max_non_stream_response_bytes: 32 * 1024 * 1024,
             },
             http: HttpConfig::default(),
             log: LogConfig::default(),
@@ -1410,6 +1413,14 @@ impl ConcurrencyLimiter {
     }
 }
 
+/// A typed inflight failure that preserves protocol-aware HTTP mapping for
+/// non-stream followers while exposing a safe message to streaming clients.
+#[derive(Debug, Clone)]
+pub struct InflightFailure {
+    pub error: ProviderError,
+    pub message: String,
+}
+
 /// An event in the inflight broadcast channel.
 #[derive(Debug, Clone)]
 pub enum InflightEvent {
@@ -1418,7 +1429,7 @@ pub enum InflightEvent {
     /// The stream completed (no more events).
     Done,
     /// An error occurred during streaming.
-    Error(String),
+    Error(InflightFailure),
 }
 
 /// Registry of provider instances and cached model lists.

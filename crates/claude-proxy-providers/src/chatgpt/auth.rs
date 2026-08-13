@@ -73,10 +73,14 @@ pub struct ChatGptAuth {
     token_refresh_lock: Mutex<()>,
     token_dir: PathBuf,
     http_client: Client,
+    max_response_body_bytes: u64,
 }
 
 impl ChatGptAuth {
-    pub async fn new(http_client: Client) -> Result<Arc<Self>, ProviderError> {
+    pub async fn new(
+        http_client: Client,
+        max_response_body_bytes: u64,
+    ) -> Result<Arc<Self>, ProviderError> {
         let token_dir = Self::token_dir();
         fs::create_dir_all(&token_dir)
             .map_err(|e| ProviderError::Network(format!("failed to create token dir: {e}")))?;
@@ -86,6 +90,7 @@ impl ChatGptAuth {
             token_refresh_lock: Mutex::new(()),
             token_dir,
             http_client,
+            max_response_body_bytes,
         });
 
         if auth.token.read().await.is_some() {
@@ -145,8 +150,12 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: DeviceCodeResponse =
-            read_upstream_response_json(response, "invalid ChatGPT device code response").await?;
+        let data: DeviceCodeResponse = read_upstream_response_json(
+            response,
+            self.max_response_body_bytes,
+            "invalid ChatGPT device code response",
+        )
+        .await?;
 
         Ok(DeviceCodeInfo {
             device_auth_id: data.device_auth_id,
@@ -180,9 +189,12 @@ impl ChatGptAuth {
                 })?;
 
             if response.status().is_success() {
-                let data: DeviceTokenResponse =
-                    read_upstream_response_json(response, "invalid ChatGPT device token response")
-                        .await?;
+                let data: DeviceTokenResponse = read_upstream_response_json(
+                    response,
+                    self.max_response_body_bytes,
+                    "invalid ChatGPT device token response",
+                )
+                .await?;
                 let token = self
                     .exchange_authorization_code(
                         &data.authorization_code,
@@ -322,8 +334,12 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: TokenResponse =
-            read_upstream_response_json(response, "invalid ChatGPT token refresh response").await?;
+        let data: TokenResponse = read_upstream_response_json(
+            response,
+            self.max_response_body_bytes,
+            "invalid ChatGPT token refresh response",
+        )
+        .await?;
         let token = token_from_response(data, Some(&current.refresh_token));
         self.store_token(token).await;
         Ok(())
@@ -359,9 +375,12 @@ impl ChatGptAuth {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: TokenResponse =
-            read_upstream_response_json(response, "invalid ChatGPT token exchange response")
-                .await?;
+        let data: TokenResponse = read_upstream_response_json(
+            response,
+            self.max_response_body_bytes,
+            "invalid ChatGPT token exchange response",
+        )
+        .await?;
         Ok(token_from_response(data, None))
     }
 
@@ -470,6 +489,7 @@ mod tests {
             token_refresh_lock: Mutex::new(()),
             token_dir,
             http_client: Client::new(),
+            max_response_body_bytes: 1024 * 1024,
         }
     }
 

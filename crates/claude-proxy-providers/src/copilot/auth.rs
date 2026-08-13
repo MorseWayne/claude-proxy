@@ -74,11 +74,16 @@ pub struct CopilotAuth {
     token_dir: PathBuf,
     http_client: Client,
     oauth_app: String,
+    max_response_body_bytes: u64,
 }
 
 impl CopilotAuth {
     /// Create a new auth manager.  Loads persisted GitHub token if available.
-    pub async fn new(http_client: Client, oauth_app: &str) -> Result<Arc<Self>, ProviderError> {
+    pub async fn new(
+        http_client: Client,
+        oauth_app: &str,
+        max_response_body_bytes: u64,
+    ) -> Result<Arc<Self>, ProviderError> {
         let token_dir = Self::token_dir();
         fs::create_dir_all(&token_dir)
             .map_err(|e| ProviderError::Network(format!("failed to create token dir: {e}")))?;
@@ -92,6 +97,7 @@ impl CopilotAuth {
             token_dir,
             http_client,
             oauth_app: oauth_app.to_string(),
+            max_response_body_bytes,
         });
 
         if auth.github_token.read().await.is_some() {
@@ -239,13 +245,20 @@ impl CopilotAuth {
             };
 
             if !resp.status().is_success() {
-                let body = read_upstream_response_text(resp).await.unwrap_or_default();
+                let body = read_upstream_response_text(resp, self.max_response_body_bytes)
+                    .await
+                    .unwrap_or_default();
                 return Err(ProviderError::Authentication(format!(
                     "device code request rejected: {body}"
                 )));
             }
 
-            return read_upstream_response_json(resp, "invalid device code response").await;
+            return read_upstream_response_json(
+                resp,
+                self.max_response_body_bytes,
+                "invalid device code response",
+            )
+            .await;
         }
 
         unreachable!("device code request loop must return");
@@ -273,7 +286,7 @@ impl CopilotAuth {
                     ProviderError::Network(format!("token poll failed: {}", fmt_reqwest_err(&e)))
                 })?;
 
-            let body_text = read_upstream_response_text(resp).await?;
+            let body_text = read_upstream_response_text(resp, self.max_response_body_bytes).await?;
             let parsed: AccessTokenResponse = serde_json::from_str(&body_text)
                 .map_err(|e| ProviderError::Network(format!("invalid token response: {e}")))?;
 
@@ -360,7 +373,9 @@ impl CopilotAuth {
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = read_upstream_response_text(resp).await.unwrap_or_default();
+            let body = read_upstream_response_text(resp, self.max_response_body_bytes)
+                .await
+                .unwrap_or_default();
 
             if status == 401 {
                 let mut token = self.github_token.write().await;
@@ -375,8 +390,12 @@ impl CopilotAuth {
             return Err(ProviderError::UpstreamError { status, body });
         }
 
-        let data: Value =
-            read_upstream_response_json(resp, "invalid copilot token response").await?;
+        let data: Value = read_upstream_response_json(
+            resp,
+            self.max_response_body_bytes,
+            "invalid copilot token response",
+        )
+        .await?;
 
         let token_str = data["token"]
             .as_str()
@@ -483,6 +502,7 @@ mod tests {
             token_dir: PathBuf::new(),
             http_client: Client::new(),
             oauth_app: "vscode".to_string(),
+            max_response_body_bytes: 1024 * 1024,
         }
     }
 

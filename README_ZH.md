@@ -461,12 +461,15 @@ max_concurrency_queue = 32              # 全局并发等待队列长度
 provider_max_concurrency = 4            # 单个上游 provider 最大并发请求数
 provider_max_concurrency_queue = 16     # 单个 provider 并发等待队列长度
 model_cache_ttl_seconds = 3600          # 上游模型列表缓存时长（秒）
+max_non_stream_response_bytes = 33554432 # stream=false 保留的逻辑 ProviderEvent 上限（32 MiB）
 
 [http]
 read_timeout = 300                      # 上游读取超时（秒）
 write_timeout = 60                      # 上游写入超时（秒）
 connect_timeout = 60                    # 上游连接超时（秒）
 extra_ca_certs = []                     # 额外 CA 证书路径，适合企业 TLS 代理
+max_response_body_bytes = 16777216      # 上游成功非 SSE body 上限（16 MiB）
+max_sse_frame_bytes = 1048576           # 上游单个未闭合 SSE frame 上限（1 MiB）
 
 [log]
 level = "info"
@@ -475,6 +478,11 @@ with_stdout = true
 raw_api_payloads = false                # 调试时再开启，可能包含敏感信息
 raw_sse_events = false
 ```
+
+响应边界默认启用，单位均为字节。非流式响应超限时会在提交下游响应头前返回上游
+`502` 错误；流式 SSE frame 超限时，由于 HTTP 流已开始，会通过对应协议的带内错误
+终止。非流式预算统计 normalized/native 事件实际保留的逻辑载荷，不等同于 allocator
+的精确堆内存用量。
 
 ## HTTP API
 
@@ -668,6 +676,24 @@ console.log(response.output_text);
 - **调试模型成本**：用 TUI Dashboard 观察模型维度 token 用量和错误率。
 
 ## 从源码构建
+
+一条命令完成 Release 编译并安装到本地：
+
+```bash
+cargo install-local
+```
+
+Cargo 会将 `claude-proxy` 安装到 `$CARGO_HOME/bin`（通常是 `~/.cargo/bin`）。
+如需安装到其他根目录，例如 `~/.local/bin`，可以运行：
+
+```bash
+CARGO_INSTALL_ROOT="$HOME/.local" cargo install-local
+```
+
+该快捷命令等价于
+`cargo install --path crates/claude-proxy-cli --locked --force`；Cargo 的 install 命令默认使用 Release profile 编译，提交到仓库的 lockfile 用于保证本地安装结果可复现。
+
+如果只需编译而不安装：
 
 ```bash
 cargo build --release

@@ -13,8 +13,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::http::{
-    apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response, next_upstream_stream_item,
-    read_upstream_response_text, send_upstream_request,
+    ResponsePayloadLimits, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
+    next_upstream_stream_item, read_upstream_response_text, send_upstream_request,
 };
 use crate::provider::{Provider, ProviderError, ProviderEvent};
 use crate::sse::{SseDecoder, parse_sse_frame};
@@ -24,6 +24,7 @@ pub struct AnthropicProvider {
     id: String,
     client: Client,
     base_url: String,
+    payload_limits: ResponsePayloadLimits,
 }
 
 impl AnthropicProvider {
@@ -36,6 +37,7 @@ impl AnthropicProvider {
         connect_timeout: u64,
         read_timeout: u64,
         extra_ca_certs: &[String],
+        payload_limits: ResponsePayloadLimits,
     ) -> Result<Self, ProviderError> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout))
@@ -72,6 +74,7 @@ impl AnthropicProvider {
             id: id.to_string(),
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            payload_limits,
         })
     }
 }
@@ -105,9 +108,10 @@ impl Provider for AnthropicProvider {
         }
 
         if request.stream {
+            let max_sse_frame_bytes = self.payload_limits.max_sse_frame_bytes;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, ProviderError>>(64);
             tokio::spawn(async move {
-                let mut decoder = SseDecoder::new();
+                let mut decoder = SseDecoder::new(max_sse_frame_bytes);
                 let mut byte_stream = response.bytes_stream();
                 loop {
                     let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
@@ -121,7 +125,15 @@ impl Provider for AnthropicProvider {
 
                     match chunk_result {
                         Ok(bytes) => {
-                            decoder.push(&bytes);
+                            if let Err(error) = decoder.push(&bytes) {
+                                let _ = tx
+                                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                                        "SSE frame exceeds configured limit of {} bytes",
+                                        error.limit
+                                    ))))
+                                    .await;
+                                return;
+                            }
                             while let Some(frame) = decoder.next_frame() {
                                 let Some(event) = parse_anthropic_sse_frame(&frame) else {
                                     continue;
@@ -140,10 +152,21 @@ impl Provider for AnthropicProvider {
                     }
                 }
 
-                if let Some(frame) = decoder.finish()
-                    && let Some(event) = parse_anthropic_sse_frame(&frame)
-                {
-                    let _ = tx.send(Ok(event)).await;
+                match decoder.finish() {
+                    Ok(Some(frame)) => {
+                        if let Some(event) = parse_anthropic_sse_frame(&frame) {
+                            let _ = tx.send(Ok(event)).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(ProviderError::ResponseTooLarge(format!(
+                                "SSE frame exceeds configured limit of {} bytes",
+                                error.limit
+                            ))))
+                            .await;
+                    }
                 }
             });
             Ok(Box::pin(
@@ -151,7 +174,9 @@ impl Provider for AnthropicProvider {
                     .map(|event| event.map(ProviderEvent::from)),
             ))
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = SseEvent {
                 event: "message".to_string(),
@@ -499,12 +524,16 @@ mod tests {
 
     #[test]
     fn anthropic_sse_decoder_waits_for_complete_frames() {
-        let mut decoder = SseDecoder::new();
-        decoder.push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"");
+        let mut decoder = SseDecoder::new(1024 * 1024);
+        decoder
+            .push(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"")
+            .unwrap();
 
         assert!(decoder.next_frame().is_none());
 
-        decoder.push(b"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        decoder
+            .push(b"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap();
 
         let first = parse_anthropic_sse_frame(&decoder.next_frame().unwrap()).unwrap();
         assert_eq!(first.event, "content_block_delta");
@@ -579,8 +608,20 @@ mod tests {
     #[tokio::test]
     async fn anthropic_chat_retries_transient_upstream_status() {
         let (base_url, attempts, server) = retry_then_success_server().await;
-        let provider =
-            AnthropicProvider::new("anthropic", "test-key", &base_url, "", 5, 5, &[]).unwrap();
+        let provider = AnthropicProvider::new(
+            "anthropic",
+            "test-key",
+            &base_url,
+            "",
+            5,
+            5,
+            &[],
+            ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
         let mut request = base_request(vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_string()),

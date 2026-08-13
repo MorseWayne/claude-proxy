@@ -23,7 +23,7 @@ use std::sync::Arc;
 use claude_proxy_config::Settings;
 use claude_proxy_config::settings::{ProviderConfig, ProviderType};
 
-use crate::http::UpstreamRequestPolicy;
+use crate::http::{ResponsePayloadLimits, UpstreamRequestPolicy};
 
 /// Create a provider instance from config.
 pub async fn create_provider(
@@ -47,6 +47,7 @@ pub async fn create_provider(
             &settings.http.extra_ca_certs,
             UpstreamRequestPolicy::from_runtime_config(&config.runtime),
             config.runtime.clone(),
+            ResponsePayloadLimits::from_settings(settings),
         )?)),
         ProviderType::Anthropic => Ok(Arc::new(anthropic::AnthropicProvider::new(
             provider_id,
@@ -56,6 +57,7 @@ pub async fn create_provider(
             settings.http.connect_timeout,
             settings.http.read_timeout,
             &settings.http.extra_ca_certs,
+            ResponsePayloadLimits::from_settings(settings),
         )?)),
         ProviderType::CustomAnthropic(_) => Ok(Arc::new(anthropic::AnthropicProvider::new(
             provider_id,
@@ -65,6 +67,7 @@ pub async fn create_provider(
             settings.http.connect_timeout,
             settings.http.read_timeout,
             &settings.http.extra_ca_certs,
+            ResponsePayloadLimits::from_settings(settings),
         )?)),
         ProviderType::Copilot => Ok(Arc::new(
             copilot::CopilotProvider::new(provider_id, config, settings).await?,
@@ -83,6 +86,7 @@ pub async fn create_provider(
                 &settings.http.extra_ca_certs,
                 UpstreamRequestPolicy::from_runtime_config(&config.runtime),
                 config.runtime.clone(),
+                ResponsePayloadLimits::from_settings(settings),
             )?))
         }
     }

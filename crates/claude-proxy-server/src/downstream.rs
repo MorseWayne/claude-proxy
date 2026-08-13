@@ -62,23 +62,20 @@ impl DownstreamProtocol {
         }
     }
 
-    pub(crate) fn non_stream_response(&self, events: &[ProviderEvent]) -> Response {
-        let normalized = events
-            .iter()
-            .flat_map(ProviderEvent::normalized_events)
-            .cloned()
-            .collect::<Vec<_>>();
+    pub(crate) fn non_stream_response(&self, mut events: Vec<ProviderEvent>) -> Response {
         match self {
             Self::Anthropic => {
+                let normalized = into_normalized_events(events);
                 let response_data = crate::non_stream::response_from_events(&normalized)
                     .or_else(|| normalized.last().map(|event| event.data.clone()))
                     .unwrap_or_else(|| json!({"error": "no response from provider"}));
                 Json(response_data).into_response()
             }
             Self::ChatCompletions(options) => {
-                if let Some(response) = native_chat_completion_response(events, options) {
+                if let Some(response) = native_chat_completion_response(&events, options) {
                     return Json(response).into_response();
                 }
+                let normalized = into_normalized_events(events);
                 let Some(message) = crate::non_stream::response_from_events(&normalized) else {
                     return protocol_error_response(
                         self,
@@ -89,9 +86,10 @@ impl DownstreamProtocol {
                 Json(chat_completion_response(options, &message)).into_response()
             }
             Self::Responses(options) => {
-                if let Some(response) = native_responses_response(events, options) {
+                if let Some(response) = native_responses_response(&mut events, options) {
                     return Json(response).into_response();
                 }
+                let normalized = into_normalized_events(events);
                 let Some(message) = crate::non_stream::response_from_events(&normalized) else {
                     return protocol_error_response(
                         self,
@@ -103,6 +101,13 @@ impl DownstreamProtocol {
             }
         }
     }
+}
+
+fn into_normalized_events(events: Vec<ProviderEvent>) -> Vec<SseEvent> {
+    events
+        .into_iter()
+        .flat_map(|event| event.into_normalized_events())
+        .collect()
 }
 
 pub(crate) enum StreamEncoder {
@@ -244,6 +249,12 @@ pub(crate) fn provider_error_response(
             ProviderError::RequestTooLarge(message) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorResponse::invalid_request(message),
+                None,
+                false,
+            ),
+            ProviderError::ResponseTooLarge(message) => (
+                StatusCode::BAD_GATEWAY,
+                ErrorResponse::api_error(message),
                 None,
                 false,
             ),
@@ -1774,18 +1785,24 @@ fn normalize_native_response(response: &mut Value, options: &ResponsesOptions) {
 }
 
 fn native_responses_response(
-    events: &[ProviderEvent],
+    events: &mut Vec<ProviderEvent>,
     options: &ResponsesOptions,
 ) -> Option<Value> {
-    let mut response = events.iter().rev().find_map(|event| {
-        let NativeProviderEvent::OpenAiResponses(event) = event.native_event()?;
+    let index = events.iter().rposition(|event| {
         matches!(
-            event.data["type"].as_str(),
-            Some("response.completed" | "response.incomplete" | "response.failed")
+            event.native_event(),
+            Some(NativeProviderEvent::OpenAiResponses(native))
+                if matches!(
+                    native.data["type"].as_str(),
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                ) && native.data.get("response").is_some()
         )
-        .then(|| event.data.get("response").cloned())
-        .flatten()
     })?;
+    let (_, native) = events.remove(index).into_parts();
+    let Some(NativeProviderEvent::OpenAiResponses(mut event)) = native else {
+        return None;
+    };
+    let mut response = event.data.get_mut("response").map(Value::take)?;
     normalize_native_response(&mut response, options);
     Some(response)
 }
@@ -2233,7 +2250,7 @@ mod tests {
             )]),
         };
 
-        let response = native_responses_response(&[event], &options).unwrap();
+        let response = native_responses_response(&mut vec![event], &options).unwrap();
         assert_eq!(response["id"], "resp_native");
         assert_eq!(response["model"], "client-model");
         assert_eq!(response["parallel_tool_calls"], false);

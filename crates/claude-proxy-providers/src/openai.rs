@@ -31,6 +31,7 @@ pub struct OpenAiProvider {
     base_url: String,
     request_policy: UpstreamRequestPolicy,
     runtime: ProviderRuntimeConfig,
+    payload_limits: crate::http::ResponsePayloadLimits,
 }
 
 fn merge_model_info(mut upstream: ModelInfo) -> ModelInfo {
@@ -177,6 +178,7 @@ impl OpenAiProvider {
         extra_ca_certs: &[String],
         request_policy: UpstreamRequestPolicy,
         runtime: ProviderRuntimeConfig,
+        payload_limits: crate::http::ResponsePayloadLimits,
     ) -> Result<Self, ProviderError> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout))
@@ -214,6 +216,7 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             request_policy,
             runtime,
+            payload_limits,
         })
     }
 
@@ -242,10 +245,13 @@ impl OpenAiProvider {
                     response,
                     marker_mode_from_request(&request),
                     observer,
+                    self.payload_limits.max_sse_frame_bytes,
                 ),
             )
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let events = crate::chat_completions::convert_non_streaming_response_with_marker_mode(
                 &data,
@@ -299,10 +305,13 @@ impl OpenAiProvider {
                     marker_mode_from_request(&request),
                     correlation,
                     observer,
+                    self.payload_limits.max_sse_frame_bytes,
                 ),
             )
         } else {
-            let body = read_upstream_response_text(response).await?;
+            let body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
             let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let event = crate::responses::convert_non_streaming_provider_response_with_context(
                 &data,
@@ -352,8 +361,12 @@ impl Provider for OpenAiProvider {
             return Err(map_upstream_response(response).await);
         }
 
-        let data: Value =
-            read_upstream_response_json(response, "failed to parse models response").await?;
+        let data: Value = read_upstream_response_json(
+            response,
+            self.payload_limits.max_response_body_bytes,
+            "failed to parse models response",
+        )
+        .await?;
 
         let models = data["data"]
             .as_array()
@@ -429,6 +442,10 @@ mod tests {
             &[],
             UpstreamRequestPolicy::default(),
             runtime,
+            crate::http::ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
         )
         .unwrap();
         let req = MessagesRequest {
@@ -486,6 +503,10 @@ mod tests {
             &[],
             UpstreamRequestPolicy::default(),
             ProviderRuntimeConfig::default(),
+            crate::http::ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
         )
         .unwrap();
         let mut req = MessagesRequest {
@@ -527,6 +548,10 @@ mod tests {
             &[],
             UpstreamRequestPolicy::default(),
             ProviderRuntimeConfig::default(),
+            crate::http::ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
         )
         .unwrap();
         let req = MessagesRequest {
