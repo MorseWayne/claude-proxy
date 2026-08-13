@@ -539,6 +539,24 @@ fn chat_finish_reason(reason: &str) -> &str {
     }
 }
 
+fn response_output_missing_or_empty(response: &Value) -> bool {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+}
+
+fn reconstructed_responses_output(events: &[ProviderEvent]) -> Option<Vec<Value>> {
+    let normalized = events
+        .iter()
+        .flat_map(ProviderEvent::normalized_events)
+        .cloned()
+        .collect::<Vec<_>>();
+    let message = crate::non_stream::response_from_events(&normalized)?;
+    let output = responses_output_items(&message);
+    (!output.is_empty()).then_some(output)
+}
+
 fn native_chat_completion_response(
     events: &[ProviderEvent],
     options: &ChatCompletionsOptions,
@@ -552,10 +570,17 @@ fn native_chat_completion_response(
         .then(|| event.data.get("response"))
         .flatten()
     })?;
+    let reconstructed_output = response_output_missing_or_empty(response)
+        .then(|| reconstructed_responses_output(events))
+        .flatten();
+    let output = response["output"]
+        .as_array()
+        .filter(|output| !output.is_empty())
+        .or(reconstructed_output.as_ref());
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    for item in response["output"].as_array().into_iter().flatten() {
+    for item in output.into_iter().flatten() {
         match item["type"].as_str() {
             Some("message") => {
                 for part in item["content"].as_array().into_iter().flatten() {
@@ -1798,11 +1823,21 @@ fn native_responses_response(
                 ) && native.data.get("response").is_some()
         )
     })?;
+    let reconstructed_output = events[index]
+        .native_event()
+        .and_then(|native| match native {
+            NativeProviderEvent::OpenAiResponses(event) => event.data.get("response"),
+        })
+        .filter(|response| response_output_missing_or_empty(response))
+        .and_then(|_| reconstructed_responses_output(events));
     let (_, native) = events.remove(index).into_parts();
     let Some(NativeProviderEvent::OpenAiResponses(mut event)) = native else {
         return None;
     };
     let mut response = event.data.get_mut("response").map(Value::take)?;
+    if let Some(output) = reconstructed_output {
+        response["output"] = Value::Array(output);
+    }
     normalize_native_response(&mut response, options);
     Some(response)
 }
@@ -1978,6 +2013,46 @@ mod tests {
                 event: "message_stop".to_string(),
                 data: json!({"type": "message_stop"}),
             },
+        ]
+    }
+
+    fn native_text_delta_events_with_empty_terminal_output() -> Vec<ProviderEvent> {
+        let mut normalized = text_events();
+        let terminal_normalized = normalized.split_off(3);
+        vec![
+            ProviderEvent::openai_responses(
+                SseEvent {
+                    event: "response.output_text.delta".to_string(),
+                    data: json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "hello"
+                    }),
+                },
+                normalized,
+            ),
+            ProviderEvent::openai_responses(
+                SseEvent {
+                    event: "response.completed".to_string(),
+                    data: json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_empty_terminal",
+                            "object": "response",
+                            "model": "upstream-model",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 4,
+                                "output_tokens": 2,
+                                "total_tokens": 6
+                            }
+                        }
+                    }),
+                },
+                terminal_normalized,
+            ),
         ]
     }
 
@@ -2258,6 +2333,24 @@ mod tests {
     }
 
     #[test]
+    fn native_non_stream_response_reconstructs_empty_terminal_output_from_deltas() {
+        let mut events = native_text_delta_events_with_empty_terminal_output();
+        let options = ResponsesOptions {
+            model: "client-model".to_string(),
+            response_fields: Map::new(),
+        };
+
+        let response = native_responses_response(&mut events, &options).unwrap();
+
+        assert_eq!(response["id"], "resp_empty_terminal");
+        assert_eq!(response["model"], "client-model");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["usage"]["input_tokens"], 4);
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(response["output"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
     fn native_non_stream_chat_preserves_parallel_tool_calls_and_reasoning() {
         let event = ProviderEvent::openai_responses(
             SseEvent {
@@ -2322,6 +2415,26 @@ mod tests {
             response["usage"]["completion_tokens_details"]["reasoning_tokens"],
             2
         );
+    }
+
+    #[test]
+    fn native_non_stream_chat_reconstructs_empty_terminal_output_from_deltas() {
+        let events = native_text_delta_events_with_empty_terminal_output();
+
+        let response = native_chat_completion_response(
+            &events,
+            &ChatCompletionsOptions {
+                model: "client-model".to_string(),
+                include_usage: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response["model"], "client-model");
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+        assert_eq!(response["usage"]["prompt_tokens"], 4);
+        assert_eq!(response["usage"]["completion_tokens"], 2);
     }
 
     #[test]
