@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.0.6 - 2026-08-19
+
+### Changed in v3.0.6
+
+- Defaulted GPT-5.6 ChatGPT/Codex model capabilities to the Codex catalog's 872K supported context window.
+- Prefer `max_context_window` for GPT-5.6 remote model metadata while preserving explicit capability overrides and the active-window behavior for other models.
+- Updated virtual-context preflight thresholds and ChatGPT capability documentation for the 872K default.
+
 ## v3.0.5 - 2026-08-13
 
 ### Fixed in v3.0.5

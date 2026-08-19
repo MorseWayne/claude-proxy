@@ -18,7 +18,7 @@
 
 - **已有账号直接接入**：ChatGPT 和 GitHub Copilot 支持 OAuth，无需手动维护 API key。
 - **多 Provider 原生路由**：一份配置同时使用 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和私有兼容服务。
-- **Claude Code 上下文增强**：为符合条件的 ChatGPT 模型提供虚拟 1M 投影、本地上下文预检和自动压缩信号。
+- **Claude Code 上下文增强**：为符合条件的 ChatGPT 模型提供虚拟 1M 投影、GPT-5.6 默认 872K 上游窗口、本地上下文预检和自动压缩信号。
 - **按模型能力配置推理**：模型别名、推理强度和能力约束由真实模型元数据驱动，避免发送不支持的参数。
 - **可观察、可运营**：内置 TUI Dashboard、SQLite 历史指标、限流、并发控制、热重载、守护进程和请求去重。
 - **单文件部署**：原生 Rust 二进制，零运行时依赖，适合个人工作站和团队网关。
@@ -263,28 +263,29 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 # claude_code_context = "auto" # "standard" 可关闭虚拟 1M 投影
 
 # 可选：在线 /models 目录不可用或需要本地强制覆盖时使用。
+# GPT-5.6 默认采用 Codex 目录声明的 872K 支持上限；显式覆盖优先。
 [providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
-context_window = 272000
+context_window = 872000
 image_input = true
 reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
 responses_lite = true
 ```
 
-ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `claude-proxy/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 账号哈希 / 模型的远端缓存 > 内置能力表。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
+ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `claude-proxy/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 账号哈希 / 模型的远端缓存 > 内置能力表。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
 
 当前内置 GPT-5.6 回退能力如下：
 
 | 模型 | 用途 | Context | 推理强度 | Responses Lite |
 |------|------|---------|----------|----------------|
-| `gpt-5.6-sol` | 默认 / Reasoning / Opus | 272k | `low`…`ultra` | 是 |
-| `gpt-5.6-terra` | Sonnet | 272k | `low`…`ultra` | 是 |
-| `gpt-5.6-luna` | Haiku | 272k | `low`…`max` | 是 |
+| `gpt-5.6-sol` | 默认 / Reasoning / Opus | 872k | `low`…`ultra` | 是 |
+| `gpt-5.6-terra` | Sonnet | 872k | `low`…`ultra` | 是 |
+| `gpt-5.6-luna` | Haiku | 872k | `low`…`max` | 是 |
 
 所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；Sol/Terra 且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
 #### Claude Code 虚拟 1M 与真实上游窗口
 
-Claude Code 2.1.206+ 支持通过模型名 `[1m]` 后缀启用 1M 上下文协议。`claude_code_context = "auto"` 是默认值：对真实上下文大于 200k 的 ChatGPT 模型，TUI 保存时只在同步到 Claude Code 的五个模型环境变量上追加 `[1m]`；代理内部的 `ModelInfo.context_window` 仍保持上游真实值，例如 GPT-5.6 为 272k。设置为 `standard` 或在 Providers 页把 **Claude Context** 切到 `OFF` 可关闭投影。
+Claude Code 2.1.206+ 支持通过模型名 `[1m]` 后缀启用 1M 上下文协议。`claude_code_context = "auto"` 是默认值：对真实上下文大于 200k 的 ChatGPT 模型，TUI 保存时只在同步到 Claude Code 的五个模型环境变量上追加 `[1m]`；代理内部的 `ModelInfo.context_window` 仍保持上游真实值，例如 GPT-5.6 默认为 872k。设置为 `standard` 或在 Providers 页把 **Claude Context** 切到 `OFF` 可关闭投影。
 
 代理不删除历史消息，也不向上游额外发起压缩请求。虚拟 1M 请求会在本地按内容估算 token；同一账号、模型和稳定 session 的连续请求优先采用“最近一次上游 usage + 新增 delta”，否则使用完整粗估，图片和文档按固定 2000 token 计入而不是按 base64 长度。接近真实窗口时，代理在上游请求前返回 Claude Code 可识别的 HTTP 400 `invalid_request_error`：
 
@@ -292,7 +293,7 @@ Claude Code 2.1.206+ 支持通过模型名 `[1m]` 后缀启用 1M 上下文协�
 Prompt is too long: N tokens > M maximum safe input (model context window: W; local estimate based on SOURCE)
 ```
 
-普通且有可压缩历史的请求、以及压缩后的续接请求，安全输入线为 `真实窗口 - 33k`；压缩摘要生成和没有可压缩历史的请求使用 `真实窗口 - 20k`。对 272k 模型分别是 239k 和 252k。Claude Code 收到提示后负责生成摘要并续接；若本地估算漏过，上游真正的 prompt-too-long 也会归一化成同类 HTTP 400，但 `input + max_tokens` 的输出预算错误保持独立恢复语义。TUI Model 页会显示虚拟窗口、真实窗口和两条阈值，Dashboard 会统计 1M 请求、本地拦截和上游漏拦截。
+普通且有可压缩历史的请求、以及压缩后的续接请求，安全输入线为 `真实窗口 - 33k`；压缩摘要生成和没有可压缩历史的请求使用 `真实窗口 - 20k`。对 872k 模型分别是 839k 和 852k。Claude Code 收到提示后负责生成摘要并续接；若本地估算漏过，上游真正的 prompt-too-long 也会归一化成同类 HTTP 400，但 `input + max_tokens` 的输出预算错误保持独立恢复语义。TUI Model 页会显示虚拟窗口、真实窗口和两条阈值，Dashboard 会统计 1M 请求、本地拦截和上游漏拦截。
 
 #### 3. 设置默认模型和 Claude 模型别名
 

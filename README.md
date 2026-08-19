@@ -18,7 +18,7 @@
 
 - **Use existing accounts**: Sign in to ChatGPT and GitHub Copilot with OAuth instead of maintaining API keys.
 - **Route across providers**: Mix OpenAI, Anthropic, Copilot, ChatGPT, OpenRouter, Google, and private compatible services in one configuration.
-- **Extend Claude Code context**: Eligible ChatGPT models get virtual 1M projection, local context preflight, and automatic compaction signals.
+- **Extend Claude Code context**: Eligible ChatGPT models get virtual 1M projection, an 872K GPT-5.6 default upstream window, local context preflight, and automatic compaction signals.
 - **Respect model capabilities**: Model aliases and reasoning-effort choices follow real capability metadata instead of sending unsupported values.
 - **Operate with confidence**: Built-in TUI dashboard, persistent SQLite metrics, rate limits, concurrency controls, hot reload, daemon mode, and request deduplication.
 - **Deploy one file**: A native Rust binary for both local workstations and shared team gateways.
@@ -148,8 +148,9 @@ base_url = "https://chatgpt.com/backend-api/codex"
 # user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
 
 # Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
+# GPT-5.6 defaults to the Codex catalog's 872K supported maximum; an explicit override wins.
 [providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
-context_window = 272000
+context_window = 872000
 image_input = true
 reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
 responses_lite = true

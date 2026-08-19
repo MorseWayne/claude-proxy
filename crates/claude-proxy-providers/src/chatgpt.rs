@@ -70,6 +70,7 @@ const CHATGPT_SSE_REQUEST_ZSTD_LEVEL: i32 = 3;
 pub const CLAUDE_CODE_CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 pub const VIRTUAL_CONTEXT_1M_EXTRA_KEY: &str = "_claude_proxy_virtual_context_1m";
 pub const CLAUDE_CODE_DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
+const CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW: u32 = 872_000;
 const CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE: u32 = 20_000;
 const CLAUDE_CODE_AUTO_COMPACT_BUFFER: u32 = 13_000;
 const CHATGPT_MEDIA_ESTIMATED_TOKENS: u64 = 2_000;
@@ -3544,7 +3545,7 @@ struct ChatGptModelSpec {
 const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     ChatGptModelSpec {
         model_id: "gpt-5.6-sol",
-        context_window: 272_000,
+        context_window: CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3552,7 +3553,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-terra",
-        context_window: 272_000,
+        context_window: CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3560,7 +3561,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-5.6-luna",
-        context_window: 272_000,
+        context_window: CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
@@ -3617,12 +3618,7 @@ fn chatgpt_catalog_model_from_remote(
     let capability = config.model_capabilities.get(&model.slug);
     let context_window = capability
         .and_then(|capability| capability.context_window)
-        .or_else(|| {
-            model
-                .context_window
-                .or(model.max_context_window)
-                .and_then(|window| u32::try_from(window).ok())
-        });
+        .or_else(|| chatgpt_remote_context_window(&model));
     let image_input = capability
         .and_then(|capability| capability.image_input)
         .unwrap_or_else(|| {
@@ -3677,6 +3673,21 @@ fn chatgpt_catalog_model_from_remote(
         priority: model.priority,
         service_tiers,
     }
+}
+
+fn chatgpt_remote_context_window(model: &ChatGptRemoteModel) -> Option<u32> {
+    // The Codex catalog exposes the currently active 272K window separately from
+    // the GPT-5.6 model's supported 872K maximum. The proxy's default is the
+    // larger supported window; explicit model_capabilities overrides still win.
+    let windows = if model.slug.starts_with("gpt-5.6") {
+        [model.max_context_window, model.context_window]
+    } else {
+        [model.context_window, model.max_context_window]
+    };
+    windows
+        .into_iter()
+        .flatten()
+        .find_map(|window| u32::try_from(window).ok())
 }
 
 fn chatgpt_model_info(model_id: &str, config: &ChatGptProviderConfig) -> Option<ModelInfo> {
@@ -4624,7 +4635,7 @@ mod tests {
 
         assert_eq!(
             threshold,
-            272_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
+            872_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
         );
         assert!(request_size_warning("gpt-5.6-sol", &config, threshold - 1).is_none());
         assert_eq!(
@@ -4725,7 +4736,10 @@ mod tests {
             .find(|model| model.model_id == "gpt-5.6-luna")
             .expect("gpt-5.6-luna model");
         for model in [sol, terra, luna] {
-            assert_eq!(model.capabilities.limits.context_window, Some(272_000));
+            assert_eq!(
+                model.capabilities.limits.context_window,
+                Some(CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW)
+            );
             assert!(model.capabilities.modalities.input.image.is_supported());
         }
         assert_eq!(
@@ -4855,6 +4869,35 @@ mod tests {
         assert_eq!(catalog.effective_context_window_percent, Some(85));
         assert_eq!(catalog.visibility.as_deref(), Some("list"));
         assert_eq!(catalog.priority, 1);
+    }
+
+    #[test]
+    fn remote_gpt_56_catalog_defaults_to_supported_max_context_window() {
+        let remote: ChatGptRemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.6-sol",
+            "context_window": 272000,
+            "max_context_window": 872000
+        }))
+        .unwrap();
+
+        let catalog = chatgpt_catalog_model_from_remote(remote, &ChatGptProviderConfig::default());
+
+        assert_eq!(
+            catalog.info.capabilities.limits.context_window,
+            Some(CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW)
+        );
+
+        let remote: ChatGptRemoteModel = serde_json::from_value(json!({
+            "slug": "gpt-5.5",
+            "context_window": 272000,
+            "max_context_window": 872000
+        }))
+        .unwrap();
+        let catalog = chatgpt_catalog_model_from_remote(remote, &ChatGptProviderConfig::default());
+        assert_eq!(
+            catalog.info.capabilities.limits.context_window,
+            Some(272_000)
+        );
     }
 
     #[test]
