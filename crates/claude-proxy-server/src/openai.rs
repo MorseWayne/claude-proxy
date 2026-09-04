@@ -48,38 +48,6 @@ const CHAT_FIELDS: &[&str] = &[
     "function_call",
 ];
 
-const RESPONSES_FIELDS: &[&str] = &[
-    "model",
-    "input",
-    "instructions",
-    "max_output_tokens",
-    "temperature",
-    "top_p",
-    "stream",
-    "stream_options",
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
-    "reasoning",
-    "metadata",
-    "service_tier",
-    "prompt_cache_key",
-    "prompt_cache_options",
-    "safety_identifier",
-    "text",
-    "store",
-    "background",
-    "previous_response_id",
-    "conversation",
-    "include",
-    "max_tool_calls",
-    "prompt",
-    "top_logprobs",
-    "truncation",
-    "user",
-    "client_metadata",
-];
-
 #[derive(Debug)]
 struct RequestError {
     message: String,
@@ -130,7 +98,7 @@ pub async fn chat_completions(
     crate::routes::execute_messages_request(state, headers, request, protocol).await
 }
 
-/// POST /v1/responses — OpenAI Responses compatibility endpoint.
+/// POST /v1/responses — native, stateless Codex Responses endpoint.
 pub async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -140,11 +108,23 @@ pub async fn responses(
         Ok(Json(value)) => value,
         Err(error) => return json_rejection_response(error),
     };
-    let (request, protocol) = match convert_responses_request(value) {
+    let (request, model) = match validate_native_responses_request(value) {
         Ok(converted) => converted,
         Err(error) => return error.into_response(),
     };
-    crate::routes::execute_messages_request(state, headers, request, protocol).await
+    crate::routes::execute_responses_request(state, headers, request, model).await
+}
+
+/// Codex treats HTTP 426 as an explicit instruction to use Responses over
+/// HTTP instead of retrying the optional WebSocket transport.
+pub async fn responses_websocket_upgrade_required() -> Response {
+    openai_error_response(
+        StatusCode::UPGRADE_REQUIRED,
+        "Responses WebSocket transport is not supported; retry with HTTPS streaming",
+        "invalid_request_error",
+        Some("responses_websocket_not_supported"),
+        None,
+    )
 }
 
 fn json_rejection_response(error: JsonRejection) -> Response {
@@ -180,11 +160,8 @@ fn convert_chat_request(
     )?;
     let stream = optional_bool(&object, "stream")?.unwrap_or(false);
     let include_usage = chat_include_usage(&object)?;
-    let (mut tools, tool_choice) = convert_tools_and_choice(
-        object.get("tools"),
-        object.get("tool_choice"),
-        ToolShape::Chat,
-    )?;
+    let (mut tools, tool_choice) =
+        convert_tools_and_choice(object.get("tools"), object.get("tool_choice"))?;
     if object.get("tool_choice").and_then(Value::as_str) == Some("none") {
         tools = None;
     }
@@ -225,143 +202,33 @@ fn convert_chat_request(
     ))
 }
 
-fn convert_responses_request(
-    value: Value,
-) -> Result<(MessagesRequest, DownstreamProtocol), RequestError> {
-    let object = request_object(value)?;
-    reject_unknown_fields(&object, RESPONSES_FIELDS)?;
-    reject_responses_semantic_gaps(&object)?;
-    validate_responses_passthrough_fields(&object)?;
-
+fn validate_native_responses_request(value: Value) -> Result<(Value, String), RequestError> {
+    let mut object = request_object(value)?;
     let model = required_string(&object, "model")?;
-    let input = object
-        .get("input")
-        .ok_or_else(|| RequestError::invalid("input", "missing required field: input"))?;
-    let (inline_system, messages) = convert_responses_input(input)?;
-    let instructions = optional_string(&object, "instructions")?;
-    let system = merge_system_prompts(instructions, inline_system);
-    let stream = optional_bool(&object, "stream")?.unwrap_or(false);
-    let (mut tools, tool_choice) = convert_tools_and_choice(
-        object.get("tools"),
-        object.get("tool_choice"),
-        ToolShape::Responses,
-    )?;
-    if object.get("tool_choice").and_then(Value::as_str) == Some("none") {
-        tools = None;
+    if !object.contains_key("input") {
+        return Err(RequestError::invalid(
+            "input",
+            "missing required field: input",
+        ));
     }
-
-    let mut extra = HashMap::new();
-    copy_extra(
-        &object,
-        &mut extra,
-        &[
-            "reasoning",
-            "service_tier",
-            "prompt_cache_key",
-            "prompt_cache_options",
-            "safety_identifier",
-            "parallel_tool_calls",
-            "stream_options",
-            "client_metadata",
-        ],
-    );
-    if let Some(effort) = object
-        .get("reasoning")
-        .and_then(|value| value.get("effort"))
-        .filter(|value| !value.is_null())
-    {
-        extra.insert("reasoning_effort".to_string(), effort.clone());
+    if optional_bool(&object, "stream")? != Some(true) {
+        return Err(RequestError::invalid(
+            "stream",
+            "the native Responses endpoint requires stream=true",
+        ));
     }
-    if let Some(verbosity) = object
-        .get("text")
-        .and_then(|value| value.get("verbosity"))
-        .filter(|value| !value.is_null())
-    {
-        extra.insert("verbosity".to_string(), verbosity.clone());
-    }
-
-    let mut response_fields = Map::new();
-    for key in [
-        "instructions",
-        "max_output_tokens",
-        "parallel_tool_calls",
-        "reasoning",
-        "service_tier",
-        "temperature",
-        "text",
-        "tool_choice",
-        "tools",
-        "top_p",
-        "truncation",
-        "metadata",
-    ] {
-        if let Some(value) = object.get(key) {
-            response_fields.insert(key.to_string(), value.clone());
+    for field in ["store", "background"] {
+        if optional_bool(&object, field)? == Some(true) {
+            return Err(RequestError::unsupported(field));
         }
     }
-    response_fields.insert("store".to_string(), Value::Bool(false));
-    response_fields.insert("background".to_string(), Value::Bool(false));
-
-    let request = MessagesRequest {
-        model: model.clone(),
-        system,
-        messages,
-        max_tokens: optional_u32(&object, "max_output_tokens")?,
-        temperature: optional_f32(&object, "temperature")?,
-        top_p: optional_f32(&object, "top_p")?,
-        top_k: None,
-        stop_sequences: None,
-        stream,
-        tools,
-        tool_choice,
-        thinking: None,
-        metadata: object.get("metadata").filter(|v| !v.is_null()).cloned(),
-        extra,
-    };
-    Ok((
-        request,
-        DownstreamProtocol::responses(model, response_fields),
-    ))
-}
-
-fn validate_responses_passthrough_fields(object: &Map<String, Value>) -> Result<(), RequestError> {
-    if let Some(stream_options) = object
-        .get("stream_options")
-        .filter(|value| !value.is_null())
-    {
-        stream_options.as_object().ok_or_else(|| {
-            RequestError::invalid("stream_options", "stream_options must be an object")
-        })?;
-    }
-
-    if let Some(prompt_cache_options) = object
-        .get("prompt_cache_options")
-        .filter(|value| !value.is_null())
-    {
-        prompt_cache_options.as_object().ok_or_else(|| {
-            RequestError::invalid(
-                "prompt_cache_options",
-                "prompt_cache_options must be an object",
-            )
-        })?;
-    }
-
-    if let Some(client_metadata) = object
-        .get("client_metadata")
-        .filter(|value| !value.is_null())
-    {
-        let client_metadata = client_metadata.as_object().ok_or_else(|| {
-            RequestError::invalid("client_metadata", "client_metadata must be an object")
-        })?;
-        if client_metadata.values().any(|value| !value.is_string()) {
-            return Err(RequestError::invalid(
-                "client_metadata",
-                "client_metadata values must be strings",
-            ));
-        }
-    }
-
-    Ok(())
+    object.insert("store".to_string(), Value::Bool(false));
+    object.remove("background");
+    reject_non_null(&object, "previous_response_id")?;
+    reject_non_null(&object, "conversation")?;
+    object.remove("previous_response_id");
+    object.remove("conversation");
+    Ok((Value::Object(object), model))
 }
 
 fn request_object(value: Value) -> Result<Map<String, Value>, RequestError> {
@@ -415,51 +282,6 @@ fn reject_chat_semantic_gaps(object: &Map<String, Value>) -> Result<(), RequestE
     {
         return Err(RequestError::invalid(
             "response_format",
-            "structured response formats are not supported by this compatibility endpoint",
-        ));
-    }
-    validate_parallel_tool_calls(object)?;
-    Ok(())
-}
-
-fn reject_responses_semantic_gaps(object: &Map<String, Value>) -> Result<(), RequestError> {
-    reject_true(object, "store")?;
-    reject_true(object, "background")?;
-    reject_non_null(object, "previous_response_id")?;
-    reject_non_null(object, "conversation")?;
-    reject_non_null(object, "max_tool_calls")?;
-    reject_non_null(object, "prompt")?;
-    reject_positive_u32(object, "top_logprobs")?;
-
-    if let Some(include) = object.get("include").filter(|v| !v.is_null()) {
-        let supported = include.as_array().is_some_and(|values| {
-            values
-                .iter()
-                .all(|value| value.as_str() == Some("reasoning.encrypted_content"))
-        });
-        if !supported {
-            return Err(RequestError::invalid(
-                "include",
-                "only reasoning.encrypted_content is supported",
-            ));
-        }
-    }
-    if let Some(truncation) = object.get("truncation").and_then(Value::as_str)
-        && truncation != "disabled"
-    {
-        return Err(RequestError::invalid(
-            "truncation",
-            "only truncation=disabled is supported",
-        ));
-    }
-    if let Some(format) = object
-        .get("text")
-        .and_then(|value| value.get("format"))
-        .filter(|value| !value.is_null())
-        && format.get("type").and_then(Value::as_str) != Some("text")
-    {
-        return Err(RequestError::invalid(
-            "text.format",
             "structured response formats are not supported by this compatibility endpoint",
         ));
     }
@@ -910,220 +732,6 @@ fn tool_result_content(value: &Value, path: &str) -> Result<Option<Value>, Reque
     }
 }
 
-fn convert_responses_input(
-    value: &Value,
-) -> Result<(Option<SystemPrompt>, Vec<Message>), RequestError> {
-    match value {
-        Value::String(text) => Ok((
-            None,
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::Text(text.clone()),
-            }],
-        )),
-        Value::Array(items) => {
-            let mut system_parts = Vec::new();
-            let mut messages = Vec::new();
-            for (index, item) in items.iter().enumerate() {
-                convert_response_input_item(item, index, &mut system_parts, &mut messages)?;
-            }
-            let system =
-                (!system_parts.is_empty()).then(|| SystemPrompt::Text(system_parts.join("\n\n")));
-            Ok((system, messages))
-        }
-        _ => Err(RequestError::invalid(
-            "input",
-            "input must be a string or an array of input items",
-        )),
-    }
-}
-
-fn convert_response_input_item(
-    item: &Value,
-    index: usize,
-    system_parts: &mut Vec<String>,
-    messages: &mut Vec<Message>,
-) -> Result<(), RequestError> {
-    let path = format!("input[{index}]");
-    let object = item
-        .as_object()
-        .ok_or_else(|| RequestError::invalid(&path, format!("{path} must be an object")))?;
-    let item_type = object.get("type").and_then(Value::as_str);
-    match item_type {
-        None | Some("message") => {
-            let role = object.get("role").and_then(Value::as_str).unwrap_or("user");
-            if matches!(role, "system" | "developer") {
-                let text = text_only_content(
-                    object.get("content").unwrap_or(&Value::Null),
-                    &format!("{path}.content"),
-                )?;
-                if !text.is_empty() {
-                    system_parts.push(text);
-                }
-                return Ok(());
-            }
-            let role = match role {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                _ => {
-                    return Err(RequestError::invalid(
-                        format!("{path}.role"),
-                        format!("unsupported input message role: {role}"),
-                    ));
-                }
-            };
-            let blocks = response_content_blocks(
-                object.get("content").unwrap_or(&Value::Null),
-                &format!("{path}.content"),
-                role == Role::Assistant,
-            )?;
-            messages.push(Message {
-                role,
-                content: MessageContent::Blocks(blocks),
-            });
-        }
-        Some("function_call") => {
-            let name = required_string(object, "name")?;
-            let call_id = object
-                .get("call_id")
-                .or_else(|| object.get("id"))
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    RequestError::invalid(
-                        format!("{path}.call_id"),
-                        "function_call requires call_id",
-                    )
-                })?;
-            let arguments = object
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let input = serde_json::from_str(arguments).map_err(|error| {
-                RequestError::invalid(
-                    format!("{path}.arguments"),
-                    format!("function_call arguments must be valid JSON: {error}"),
-                )
-            })?;
-            messages.push(Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![Content::ToolUse {
-                    id: call_id.to_string(),
-                    name,
-                    input,
-                }]),
-            });
-        }
-        Some("function_call_output") => {
-            let call_id = object
-                .get("call_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    RequestError::invalid(
-                        format!("{path}.call_id"),
-                        "function_call_output requires call_id",
-                    )
-                })?;
-            messages.push(Message {
-                role: Role::User,
-                content: MessageContent::Blocks(vec![Content::ToolResult {
-                    tool_use_id: call_id.to_string(),
-                    content: object.get("output").filter(|v| !v.is_null()).cloned(),
-                    is_error: None,
-                }]),
-            });
-        }
-        Some("reasoning") => {
-            let text = object
-                .get("summary")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
-            let signature = object
-                .get("encrypted_content")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            messages.push(Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(vec![Content::Thinking {
-                    thinking: text,
-                    signature,
-                }]),
-            });
-        }
-        Some("item_reference") => {
-            return Err(RequestError::invalid(
-                format!("{path}.type"),
-                "item_reference requires server-side Responses state and is not supported",
-            ));
-        }
-        Some(kind) => {
-            return Err(RequestError::invalid(
-                format!("{path}.type"),
-                format!("unsupported input item type: {kind}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn response_content_blocks(
-    value: &Value,
-    path: &str,
-    assistant: bool,
-) -> Result<Vec<Content>, RequestError> {
-    match value {
-        Value::Null => Ok(Vec::new()),
-        Value::String(text) => Ok(vec![Content::Text { text: text.clone() }]),
-        Value::Array(parts) => parts
-            .iter()
-            .enumerate()
-            .map(|(index, part)| {
-                let part_path = format!("{path}[{index}]");
-                let object = part.as_object().ok_or_else(|| {
-                    RequestError::invalid(&part_path, "input content part must be an object")
-                })?;
-                match object.get("type").and_then(Value::as_str) {
-                    Some("input_text") | Some("output_text") | Some("text") => Ok(Content::Text {
-                        text: object
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    }),
-                    Some("input_image") if !assistant => {
-                        let url = image_url_value(object.get("image_url"), &part_path)?;
-                        Ok(image_content(url))
-                    }
-                    Some("refusal") if assistant => Ok(Content::Text {
-                        text: object
-                            .get("refusal")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    }),
-                    Some(kind) => Err(RequestError::invalid(
-                        format!("{part_path}.type"),
-                        format!("unsupported input content part type: {kind}"),
-                    )),
-                    None => Err(RequestError::invalid(
-                        format!("{part_path}.type"),
-                        "input content part type is required",
-                    )),
-                }
-            })
-            .collect(),
-        _ => Err(RequestError::invalid(
-            path,
-            "input content must be a string, array, or null",
-        )),
-    }
-}
-
 fn image_url_value(value: Option<&Value>, path: &str) -> Result<String, RequestError> {
     match value {
         Some(Value::String(url)) if !url.is_empty() => Ok(url.clone()),
@@ -1165,53 +773,16 @@ fn image_content(url: String) -> Content {
     }))
 }
 
-fn merge_system_prompts(
-    instructions: Option<String>,
-    inline: Option<SystemPrompt>,
-) -> Option<SystemPrompt> {
-    let inline = match inline {
-        Some(SystemPrompt::Text(text)) => Some(text),
-        Some(SystemPrompt::Blocks(blocks)) => Some(
-            blocks
-                .into_iter()
-                .filter_map(|block| match block {
-                    Content::Text { text } => Some(text),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        ),
-        None => None,
-    };
-    let text = [instructions, inline]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (!text.is_empty()).then_some(SystemPrompt::Text(text))
-}
-
-#[derive(Clone, Copy)]
-enum ToolShape {
-    Chat,
-    Responses,
-}
-
 fn convert_tools_and_choice(
     tools: Option<&Value>,
     choice: Option<&Value>,
-    shape: ToolShape,
 ) -> Result<(Option<Vec<Tool>>, Option<Value>), RequestError> {
-    let tools = convert_tools(tools, shape)?;
-    let choice = convert_tool_choice(choice, shape)?;
+    let tools = convert_tools(tools)?;
+    let choice = convert_tool_choice(choice)?;
     Ok((tools, choice))
 }
 
-fn convert_tools(
-    value: Option<&Value>,
-    shape: ToolShape,
-) -> Result<Option<Vec<Tool>>, RequestError> {
+fn convert_tools(value: Option<&Value>) -> Result<Option<Vec<Tool>>, RequestError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
     };
@@ -1232,18 +803,15 @@ fn convert_tools(
                     "only function tools are supported",
                 ));
             }
-            let function = match shape {
-                ToolShape::Chat => object
-                    .get("function")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        RequestError::invalid(
-                            format!("{path}.function"),
-                            "function tool definition is required",
-                        )
-                    })?,
-                ToolShape::Responses => object,
-            };
+            let function = object
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    RequestError::invalid(
+                        format!("{path}.function"),
+                        "function tool definition is required",
+                    )
+                })?;
             if function.get("strict").and_then(Value::as_bool) == Some(true) {
                 return Err(RequestError::invalid(
                     format!("{path}.strict"),
@@ -1265,10 +833,7 @@ fn convert_tools(
     Ok((!tools.is_empty()).then_some(tools))
 }
 
-fn convert_tool_choice(
-    value: Option<&Value>,
-    shape: ToolShape,
-) -> Result<Option<Value>, RequestError> {
+fn convert_tool_choice(value: Option<&Value>) -> Result<Option<Value>, RequestError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
     };
@@ -1293,18 +858,15 @@ fn convert_tool_choice(
             "only named function tool_choice objects are supported",
         ));
     }
-    let function = match shape {
-        ToolShape::Chat => object
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                RequestError::invalid(
-                    "tool_choice.function",
-                    "tool_choice.function must be an object",
-                )
-            })?,
-        ToolShape::Responses => object,
-    };
+    let function = object
+        .get("function")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RequestError::invalid(
+                "tool_choice.function",
+                "tool_choice.function must be an object",
+            )
+        })?;
     Ok(Some(json!({
         "type": "tool",
         "name": required_string(function, "name")?,
@@ -1395,91 +957,58 @@ mod tests {
     }
 
     #[test]
-    fn converts_responses_function_history() {
-        let (request, protocol) = convert_responses_request(json!({
+    fn native_responses_preserves_codex_items_and_unknown_fields() {
+        let request = json!({
             "model": "gpt-test",
-            "instructions": "Use tools",
             "stream": true,
-            "stream_options": {
-                "reasoning_summary_delivery": "sequential_cutoff"
-            },
-            "prompt_cache_options": {
-                "mode": "explicit",
-                "ttl": "24h"
-            },
-            "client_metadata": {
-                "x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"
-            },
+            "future_option": {"enabled": true},
             "input": [
-                {"type": "message", "role": "user", "content": [
-                    {"type": "input_text", "text": "weather?"}
-                ]},
                 {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "weather",
-                    "arguments": "{\"city\":\"Paris\"}"
+                    "id": "at_stable",
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "function", "name": "weather"}]
                 },
-                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+                {
+                    "type": "configuration_update",
+                    "reasoning": {"effort": "high"}
+                },
+                {
+                    "type": "function_call_output",
+                    "name": "notifications",
+                    "namespace": "slack",
+                    "output": "Alice mentioned you"
+                },
+                {"type": "compaction_trigger"}
             ]
-        }))
-        .unwrap();
+        });
+        let (validated, model) = validate_native_responses_request(request.clone()).unwrap();
 
-        assert_eq!(request.messages.len(), 3);
-        assert!(matches!(request.system, Some(SystemPrompt::Text(_))));
-        assert_eq!(
-            request.extra["stream_options"],
-            json!({"reasoning_summary_delivery": "sequential_cutoff"})
-        );
-        assert_eq!(
-            request.extra["prompt_cache_options"],
-            json!({"mode": "explicit", "ttl": "24h"})
-        );
-        assert_eq!(
-            request.extra["client_metadata"],
-            json!({"x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"})
-        );
-        assert!(matches!(protocol, DownstreamProtocol::Responses(_)));
+        assert_eq!(model, "gpt-test");
+        assert_eq!(validated["input"], request["input"]);
+        assert_eq!(validated["future_option"], request["future_option"]);
+        assert_eq!(validated["store"], false);
+        assert!(validated.get("background").is_none());
     }
 
     #[test]
-    fn rejects_invalid_codex_responses_transport_options() {
-        for (request, expected_param) in [
-            (
-                json!({
-                    "model": "gpt-test",
-                    "input": "hello",
-                    "stream_options": []
-                }),
-                "stream_options",
-            ),
-            (
-                json!({
-                    "model": "gpt-test",
-                    "input": "hello",
-                    "prompt_cache_options": "24h"
-                }),
-                "prompt_cache_options",
-            ),
-            (
-                json!({
-                    "model": "gpt-test",
-                    "input": "hello",
-                    "client_metadata": {"attempt": 1}
-                }),
-                "client_metadata",
-            ),
-        ] {
-            let error = convert_responses_request(request).unwrap_err();
-            assert_eq!(error.param.as_deref(), Some(expected_param));
+    fn native_responses_requires_streaming() {
+        for stream in [None, Some(json!(false)), Some(Value::Null)] {
+            let mut request = json!({"model": "gpt-test", "input": "hello"});
+            if let Some(stream) = stream {
+                request["stream"] = stream;
+            }
+            let error = validate_native_responses_request(request).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some("stream"));
         }
     }
 
     #[test]
     fn rejects_stateful_responses_fields() {
-        let error = convert_responses_request(json!({
+        let error = validate_native_responses_request(json!({
             "model": "gpt-test",
             "input": "hello",
+            "stream": true,
             "previous_response_id": "resp_old"
         }))
         .unwrap_err();
@@ -1499,14 +1028,15 @@ mod tests {
             Some(&json!(false))
         );
 
-        let (responses_request, _) = convert_responses_request(json!({
+        let (responses_request, _) = validate_native_responses_request(json!({
             "model": "gpt-test",
             "input": "hello",
+            "stream": true,
             "parallel_tool_calls": false
         }))
         .unwrap();
         assert_eq!(
-            responses_request.extra.get("parallel_tool_calls"),
+            responses_request.get("parallel_tool_calls"),
             Some(&json!(false))
         );
     }

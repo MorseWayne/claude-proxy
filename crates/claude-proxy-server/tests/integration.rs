@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use claude_proxy_config::Settings;
@@ -71,6 +71,7 @@ fn test_settings(upstream_url: &str, auth_token: &str) -> Settings {
 async fn start_mock_openai() -> String {
     let app = Router::new()
         .route("/chat/completions", post(mock_chat_completions))
+        .route("/responses", post(mock_responses))
         .route("/models", get(mock_models));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -126,6 +127,77 @@ data: [DONE]
         .unwrap()
 }
 
+/// Mock native /responses endpoint. Assertions here verify that the proxy did
+/// not translate or discard Codex-specific input items.
+async fn mock_responses(headers: HeaderMap, Json(payload): Json<serde_json::Value>) -> Response {
+    assert_eq!(headers["authorization"], "Bearer test-key");
+    assert_eq!(headers["x-codex-turn-state"], "turn-state-1");
+    assert!(headers.get("x-api-key").is_none());
+    assert!(headers.get("cookie").is_none());
+    assert_eq!(payload["stream"], true);
+    assert_eq!(payload["store"], false);
+    assert!(payload.get("background").is_none());
+    assert_eq!(payload["future_option"], json!({"enabled": true}));
+    let input = payload["input"].as_array().expect("Responses input array");
+    assert!(input.iter().any(|item| item["type"] == "additional_tools"));
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "configuration_update")
+    );
+    assert!(input.iter().any(|item| {
+        item["type"] == "function_call_output"
+            && item.get("call_id").is_none()
+            && item["name"] == "notifications"
+    }));
+
+    let is_compaction = input
+        .iter()
+        .any(|item| item["type"] == "compaction_trigger");
+    let force_failure = payload
+        .pointer("/metadata/force_failure")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let sse_data = if force_failure {
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"model\":\"gpt-5.6-sol\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"retry in 2s\"}}}\n\n",
+        )
+    } else if is_compaction {
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-compact\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"cmp-1\",\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-compact\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"id\":\"cmp-1\",\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        )
+    } else {
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        )
+    };
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("x-request-id", "req-native")
+        .header("openai-model", "gpt-5.6-sol")
+        .header("x-codex-primary-used-percent", "42")
+        .header("set-cookie", "upstream-secret=do-not-forward")
+        .body(Body::from(sse_data))
+        .unwrap()
+}
+
 /// Mock /models endpoint.
 async fn mock_models() -> Json<serde_json::Value> {
     Json(json!({
@@ -154,6 +226,36 @@ async fn start_proxy(settings: Settings) -> String {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     base_url
+}
+
+fn native_codex_input(compaction: bool) -> Vec<serde_json::Value> {
+    let mut input = vec![
+        json!({
+            "id": "at-stable",
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{"type": "function", "name": "weather"}]
+        }),
+        json!({
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }),
+        json!({
+            "type": "function_call_output",
+            "name": "notifications",
+            "namespace": "slack",
+            "output": "Alice mentioned you"
+        }),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hi"}]
+        }),
+    ];
+    if compaction {
+        input.push(json!({"type": "compaction_trigger"}));
+    }
+    input
 }
 
 #[tokio::test]
@@ -432,7 +534,7 @@ async fn test_openai_chat_completions_streaming() {
 }
 
 #[tokio::test]
-async fn test_openai_responses_non_streaming() {
+async fn test_openai_responses_requires_streaming() {
     let mock_url = start_mock_openai().await;
     let settings = test_settings(&mock_url, "test-token");
     let proxy_url = start_proxy(settings).await;
@@ -440,6 +542,8 @@ async fn test_openai_responses_non_streaming() {
     let response = reqwest::Client::new()
         .post(format!("{proxy_url}/v1/responses"))
         .header("x-api-key", "test-token")
+        .header("x-codex-turn-state", "turn-state-1")
+        .header("cookie", "downstream-secret=do-not-forward")
         .json(&json!({
             "model": "gpt-4",
             "instructions": "Be concise",
@@ -449,15 +553,42 @@ async fn test_openai_responses_non_streaming() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["object"], "response");
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["model"], "gpt-4");
-    assert_eq!(body["output"][0]["type"], "message");
-    assert_eq!(body["output"][0]["content"][0]["text"], "Hello world");
-    assert_eq!(body["usage"]["input_tokens"], 4);
-    assert_eq!(body["usage"]["output_tokens"], 2);
+    assert_eq!(body["error"]["param"], "stream");
+}
+
+#[tokio::test]
+async fn test_openai_responses_rejects_non_native_provider() {
+    let mock_url = start_mock_openai().await;
+    let mut settings = test_settings(&mock_url, "test-token");
+    settings
+        .providers
+        .get_mut("openai")
+        .expect("test provider")
+        .provider_type = Some(ProviderType::Anthropic);
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("x-api-key", "test-token")
+        .json(&json!({
+            "model": "gpt-4",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("native Responses"))
+    );
 }
 
 #[tokio::test]
@@ -469,18 +600,23 @@ async fn test_openai_responses_streaming() {
     let response = reqwest::Client::new()
         .post(format!("{proxy_url}/v1/responses"))
         .header("x-api-key", "test-token")
+        .header("x-codex-turn-state", "turn-state-1")
+        .header("cookie", "downstream-secret=do-not-forward")
         .json(&json!({
             "model": "gpt-4",
-            "input": [{"role": "user", "content": [
-                {"type": "input_text", "text": "Hi"}
-            ]}],
-            "stream": true
+            "input": native_codex_input(false),
+            "stream": true,
+            "future_option": {"enabled": true}
         }))
         .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-request-id"], "req-native");
+    assert_eq!(response.headers()["openai-model"], "gpt-5.6-sol");
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "42");
+    assert!(response.headers().get("set-cookie").is_none());
     let body = response.text().await.unwrap();
     assert!(body.contains("event: response.created"));
     assert!(body.contains("event: response.output_text.delta"));
@@ -488,6 +624,77 @@ async fn test_openai_responses_streaming() {
     assert!(body.contains("event: response.output_item.done"));
     assert!(body.contains("event: response.completed"));
     assert!(!body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn test_openai_responses_preserves_v2_compaction() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("x-api-key", "test-token")
+        .header("x-codex-turn-state", "turn-state-1")
+        .json(&json!({
+            "model": "gpt-4",
+            "input": native_codex_input(true),
+            "stream": true,
+            "future_option": {"enabled": true}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.output_item.done"));
+    assert!(body.contains("\"type\":\"compaction\""));
+    assert!(body.contains("\"encrypted_content\":\"opaque\""));
+}
+
+#[tokio::test]
+async fn test_openai_responses_preserves_structured_failure() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/responses"))
+        .header("x-api-key", "test-token")
+        .header("x-codex-turn-state", "turn-state-1")
+        .json(&json!({
+            "model": "gpt-4",
+            "input": native_codex_input(false),
+            "stream": true,
+            "future_option": {"enabled": true},
+            "metadata": {"force_failure": true}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.failed"));
+    assert!(body.contains("\"code\":\"rate_limit_exceeded\""));
+    assert!(body.contains("\"message\":\"retry in 2s\""));
+    assert!(!body.contains("upstream_stream_error"));
+}
+
+#[tokio::test]
+async fn test_responses_websocket_probe_returns_upgrade_required() {
+    let mock_url = start_mock_openai().await;
+    let settings = test_settings(&mock_url, "test-token");
+    let proxy_url = start_proxy(settings).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{proxy_url}/v1/responses"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
 }
 
 #[tokio::test]
@@ -519,6 +726,7 @@ async fn test_openai_endpoint_errors_use_openai_shape() {
         .json(&json!({
             "model": "gpt-4",
             "input": "Hi",
+            "stream": true,
             "previous_response_id": "resp_previous"
         }))
         .send()

@@ -22,7 +22,11 @@ use crate::http::{
 use crate::openai_compat::{
     apply_openai_intent, log_request_observability, openai_model_info, prefers_responses,
 };
-use crate::provider::{Provider, ProviderError, ProviderEvent, ProviderRequestObserver};
+use crate::provider::{
+    NativeResponsesRequest, NativeResponsesResponse, Provider, ProviderError, ProviderEvent,
+    ProviderRequestMetadata, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind,
+};
 use crate::reasoning_markers::marker_mode_from_request;
 
 pub struct OpenAiProvider {
@@ -349,6 +353,63 @@ impl Provider for OpenAiProvider {
             let stream = self.chat_via_completions(request, observer).await?;
             Ok(Box::pin(stream.map(|event| event.map(ProviderEvent::from))))
         }
+    }
+
+    async fn responses(
+        &self,
+        request: NativeResponsesRequest,
+        observer: Option<ProviderRequestObserver>,
+    ) -> Result<NativeResponsesResponse, ProviderError> {
+        let NativeResponsesRequest { mut body, headers } = request;
+        if let Some(service_tier) = self.runtime.openai.service_tier.as_deref()
+            && let Some(object) = body.as_object_mut()
+        {
+            insert_trimmed_string(object, "service_tier", Some(service_tier));
+        }
+        if let Some(observer) = observer.as_ref() {
+            let body_bytes = serde_json::to_vec(&body)
+                .map_err(|error| {
+                    ProviderError::InvalidRequest(format!(
+                        "failed to encode native Responses request: {error}"
+                    ))
+                })?
+                .len() as u64;
+            observer(ProviderRequestObserverEvent {
+                event: ProviderRequestObserverEventKind::RequestMetadata,
+                request_metadata: Some(ProviderRequestMetadata {
+                    transport: Some("sse".to_string()),
+                    responses_lite: headers
+                        .get("x-openai-internal-codex-responses-lite")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.eq_ignore_ascii_case("true")),
+                    prompt_cache_key_present: Some(body.get("prompt_cache_key").is_some()),
+                    request_body_bytes: Some(body_bytes),
+                    upstream_send_body_bytes: Some(body_bytes),
+                    ..ProviderRequestMetadata::default()
+                }),
+                ..ProviderRequestObserverEvent::default()
+            });
+        }
+        let url = format!("{}/responses", self.base_url);
+        log_request_observability("openai", "/responses", &body, None);
+
+        let upstream_request =
+            apply_runtime_request_config(self.client.post(&url).headers(headers), &self.runtime)?
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(&body);
+        let response =
+            send_upstream_request_with_policy(upstream_request, self.request_policy).await?;
+        if !response.status().is_success() {
+            return Err(map_upstream_response(response).await);
+        }
+
+        let headers = response.headers().clone();
+        let stream = crate::responses::stream_native_responses_response_with_provider_observer(
+            response,
+            observer,
+            self.payload_limits.max_sse_frame_bytes,
+        );
+        Ok(NativeResponsesResponse { headers, stream })
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

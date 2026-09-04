@@ -339,7 +339,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-proxy-cli"
-version = "3.0.6"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "claude-proxy-config"
-version = "3.0.6"
+version = "4.0.0"
 dependencies = [
  "dirs",
  "serde",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "claude-proxy-core"
-version = "3.0.6"
+version = "4.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "claude-proxy-providers"
-version = "3.0.6"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "claude-proxy-server"
-version = "3.0.6"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",

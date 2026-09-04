@@ -72,7 +72,7 @@ fn render_server_page(f: &mut Frame, app: &App, area: Rect) {
     render_hint(
         f,
         rows[6],
-        "Responses: POST /v1/responses · Models: GET /v1/models",
+        "Native Responses stream: POST /v1/responses · Models: GET /v1/models",
     );
     render_hint(
         f,

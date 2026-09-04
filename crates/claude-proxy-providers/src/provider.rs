@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use claude_proxy_core::{MessagesRequest, ModelInfo, SseEvent};
 use futures::stream::BoxStream;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -394,6 +396,23 @@ pub enum ProviderRequestObserverEventKind {
 
 pub type ProviderRequestObserver = Arc<dyn Fn(ProviderRequestObserverEvent) + Send + Sync>;
 
+/// A validated, stateless OpenAI Responses request whose item ordering and
+/// provider-native fields must be preserved.
+#[derive(Debug, Clone)]
+pub struct NativeResponsesRequest {
+    pub body: Value,
+    /// A server-filtered set of Codex protocol headers. Authentication and
+    /// provider-owned routing headers are never included here.
+    pub headers: HeaderMap,
+}
+
+/// An upstream Responses stream together with the response headers that are
+/// safe candidates for downstream projection.
+pub struct NativeResponsesResponse {
+    pub headers: HeaderMap,
+    pub stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
+}
+
 /// Trait implemented by upstream provider adapters.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -412,6 +431,18 @@ pub trait Provider: Send + Sync {
         _observer: Option<ProviderRequestObserver>,
     ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         self.chat(request).await
+    }
+
+    /// Send an already-canonical OpenAI Responses request without translating
+    /// its input items through the Anthropic Messages representation.
+    async fn responses(
+        &self,
+        _request: NativeResponsesRequest,
+        _observer: Option<ProviderRequestObserver>,
+    ) -> Result<NativeResponsesResponse, ProviderError> {
+        Err(ProviderError::InvalidRequest(
+            "selected provider does not support native Responses requests".to_string(),
+        ))
     }
 
     /// List available models from this provider.

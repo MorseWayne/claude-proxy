@@ -1426,6 +1426,44 @@ pub fn stream_responses_response_with_context_and_observer<F>(
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
+    stream_responses_response_with_context_and_error_policy(
+        response,
+        marker_mode,
+        correlation,
+        max_sse_frame_bytes,
+        false,
+        on_event,
+    )
+}
+
+/// Preserve Responses terminal failure events for a matching downstream
+/// instead of reducing them to the provider-neutral error taxonomy.
+pub fn stream_native_responses_response_with_provider_observer(
+    response: reqwest::Response,
+    observer: Option<ProviderRequestObserver>,
+    max_sse_frame_bytes: u64,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    stream_responses_response_with_context_and_error_policy(
+        response,
+        ReasoningMarkerMode::Strict,
+        ResponsesCorrelation::default(),
+        max_sse_frame_bytes,
+        true,
+        move |event| notify_stream_metadata(observer.as_ref(), event),
+    )
+}
+
+fn stream_responses_response_with_context_and_error_policy<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
+    preserve_failed_events: bool,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     let status = response.status().as_u16();
     let content_type = response
@@ -1473,7 +1511,9 @@ where
                         }
                         if let Some(value) = parse_sse_json(&event) {
                             on_event(&value);
-                            if let Some(error) = responses_error_event(&value) {
+                            if let Some(error) =
+                                responses_stream_error(&value, preserve_failed_events)
+                            {
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
@@ -1502,7 +1542,9 @@ where
                                 saw_done = true;
                             } else if let Some(value) = parse_sse_json(&event) {
                                 on_event(&value);
-                                if let Some(error) = responses_error_event(&value) {
+                                if let Some(error) =
+                                    responses_stream_error(&value, preserve_failed_events)
+                                {
                                     let _ = tx.send(Err(error)).await;
                                     return;
                                 }
@@ -1546,7 +1588,7 @@ where
             Ok(Some(event)) if !is_sse_done(&event) => {
                 if let Some(value) = parse_sse_json(&event) {
                     on_event(&value);
-                    if let Some(error) = responses_error_event(&value) {
+                    if let Some(error) = responses_stream_error(&value, preserve_failed_events) {
                         let _ = tx.send(Err(error)).await;
                         return;
                     }
@@ -1693,6 +1735,16 @@ fn responses_error_event(value: &Value) -> Option<ProviderError> {
         }
         Some("response.failed") => Some(responses_failed_error(value)),
         _ => None,
+    }
+}
+
+fn responses_stream_error(value: &Value, preserve_failed_events: bool) -> Option<ProviderError> {
+    if preserve_failed_events
+        && value.get("type").and_then(Value::as_str) == Some("response.failed")
+    {
+        None
+    } else {
+        responses_error_event(value)
     }
 }
 
@@ -3653,6 +3705,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::provider::NativeProviderEvent;
     use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -3823,6 +3876,31 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_stream_preserves_response_failed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-5.6-sol\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"retry in 2s\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream =
+            stream_native_responses_response_with_provider_observer(response, None, 1024 * 1024);
+        let mut failed = None;
+
+        while let Some(event) = stream.next().await {
+            let event = event.expect("native failure must remain a protocol event");
+            if let Some(NativeProviderEvent::OpenAiResponses(native)) = event.native_event()
+                && native.event == "response.failed"
+            {
+                failed = Some(native.data.clone());
+            }
+        }
+
+        let failed = failed.expect("response.failed event");
+        assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(failed["response"]["error"]["message"], "retry in 2s");
     }
 
     #[test]

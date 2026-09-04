@@ -494,14 +494,18 @@ raw_sse_events = false
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/v1/messages` | Anthropic Messages API 代理 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容代理 |
-| `POST` | `/v1/responses` | OpenAI Responses 兼容代理 |
+| `POST` | `/v1/responses` | Codex 原生流式 Responses 代理 |
+| `GET` | `/v1/responses` | 返回 `426`，让 Codex 从 WebSocket 降级到 HTTP |
 | `GET` | `/v1/models` | 获取可用模型列表 |
 
-两个 OpenAI 兼容接口均支持流式/非流式文本、reasoning、function tool、tool
-历史、usage 以及图片 URL/data URL 输入。Responses 接口按无状态模式工作：
-`store: true`、`background: true`、`previous_response_id`、`conversation` 和
-`item_reference` 等依赖服务端状态的字段会明确返回错误，不会静默忽略；暂不暴露
-Responses WebSocket 传输和 structured output 格式。
+Chat Completions 为已配置的 Provider 保留流式和非流式兼容。Responses 接口的范围
+更窄：必须使用 `stream: true`，并且只能路由到原生 OpenAI 或 ChatGPT Responses
+Provider。请求项和 SSE 事件不会先转换成 Anthropic Messages，因此会保留 Responses
+Lite、configuration update、带 namespace 的工具输出和 V2 compaction 项。
+
+Responses 接口仍按无状态模式工作：`store: true`、`background: true`、
+`previous_response_id` 和 `conversation` 会明确返回错误。暂不暴露下游 Responses
+WebSocket；GET 探测会返回 `426 Upgrade Required`，让 Codex 立即改走 HTTP。
 
 ### OpenAI 客户端接入
 
@@ -530,13 +534,13 @@ curl "$OPENAI_BASE_URL/chat/completions" \
 Responses：
 
 ```bash
-curl "$OPENAI_BASE_URL/responses" \
+curl -N "$OPENAI_BASE_URL/responses" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "openai/gpt-4.1",
     "input": "你好",
-    "stream": false
+    "stream": true
   }'
 ```
 
@@ -567,11 +571,14 @@ const client = new OpenAI({
   apiKey: "your-server-auth-token",
 });
 
-const response = await client.responses.create({
+const stream = await client.responses.create({
   model: "openai/gpt-4.1",
   input: "你好",
+  stream: true,
 });
-console.log(response.output_text);
+for await (const event of stream) {
+  console.log(event);
+}
 ```
 
 ### 管理接口

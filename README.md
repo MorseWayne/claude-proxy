@@ -221,16 +221,21 @@ Claude model names (e.g., `claude-opus-4-20250514`) are automatically resolved t
 | `GET` | `/health` | Health check |
 | `POST` | `/v1/messages` | Anthropic Messages API proxy |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions-compatible proxy |
-| `POST` | `/v1/responses` | OpenAI Responses-compatible proxy |
+| `POST` | `/v1/responses` | Native streaming Codex Responses proxy |
+| `GET` | `/v1/responses` | Returns `426` so Codex falls back from WebSocket to HTTP |
 | `GET` | `/v1/models` | List available models |
 
-Both OpenAI-compatible endpoints support streaming and non-streaming text,
-reasoning, function tools, tool history, usage, and image URL/data URL input.
-The Responses endpoint is stateless: server-side storage/continuation fields
-such as `store: true`, `background: true`, `previous_response_id`,
-`conversation`, and `item_reference` are rejected instead of being silently
-ignored. Responses WebSocket transport and structured output formats are not
-exposed.
+Chat Completions supports streaming and non-streaming compatibility across the
+configured providers. The Responses endpoint is deliberately narrower: it
+requires `stream: true` and routes only to native OpenAI or ChatGPT Responses
+providers. Request items and SSE events are preserved instead of being
+translated through the Anthropic Messages format, including Responses Lite,
+configuration updates, namespaced tool output, and V2 compaction items.
+
+The Responses endpoint remains stateless. `store: true`, `background: true`,
+`previous_response_id`, and `conversation` are rejected. Downstream Responses
+WebSocket transport is not exposed; its GET probe returns `426 Upgrade
+Required` so Codex immediately retries over HTTP.
 
 ### OpenAI Client Setup
 
@@ -259,13 +264,13 @@ curl "$OPENAI_BASE_URL/chat/completions" \
 Responses:
 
 ```bash
-curl "$OPENAI_BASE_URL/responses" \
+curl -N "$OPENAI_BASE_URL/responses" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "openai/gpt-4.1",
     "input": "Hello",
-    "stream": false
+    "stream": true
   }'
 ```
 
@@ -296,11 +301,14 @@ const client = new OpenAI({
   apiKey: "your-server-auth-token",
 });
 
-const response = await client.responses.create({
+const stream = await client.responses.create({
   model: "openai/gpt-4.1",
   input: "Hello",
+  stream: true,
 });
-console.log(response.output_text);
+for await (const event of stream) {
+  console.log(event);
+}
 ```
 
 ### Admin Endpoints

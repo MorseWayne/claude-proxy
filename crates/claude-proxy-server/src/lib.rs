@@ -33,7 +33,10 @@ pub fn build_router(state: AppState, _settings: &Settings) -> Router {
         .route("/health", get(routes::health))
         .route("/v1/messages", post(routes::messages))
         .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/responses", post(openai::responses))
+        .route(
+            "/v1/responses",
+            get(openai::responses_websocket_upgrade_required).post(openai::responses),
+        )
         .route("/v1/models", get(routes::list_models))
         .route("/admin/config", get(routes::admin_get_config))
         .route("/admin/config", put(routes::admin_update_config))

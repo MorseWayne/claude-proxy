@@ -1,5 +1,17 @@
 # Changelog
 
+## v4.0.0 - 2026-09-04
+
+### Breaking
+
+- Changed `POST /v1/responses` into a native, streaming-only Codex Responses endpoint. It now requires `stream: true`, routes only to OpenAI or ChatGPT provider types, and no longer translates requests through the Anthropic Messages representation.
+- Removed non-streaming and non-native provider compatibility from `/v1/responses`; use `/v1/chat/completions` or `/v1/messages` for those workflows.
+
+### Added
+
+- Preserved Responses Lite items, durable configuration updates, namespaced tool output, V2 compaction controls, unknown future request fields, native SSE failure events, and selected Codex response headers end to end.
+- Added `GET /v1/responses` with HTTP 426 so Codex can immediately fall back from its optional WebSocket transport to HTTP streaming.
+
 ## v3.0.6 - 2026-08-19
 
 ### Changed in v3.0.6

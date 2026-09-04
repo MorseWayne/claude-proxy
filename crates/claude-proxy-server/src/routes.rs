@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use claude_proxy_config::settings::{
     ModelReasoningEffort, ProviderType, REASONING_MARKER_MODE_EXTRA_KEY, ReasoningMarkerMode,
@@ -15,9 +15,9 @@ use claude_proxy_core::*;
 use claude_proxy_providers::chatgpt::{CLAUDE_CODE_CONTEXT_1M_BETA, VIRTUAL_CONTEXT_1M_EXTRA_KEY};
 use claude_proxy_providers::openai_request_log_info;
 use claude_proxy_providers::provider::{
-    Provider, ProviderError, ProviderEvent, ProviderRequestMetadata, ProviderRequestObserver,
-    ProviderRequestObserverEvent, ProviderRequestObserverEventKind, ProviderUsageMetadata,
-    UpstreamErrorMetadata,
+    NativeResponsesRequest, NativeResponsesResponse, Provider, ProviderError, ProviderEvent,
+    ProviderRequestMetadata, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, ProviderUsageMetadata, UpstreamErrorMetadata,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -376,6 +376,318 @@ pub(crate) async fn execute_messages_request(
             )
             .await
         }
+    }
+}
+
+/// Execute a streaming OpenAI Responses request without translating its input
+/// items through the Anthropic Messages representation.
+pub(crate) async fn execute_responses_request(
+    state: AppState,
+    headers: HeaderMap,
+    mut body: Value,
+    downstream_model: String,
+) -> Response {
+    let start = std::time::Instant::now();
+    let protocol = DownstreamProtocol::responses(downstream_model.clone(), serde_json::Map::new());
+    let (observability_enabled, observability_idle_gap_ms, stream_config) = {
+        let settings = state.settings.read().await;
+        (
+            settings.observability.enabled,
+            settings.observability.idle_gap_ms,
+            StreamResponseConfig::from_settings(&settings),
+        )
+    };
+    state.metrics.record_request();
+
+    {
+        let settings = state.settings.read().await;
+        if !check_auth(&headers, &settings.server.auth_token) {
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::UNAUTHORIZED,
+                &ErrorResponse::authentication("invalid API key"),
+            );
+        }
+    }
+
+    let request_permit = match acquire_request_permit(&state, start, &protocol).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
+    let intent = body
+        .get("metadata")
+        .and_then(|metadata| metadata.get("intent"))
+        .and_then(Value::as_str);
+    let (provider_id, provider_type, upstream_model, alias_reasoning_effort) = {
+        let settings = state.settings.read().await;
+        let resolved = settings.resolve_model_with_intent(&downstream_model, intent);
+        let provider_id = resolved.provider_id.clone();
+        let provider_type = settings
+            .providers
+            .get(&provider_id)
+            .map(|config| config.resolve_type(&provider_id))
+            .unwrap_or_else(|| ProviderType::parse(&provider_id));
+        (
+            provider_id,
+            provider_type,
+            resolved.upstream_model.clone(),
+            resolved.reasoning_effort,
+        )
+    };
+
+    if !matches!(provider_type, ProviderType::OpenAI | ProviderType::ChatGPT) {
+        record_request_error(&state, start);
+        return protocol_error_response(
+            &protocol,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(
+                "selected provider does not support native Responses requests",
+            ),
+        );
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".to_string(), Value::String(upstream_model.clone()));
+        apply_responses_alias_reasoning_effort(object, alias_reasoning_effort);
+    }
+    let initiator = responses_request_initiator(&headers, &body);
+    info!(
+        initiator,
+        model = %downstream_model,
+        provider = %provider_id,
+        upstream_model = %upstream_model,
+        "Native Responses request resolved"
+    );
+
+    let provider = match get_provider(&state, &provider_id).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::NOT_FOUND,
+                &ErrorResponse::not_found(&format!("provider not available: {error}")),
+            );
+        }
+    };
+    let provider_permit =
+        match acquire_provider_permit(&state, &provider_id, start, &protocol).await {
+            Ok(permit) => permit,
+            Err(response) => return response,
+        };
+
+    let provider_setup_ms = start.elapsed().as_millis() as u64;
+    let metrics_context = RequestMetricsContext {
+        provider_id: provider_id.clone(),
+        model: upstream_model,
+        initiator,
+    };
+    let payload_stats = responses_payload_stats(&body);
+    let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
+    let provider_observer = Some(provider_request_observer(observer_state.clone()));
+    let upstream_connect_start = std::time::Instant::now();
+    let request_id = Uuid::new_v4();
+    let request_hash = request_id.as_u128() as u64;
+    let (broadcast_tx, _) = broadcast::channel::<InflightEvent>(1);
+    let request = NativeResponsesRequest {
+        body,
+        headers: native_responses_request_headers(&headers),
+    };
+
+    match provider.responses(request, provider_observer).await {
+        Ok(NativeResponsesResponse {
+            headers: upstream_headers,
+            stream,
+        }) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: request_id.to_string(),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: true,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state: observer_state.clone(),
+            });
+            let mut response = stream_leader_response(
+                &state,
+                &metrics_context,
+                stream,
+                LeaderResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    permits: StreamPermits {
+                        _request: request_permit,
+                        _provider: Some(provider_permit),
+                    },
+                    start,
+                    observer_state,
+                    observability,
+                    stream_config,
+                    protocol,
+                },
+            )
+            .await;
+            attach_native_responses_headers(&mut response, &upstream_headers);
+            response
+        }
+        Err(error) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: request_id.to_string(),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: true,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state,
+            });
+            handle_provider_error(
+                &state,
+                &metrics_context,
+                error,
+                ProviderErrorResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    start,
+                    observability,
+                    protocol,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn apply_responses_alias_reasoning_effort(
+    object: &mut serde_json::Map<String, Value>,
+    effort: Option<ModelReasoningEffort>,
+) {
+    let Some(effort) = effort.and_then(ModelReasoningEffort::request_value) else {
+        return;
+    };
+    let reasoning = object
+        .entry("reasoning".to_string())
+        .or_insert_with(|| json!({}));
+    if !reasoning.is_object() {
+        *reasoning = json!({});
+    }
+    if let Some(reasoning) = reasoning.as_object_mut() {
+        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+    }
+}
+
+fn responses_request_initiator(headers: &HeaderMap, body: &Value) -> &'static str {
+    let header_marks_subagent = headers
+        .get("x-openai-subagent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let metadata_marks_subagent = body
+        .pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.get("subagent_kind").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .is_some_and(|value| !value.trim().is_empty());
+    if header_marks_subagent || metadata_marks_subagent {
+        "agent"
+    } else {
+        "user"
+    }
+}
+
+fn native_responses_request_headers(headers: &HeaderMap) -> HeaderMap {
+    const FORWARDED: &[&str] = &[
+        "openai-beta",
+        "x-codex-beta-features",
+        "x-openai-internal-codex-responses-lite",
+        "x-codex-turn-state",
+        "x-codex-turn-metadata",
+        "x-codex-window-id",
+        "x-codex-installation-id",
+        "x-codex-parent-thread-id",
+        "x-openai-subagent",
+        "x-openai-memgen-request",
+        "x-responsesapi-include-timing-metrics",
+        "session-id",
+        "thread-id",
+        "traceparent",
+        "tracestate",
+    ];
+    let mut forwarded = HeaderMap::new();
+    for name in FORWARDED {
+        let name = HeaderName::from_static(name);
+        for value in headers.get_all(&name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
+fn attach_native_responses_headers(response: &mut Response, upstream: &HeaderMap) {
+    for (name, value) in upstream {
+        let name_text = name.as_str();
+        let allowed = matches!(
+            name_text,
+            "x-request-id"
+                | "openai-model"
+                | "x-openai-model"
+                | "x-codex-turn-state"
+                | "x-models-etag"
+                | "x-reasoning-included"
+                | "x-codex-safety-buffering-enabled"
+                | "x-codex-safety-buffering-faster-model"
+                | "retry-after"
+        ) || name_text.starts_with("x-ratelimit-")
+            || name_text.starts_with("x-codex-primary-")
+            || name_text.starts_with("x-codex-secondary-")
+            || name_text.starts_with("x-codex-credits-");
+        if allowed {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+}
+
+fn responses_payload_stats(body: &Value) -> RequestPayloadStats {
+    let input = body.get("input");
+    let items = input.and_then(Value::as_array);
+    RequestPayloadStats {
+        messages: items.map_or(0, |items| items.len() as u64),
+        content_blocks: items
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .map_or(1, Vec::len)
+                    })
+                    .sum::<usize>() as u64
+            })
+            .unwrap_or_else(|| u64::from(input.is_some())),
+        tool_results: items
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind.ends_with("_call_output"))
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0),
+        text_bytes: input.map_or(0, json_text_bytes),
     }
 }
 
@@ -1552,6 +1864,11 @@ async fn stream_leader_response(
                             for normalized in event.normalized_events() {
                                 extract_usage_from_event(&normalized.data, &mut usage);
                             }
+                            if let Some(message) = native_response_failure_message(&event) {
+                                had_error = true;
+                                terminal_reason = "response_failed";
+                                last_error = Some(message);
+                            }
                             if provider_event_starts_tool_use(&event) {
                                 tool_use_pending = true;
                                 tool_use_deadline.as_mut().reset(
@@ -2437,6 +2754,23 @@ fn provider_event_type(event: &ProviderEvent) -> String {
             .map(sse_event_type)
             .unwrap_or_else(|| "unknown".to_string()),
     }
+}
+
+fn native_response_failure_message(event: &ProviderEvent) -> Option<String> {
+    let claude_proxy_providers::NativeProviderEvent::OpenAiResponses(event) =
+        event.native_event()?;
+    if event.data.get("type").and_then(Value::as_str) != Some("response.failed") {
+        return None;
+    }
+    Some(
+        event
+            .data
+            .pointer("/response/error/message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("upstream response failed")
+            .to_string(),
+    )
 }
 
 fn format_timeout_duration(duration: Duration) -> String {
@@ -3415,6 +3749,50 @@ mod tests {
         );
         assert!(!request.extra.contains_key("reasoning"));
         assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn native_responses_alias_effort_preserves_other_reasoning_controls() {
+        let mut body = json!({
+            "reasoning": {
+                "effort": "low",
+                "summary": "auto",
+                "context": "all_turns"
+            }
+        });
+
+        apply_responses_alias_reasoning_effort(
+            body.as_object_mut().unwrap(),
+            Some(ModelReasoningEffort::High),
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn native_responses_headers_keep_protocol_metadata_and_drop_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer downstream".parse().unwrap());
+        headers.insert("x-api-key", "downstream".parse().unwrap());
+        headers.insert("cookie", "secret=true".parse().unwrap());
+        headers.insert("x-client-request-id", "client-owned".parse().unwrap());
+        headers.insert("x-codex-turn-state", "state-1".parse().unwrap());
+        headers.insert("x-codex-beta-features", "feature-1".parse().unwrap());
+
+        let forwarded = native_responses_request_headers(&headers);
+
+        assert_eq!(forwarded["x-codex-turn-state"], "state-1");
+        assert_eq!(forwarded["x-codex-beta-features"], "feature-1");
+        for name in [
+            "authorization",
+            "x-api-key",
+            "cookie",
+            "x-client-request-id",
+        ] {
+            assert!(forwarded.get(name).is_none(), "unexpected header: {name}");
+        }
     }
 
     #[test]

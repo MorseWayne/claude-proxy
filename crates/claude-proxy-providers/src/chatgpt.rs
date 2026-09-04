@@ -48,9 +48,10 @@ use crate::openai_compat::{
     log_compact_request_observability, log_request_observability,
 };
 use crate::provider::{
-    Provider, ProviderError, ProviderEvent, ProviderRequestMetadata, ProviderRequestObserver,
-    ProviderRequestObserverEvent, ProviderRequestObserverEventKind, RateLimitCredits,
-    RateLimitSnapshot, RateLimitSource, RateLimitWindow,
+    NativeResponsesRequest, NativeResponsesResponse, Provider, ProviderError, ProviderEvent,
+    ProviderRequestMetadata, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, RateLimitCredits, RateLimitSnapshot, RateLimitSource,
+    RateLimitWindow,
 };
 use crate::reasoning_markers::marker_mode_from_request;
 use tracing::{info, warn};
@@ -1081,12 +1082,31 @@ impl ChatGptProvider {
         cooldown_until
     }
 
+    #[cfg(test)]
     async fn send_responses_request(
         &self,
         body: &Value,
         token: &ChatGptToken,
         context: ChatGptSseRequestContext,
         prompt_too_long_attempt: usize,
+    ) -> Result<Response, ProviderError> {
+        self.send_responses_request_with_headers(
+            body,
+            token,
+            context,
+            prompt_too_long_attempt,
+            None,
+        )
+        .await
+    }
+
+    async fn send_responses_request_with_headers(
+        &self,
+        body: &Value,
+        token: &ChatGptToken,
+        context: ChatGptSseRequestContext,
+        prompt_too_long_attempt: usize,
+        forwarded_headers: Option<&HeaderMap>,
     ) -> Result<Response, ProviderError> {
         let ChatGptSseRequestContext {
             compact_request,
@@ -1157,6 +1177,10 @@ impl ChatGptProvider {
             .header("session-id", session_id)
             .header("thread-id", thread_id)
             .header("x-codex-window-id", window_id);
+
+        if let Some(headers) = forwarded_headers {
+            request_builder = request_builder.headers(headers.clone());
+        }
 
         if let Some(routing_hint) = responses::codex_routing_hint(body) {
             let routing_hint = HeaderValue::from_str(&routing_hint).map_err(|error| {
@@ -1231,6 +1255,20 @@ impl ChatGptProvider {
         context: ChatGptSseRequestContext,
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
+        self.send_responses_request_with_prompt_too_long_retry_and_headers(
+            body, token, context, observer, None,
+        )
+        .await
+    }
+
+    async fn send_responses_request_with_prompt_too_long_retry_and_headers(
+        &self,
+        body: &mut Value,
+        token: &ChatGptToken,
+        context: ChatGptSseRequestContext,
+        observer: Option<&ProviderRequestObserver>,
+        forwarded_headers: Option<&HeaderMap>,
+    ) -> Result<Response, ProviderError> {
         validate_chatgpt_tool_schema_budget(body)?;
         let body_bytes = json_len(body);
         notify_request_metadata_observer(
@@ -1248,7 +1286,7 @@ impl ChatGptProvider {
             effective: body.get("max_output_tokens").and_then(Value::as_u64),
         };
         let response = self
-            .send_responses_request(
+            .send_responses_request_with_headers(
                 body,
                 token,
                 ChatGptSseRequestContext {
@@ -1256,6 +1294,7 @@ impl ChatGptProvider {
                     ..context
                 },
                 0,
+                forwarded_headers,
             )
             .await?;
         let status = response.status();
@@ -2312,6 +2351,88 @@ impl Provider for ChatGptProvider {
             )
             .await?;
         Ok(stream)
+    }
+
+    async fn responses(
+        &self,
+        request: NativeResponsesRequest,
+        observer: Option<ProviderRequestObserver>,
+    ) -> Result<NativeResponsesResponse, ProviderError> {
+        let NativeResponsesRequest {
+            mut body,
+            headers: forwarded_headers,
+        } = request;
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::InvalidRequest("model is required".to_string()))?
+            .to_string();
+        if body.get("service_tier").is_none()
+            && let Some(service_tier) = self.codex_service_tier(&model)
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "service_tier".to_string(),
+                Value::String(service_tier.to_string()),
+            );
+        }
+        normalize_chatgpt_native_56_reasoning(&mut body, &model);
+        let responses_lite = self.responses_lite_decision(&model);
+        let compact_request = classify_compact_request_body(&body) != CompactRequestKind::None;
+        let request_id = next_chatgpt_request_id();
+        let output_token_budget = ChatGptOutputTokenBudget {
+            requested: body.get("max_output_tokens").and_then(Value::as_u64),
+            effective: body.get("max_output_tokens").and_then(Value::as_u64),
+        };
+        validate_chatgpt_tool_schema_budget(&body)?;
+        log_request_observability("chatgpt", "/responses", &body, Some(request_id));
+        log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
+
+        let context = ChatGptSseRequestContext {
+            compact_request,
+            request_id,
+            budget: output_token_budget,
+            responses_lite,
+        };
+        let mut token = self.auth.get_existing_token().await?;
+        let mut response = self
+            .send_responses_request_with_prompt_too_long_retry_and_headers(
+                &mut body,
+                &token,
+                context,
+                observer.as_ref(),
+                Some(&forwarded_headers),
+            )
+            .await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            token = self.auth.force_refresh_token().await?;
+            response = self
+                .send_responses_request_with_prompt_too_long_retry_and_headers(
+                    &mut body,
+                    &token,
+                    context,
+                    observer.as_ref(),
+                    Some(&forwarded_headers),
+                )
+                .await?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                self.auth.clear_token().await;
+            }
+        }
+        if !response.status().is_success() {
+            return Err(map_upstream_response(response).await);
+        }
+
+        let headers = response.headers().clone();
+        let header_snapshots =
+            rate_limit_snapshots_from_headers(&self.id, &headers, unix_timestamp_secs());
+        self.cache_rate_limits(header_snapshots).await;
+        let stream = crate::responses::stream_native_responses_response_with_provider_observer(
+            response,
+            observer,
+            self.payload_limits.max_sse_frame_bytes,
+        );
+        Ok(NativeResponsesResponse { headers, stream })
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -3830,6 +3951,24 @@ fn normalize_chatgpt_56_reasoning(request: &mut MessagesRequest) -> bool {
     mapped
 }
 
+fn normalize_chatgpt_native_56_reasoning(body: &mut Value, model: &str) {
+    if !normalize_chatgpt_model_id(model).starts_with("gpt-5.6") {
+        return;
+    }
+    let Some(effort) = body
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        .and_then(|reasoning| reasoning.get_mut("effort"))
+    else {
+        return;
+    };
+    match effort.as_str() {
+        Some("none" | "minimal") => *effort = Value::String("low".to_string()),
+        Some("ultra") => *effort = Value::String("max".to_string()),
+        _ => {}
+    }
+}
+
 fn request_has_delegation_tool(request: &MessagesRequest) -> bool {
     request.tools.as_ref().is_some_and(|tools| {
         tools.iter().any(|tool| {
@@ -5039,6 +5178,22 @@ mod tests {
         assert_eq!(request.extra["reasoning"]["effort"], "low");
         assert_eq!(request.extra["reasoning_effort"], "low");
         assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn chatgpt_native_56_normalizes_only_legacy_effort_values() {
+        for (input, expected) in [
+            ("minimal", "low"),
+            ("none", "low"),
+            ("ultra", "max"),
+            ("disabled", "disabled"),
+            ("high", "high"),
+        ] {
+            let mut body = json!({"reasoning": {"effort": input, "summary": "auto"}});
+            normalize_chatgpt_native_56_reasoning(&mut body, "gpt-5.6-sol");
+            assert_eq!(body["reasoning"]["effort"], expected);
+            assert_eq!(body["reasoning"]["summary"], "auto");
+        }
     }
 
     #[test]
@@ -6432,6 +6587,58 @@ mod tests {
         assert!(headers.contains("x-openai-internal-codex-responses-lite: true"));
         let request_body = request_body_json(&requests[0]);
         assert_eq!(request_body["model"], "gpt-5.3-codex");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_native_responses_send_preserves_items_and_filtered_headers() {
+        let (endpoint, requests) = capture_once_server().await;
+        let provider = test_chatgpt_provider(endpoint).await;
+        let token = chatgpt_test_token();
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "store": false,
+            "future_option": {"enabled": true},
+            "input": [
+                {"id": "at-stable", "type": "additional_tools", "role": "developer", "tools": []},
+                {"type": "configuration_update", "reasoning": {"effort": "high"}},
+                {"type": "function_call_output", "name": "notifications", "namespace": "slack", "output": "ready"},
+                {"type": "compaction_trigger"}
+            ]
+        });
+        let mut forwarded_headers = HeaderMap::new();
+        forwarded_headers.insert("x-codex-turn-state", "turn-state-1".parse().unwrap());
+        forwarded_headers.insert(
+            "x-codex-beta-features",
+            "remote_compaction_v2".parse().unwrap(),
+        );
+
+        let response = provider
+            .send_responses_request_with_prompt_too_long_retry_and_headers(
+                &mut body,
+                &token,
+                ChatGptSseRequestContext {
+                    compact_request: true,
+                    request_id: 2,
+                    budget: ChatGptOutputTokenBudget::default(),
+                    responses_lite: ResponsesLiteDecision::enabled(
+                        ResponsesLiteDecisionSource::ForcedOn,
+                    ),
+                },
+                None,
+                Some(&forwarded_headers),
+            )
+            .await
+            .expect("native request should succeed");
+
+        assert!(response.status().is_success());
+        let requests = requests.lock().await;
+        let captured = &requests[0];
+        let captured_headers = captured.headers.to_ascii_lowercase();
+        assert!(captured_headers.contains("x-codex-turn-state: turn-state-1"));
+        assert!(captured_headers.contains("x-codex-beta-features: remote_compaction_v2"));
+        let captured_body = request_body_json(captured);
+        assert_eq!(captured_body, body);
     }
 
     #[tokio::test]
