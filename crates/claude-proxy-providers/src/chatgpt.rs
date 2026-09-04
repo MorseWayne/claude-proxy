@@ -2376,14 +2376,12 @@ impl Provider for ChatGptProvider {
                 Value::String(service_tier.to_string()),
             );
         }
-        normalize_chatgpt_native_56_reasoning(&mut body, &model);
         let responses_lite = self.responses_lite_decision(&model);
+        let output_token_budget =
+            normalize_chatgpt_native_responses_body(&mut body, responses_lite.is_enabled());
+        normalize_chatgpt_native_56_reasoning(&mut body, &model);
         let compact_request = classify_compact_request_body(&body) != CompactRequestKind::None;
         let request_id = next_chatgpt_request_id();
-        let output_token_budget = ChatGptOutputTokenBudget {
-            requested: body.get("max_output_tokens").and_then(Value::as_u64),
-            effective: body.get("max_output_tokens").and_then(Value::as_u64),
-        };
         validate_chatgpt_tool_schema_budget(&body)?;
         log_request_observability("chatgpt", "/responses", &body, Some(request_id));
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
@@ -3969,6 +3967,56 @@ fn normalize_chatgpt_native_56_reasoning(body: &mut Value, model: &str) {
     }
 }
 
+fn normalize_chatgpt_native_responses_body(
+    body: &mut Value,
+    responses_lite: bool,
+) -> ChatGptOutputTokenBudget {
+    let requested = body.get("max_output_tokens").and_then(Value::as_u64);
+    let Some(object) = body.as_object_mut() else {
+        return ChatGptOutputTokenBudget {
+            requested,
+            effective: requested,
+        };
+    };
+
+    if let Some(input) = object
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        object.insert(
+            "input".to_string(),
+            serde_json::json!([{"role": "user", "content": input}]),
+        );
+    }
+
+    // The ChatGPT Codex backend rejects this public Responses API parameter.
+    // Retain it as an observed request budget, but do not send an ineffective
+    // field upstream. The limitation is advertised in /v1/models.
+    object.remove("max_output_tokens");
+
+    if responses_lite {
+        object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+        let reasoning = object
+            .entry("reasoning".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !reasoning.is_object() {
+            *reasoning = serde_json::json!({});
+        }
+        if let Some(reasoning) = reasoning.as_object_mut() {
+            reasoning.insert(
+                "context".to_string(),
+                Value::String("all_turns".to_string()),
+            );
+        }
+    }
+
+    ChatGptOutputTokenBudget {
+        requested,
+        effective: None,
+    }
+}
+
 fn request_has_delegation_tool(request: &MessagesRequest) -> bool {
     request.tools.as_ref().is_some_and(|tools| {
         tools.iter().any(|tool| {
@@ -4106,6 +4154,10 @@ fn chatgpt_model_info_from_parts(
                 token_counting: TokenCountingCapability::rough(),
                 ..Default::default()
             },
+            responses: Some(ResponsesCapabilities {
+                unsupported_parameters: vec!["max_output_tokens".to_string()],
+                ..ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)
+            }),
             supported_parameters: vec![
                 "system".to_string(),
                 "messages".to_string(),
@@ -4880,6 +4932,19 @@ mod tests {
                 Some(CHATGPT_GPT_56_DEFAULT_CONTEXT_WINDOW)
             );
             assert!(model.capabilities.modalities.input.image.is_supported());
+            let responses = model
+                .capabilities
+                .responses
+                .as_ref()
+                .expect("Responses capability details");
+            assert_eq!(responses.streaming, ResponsesStreamingMode::Required);
+            assert_eq!(responses.stateful, CapabilityState::Unsupported);
+            assert_eq!(responses.storage, CapabilityState::Unsupported);
+            assert_eq!(
+                responses.input_formats,
+                vec![ResponsesInputFormat::String, ResponsesInputFormat::Items]
+            );
+            assert_eq!(responses.unsupported_parameters, vec!["max_output_tokens"]);
         }
         assert_eq!(
             sol.capabilities.limits.reasoning_effort_levels,
@@ -5194,6 +5259,66 @@ mod tests {
             assert_eq!(body["reasoning"]["effort"], expected);
             assert_eq!(body["reasoning"]["summary"], "auto");
         }
+    }
+
+    #[test]
+    fn chatgpt_native_responses_normalizes_public_api_shape_for_lite_backend() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "input": "Return JSON",
+            "stream": true,
+            "max_output_tokens": 2_000,
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "context": "previous_response"},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "result",
+                    "schema": {"type": "object"}
+                }
+            }
+        });
+
+        let budget = normalize_chatgpt_native_responses_body(&mut body, true);
+
+        assert_eq!(
+            budget,
+            ChatGptOutputTokenBudget {
+                requested: Some(2_000),
+                effective: None,
+            }
+        );
+        assert_eq!(
+            body["input"],
+            json!([{"role": "user", "content": "Return JSON"}])
+        );
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn chatgpt_native_responses_preserves_item_input_and_non_lite_fields() {
+        let input = json!([
+            {"type": "additional_tools", "role": "developer", "tools": []},
+            {"role": "user", "content": "hello"}
+        ]);
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "input": input,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "reasoning": {"context": "previous_response"}
+        });
+
+        let budget = normalize_chatgpt_native_responses_body(&mut body, false);
+
+        assert_eq!(budget, ChatGptOutputTokenBudget::default());
+        assert_eq!(body["input"], input);
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["reasoning"]["context"], "previous_response");
     }
 
     #[test]

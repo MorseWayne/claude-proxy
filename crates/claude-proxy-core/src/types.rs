@@ -553,6 +553,56 @@ impl EndpointCapabilities {
     }
 }
 
+/// Streaming behavior exposed by an OpenAI Responses-compatible endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesStreamingMode {
+    Required,
+    Optional,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+/// Accepted shapes for the OpenAI Responses `input` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesInputFormat {
+    String,
+    Items,
+}
+
+/// Endpoint-specific behavior that cannot be represented by a simple
+/// supported/unsupported endpoint flag.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResponsesCapabilities {
+    #[serde(default)]
+    pub streaming: ResponsesStreamingMode,
+    #[serde(default)]
+    pub stateful: CapabilityState,
+    #[serde(default)]
+    pub storage: CapabilityState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_formats: Vec<ResponsesInputFormat>,
+    #[serde(default)]
+    pub structured_outputs: CapabilityState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_parameters: Vec<String>,
+}
+
+impl ResponsesCapabilities {
+    pub fn streaming_stateless(structured_outputs: CapabilityState) -> Self {
+        Self {
+            streaming: ResponsesStreamingMode::Required,
+            stateful: CapabilityState::Unsupported,
+            storage: CapabilityState::Unsupported,
+            input_formats: vec![ResponsesInputFormat::String, ResponsesInputFormat::Items],
+            structured_outputs,
+            unsupported_parameters: Vec::new(),
+        }
+    }
+}
+
 fn path_state(paths: &[String], path: &str) -> CapabilityState {
     if paths.iter().any(|candidate| candidate == path) {
         CapabilityState::Supported
@@ -820,6 +870,8 @@ pub struct ModelCapabilities {
     pub limits: ModelLimits,
     #[serde(default)]
     pub quality: QualityGateCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses: Option<ResponsesCapabilities>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_parameters: Vec<String>,
 }
@@ -1076,6 +1128,10 @@ mod tests {
                     token_counting: TokenCountingCapability::native(),
                     ..Default::default()
                 },
+                responses: Some(ResponsesCapabilities {
+                    unsupported_parameters: vec!["max_output_tokens".to_string()],
+                    ..ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)
+                }),
                 supported_parameters: vec!["messages".to_string(), "tools".to_string()],
             },
         };
@@ -1103,6 +1159,20 @@ mod tests {
             "native"
         );
         assert_eq!(value["capabilities"]["supported_parameters"][1], "tools");
+        assert_eq!(value["capabilities"]["responses"]["streaming"], "required");
+        assert_eq!(
+            value["capabilities"]["responses"]["stateful"],
+            "unsupported"
+        );
+        assert_eq!(value["capabilities"]["responses"]["storage"], "unsupported");
+        assert_eq!(
+            value["capabilities"]["responses"]["input_formats"][0],
+            "string"
+        );
+        assert_eq!(
+            value["capabilities"]["responses"]["unsupported_parameters"][0],
+            "max_output_tokens"
+        );
 
         let parsed: ModelInfo = serde_json::from_value(value).unwrap();
         assert!(
@@ -1113,6 +1183,10 @@ mod tests {
                 .is_supported()
         );
         assert_eq!(parsed.capabilities.limits.max_output_tokens, Some(128_000));
+        assert_eq!(
+            parsed.capabilities.responses.unwrap().streaming,
+            ResponsesStreamingMode::Required
+        );
         assert_eq!(
             parsed.capabilities.quality.prompt_cache.scope,
             PromptCacheScope::Basic

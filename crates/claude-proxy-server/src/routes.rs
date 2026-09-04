@@ -2447,14 +2447,16 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
     refresh_missing_model_caches(&state).await;
 
     let registry = state.provider_registry.read().await;
-    let models = registry.all_cached_models();
+    let models = registry.all_cached_models_with_provider();
 
     let data: Vec<Value> = models
         .iter()
-        .map(|m| {
+        .map(|(provider_id, m)| {
             json!({
                 "id": m.model_id,
                 "object": "model",
+                "provider": provider_id,
+                "qualified_id": format!("{provider_id}/{}", m.model_id),
                 "vendor": m.vendor,
                 "is_chat_default": m.is_chat_default,
                 "supported_endpoints": m.capabilities.endpoints.supported_paths(),
@@ -3660,6 +3662,10 @@ mod tests {
                     token_counting: TokenCountingCapability::rough(),
                     ..Default::default()
                 },
+                responses: Some(ResponsesCapabilities {
+                    unsupported_parameters: vec!["max_output_tokens".to_string()],
+                    ..ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)
+                }),
                 supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
                 ..Default::default()
             },
@@ -4959,6 +4965,33 @@ mod tests {
         assert_eq!(
             body["provider_health"]["chatgpt"]["last_error"],
             "token refresh failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_exposes_provider_scoped_responses_contract() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let state = AppState::new(settings, None);
+        state
+            .provider_registry
+            .write()
+            .await
+            .cache_models("test", vec![model_capability_fixture("gpt-5.5")]);
+
+        let Json(body) = list_models(State(state)).await;
+        let model = &body["data"][0];
+
+        assert_eq!(model["id"], "gpt-5.5");
+        assert_eq!(model["provider"], "test");
+        assert_eq!(model["qualified_id"], "test/gpt-5.5");
+        assert_eq!(model["capabilities"]["responses"]["streaming"], "required");
+        assert_eq!(
+            model["capabilities"]["responses"]["stateful"],
+            "unsupported"
+        );
+        assert_eq!(
+            model["capabilities"]["responses"]["unsupported_parameters"][0],
+            "max_output_tokens"
         );
     }
 }

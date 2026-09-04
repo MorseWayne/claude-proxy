@@ -507,6 +507,16 @@ Responses 接口仍按无状态模式工作：`store: true`、`background: true`
 `previous_response_id` 和 `conversation` 会明确返回错误。暂不暴露下游 Responses
 WebSocket；GET 探测会返回 `426 Upgrade Required`，让 Codex 立即改走 HTTP。
 
+`GET /v1/models` 会在 `capabilities.responses` 中提供按 Provider 区分的 Responses
+约束，包括必须使用的流式模式、无状态与存储行为、支持的输入形态、Structured
+Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可直接路由的
+`qualified_id`，调用方无需再从未限定的模型名猜测 Provider 能力。
+
+对于 ChatGPT Provider，字符串 `input` 会自动归一化为输入项列表，Responses Lite
+要求的 `reasoning.context=all_turns` 和 `parallel_tool_calls=false` 也会自动补齐。
+Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters` 中声明并在
+转发前移除。原生 OpenAI Provider 仍会原样收到 `max_output_tokens`。
+
 ### OpenAI 客户端接入
 
 将代理的 `/v1` 地址设置为 OpenAI Base URL，并使用 `server.auth_token` 作为

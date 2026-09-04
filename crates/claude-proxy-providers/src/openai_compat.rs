@@ -354,6 +354,8 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 token_counting: TokenCountingCapability::rough(),
                 ..Default::default()
             },
+            responses: supports_responses(model_id)
+                .then(|| ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)),
             supported_parameters: openai_supported_parameters(model_id, supports_reasoning),
         },
     }
@@ -860,6 +862,14 @@ mod tests {
             info.capabilities.quality.token_counting.mode,
             TokenCountingMode::Rough
         );
+        let responses = info
+            .capabilities
+            .responses
+            .expect("Responses capability details");
+        assert_eq!(responses.streaming, ResponsesStreamingMode::Required);
+        assert_eq!(responses.stateful, CapabilityState::Unsupported);
+        assert_eq!(responses.storage, CapabilityState::Unsupported);
+        assert!(responses.unsupported_parameters.is_empty());
     }
 
     #[test]
@@ -906,6 +916,7 @@ mod tests {
             vec!["/chat/completions"]
         );
         assert!(info.capabilities.limits.reasoning_effort_levels.is_empty());
+        assert!(info.capabilities.responses.is_none());
     }
 
     #[test]

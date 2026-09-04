@@ -205,11 +205,20 @@ fn convert_chat_request(
 fn validate_native_responses_request(value: Value) -> Result<(Value, String), RequestError> {
     let mut object = request_object(value)?;
     let model = required_string(&object, "model")?;
-    if !object.contains_key("input") {
-        return Err(RequestError::invalid(
-            "input",
-            "missing required field: input",
-        ));
+    match object.get("input") {
+        None => {
+            return Err(RequestError::invalid(
+                "input",
+                "missing required field: input",
+            ));
+        }
+        Some(Value::String(_) | Value::Array(_)) => {}
+        Some(_) => {
+            return Err(RequestError::invalid(
+                "input",
+                "input must be a string or an array of Responses input items",
+            ));
+        }
     }
     if optional_bool(&object, "stream")? != Some(true) {
         return Err(RequestError::invalid(
@@ -1000,6 +1009,32 @@ mod tests {
             }
             let error = validate_native_responses_request(request).unwrap_err();
             assert_eq!(error.param.as_deref(), Some("stream"));
+        }
+    }
+
+    #[test]
+    fn native_responses_accepts_only_standard_input_shapes() {
+        for input in [json!(null), json!({"role": "user"}), json!(42)] {
+            let error = validate_native_responses_request(json!({
+                "model": "gpt-test",
+                "input": input,
+                "stream": true
+            }))
+            .unwrap_err();
+            assert_eq!(error.param.as_deref(), Some("input"));
+            assert!(error.message.contains("string or an array"));
+        }
+
+        for input in [
+            json!("hello"),
+            json!([{"role": "user", "content": "hello"}]),
+        ] {
+            validate_native_responses_request(json!({
+                "model": "gpt-test",
+                "input": input,
+                "stream": true
+            }))
+            .unwrap();
         }
     }
 

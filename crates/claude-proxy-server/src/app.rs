@@ -628,7 +628,7 @@ mod tests {
     use claude_proxy_core::{
         CapabilityState, EndpointCapabilities, FeatureCapabilities, InputModalities,
         ModalityCapabilities, ModelCapabilities, ModelLimits, PromptCacheCapability,
-        QualityGateCapabilities, TokenCountingCapability,
+        QualityGateCapabilities, ResponsesCapabilities, TokenCountingCapability,
     };
 
     fn model_capability_fixture(model_id: &str) -> ModelInfo {
@@ -667,6 +667,9 @@ mod tests {
                     token_counting: TokenCountingCapability::rough(),
                     ..Default::default()
                 },
+                responses: Some(ResponsesCapabilities::streaming_stateless(
+                    CapabilityState::Supported,
+                )),
                 supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
             },
         }
@@ -1556,6 +1559,23 @@ impl ProviderRegistry {
             .values()
             .flat_map(|entry| entry.models.iter())
             .cloned()
+            .collect()
+    }
+
+    /// Get all cached models with the provider identity needed to interpret
+    /// provider-specific capability constraints.
+    pub fn all_cached_models_with_provider(&self) -> Vec<(String, claude_proxy_core::ModelInfo)> {
+        let mut providers = self.model_cache.iter().collect::<Vec<_>>();
+        providers.sort_by_key(|(provider_id, _)| *provider_id);
+        providers
+            .into_iter()
+            .flat_map(|(provider_id, entry)| {
+                entry
+                    .models
+                    .iter()
+                    .cloned()
+                    .map(|model| (provider_id.clone(), model))
+            })
             .collect()
     }
 

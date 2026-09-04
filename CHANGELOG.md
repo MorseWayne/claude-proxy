@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.0.1 - 2026-09-04
+
+### Added
+
+- Added provider-scoped Responses capability details to `/v1/models`, including streaming, state, storage, input-shape, Structured Outputs, and unsupported-parameter declarations.
+- Added `provider` and `qualified_id` to model-list entries so clients can select the advertised provider contract explicitly.
+
+### Fixed
+
+- Normalized public string `input` requests and Responses Lite invariants before forwarding native Responses requests to the ChatGPT/Codex backend.
+- Removed the unsupported `max_output_tokens` field only on the ChatGPT native Responses path while preserving it for native OpenAI providers.
+- Verified ChatGPT Structured Outputs end to end and added regression coverage for JSON Schema request passthrough and provider-specific normalization.
+
 ## v4.0.0 - 2026-09-04
 
 ### Breaking

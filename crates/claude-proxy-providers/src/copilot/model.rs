@@ -141,6 +141,7 @@ pub(super) fn parse_copilot_model(model: &Value) -> Option<ModelInfo> {
                 token_counting: TokenCountingCapability::rough(),
                 ..Default::default()
             },
+            responses: None,
             supported_parameters: copilot_supported_parameters(supports_thinking.is_some()),
         },
     })

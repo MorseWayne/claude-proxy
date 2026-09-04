@@ -237,6 +237,20 @@ The Responses endpoint remains stateless. `store: true`, `background: true`,
 WebSocket transport is not exposed; its GET probe returns `426 Upgrade
 Required` so Codex immediately retries over HTTP.
 
+`GET /v1/models` exposes provider-scoped Responses constraints under
+`capabilities.responses`, including the required streaming mode, stateless and
+storage behavior, accepted input shapes, Structured Outputs support, and
+unsupported parameters. Each model also includes `provider` and a routable
+`qualified_id`, so clients do not have to infer provider-specific behavior from
+an unqualified model name.
+
+For the ChatGPT provider, string `input` is normalized to an input-item list and
+Responses Lite requirements (`reasoning.context=all_turns` and
+`parallel_tool_calls=false`) are applied automatically. The Codex backend does
+not accept `max_output_tokens`; the proxy advertises it in
+`unsupported_parameters` and removes it before forwarding. Native OpenAI
+providers continue to receive `max_output_tokens` unchanged.
+
 ### OpenAI Client Setup
 
 Use the proxy's `/v1` URL as the OpenAI base URL and `server.auth_token` as the

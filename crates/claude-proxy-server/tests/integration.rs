@@ -138,6 +138,19 @@ async fn mock_responses(headers: HeaderMap, Json(payload): Json<serde_json::Valu
     assert_eq!(payload["store"], false);
     assert!(payload.get("background").is_none());
     assert_eq!(payload["future_option"], json!({"enabled": true}));
+    if payload
+        .pointer("/metadata/verify_structured_outputs")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        assert_eq!(payload["max_output_tokens"], 512);
+        assert_eq!(payload["text"]["format"]["type"], "json_schema");
+        assert_eq!(payload["text"]["format"]["name"], "verification");
+        assert_eq!(
+            payload["text"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+    }
     let input = payload["input"].as_array().expect("Responses input array");
     assert!(input.iter().any(|item| item["type"] == "additional_tools"));
     assert!(
@@ -404,6 +417,8 @@ async fn test_list_models() {
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(body["data"][0]["id"], "gpt-4");
+    assert_eq!(body["data"][0]["provider"], "openai");
+    assert_eq!(body["data"][0]["qualified_id"], "openai/gpt-4");
     assert_eq!(body["data"][1]["id"], "gpt-4-mini");
 }
 
@@ -592,7 +607,7 @@ async fn test_openai_responses_rejects_non_native_provider() {
 }
 
 #[tokio::test]
-async fn test_openai_responses_streaming() {
+async fn test_openai_responses_streaming_preserves_structured_outputs_request() {
     let mock_url = start_mock_openai().await;
     let settings = test_settings(&mock_url, "test-token");
     let proxy_url = start_proxy(settings).await;
@@ -606,7 +621,22 @@ async fn test_openai_responses_streaming() {
             "model": "gpt-4",
             "input": native_codex_input(false),
             "stream": true,
-            "future_option": {"enabled": true}
+            "future_option": {"enabled": true},
+            "max_output_tokens": 512,
+            "metadata": {"verify_structured_outputs": true},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "verification",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": false
+                    },
+                    "strict": true
+                }
+            }
         }))
         .send()
         .await
