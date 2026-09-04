@@ -139,8 +139,8 @@ impl StreamEncoder {
                         .collect()
                 }),
             Self::Responses(encoder) => match event.native_event() {
-                Some(NativeProviderEvent::OpenAiResponses(event)) => {
-                    encoder.encode_native_event(event)
+                Some(NativeProviderEvent::OpenAiResponses(native)) => {
+                    encoder.encode_native_event(native, event.normalized_events())
                 }
                 None => event
                     .normalized_events()
@@ -552,7 +552,11 @@ fn reconstructed_responses_output(events: &[ProviderEvent]) -> Option<Vec<Value>
         .flat_map(ProviderEvent::normalized_events)
         .cloned()
         .collect::<Vec<_>>();
-    let message = crate::non_stream::response_from_events(&normalized)?;
+    reconstructed_responses_output_from_normalized(&normalized)
+}
+
+fn reconstructed_responses_output_from_normalized(normalized: &[SseEvent]) -> Option<Vec<Value>> {
+    let message = crate::non_stream::response_from_events(normalized)?;
     let output = responses_output_items(&message);
     (!output.is_empty()).then_some(output)
 }
@@ -1203,6 +1207,7 @@ pub(crate) struct ResponsesStreamEncoder {
     output: BTreeMap<u32, Value>,
     usage: Usage,
     stop_reason: String,
+    native_normalized_events: Vec<SseEvent>,
 }
 
 impl ResponsesStreamEncoder {
@@ -1220,6 +1225,7 @@ impl ResponsesStreamEncoder {
             output: BTreeMap::new(),
             usage: Usage::default(),
             stop_reason: "end_turn".to_string(),
+            native_normalized_events: Vec::new(),
         }
     }
 
@@ -1274,11 +1280,17 @@ impl ResponsesStreamEncoder {
         frames
     }
 
-    fn encode_native_event(&mut self, event: &SseEvent) -> Vec<Vec<u8>> {
+    fn encode_native_event(
+        &mut self,
+        event: &SseEvent,
+        normalized_events: &[SseEvent],
+    ) -> Vec<Vec<u8>> {
         if self.done {
             return Vec::new();
         }
         self.native_mode = true;
+        self.native_normalized_events
+            .extend(normalized_events.iter().cloned());
         let event_name = event
             .data
             .get("type")
@@ -1296,6 +1308,12 @@ impl ResponsesStreamEncoder {
             self.sequence = self.sequence.saturating_add(1);
         }
         if let Some(response) = payload.get_mut("response") {
+            if response_output_missing_or_empty(response)
+                && let Some(output) =
+                    reconstructed_responses_output_from_normalized(&self.native_normalized_events)
+            {
+                response["output"] = Value::Array(output);
+            }
             normalize_native_response(response, &self.options);
         }
         if matches!(
@@ -2088,6 +2106,21 @@ mod tests {
         assert!(body.contains("event: response.completed"));
         assert!(body.contains("\"output\":[{\"content\""));
         assert!(!body.contains("[DONE]"));
+    }
+
+    #[test]
+    fn responses_stream_reconstructs_empty_native_terminal_output_from_deltas() {
+        let mut encoder =
+            DownstreamProtocol::responses("client-model", Map::new()).stream_encoder();
+        let frames = native_text_delta_events_with_empty_terminal_output()
+            .iter()
+            .flat_map(|event| encoder.encode_event(event))
+            .collect::<Vec<_>>();
+        let body = String::from_utf8(frames.concat()).unwrap();
+
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("\"output\":[{\"content\""));
+        assert!(body.contains("\"text\":\"hello\""));
     }
 
     #[test]
