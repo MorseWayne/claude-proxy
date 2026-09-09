@@ -448,6 +448,13 @@ pub trait Provider: Send + Sync {
     /// List available models from this provider.
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
 
+    /// Opaque authentication scope for model catalogs within this provider instance.
+    /// Providers with mutable credentials must change it when the catalog owner
+    /// or entitlement changes. None disables reuse while identity is unavailable.
+    fn model_cache_identity(&self) -> Option<String> {
+        Some(self.id().to_string())
+    }
+
     /// Return provider account quota/rate-limit snapshots when available.
     async fn rate_limit_snapshots(&self) -> Result<Vec<RateLimitSnapshot>, ProviderError> {
         Ok(Vec::new())

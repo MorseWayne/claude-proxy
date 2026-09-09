@@ -241,6 +241,68 @@ async fn start_proxy(settings: Settings) -> String {
     base_url
 }
 
+#[tokio::test]
+async fn astra_model_catalog_and_messages_use_responses_capabilities() {
+    let mock = Router::new()
+        .route("/models", get(|| async { Json(json!({"data":[{"id":"gpt-6-astra"}]})) }))
+        .route("/responses", post(|Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["reasoning"]["effort"], "high");
+            assert_eq!(body["text"]["verbosity"], "low");
+            assert!(body.get("temperature").is_none());
+            assert!(body.get("top_p").is_none());
+            Response::builder().header("content-type", "text/event-stream").body(Body::from(concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-astra\",\"model\":\"gpt-6-astra\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello Astra\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-astra\",\"status\":\"completed\",\"output\":[]}}\n\n"
+            ))).unwrap()
+        }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+    let proxy = start_proxy(test_settings(&mock_url, "test-token")).await;
+    let client = reqwest::Client::new();
+    let catalog: serde_json::Value = client
+        .get(format!("{proxy}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = &catalog["data"][0];
+    assert_eq!(model["qualified_id"], "openai/gpt-6-astra");
+    assert_eq!(
+        model["supported_endpoints"],
+        json!(["/chat/completions", "/responses"])
+    );
+    assert_eq!(
+        model["capabilities"]["limits"],
+        json!({
+            "context_window": 1_050_000, "max_output_tokens": 128_000,
+            "reasoning_effort_levels": ["low", "medium", "high", "xhigh", "max"]
+        })
+    );
+    assert_eq!(model["capabilities"]["responses"]["streaming"], "required");
+    assert_eq!(model["capabilities"]["features"]["sampling"], "unsupported");
+    let response = client
+        .post(format!("{proxy}/v1/messages"))
+        .header("x-api-key", "test-token")
+        .json(&json!({
+            "model":"openai/gpt-6-astra", "stream":true,
+            "messages":[{"role":"user", "content":"hello"}],
+            "thinking":{"type":"adaptive"}, "verbosity":"low", "max_tokens":1024
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("Hello Astra"));
+    upstream.abort();
+}
+
 fn native_codex_input(compaction: bool) -> Vec<serde_json::Value> {
     let mut input = vec![
         json!({

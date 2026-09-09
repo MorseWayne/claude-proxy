@@ -77,6 +77,18 @@ pub struct ChatGptAuth {
 }
 
 impl ChatGptAuth {
+    #[cfg(test)]
+    pub(super) fn for_test() -> Arc<Self> {
+        Arc::new(Self {
+            token: RwLock::new(None),
+            token_refresh_lock: Mutex::new(()),
+            token_dir: std::env::temp_dir()
+                .join(format!("claude-proxy-auth-{}", uuid::Uuid::new_v4())),
+            http_client: Client::new(),
+            max_response_body_bytes: 1024 * 1024,
+        })
+    }
+
     pub async fn new(
         http_client: Client,
         max_response_body_bytes: u64,
@@ -272,6 +284,14 @@ impl ChatGptAuth {
             self.refresh_access_token().await?;
         }
         self.current_token().await
+    }
+
+    pub(super) fn model_cache_identity(&self) -> Option<String> {
+        let token = self.token.try_read().ok()?;
+        Some(token.as_ref().map_or_else(
+            || "unauthenticated".to_string(),
+            ChatGptToken::model_cache_identity,
+        ))
     }
 
     pub async fn force_refresh_token(&self) -> Result<ChatGptToken, ProviderError> {
@@ -519,6 +539,59 @@ mod tests {
         assert!(!fresh.token_needs_refresh().await);
         assert!(stale.token_needs_refresh().await);
         assert!(missing.token_needs_refresh().await);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_rejects_response_after_auth_identity_changes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(length, 0);
+                request.extend_from_slice(&buffer[..length]);
+            }
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = r#"{"models":[{"slug":"old-account-model","context_window":100000}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut provider =
+            crate::chatgpt::tests::test_chatgpt_provider(format!("http://{address}/responses"))
+                .await;
+        provider.models_endpoint = format!("http://{address}/models");
+        let token = ChatGptToken {
+            access_token: "test-a".to_string(),
+            refresh_token: "unused".to_string(),
+            expires_at: i64::MAX,
+            account_id: Some("account-a".to_string()),
+        };
+        let auth = Arc::new(auth_with_token(Some(token)));
+        provider.auth = auth.clone();
+        let provider = Arc::new(provider);
+        let fetching = provider.clone();
+        let task = tokio::spawn(async move { fetching.fetch_remote_models().await });
+        tokio::time::timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        auth.token.write().await.as_mut().unwrap().account_id = Some("account-b".to_string());
+        release_tx.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert!(provider.remote_model("old-account-model").is_none());
+        assert!(provider.remote_models.read().unwrap().models.is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]

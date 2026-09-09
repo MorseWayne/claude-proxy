@@ -251,6 +251,18 @@ not accept `max_output_tokens`; the proxy advertises it in
 `unsupported_parameters` and removes it before forwarding. Native OpenAI
 providers continue to receive `max_output_tokens` unchanged.
 
+`openai/gpt-6-astra` advertises Responses and reasoning capabilities, including
+the public API's 1,050,000-token context and 128,000-token output limit. Messages
+requests for this model also use Responses. The ChatGPT fallback uses the Codex
+catalog's 272,000-token default context; online metadata and explicit capability
+overrides take precedence. These provider limits are separate.
+
+Disconnecting the last streaming consumer closes the upstream read immediately;
+other consumers of a shared request can continue. ChatGPT clients retain only the
+upstream `__oailb` routing cookie on known HTTPS ChatGPT hosts. Model caches are
+invalidated when their provider or authentication scope changes. Existing context
+capability caches are refreshed after upgrading to the new identity-scoped format.
+
 ### OpenAI Client Setup
 
 Use the proxy's `/v1` URL as the OpenAI base URL and `server.auth_token` as the

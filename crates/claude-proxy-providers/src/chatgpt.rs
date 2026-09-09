@@ -5,7 +5,9 @@
 
 mod auth;
 pub mod capability_cache;
+mod model_identity;
 mod responses;
+mod routing_cookie;
 mod transport;
 
 use std::collections::{BTreeSet, HashMap};
@@ -232,6 +234,12 @@ struct ChatGptCatalogModel {
     visibility: Option<String>,
     priority: i32,
     service_tiers: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct ChatGptModelCatalog {
+    identity: Option<String>,
+    models: HashMap<String, ChatGptCatalogModel>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -674,7 +682,7 @@ pub struct ChatGptProvider {
     websocket_stats: ChatGptWebSocketStats,
     websocket_session: Arc<Mutex<transport::ChatGptWebSocketSession>>,
     auth: Arc<ChatGptAuth>,
-    remote_models: Arc<RwLock<HashMap<String, ChatGptCatalogModel>>>,
+    remote_models: Arc<RwLock<ChatGptModelCatalog>>,
     cached_rate_limits: Arc<Mutex<CachedRateLimits>>,
     context_usage: Arc<StdMutex<HashMap<ContextUsageKey, ContextUsageBaseline>>>,
     payload_limits: crate::http::ResponsePayloadLimits,
@@ -713,7 +721,7 @@ impl ChatGptProvider {
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
             auth,
-            remote_models: Arc::new(RwLock::new(HashMap::new())),
+            remote_models: Arc::new(RwLock::new(ChatGptModelCatalog::default())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,
@@ -766,12 +774,7 @@ impl ChatGptProvider {
             };
         }
 
-        if let Some(model) = self
-            .remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned")
-            .get(normalized_model)
-        {
+        if let Some(model) = self.remote_model(normalized_model) {
             return if model.responses_lite {
                 ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ModelCapability)
             } else {
@@ -793,11 +796,8 @@ impl ChatGptProvider {
         )?;
         let model = normalize_chatgpt_model_id(model);
         let remote_support = self
-            .remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned")
-            .get(model)
-            .and_then(|model| model.service_tiers.as_ref())
+            .remote_model(model)
+            .and_then(|model| model.service_tiers)
             .map(|tiers| tiers.iter().any(|tier| tier == requested));
         let supported = remote_support.or_else(|| {
             CHATGPT_MODEL_SPECS
@@ -820,30 +820,21 @@ impl ChatGptProvider {
 
     fn model_info(&self, model: &str) -> Option<ModelInfo> {
         let model = normalize_chatgpt_model_id(model);
-        self.remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned")
-            .get(model)
-            .map(|model| model.info.clone())
+        self.remote_model(model)
+            .map(|model| model.info)
             .or_else(|| chatgpt_model_info(model, &self.chatgpt_config))
     }
 
     fn supports_reasoning_summary_parameter(&self, model: &str) -> bool {
         let model = normalize_chatgpt_model_id(model);
-        self.remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned")
-            .get(model)
+        self.remote_model(model)
             .map(|model| model.supports_reasoning_summary_parameter)
             .unwrap_or(true)
     }
 
     fn supports_parallel_tool_calls(&self, model: &str) -> bool {
         let model = normalize_chatgpt_model_id(model);
-        self.remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned")
-            .get(model)
+        self.remote_model(model)
             .map(|model| model.supports_parallel_tool_calls)
             .unwrap_or(true)
     }
@@ -854,11 +845,7 @@ impl ChatGptProvider {
         model_context_window: u32,
     ) -> Option<u32> {
         let model = normalize_chatgpt_model_id(model);
-        let models = self
-            .remote_models
-            .read()
-            .expect("ChatGPT remote models lock poisoned");
-        let model = models.get(model)?;
+        let model = self.remote_model(model)?;
         let ninety_percent = model_context_window.saturating_mul(9) / 10;
         let auto_compact = model
             .auto_compact_token_limit
@@ -963,8 +950,22 @@ impl ChatGptProvider {
         }
     }
 
+    fn remote_model(&self, model: &str) -> Option<ChatGptCatalogModel> {
+        let identity = self.model_cache_identity()?;
+        let catalog = self
+            .remote_models
+            .read()
+            .expect("ChatGPT remote models lock poisoned");
+        if catalog.identity.as_ref() != Some(&identity) {
+            return None;
+        }
+        catalog.models.get(model).cloned()
+    }
+
     async fn fetch_remote_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let token = self.auth.get_existing_token().await?;
+        let identity =
+            model_identity::with_routing_headers(&token.model_cache_identity(), &self.runtime);
         let client_version =
             local_codex_cli_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         let mut request_builder = self
@@ -1009,10 +1010,21 @@ impl ChatGptProvider {
         for model in &catalog {
             cached.insert(model.info.model_id.clone(), model.clone());
         }
-        *self
-            .remote_models
-            .write()
-            .expect("ChatGPT remote models lock poisoned") = cached;
+        {
+            let mut target = self
+                .remote_models
+                .write()
+                .expect("ChatGPT remote models lock poisoned");
+            if self.model_cache_identity().as_ref() != Some(&identity) {
+                return Err(ProviderError::InvalidRequest(
+                    "ChatGPT model catalog identity changed during refresh; retry".to_string(),
+                ));
+            }
+            *target = ChatGptModelCatalog {
+                identity: Some(identity.clone()),
+                models: cached,
+            };
+        }
 
         let mut visible = catalog
             .iter()
@@ -1032,7 +1044,7 @@ impl ChatGptProvider {
         if let Some(model) = visible.first_mut() {
             model.is_chat_default = Some(true);
         }
-        if let Some(account_hash) = capability_cache::account_hash(token.account_id.as_deref()) {
+        if self.model_cache_identity().as_ref() == Some(&identity) {
             let cached_models = catalog
                 .iter()
                 .map(|model| model.info.clone())
@@ -1041,7 +1053,7 @@ impl ChatGptProvider {
             capability_cache::store_model_capabilities(
                 &self.id,
                 &self.base_url,
-                &account_hash,
+                &identity,
                 &cached_models,
             );
         }
@@ -2143,6 +2155,12 @@ impl Provider for ChatGptProvider {
         &self.id
     }
 
+    fn model_cache_identity(&self) -> Option<String> {
+        self.auth
+            .model_cache_identity()
+            .map(|identity| model_identity::with_routing_headers(&identity, &self.runtime))
+    }
+
     async fn chat(
         &self,
         request: MessagesRequest,
@@ -2162,11 +2180,12 @@ impl Provider for ChatGptProvider {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let mut request = apply_openai_intent(request);
-        let requested_ultra = normalize_chatgpt_56_reasoning(&mut request);
+        let requested_ultra = normalize_chatgpt_reasoning(&mut request);
         let model_info = self.model_info(&request.model);
-        let model_context = model_info
-            .as_ref()
-            .filter(|model| model.model_id.starts_with("gpt-5.6"));
+        let model_context = model_info.as_ref().filter(|model| {
+            model.model_id.starts_with("gpt-5.6")
+                || crate::openai_compat::is_gpt_6_astra(&model.model_id)
+        });
         let ultra_supported = model_info.as_ref().is_some_and(|model| {
             model
                 .capabilities
@@ -2379,7 +2398,7 @@ impl Provider for ChatGptProvider {
         let responses_lite = self.responses_lite_decision(&model);
         let output_token_budget =
             normalize_chatgpt_native_responses_body(&mut body, responses_lite.is_enabled());
-        normalize_chatgpt_native_56_reasoning(&mut body, &model);
+        normalize_chatgpt_native_reasoning(&mut body, &model);
         let compact_request = classify_compact_request_body(&body) != CompactRequestKind::None;
         let request_id = next_chatgpt_request_id();
         validate_chatgpt_tool_schema_budget(&body)?;
@@ -2758,6 +2777,7 @@ fn is_version_token(token: &str) -> bool {
 
 fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, ProviderError> {
     let mut builder = Client::builder()
+        .cookie_provider(Arc::new(routing_cookie::RoutingCookieJar::default()))
         .connect_timeout(Duration::from_secs(settings.http.connect_timeout))
         .read_timeout(Duration::from_secs(settings.http.read_timeout));
 
@@ -3686,6 +3706,16 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
         service_tiers: &["priority"],
     },
+    // Codex 0d46c252b models.json: use the default backend window, not the
+    // public OpenAI API limit or the optional expanded max_context_window.
+    ChatGptModelSpec {
+        model_id: "gpt-6-astra",
+        context_window: 272_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
+    },
 ];
 
 fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
@@ -3843,11 +3873,11 @@ pub fn configured_chatgpt_context_window(
     {
         return Some(context_window);
     }
-    if let Some(account_hash) = capability_cache::current_account_hash()
+    if let Some(identity) = capability_cache::current_model_identity(&provider.runtime)
         && let Some(context_window) = capability_cache::cached_context_window(
             provider_id,
             &normalized_codex_base_url(&provider.base_url),
-            &account_hash,
+            &identity,
             model_id,
         )
     {
@@ -3889,8 +3919,9 @@ fn normalize_chatgpt_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn normalize_chatgpt_56_reasoning(request: &mut MessagesRequest) -> bool {
-    if !normalize_chatgpt_model_id(&request.model).starts_with("gpt-5.6") {
+fn normalize_chatgpt_reasoning(request: &mut MessagesRequest) -> bool {
+    let model = normalize_chatgpt_model_id(&request.model);
+    if !model.starts_with("gpt-5.6") && !crate::openai_compat::is_gpt_6_astra(model) {
         return false;
     }
 
@@ -3949,8 +3980,9 @@ fn normalize_chatgpt_56_reasoning(request: &mut MessagesRequest) -> bool {
     mapped
 }
 
-fn normalize_chatgpt_native_56_reasoning(body: &mut Value, model: &str) {
-    if !normalize_chatgpt_model_id(model).starts_with("gpt-5.6") {
+fn normalize_chatgpt_native_reasoning(body: &mut Value, model: &str) {
+    let model = normalize_chatgpt_model_id(model);
+    if !model.starts_with("gpt-5.6") && !crate::openai_compat::is_gpt_6_astra(model) {
         return;
     }
     let Some(effort) = body
@@ -4253,10 +4285,12 @@ mod tests {
     async fn codex_service_tier_filters_known_unsupported_models() {
         let mut provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
         provider.chatgpt_config.fast_mode = true;
+        provider.remote_models.write().unwrap().identity = provider.model_cache_identity();
         provider
             .remote_models
             .write()
             .expect("ChatGPT remote models lock poisoned")
+            .models
             .insert(
                 "remote-no-priority".to_string(),
                 ChatGptCatalogModel {
@@ -4910,7 +4944,15 @@ mod tests {
             .iter()
             .map(|model| model.model_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-6-astra"
+            ]
+        );
         assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_none());
         assert!(chatgpt_model_info("gpt-5.4-mini", &ChatGptProviderConfig::default()).is_none());
 
@@ -4958,6 +5000,36 @@ mod tests {
             luna.capabilities.limits.reasoning_effort_levels,
             vec!["low", "medium", "high", "xhigh", "max"]
         );
+    }
+
+    #[tokio::test]
+    async fn astra_chatgpt_catalog_and_lite_normalization_follow_codex() {
+        let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
+        let model = provider.model_info("gpt-6-astra").unwrap();
+        assert_eq!(model.capabilities.limits.context_window, Some(272_000));
+        assert!(provider.responses_lite_decision("gpt-6-astra").is_enabled());
+        let remote: ChatGptRemoteModel = serde_json::from_value(json!({
+            "slug":"gpt-6-astra", "visibility":"list", "context_window":272_000,
+            "max_context_window":872_000, "use_responses_lite":true,
+            "input_modalities":["text","image"], "supports_experimental_context":true,
+            "guardian":{}, "supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}]
+        }))
+        .unwrap();
+        let catalog = chatgpt_catalog_model_from_remote(remote, &provider.chatgpt_config);
+        assert_eq!(
+            catalog.info.capabilities.limits.context_window,
+            Some(272_000)
+        );
+        assert!(catalog.responses_lite);
+        assert_eq!(catalog.visibility.as_deref(), Some("list"));
+        let mut body = json!({"model":"gpt-6-astra", "input":"hi", "reasoning":{"effort":"ultra"}});
+        normalize_chatgpt_native_reasoning(&mut body, "gpt-6-astra");
+        normalize_chatgpt_native_responses_body(&mut body, catalog.responses_lite);
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort":"max", "context":"all_turns"})
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
@@ -5163,7 +5235,7 @@ mod tests {
             extra: HashMap::from([("reasoning_effort".to_string(), json!("ultra"))]),
         };
 
-        assert!(normalize_chatgpt_56_reasoning(&mut request));
+        assert!(normalize_chatgpt_reasoning(&mut request));
         assert!(request_has_delegation_tool(&request));
         assert_eq!(request.extra["reasoning_effort"], "max");
 
@@ -5204,7 +5276,7 @@ mod tests {
             extra: HashMap::from([("reasoning".to_string(), json!({"effort": "ultra"}))]),
         };
 
-        assert!(normalize_chatgpt_56_reasoning(&mut request));
+        assert!(normalize_chatgpt_reasoning(&mut request));
         assert!(!request_has_delegation_tool(&request));
         assert_eq!(request.extra["reasoning"]["effort"], "max");
         let luna = chatgpt_model_info("gpt-5.6-luna", &ChatGptProviderConfig::default()).unwrap();
@@ -5239,7 +5311,7 @@ mod tests {
             extra: HashMap::from([("reasoning".to_string(), json!({"effort": "minimal"}))]),
         };
 
-        assert!(!normalize_chatgpt_56_reasoning(&mut request));
+        assert!(!normalize_chatgpt_reasoning(&mut request));
         assert_eq!(request.extra["reasoning"]["effort"], "low");
         assert_eq!(request.extra["reasoning_effort"], "low");
         assert!(request.thinking.is_none());
@@ -5255,7 +5327,7 @@ mod tests {
             ("high", "high"),
         ] {
             let mut body = json!({"reasoning": {"effort": input, "summary": "auto"}});
-            normalize_chatgpt_native_56_reasoning(&mut body, "gpt-5.6-sol");
+            normalize_chatgpt_native_reasoning(&mut body, "gpt-5.6-sol");
             assert_eq!(body["reasoning"]["effort"], expected);
             assert_eq!(body["reasoning"]["summary"], "auto");
         }
@@ -9179,7 +9251,7 @@ mod tests {
             .collect()
     }
 
-    async fn test_chatgpt_provider(endpoint: String) -> ChatGptProvider {
+    pub(super) async fn test_chatgpt_provider(endpoint: String) -> ChatGptProvider {
         ChatGptProvider {
             id: "chatgpt".to_string(),
             base_url: endpoint.clone(),
@@ -9206,12 +9278,12 @@ mod tests {
             websocket_sse_cooldown_until_secs: Arc::new(AtomicU64::new(0)),
             websocket_stats: ChatGptWebSocketStats::default(),
             websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
-            auth: ChatGptAuth::new(Client::new(), 1024 * 1024).await.unwrap(),
+            auth: ChatGptAuth::for_test(),
             payload_limits: crate::http::ResponsePayloadLimits {
                 max_response_body_bytes: 1024 * 1024,
                 max_sse_frame_bytes: 1024 * 1024,
             },
-            remote_models: Arc::new(RwLock::new(HashMap::new())),
+            remote_models: Arc::new(RwLock::new(ChatGptModelCatalog::default())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
                 snapshots: Vec::new(),
                 fetched_at: None,

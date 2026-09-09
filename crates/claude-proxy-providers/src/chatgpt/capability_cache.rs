@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const DEFAULT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -24,7 +24,7 @@ struct CapabilityCache {
 struct CapabilityCacheEntry {
     provider_id: String,
     base_url: String,
-    account_hash: String,
+    identity_hash: String,
     model_id: String,
     context_window: u32,
     updated_at_unix_secs: u64,
@@ -47,10 +47,26 @@ pub fn current_account_hash() -> Option<String> {
     account_hash(token.get("account_id").and_then(Value::as_str))
 }
 
+/// Identity for persisted model capabilities, including available user/plan claims.
+pub fn current_model_identity(
+    runtime: &claude_proxy_config::settings::ProviderRuntimeConfig,
+) -> Option<String> {
+    let token_path = dirs::config_dir()?
+        .join("claude-proxy")
+        .join("chatgpt")
+        .join("token.json");
+    let token: super::auth::ChatGptToken =
+        serde_json::from_str(&fs::read_to_string(token_path).ok()?).ok()?;
+    Some(super::model_identity::with_routing_headers(
+        &token.model_cache_identity(),
+        runtime,
+    ))
+}
+
 pub fn cached_context_window(
     provider_id: &str,
     base_url: &str,
-    account_hash: &str,
+    identity_hash: &str,
     model_id: &str,
 ) -> Option<u32> {
     let cache = load_cache()?;
@@ -58,7 +74,7 @@ pub fn cached_context_window(
         &cache,
         provider_id,
         base_url,
-        account_hash,
+        identity_hash,
         model_id,
         unix_timestamp_secs(),
     )
@@ -68,7 +84,7 @@ fn find_cached_context_window(
     cache: &CapabilityCache,
     provider_id: &str,
     base_url: &str,
-    account_hash: &str,
+    identity_hash: &str,
     model_id: &str,
     now: u64,
 ) -> Option<u32> {
@@ -78,7 +94,7 @@ fn find_cached_context_window(
         .filter(|entry| {
             entry.provider_id == provider_id
                 && entry.base_url == normalize_base_url(base_url)
-                && entry.account_hash == account_hash
+                && entry.identity_hash == identity_hash
                 && entry.model_id == model_id
                 && now.saturating_sub(entry.updated_at_unix_secs) <= DEFAULT_RETENTION_SECS
         })
@@ -89,7 +105,7 @@ fn find_cached_context_window(
 pub(super) fn store_model_capabilities(
     provider_id: &str,
     base_url: &str,
-    account_hash: &str,
+    identity_hash: &str,
     models: &[ModelInfo],
 ) {
     let Some(path) = cache_path() else {
@@ -114,13 +130,13 @@ pub(super) fn store_model_capabilities(
         cache.entries.retain(|entry| {
             !(entry.provider_id == provider_id
                 && entry.base_url == base_url
-                && entry.account_hash == account_hash
+                && entry.identity_hash == identity_hash
                 && entry.model_id == model.model_id)
         });
         cache.entries.push(CapabilityCacheEntry {
             provider_id: provider_id.to_string(),
             base_url: base_url.clone(),
-            account_hash: account_hash.to_string(),
+            identity_hash: identity_hash.to_string(),
             model_id: model.model_id.clone(),
             context_window,
             updated_at_unix_secs: now,
@@ -144,7 +160,7 @@ fn load_cache() -> Option<CapabilityCache> {
 
 fn load_cache_from_path(path: &Path) -> Option<CapabilityCache> {
     let cache: CapabilityCache = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
-    (cache.version == 0 || cache.version == CACHE_VERSION).then_some(cache)
+    (cache.version == CACHE_VERSION).then_some(cache)
 }
 
 fn write_cache_atomically(path: &Path, cache: &CapabilityCache) -> std::io::Result<()> {
@@ -176,7 +192,10 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 fn normalize_base_url(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+    let trimmed = base_url.trim().trim_end_matches('/');
+    reqwest::Url::parse(trimmed)
+        .map(|url| url.to_string().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -207,7 +226,7 @@ mod tests {
             entries: vec![CapabilityCacheEntry {
                 provider_id: "chatgpt".to_string(),
                 base_url: "https://example.test/codex".to_string(),
-                account_hash: "account-hash".to_string(),
+                identity_hash: "account-hash".to_string(),
                 model_id: "gpt-5.6-sol".to_string(),
                 context_window: 372_000,
                 updated_at_unix_secs: now,
@@ -224,6 +243,17 @@ mod tests {
                 now,
             ),
             Some(372_000)
+        );
+        assert_eq!(
+            find_cached_context_window(
+                &cache,
+                "chatgpt",
+                "https://example.test/Codex",
+                "account-hash",
+                "gpt-5.6-sol",
+                now,
+            ),
+            None
         );
         assert_eq!(
             find_cached_context_window(
@@ -264,7 +294,7 @@ mod tests {
             entries: vec![CapabilityCacheEntry {
                 provider_id: "chatgpt".to_string(),
                 base_url: "https://example.test/codex".to_string(),
-                account_hash: "hash-only".to_string(),
+                identity_hash: "hash-only".to_string(),
                 model_id: "gpt-5.6-luna".to_string(),
                 context_window: 372_000,
                 updated_at_unix_secs: unix_timestamp_secs(),
@@ -274,9 +304,16 @@ mod tests {
         write_cache_atomically(&path, &cache).unwrap();
         let loaded = load_cache_from_path(&path).unwrap();
         assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].account_hash, "hash-only");
+        assert_eq!(loaded.entries[0].identity_hash, "hash-only");
         assert_eq!(loaded.entries[0].context_window, 372_000);
         assert!(!fs::read_to_string(&path).unwrap().contains("raw-account"));
+        let mut legacy = serde_json::to_value(&cache).unwrap();
+        legacy["version"] = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_cache_from_path(&path).is_none(),
+            "legacy caches lack the required identity scope"
+        );
         let _ = fs::remove_file(path);
     }
 }

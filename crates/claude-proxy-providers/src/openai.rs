@@ -111,7 +111,8 @@ fn apply_openai_responses_options(
 }
 
 fn openai_responses_verbosity(request: &MessagesRequest) -> Option<&str> {
-    if !request.model.starts_with("gpt-5") {
+    if !request.model.starts_with("gpt-5") && !crate::openai_compat::is_gpt_6_astra(&request.model)
+    {
         return None;
     }
 
@@ -269,6 +270,37 @@ impl OpenAiProvider {
     fn responses_request_body(&self, request: &MessagesRequest) -> Result<Value, ProviderError> {
         let mut request = request.clone();
         normalize_openai_56_reasoning(&mut request);
+        if crate::openai_compat::is_gpt_6_astra(&request.model) {
+            // Messages clients can disable thinking; Astra's lowest supported
+            // effort is low. Native Responses requests remain passthrough.
+            if request
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.r#type.as_deref())
+                == Some("disabled")
+            {
+                request.thinking = None;
+                request
+                    .extra
+                    .insert("reasoning_effort".to_string(), json!("low"));
+            }
+            for key in ["reasoning_effort", "reasoning"] {
+                if let Some(value) = request.extra.get_mut(key) {
+                    let effort = if key == "reasoning" {
+                        value.get_mut("effort")
+                    } else {
+                        Some(value)
+                    };
+                    if let Some(effort) = effort {
+                        match effort.as_str() {
+                            Some("none" | "minimal") => *effort = json!("low"),
+                            Some("ultra") => *effort = json!("max"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         let model = openai_model_info(&request.model);
         let mut body = crate::responses::convert_to_responses_with_context(
             &request,
@@ -550,6 +582,50 @@ mod tests {
             body["client_metadata"],
             json!({"x-codex-turn-metadata": "{\"turn_id\":\"turn-1\"}"})
         );
+    }
+
+    #[test]
+    fn astra_messages_normalize_reasoning_aliases_without_losing_controls() {
+        let provider = OpenAiProvider::new(
+            "openai",
+            "test-key",
+            "http://127.0.0.1:1",
+            "",
+            1,
+            1,
+            &[],
+            UpstreamRequestPolicy::default(),
+            ProviderRuntimeConfig::default(),
+            crate::http::ResponsePayloadLimits {
+                max_response_body_bytes: 1024 * 1024,
+                max_sse_frame_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        for (controls, expected) in [
+            (json!({"thinking":{"type":"disabled"}}), "low"),
+            (json!({"reasoning_effort":"none"}), "low"),
+            (json!({"reasoning_effort":"minimal"}), "low"),
+            (json!({"reasoning_effort":"ultra"}), "max"),
+            (
+                json!({"reasoning":{"effort":"minimal", "summary":"auto"}}),
+                "low",
+            ),
+            (json!({"metadata":{"intent":"fast"}}), "low"),
+        ] {
+            let mut value = json!({"model":"gpt-6-astra", "messages":[{"role":"user","content":"hello"}], "stream":true});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let request = apply_openai_intent(serde_json::from_value(value).unwrap());
+            let body = provider.responses_request_body(&request).unwrap();
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["reasoning"]["effort"], expected);
+            if controls.get("reasoning").is_some() {
+                assert_eq!(body["reasoning"]["summary"], "auto");
+            }
+        }
     }
 
     #[test]

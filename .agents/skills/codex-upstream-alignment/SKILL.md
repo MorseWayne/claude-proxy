@@ -1,11 +1,11 @@
 ---
 name: codex-upstream-alignment
-description: Sync the local openai/codex source checkout, analyze upstream changes, and determine or implement what claude-proxy must follow across endpoints, wire protocols, models, tools, auth, and streaming behavior. Use when updating `/home/wayne/source/open/codex`, comparing Codex revisions, or planning claude-proxy alignment from a Codex delta; do not use for generic API compatibility work without an upstream Codex change.
+description: Force-sync the local openai/codex reference checkout from its authoritative remote, analyze upstream changes, and determine or implement what claude-proxy must follow across endpoints, wire protocols, models, tools, auth, and streaming behavior. Use when updating `/home/wayne/source/open/codex`, comparing Codex revisions, or planning claude-proxy alignment from a Codex delta; do not use for generic API compatibility work without an upstream Codex change.
 ---
 
 # Codex Upstream Alignment
 
-Synchronize openai/codex safely, reduce its changes to the subset relevant to claude-proxy, and produce an evidence-backed follow-up plan or implementation.
+Synchronize openai/codex with the remote as the source of truth, reduce its changes to the subset relevant to claude-proxy, and produce an evidence-backed follow-up plan or implementation.
 
 ## Repositories and Baseline
 
@@ -16,18 +16,22 @@ Synchronize openai/codex safely, reduce its changes to the subset relevant to cl
 
 The baseline means “last Codex revision whose relevant behavior was reviewed,” not merely “last fetched revision.” Update it only after the analysis is complete and any requested alignment has been verified.
 
-## 1. Synchronize Codex Without Losing Local Work
+## 1. Force-Synchronize Codex from the Remote
 
-When the user asks to update or sync Codex:
+Treat the Codex checkout as an upstream reference copy. A request to synchronize it authorizes replacing local tracked changes and local-only commits on the synchronized branch with the selected remote revision, including changes to `AGENTS.md`. Do not stop or ask again because paths overlap, the checkout is dirty, or the branch has diverged. Do not stash or merge local changes back afterward.
+
+When the user asks to update or sync Codex, or invokes this skill to start the alignment workflow:
 
 1. Read the upstream repository's `AGENTS.md` and relevant nested instructions.
 2. Record the current branch, `HEAD`, tracking branch, remotes, and `git status --short`.
-3. Fetch the requested remote, then determine whether the working branch can fast-forward.
-4. Use a fast-forward-only update when it preserves existing local changes.
+3. Use the explicitly requested remote branch, otherwise the configured tracking branch (default `origin/main`). Fetch that remote and resolve the fetched branch to an exact commit. If fetching fails or the target cannot be resolved, stop synchronization rather than resetting to a stale or guessed ref.
+4. Confirm the command targets the Codex checkout, then run `git reset --hard <fetched_sha>` to replace the index, tracked files, and current branch tip with that revision.
+5. Remove untracked files and directories in this reference checkout with `git clean -fd`. Leave ignored build caches alone; removing ignored files requires an explicit request.
+6. Verify `HEAD` equals the fetched commit and `git status --short` is clean. Read any changed upstream instructions before continuing the review.
 
-Never reset, discard, overwrite, or silently stash upstream-checkout changes. If the checkout is dirty, compare locally modified paths with paths changed by the incoming range. If they overlap, or the branch has diverged, stop the update and explain the conflict. Analysis can continue against the fetched remote ref or an isolated temporary worktree when that stays within the user's request.
+This replacement policy applies only to the identified Codex reference checkout. Preserve local work in claude-proxy and other repositories. Analysis-only requests that explicitly exclude synchronization must not reset or clean the checkout. Tool or filesystem permission requirements still apply; this policy removes the skill's extra confirmation gate.
 
-Record `before_sha`, `after_sha`, and the exact analyzed range. Do not treat a successful fetch as a completed working-tree update.
+Record `before_sha`, `after_sha`, the fetched target, and the local changes replaced. Keep the synchronization revision separate from the reviewed baseline and record the exact analyzed range. Do not treat a successful fetch as a completed working-tree update.
 
 ## 2. Analyze the Upstream Delta
 
@@ -90,6 +94,6 @@ Update `references/upstream-baseline.md` with the reviewed Codex commit, date, p
 
 ## Mutation and Release Boundaries
 
-Syncing Codex does not authorize modifying or pushing the Codex repository. Analysis does not authorize editing claude-proxy unless the user asks for implementation.
+Syncing Codex authorizes the local replacement described in section 1, not authoring upstream changes or pushing to its remote. Analysis does not authorize editing claude-proxy runtime code unless the user asks for implementation; maintain the review report and baseline as part of the alignment workflow.
 
 Do not commit, push, tag, publish, restart services, or monitor CI unless requested. When release work is requested, preserve unrelated files, stage only the scoped changes, verify commit and tag identity after pushing, and stop without checking CI when the user says not to track it.

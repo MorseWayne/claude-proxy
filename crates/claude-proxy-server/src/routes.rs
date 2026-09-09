@@ -1680,6 +1680,7 @@ fn join_inflight_stream(
         heartbeat.tick().await;
         loop {
             tokio::select! {
+                _ = tx.closed() => break,
                 event = receiver.recv() => {
                     match event {
                         Ok(InflightEvent::Event(event)) => {
@@ -1829,6 +1830,14 @@ async fn stream_leader_response(
 
         loop {
             tokio::select! {
+                _ = sender.closed(), if leader_tx_open => {
+                    leader_tx_open = false;
+                    terminal_reason = "client_disconnected";
+                    if broadcast_tx.receiver_count() == 0 {
+                        break;
+                    }
+                }
+                _ = broadcast_tx.closed(), if !leader_tx_open => break,
                 event_result = stream.next() => {
                     let Some(event_result) = event_result else {
                         if tool_use_pending {
@@ -4028,6 +4037,87 @@ mod tests {
 
         assert_eq!(leader_count, 1);
         assert_eq!(state.inflight.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_disconnect_releases_idle_stream_after_last_consumer() {
+        for with_follower in [false, true] {
+            let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+            let request = RequestMetricsContext {
+                provider_id: "test".to_string(),
+                model: "model".to_string(),
+                initiator: "user",
+            };
+            let (broadcast_tx, follower) = broadcast::channel::<InflightEvent>(16);
+            let mut follower = with_follower.then_some(follower);
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+            let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+            let response = stream_leader_response(
+                &state,
+                &request,
+                tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+                LeaderResponseContext {
+                    request_hash: 0xdead_beef,
+                    broadcast_tx,
+                    permits: StreamPermits {
+                        _request: limiter.clone().acquire_owned().await.unwrap(),
+                        _provider: None,
+                    },
+                    start: std::time::Instant::now(),
+                    observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                    observability: None,
+                    stream_config: test_stream_config(),
+                    protocol: DownstreamProtocol::responses("model", Default::default()),
+                },
+            )
+            .await;
+            drop(response);
+            if let Some(follower) = follower.as_mut() {
+                event_tx
+                    .send(Ok(SseEvent {
+                        event: "content_block_delta".to_string(),
+                        data: json!({"type":"content_block_delta", "delta":{"text":"still here"}}),
+                    }
+                    .into()))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), follower.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    InflightEvent::Event(_)
+                ));
+            }
+            drop(follower);
+            tokio::time::timeout(Duration::from_secs(2), event_tx.closed())
+                .await
+                .expect("last consumer disconnect must drop the idle provider stream");
+            let _permit = tokio::time::timeout(Duration::from_secs(2), limiter.acquire())
+                .await
+                .expect("request permit must be released")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_follower_disconnect_unsubscribes_without_heartbeat() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(16);
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let response = join_inflight_stream(
+            receiver,
+            StreamPermits {
+                _request: limiter.clone().acquire_owned().await.unwrap(),
+                _provider: None,
+            },
+            test_stream_config(),
+            DownstreamProtocol::responses("model", Default::default()),
+        );
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(2), broadcast_tx.closed())
+            .await
+            .expect("idle follower must unsubscribe when its response is dropped");
+        assert_eq!(limiter.available_permits(), 1);
     }
 
     #[tokio::test]

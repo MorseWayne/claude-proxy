@@ -1,5 +1,27 @@
 # Changelog
 
+## v4.0.2 - 2026-09-09
+
+### Added
+
+- Added GPT-6 Astra capabilities and Responses routing for OpenAI Messages requests, including reasoning aliases and verbosity. ChatGPT's Astra fallback uses the Codex catalog's 272K default context and Responses Lite settings.
+- Added per-client storage for the ChatGPT backend's `__oailb` routing cookie, restricted to known HTTPS ChatGPT hosts and normal cookie scope and expiration rules.
+
+### Fixed
+
+- Close idle upstream Responses connections when the last consumer disconnects, while preserving streams still used by other consumers of a shared request.
+- Bind model caches to provider and authentication identity, reject stale refresh results after identity changes or provider replacement, and preserve cache reuse across known-owner token rotation.
+- Reconstruct native Responses output from streamed deltas when terminal output is empty.
+
+### Changed
+
+- Upgraded persisted context capability caches to format v2. Older entries are refreshed automatically; the authentication token storage format is unchanged.
+- Updated the Codex upstream alignment skill to synchronize its reference checkout with the remote as the source of truth.
+
+### Validation
+
+- Passed all 602 workspace tests, formatting checks, and Clippy with warnings denied. Provider validation used local mocks.
+
 ## v4.0.1 - 2026-09-04
 
 ### Added

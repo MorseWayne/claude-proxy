@@ -1435,6 +1435,10 @@ pub enum InflightEvent {
     Error(InflightFailure),
 }
 
+#[cfg(test)]
+#[path = "app/model_cache_tests.rs"]
+mod model_cache_tests;
+
 /// Registry of provider instances and cached model lists.
 pub struct ProviderRegistry {
     providers: std::collections::HashMap<String, Arc<dyn Provider>>,
@@ -1456,19 +1460,44 @@ pub struct ModelCacheStatus {
 struct ModelCacheEntry {
     models: Vec<claude_proxy_core::ModelInfo>,
     cached_at: Instant,
+    provider: Option<Arc<dyn Provider>>,
+    identity: Option<String>,
 }
 
 impl ModelCacheEntry {
-    fn new(models: Vec<claude_proxy_core::ModelInfo>) -> Self {
+    fn new(
+        models: Vec<claude_proxy_core::ModelInfo>,
+        provider: Option<Arc<dyn Provider>>,
+        identity: Option<String>,
+    ) -> Self {
         Self {
             models,
             cached_at: Instant::now(),
+            provider,
+            identity,
         }
     }
 
     #[cfg(test)]
     fn with_timestamp(models: Vec<claude_proxy_core::ModelInfo>, cached_at: Instant) -> Self {
-        Self { models, cached_at }
+        Self {
+            models,
+            cached_at,
+            provider: None,
+            identity: None,
+        }
+    }
+
+    fn matches_provider(&self, current: Option<&Arc<dyn Provider>>) -> bool {
+        match (&self.provider, current) {
+            (Some(cached), Some(current)) => {
+                Arc::ptr_eq(cached, current)
+                    && self.identity.is_some()
+                    && self.identity == current.model_cache_identity()
+            }
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     fn is_fresh_at(&self, now: Instant, ttl: Duration) -> bool {
@@ -1520,8 +1549,36 @@ impl ProviderRegistry {
 
     /// Cache model list for a provider.
     pub fn cache_models(&mut self, provider_id: &str, models: Vec<claude_proxy_core::ModelInfo>) {
-        self.model_cache
-            .insert(provider_id.to_string(), ModelCacheEntry::new(models));
+        let provider = self.providers.get(provider_id).cloned();
+        let identity = provider
+            .as_ref()
+            .and_then(|provider| provider.model_cache_identity());
+        self.model_cache.insert(
+            provider_id.to_string(),
+            ModelCacheEntry::new(models, provider, identity),
+        );
+    }
+
+    fn cache_models_if_current(
+        &mut self,
+        provider_id: &str,
+        provider: &Arc<dyn Provider>,
+        identity: String,
+        models: Vec<claude_proxy_core::ModelInfo>,
+    ) -> bool {
+        if !self
+            .providers
+            .get(provider_id)
+            .is_some_and(|current| Arc::ptr_eq(current, provider))
+            || provider.model_cache_identity().as_ref() != Some(&identity)
+        {
+            return false;
+        }
+        self.model_cache.insert(
+            provider_id.to_string(),
+            ModelCacheEntry::new(models, Some(provider.clone()), Some(identity)),
+        );
+        true
     }
 
     #[cfg(test)]
@@ -1549,15 +1606,19 @@ impl ProviderRegistry {
     ) -> Option<&Vec<claude_proxy_core::ModelInfo>> {
         self.model_cache
             .get(provider_id)
-            .filter(|entry| entry.is_fresh_at(now, self.model_cache_ttl))
+            .filter(|entry| {
+                entry.is_fresh_at(now, self.model_cache_ttl)
+                    && entry.matches_provider(self.providers.get(provider_id))
+            })
             .map(|entry| &entry.models)
     }
 
     /// Get all cached models across all providers.
     pub fn all_cached_models(&self) -> Vec<claude_proxy_core::ModelInfo> {
         self.model_cache
-            .values()
-            .flat_map(|entry| entry.models.iter())
+            .iter()
+            .filter(|(provider_id, entry)| entry.matches_provider(self.providers.get(*provider_id)))
+            .flat_map(|(_, entry)| entry.models.iter())
             .cloned()
             .collect()
     }
@@ -1569,6 +1630,7 @@ impl ProviderRegistry {
         providers.sort_by_key(|(provider_id, _)| *provider_id);
         providers
             .into_iter()
+            .filter(|(provider_id, entry)| entry.matches_provider(self.providers.get(*provider_id)))
             .flat_map(|(provider_id, entry)| {
                 entry
                     .models
@@ -1592,7 +1654,11 @@ impl ProviderRegistry {
         let mut statuses = provider_ids
             .iter()
             .map(|provider_id| {
-                let Some(entry) = self.model_cache.get(provider_id) else {
+                let Some(entry) = self
+                    .model_cache
+                    .get(provider_id)
+                    .filter(|entry| entry.matches_provider(self.providers.get(provider_id)))
+                else {
                     return ModelCacheStatus {
                         provider: provider_id.clone(),
                         cached: false,
@@ -1625,6 +1691,7 @@ impl ProviderRegistry {
         let capabilities = self
             .model_cache
             .iter()
+            .filter(|(provider_id, entry)| entry.matches_provider(self.providers.get(*provider_id)))
             .flat_map(|(provider_id, entry)| {
                 entry.models.iter().map(move |model| {
                     (
@@ -1769,6 +1836,9 @@ impl AppState {
 
     async fn fetch_and_cache_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>, String> {
         let provider = self.get_or_create_provider(provider_id).await?;
+        let identity = provider.model_cache_identity().ok_or_else(|| {
+            format!("model catalog identity unavailable for provider '{provider_id}'; retry")
+        })?;
         let models = match provider.list_models().await {
             Ok(models) => {
                 self.record_provider_success(provider_id).await;
@@ -1782,10 +1852,16 @@ impl AppState {
             }
         };
 
-        self.provider_registry
+        if !self
+            .provider_registry
             .write()
             .await
-            .cache_models(provider_id, models.clone());
+            .cache_models_if_current(provider_id, &provider, identity, models.clone())
+        {
+            return Err(format!(
+                "provider '{provider_id}' or its model catalog identity changed during refresh; retry"
+            ));
+        }
 
         Ok(models)
     }

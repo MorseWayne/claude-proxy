@@ -275,7 +275,11 @@ fn history_payload_budget_bytes(model: &str) -> usize {
     let model = model.to_ascii_lowercase();
     if model.contains("mini") || model.contains("small") || model.contains("flash") {
         SMALL_HISTORY_PAYLOAD_BUDGET_BYTES
-    } else if model.contains("gpt-5") || model.contains("o3") || model.contains("o4") {
+    } else if model.contains("gpt-5")
+        || model.contains("o3")
+        || model.contains("o4")
+        || crate::openai_compat::is_gpt_6_astra(&model)
+    {
         LARGE_HISTORY_PAYLOAD_BUDGET_BYTES
     } else {
         DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES
@@ -1483,7 +1487,12 @@ where
         let mut saw_done = false;
 
         loop {
-            let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                next = next_upstream_stream_item(byte_stream.next()) => next,
+            };
+            let chunk_result = match next {
                 Ok(Some(chunk_result)) => chunk_result,
                 Ok(None) => break,
                 Err(error) => {
@@ -1648,6 +1657,10 @@ where
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
+
+#[cfg(test)]
+#[path = "responses/cancellation_tests.rs"]
+mod cancellation_tests;
 
 pub(crate) fn stream_responses_json_events_with_context_and_observer<F>(
     mut events: mpsc::Receiver<Result<Value, ProviderError>>,

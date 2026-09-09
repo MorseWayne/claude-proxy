@@ -271,17 +271,20 @@ reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
 responses_lite = true
 ```
 
-ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `claude-proxy/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 账号哈希 / 模型的远端缓存 > 内置能力表。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
+ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `claude-proxy/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 身份摘要 / 模型的远端缓存 > 内置能力表。身份摘要包含可用的账号、用户、邮箱、套餐及额外路由头信息；已知身份的普通 token 轮换可以继续复用，身份改变或 provider 被替换后，旧刷新结果会被拒绝。持久化缓存已升级到 v2，旧条目会重新获取，token 存储格式不变。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
 
-当前内置 GPT-5.6 回退能力如下：
+当前内置 ChatGPT 回退能力如下：
 
 | 模型 | 用途 | Context | 推理强度 | Responses Lite |
 |------|------|---------|----------|----------------|
 | `gpt-5.6-sol` | 默认 / Reasoning / Opus | 872k | `low`…`ultra` | 是 |
 | `gpt-5.6-terra` | Sonnet | 872k | `low`…`ultra` | 是 |
 | `gpt-5.6-luna` | Haiku | 872k | `low`…`max` | 是 |
+| `gpt-6-astra` | 可选高级模型 | 272k | `low`…`ultra` | 是 |
 
-所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；Sol/Terra 且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
+Astra 的 ChatGPT 回退使用 Codex 目录中的 272K 默认窗口，不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
+
+所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；Sol/Terra/Astra 且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
 #### Claude Code 虚拟 1M 与真实上游窗口
 
@@ -516,6 +519,8 @@ Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可
 要求的 `reasoning.context=all_turns` 和 `parallel_tool_calls=false` 也会自动补齐。
 Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters` 中声明并在
 转发前移除。原生 OpenAI Provider 仍会原样收到 `max_output_tokens`。
+
+最后一个流式消费者断开后，Proxy 会立即停止上游读取；仍有其他共享消费者时继续传输。ChatGPT 客户端仅在已知 HTTPS ChatGPT 域名存储上游 `__oailb` 路由 Cookie，并遵守域名、路径、安全传输和过期规则。
 
 ### OpenAI 客户端接入
 

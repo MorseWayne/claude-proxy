@@ -4,6 +4,7 @@ use tracing::{Level, debug, enabled, info};
 
 const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 const GPT_56_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+const ASTRA_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 fn intent(req: &MessagesRequest) -> Option<&str> {
     req.metadata
@@ -180,6 +181,9 @@ fn apply_reasoning_effort(request: &mut MessagesRequest, intent: Option<&str>) {
     }
 
     let effort = match intent {
+        Some("fast" | "quick_reply" | "summarization") if is_gpt_6_astra(&request.model) => {
+            Some("low")
+        }
         Some("fast" | "quick_reply" | "summarization") => Some("none"),
         Some("deep_think" | "reasoning") => highest_reasoning_effort(&request.model),
         Some("tool_use" | "agent") if supports_reasoning_effort(&request.model, "medium") => {
@@ -227,7 +231,9 @@ pub(crate) fn supports_reasoning_summary(model: &str) -> bool {
 }
 
 fn model_reasoning_efforts(model: &str) -> Vec<&'static str> {
-    if is_gpt_56_model(model) {
+    if is_gpt_6_astra(model) {
+        ASTRA_REASONING_EFFORTS.to_vec()
+    } else if is_gpt_56_model(model) {
         GPT_56_REASONING_EFFORTS.to_vec()
     } else if is_reasoning_model(model) || model.starts_with("gpt-5") {
         REASONING_EFFORTS.to_vec()
@@ -241,7 +247,11 @@ fn is_reasoning_model(model: &str) -> bool {
 }
 
 pub(crate) fn supports_responses(model: &str) -> bool {
-    model.starts_with("gpt-5") || is_reasoning_model(model)
+    model.starts_with("gpt-5") || is_reasoning_model(model) || is_gpt_6_astra(model)
+}
+
+pub(crate) fn is_gpt_6_astra(model: &str) -> bool {
+    model == "gpt-6-astra"
 }
 
 fn is_codex_model(model: &str) -> bool {
@@ -257,7 +267,7 @@ fn context_window_for_model(model_id: &str) -> Option<u32> {
         // Codex-family upstreams currently reject prompts above this observed backend limit,
         // even when adjacent GPT-5 metadata advertises a larger public context window.
         Some(272_000)
-    } else if is_gpt_56_model(model_id) {
+    } else if is_gpt_56_model(model_id) || is_gpt_6_astra(model_id) {
         Some(1_050_000)
     } else if model_id.starts_with("gpt-5") {
         Some(400_000)
@@ -267,7 +277,7 @@ fn context_window_for_model(model_id: &str) -> Option<u32> {
 }
 
 fn max_output_tokens_for_model(model_id: &str) -> Option<u32> {
-    if is_gpt_56_model(model_id) || model_id.starts_with("gpt-5.5") {
+    if is_gpt_56_model(model_id) || is_gpt_6_astra(model_id) || model_id.starts_with("gpt-5.5") {
         Some(128_000)
     } else if model_id.contains("mini") {
         Some(16_384)
@@ -306,7 +316,7 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
         is_chat_default: None,
         capabilities: ModelCapabilities {
             endpoints: EndpointCapabilities::from_paths(&supported_endpoints),
-            modalities: if is_gpt_56_model(model_id) {
+            modalities: if is_gpt_56_model(model_id) || is_gpt_6_astra(model_id) {
                 ModalityCapabilities {
                     input: InputModalities {
                         text: CapabilityState::Supported,
@@ -331,8 +341,8 @@ pub(crate) fn openai_model_info(model_id: &str) -> ModelInfo {
                 tool_choice: CapabilityState::Supported,
                 thinking: CapabilityState::from_bool(supports_reasoning.then_some(true)),
                 reasoning_effort: CapabilityState::from_bool(supports_reasoning.then_some(true)),
-                sampling: CapabilityState::Supported,
-                stop_sequences: CapabilityState::Supported,
+                sampling: CapabilityState::from_bool(Some(!is_gpt_6_astra(model_id))),
+                stop_sequences: CapabilityState::from_bool(Some(!is_gpt_6_astra(model_id))),
                 ..Default::default()
             },
             limits: ModelLimits {
@@ -377,7 +387,15 @@ fn openai_supported_parameters(model_id: &str, supports_reasoning: bool) -> Vec<
         parameters.push("thinking".to_string());
         parameters.push("reasoning_effort".to_string());
     }
-    if is_gpt_56_model(model_id) {
+    if is_gpt_6_astra(model_id) {
+        parameters.retain(|parameter| {
+            !matches!(
+                parameter.as_str(),
+                "temperature" | "top_p" | "stop_sequences"
+            )
+        });
+    }
+    if is_gpt_56_model(model_id) || is_gpt_6_astra(model_id) {
         parameters.extend(
             [
                 "prompt_cache_key",
@@ -569,7 +587,11 @@ fn history_payload_budget_bytes_for_stats(model: &str) -> usize {
     let model = model.to_ascii_lowercase();
     if model.contains("mini") || model.contains("small") || model.contains("flash") {
         256 * 1024
-    } else if model.contains("gpt-5") || model.contains("o3") || model.contains("o4") {
+    } else if model.contains("gpt-5")
+        || model.contains("o3")
+        || model.contains("o4")
+        || is_gpt_6_astra(&model)
+    {
         1024 * 1024
     } else {
         512 * 1024

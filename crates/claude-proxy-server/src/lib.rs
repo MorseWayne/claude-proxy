@@ -122,19 +122,8 @@ fn spawn_model_warmup(state: AppState) {
         };
 
         for provider_id in &provider_ids {
-            let provider = match state.get_or_create_provider(provider_id).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to create provider '{provider_id}' for warmup: {e}");
-                    continue;
-                }
-            };
-
-            // Fetch models without holding the registry lock
-            match provider.list_models().await {
+            match state.get_or_refresh_models(provider_id).await {
                 Ok(models) => {
-                    let mut reg = state.provider_registry.write().await;
-                    reg.cache_models(provider_id, models.clone());
                     info!(
                         "Warmed up model cache for '{}': {} models",
                         provider_id,
