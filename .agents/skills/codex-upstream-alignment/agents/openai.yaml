@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Upstream Alignment"
+  short_description: "Sync Codex changes and align claude-proxy"
+  default_prompt: "Use $codex-upstream-alignment to sync the Codex checkout and identify what claude-proxy must follow."
